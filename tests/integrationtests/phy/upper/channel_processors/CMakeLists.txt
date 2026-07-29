@@ -178,3 +178,20 @@ endif()
 add_test(NAME pusch_e2e_sensitivity_sweep
          COMMAND pusch_e2e_sensitivity_sweep --nof_prb 25 --mcs_index 11,27 --nof_frames 20)
 set_tests_properties(pusch_e2e_sensitivity_sweep PROPERTIES TIMEOUT 600)
+
+# GPU tests must not run concurrently with each other. The CUDA runtime rejects allocations with
+# cudaErrorDevicesUnavailable while several exclusive device contexts are active, which surfaces as intermittent ctest
+# failures that look like defects in the accelerated code. The shared lock lets ctest keep running the rest of the suite
+# in parallel while serialising the tests that drive the GPU.
+if (CUDA_ACCEL_FOUND)
+    set_tests_properties(
+            pusch_gpu_cpu_comparison_test
+            pdsch_gpu_e2e_test
+            pusch_gpu_cpu_result_parity_test
+            pusch_64qam_stress_test
+            pusch_e2e_pipeline_test
+            pusch_resident_dematch_scramble_test
+            pusch_e2e_correctness_sweep
+            pusch_e2e_sensitivity_sweep
+            PROPERTIES RESOURCE_LOCK ocudu_cuda_device)
+endif ()

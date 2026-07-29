@@ -72,7 +72,9 @@ if(CUDA_ACCEL_FOUND)
           GTest::gtest
           GTest::gtest_main)
   target_compile_definitions(pdsch_grid_output_strategy_test PRIVATE ENABLE_CUDA)
-  gtest_discover_tests(pdsch_grid_output_strategy_test)
+  # Serialise GPU tests: the CUDA runtime rejects allocations with cudaErrorDevicesUnavailable while several
+    # exclusive device contexts are active, which surfaces as intermittent failures rather than real defects.
+    gtest_discover_tests(pdsch_grid_output_strategy_test PROPERTIES RESOURCE_LOCK ocudu_cuda_device)
 
   add_executable(cuda_visible_phy_support_test cuda_visible_phy_support_test.cpp)
   target_include_directories(cuda_visible_phy_support_test PRIVATE ${PROJECT_SOURCE_DIR}/lib/phy/upper)
@@ -83,5 +85,7 @@ if(CUDA_ACCEL_FOUND)
           GTest::gtest
           GTest::gtest_main)
   target_compile_definitions(cuda_visible_phy_support_test PRIVATE ENABLE_CUDA)
-  gtest_discover_tests(cuda_visible_phy_support_test)
+  # Serialise GPU tests: the CUDA runtime rejects allocations with cudaErrorDevicesUnavailable while several
+    # exclusive device contexts are active, which surfaces as intermittent failures rather than real defects.
+    gtest_discover_tests(cuda_visible_phy_support_test PROPERTIES RESOURCE_LOCK ocudu_cuda_device)
 endif()

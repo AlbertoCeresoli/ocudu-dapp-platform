@@ -66,6 +66,9 @@ foreach(srs_estimator_gpu_profile IN LISTS srs_estimator_gpu_quick_profiles)
             COMMAND srs_estimator_gpu_latency_benchmark -R 1 -W 0 -P ${srs_estimator_gpu_profile} -G host)
     add_test(NAME srs_estimator_gpu_sensitivity_${srs_estimator_gpu_profile}
             COMMAND srs_estimator_gpu_sensitivity_sweep -F 1 -P ${srs_estimator_gpu_profile} -A 20 -B 20 -D 5 -G host)
+    list(APPEND srs_estimator_gpu_tests
+            srs_estimator_gpu_latency_${srs_estimator_gpu_profile}
+            srs_estimator_gpu_sensitivity_${srs_estimator_gpu_profile})
 endforeach()
 
 add_test(NAME srs_estimator_gpu_config_sweep
@@ -76,3 +79,15 @@ add_test(NAME srs_estimator_gpu_thread_safety_host
         COMMAND srs_estimator_gpu_thread_safety_test -T 4 -I 8 -P baseline_4x4_n4 -G host)
 add_test(NAME srs_estimator_gpu_thread_safety_visible
         COMMAND srs_estimator_gpu_thread_safety_test -T 4 -I 8 -P baseline_4x4_n4 -G visible)
+
+# GPU tests must not run concurrently with each other. The CUDA runtime rejects allocations with
+# cudaErrorDevicesUnavailable while several exclusive device contexts are active, which surfaces as intermittent ctest
+# failures that look like defects in the accelerated code. The shared lock lets ctest keep running the rest of the suite
+# in parallel while serialising the tests that drive the GPU.
+set_tests_properties(
+        ${srs_estimator_gpu_tests}
+        srs_estimator_gpu_config_sweep
+        srs_estimator_gpu_config_sweep_windowed
+        srs_estimator_gpu_thread_safety_host
+        srs_estimator_gpu_thread_safety_visible
+        PROPERTIES RESOURCE_LOCK ocudu_cuda_device)

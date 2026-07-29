@@ -29,5 +29,7 @@ if(CUDA_ACCEL_FOUND)
             ocudulog
             GTest::gtest
             GTest::gtest_main)
-    gtest_discover_tests(srs_estimator_cuda_test)
+    # Serialise GPU tests: the CUDA runtime rejects allocations with cudaErrorDevicesUnavailable while several
+    # exclusive device contexts are active, which surfaces as intermittent failures rather than real defects.
+    gtest_discover_tests(srs_estimator_cuda_test PROPERTIES RESOURCE_LOCK ocudu_cuda_device)
 endif()

@@ -9,5 +9,7 @@ if (CUDA_ACCEL_FOUND)
             GTest::gtest
             GTest::gtest_main)
     target_compile_definitions(ofh_iq_compression_cuda_test PRIVATE ENABLE_CUDA)
-    gtest_discover_tests(ofh_iq_compression_cuda_test)
+    # Serialise GPU tests: the CUDA runtime rejects allocations with cudaErrorDevicesUnavailable while several
+    # exclusive device contexts are active, which surfaces as intermittent failures rather than real defects.
+    gtest_discover_tests(ofh_iq_compression_cuda_test PROPERTIES RESOURCE_LOCK ocudu_cuda_device)
 endif()

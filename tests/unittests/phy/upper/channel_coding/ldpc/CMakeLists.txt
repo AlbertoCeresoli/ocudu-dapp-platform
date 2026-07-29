@@ -39,3 +39,14 @@ if(CUDA_ACCEL_FOUND)
     add_test(ldpc_decoder_gpu_cpu_test ldpc_decoder_gpu_cpu_test)
 
 endif()
+
+# GPU tests must not run concurrently with each other. The CUDA runtime rejects allocations with
+# cudaErrorDevicesUnavailable while several exclusive device contexts are active, which surfaces as intermittent ctest
+# failures that look like defects in the accelerated code. The shared lock lets ctest keep running the rest of the suite
+# in parallel while serialising the tests that drive the GPU.
+if (CUDA_ACCEL_FOUND)
+    set_tests_properties(
+            ldpc_encoder_gpu_cpu_test
+            ldpc_decoder_gpu_cpu_test
+            PROPERTIES RESOURCE_LOCK ocudu_cuda_device)
+endif ()
