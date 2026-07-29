@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "../support/resource_grid_allocation_info.h"
 #include "../support/resource_grid_reader_impl.h"
 #include "../support/resource_grid_writer_impl.h"
 #include "phy_acceleration_runtime_options.h"
@@ -17,7 +18,9 @@
 #include "ocudu/phy/support/resource_grid.h"
 #include "ocudu/phy/support/resource_grid_dimensions.h"
 #include "ocudu/phy/support/support_factories.h"
+#include "ocudu/ran/resource_block.h"
 #include "ocudu/support/error_handling.h"
+#include "ocudu/support/math/math_utils.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -64,7 +67,11 @@ class cuda_visible_resource_grid : public resource_grid
 {
 public:
   cuda_visible_resource_grid(unsigned nof_ports_, unsigned nof_symbols_, unsigned nof_subc_, int nvcuda_device_id = 0) :
-    device_id(nvcuda_device_id), nof_ports(nof_ports_), nof_symbols(nof_symbols_), nof_subc(nof_subc_)
+    alloc_mask(nof_ports_, nof_symbols_, divide_ceil(nof_subc_, NOF_SUBCARRIERS_PER_RB)),
+    device_id(nvcuda_device_id),
+    nof_ports(nof_ports_),
+    nof_symbols(nof_symbols_),
+    nof_subc(nof_subc_)
   {
     // Bind to the configured device so backing allocations and events land on the right GPU.
     (void)cudaSetDevice(device_id);
@@ -97,10 +104,14 @@ public:
 
     rg_buffer = std::make_unique<managed_tensor>(
         static_cast<cbf16_t*>(managed_data), managed_tensor::dimensions_size_type{nof_subc, nof_symbols, nof_ports});
-    writer = std::make_unique<writer_impl>(*this, *rg_buffer, empty);
-    reader = std::make_unique<reader_impl>(*this, *rg_buffer, empty);
+    writer = std::make_unique<writer_impl>(*this, *rg_buffer, alloc_mask);
+    reader = std::make_unique<reader_impl>(*this, *rg_buffer, alloc_mask);
 
-    set_all_zero();
+    // Set all the resource elements to zero. This cannot defer to set_all_zero(), because the allocation mask starts
+    // out empty and that would skip the clear, leaving the uninitialised cudaMallocManaged() contents in the grid.
+    for (unsigned port = 0; port != nof_ports; ++port) {
+      ocuduvec::zero(rg_buffer->template get_view<static_cast<unsigned>(resource_grid_dimensions::port)>({port}));
+    }
   }
 
   ~cuda_visible_resource_grid() override
@@ -132,22 +143,21 @@ public:
       return;
     }
 
-    unsigned all_empty = all_ports_empty_mask();
-    if (empty.load(std::memory_order_acquire) == all_empty) {
+    if (alloc_mask.is_empty()) {
       return;
     }
 
     if (clear_on_device()) {
-      empty.store(all_empty, std::memory_order_release);
+      alloc_mask.reset_all();
       return;
     }
 
     for (unsigned port = 0; port != nof_ports; ++port) {
-      if (!reader->is_port_empty(port)) {
+      if (!alloc_mask.is_port_empty(port)) {
         ocuduvec::zero(rg_buffer->template get_view<static_cast<unsigned>(resource_grid_dimensions::port)>({port}));
       }
     }
-    empty.store(all_empty, std::memory_order_release);
+    alloc_mask.reset_all();
     std::lock_guard<std::mutex> lock(grid_ready_mutex);
     pending_grid_ready_events.clear();
     grid_ready_recorded = false;
@@ -157,7 +167,7 @@ public:
   {
     std::unique_lock<std::mutex> lock(grid_ready_mutex);
     wait_for_active_device_mapping_locked(lock);
-    return empty.load(std::memory_order_acquire) == all_ports_empty_mask();
+    return alloc_mask.is_empty();
   }
 
   resource_grid_writer& get_writer() override { return *writer; }
@@ -171,10 +181,10 @@ private:
   class reader_impl : public resource_grid_reader_impl
   {
   public:
-    reader_impl(const cuda_visible_resource_grid& parent_,
-                const storage_type&               data_,
-                const std::atomic<unsigned>&      empty_) :
-      resource_grid_reader_impl(data_, empty_), parent(parent_)
+    reader_impl(const cuda_visible_resource_grid&    parent_,
+                const storage_type&                  data_,
+                const resource_grid_allocation_info& alloc_mask_) :
+      resource_grid_reader_impl(data_, alloc_mask_), parent(parent_)
     {
     }
 
@@ -242,8 +252,10 @@ private:
   class writer_impl : public resource_grid_writer_impl
   {
   public:
-    writer_impl(cuda_visible_resource_grid& parent_, storage_type& data_, std::atomic<unsigned>& empty_) :
-      resource_grid_writer_impl(data_, empty_), parent(parent_)
+    writer_impl(cuda_visible_resource_grid&    parent_,
+                storage_type&                  data_,
+                resource_grid_allocation_info& alloc_mask_) :
+      resource_grid_writer_impl(data_, alloc_mask_), parent(parent_)
     {
     }
 
@@ -465,11 +477,6 @@ private:
     return event;
   }
 
-  unsigned all_ports_empty_mask() const
-  {
-    return (nof_ports >= 8U * sizeof(unsigned)) ? ~0U : ((1U << nof_ports) - 1U);
-  }
-
   bool clear_on_device()
   {
     if ((managed_data == nullptr) || (managed_bytes == 0) || (maintenance_stream == nullptr)) {
@@ -586,11 +593,12 @@ private:
   void*                      maintenance_stream = nullptr;
   mutable std::vector<void*> grid_ready_events;
   mutable std::vector<void*> pending_grid_ready_events;
-  std::atomic<unsigned>      empty = {};
   mutable std::mutex         grid_ready_mutex;
   mutable bool               grid_ready_recorded             = false;
   mutable bool               device_mapping_active           = false;
   mutable bool               device_mapping_replaces_pending = false;
+  /// Per-port, per-symbol allocation tracking, shared with the reader and writer.
+  resource_grid_allocation_info alloc_mask;
   bool     prefetch_enabled = phy_acceleration_env_flag_enabled("OCUDU_CUDA_VISIBLE_GRID_PREFETCH", false);
   int      device_id        = 0;
   unsigned nof_ports        = 0;

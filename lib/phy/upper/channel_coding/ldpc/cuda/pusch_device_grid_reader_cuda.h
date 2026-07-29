@@ -49,6 +49,12 @@ public:
   bool is_empty() const override { return host_reader.is_empty(); }
 
   // See interface for documentation.
+  crb_interval get_allocation_range(unsigned port, unsigned symbol) const override
+  {
+    return host_reader.get_allocation_range(port, symbol);
+  }
+
+  // See interface for documentation.
   span<cf_t> get(span<cf_t>                                 symbols,
                  unsigned                                   port,
                  unsigned                                   l,
