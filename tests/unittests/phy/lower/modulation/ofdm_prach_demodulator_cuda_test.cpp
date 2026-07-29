@@ -12,6 +12,7 @@
 #include "ocudu/ran/prach/prach_frequency_mapping.h"
 #include "ocudu/ran/prach/prach_preamble_information.h"
 #include "ocudu/ran/resource_block.h"
+#include <algorithm>
 #include <cmath>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -76,6 +77,17 @@ void assert_symbols_near(const prach_buffer&                          cpu_buffer
                         ? get_prach_preamble_long_info(config.format)
                         : get_prach_preamble_short_info(config.format, to_ra_subcarrier_spacing(pusch_scs), true);
 
+  // The PRACH buffer stores brain floating point samples, which carry eight bits of significand. Two independently
+  // rounded values of the same magnitude can therefore land up to two quantization steps apart, and the step size grows
+  // with the magnitude of the sample. Scale the comparison accordingly, keeping the caller tolerance as a floor for
+  // samples close to zero, where the absolute step is negligible.
+  static constexpr float bf16_two_step_relative = 0x1p-6F;
+
+  auto near_bf16 = [](float lhs, float rhs, float abs_tolerance) {
+    float scale = std::max(std::abs(lhs), std::abs(rhs));
+    return std::max(abs_tolerance, bf16_two_step_relative * scale);
+  };
+
   for (unsigned i_symbol = 0; i_symbol != preamble_info.nof_symbols; ++i_symbol) {
     span<const cbf16_t> cpu_symbol = cpu_buffer.get_symbol(0, 0, 0, i_symbol);
     span<const cbf16_t> gpu_symbol = gpu_buffer.get_symbol(0, 0, 0, i_symbol);
@@ -83,8 +95,10 @@ void assert_symbols_near(const prach_buffer&                          cpu_buffer
     for (unsigned i_re = 0; i_re != cpu_symbol.size(); ++i_re) {
       cf_t cpu = to_cf(cpu_symbol[i_re]);
       cf_t gpu = to_cf(gpu_symbol[i_re]);
-      EXPECT_NEAR(cpu.real(), gpu.real(), tolerance);
-      EXPECT_NEAR(cpu.imag(), gpu.imag(), tolerance);
+      EXPECT_NEAR(cpu.real(), gpu.real(), near_bf16(cpu.real(), gpu.real(), tolerance)) << "symbol=" << i_symbol
+                                                                                       << " re=" << i_re;
+      EXPECT_NEAR(cpu.imag(), gpu.imag(), near_bf16(cpu.imag(), gpu.imag(), tolerance)) << "symbol=" << i_symbol
+                                                                                       << " re=" << i_re;
     }
   }
 }

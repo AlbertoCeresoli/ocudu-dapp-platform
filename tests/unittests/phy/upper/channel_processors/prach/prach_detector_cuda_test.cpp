@@ -9,6 +9,7 @@
 #include "ocudu/phy/upper/channel_processors/prach/prach_detector.h"
 #include "ocudu/phy/upper/channel_processors/prach/prach_generator.h"
 #include "ocudu/ran/prach/prach_preamble_information.h"
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <gtest/gtest.h>
@@ -136,8 +137,12 @@ TEST_P(prach_detector_cuda_fixture, matches_cpu_detection_for_known_preamble)
   if (test.delay_samples != 0) {
     EXPECT_GT(cpu_preamble->time_advance.to_seconds(), 0.0);
   }
-  // True-IDFT GPU path: metric must match host for zero and delayed peaks.
-  EXPECT_NEAR(cpu_preamble->detection_metric, gpu_preamble->detection_metric, 0.25);
+  // True-IDFT GPU path: metric must match host for zero and delayed peaks. The GPU accumulates the correlation in a
+  // different order than the host, so the comparison scales with the metric magnitude, which spans several orders of
+  // magnitude across the test vectors. The original absolute margin is kept as a floor for small metrics.
+  EXPECT_NEAR(cpu_preamble->detection_metric,
+              gpu_preamble->detection_metric,
+              std::max(0.25F, 1.0e-3F * std::abs(cpu_preamble->detection_metric)));
   EXPECT_GT(gpu_preamble->detection_metric, 1.0F);
   EXPECT_NEAR(cpu_preamble->preamble_power_dB, gpu_preamble->preamble_power_dB, 0.3);
   EXPECT_NEAR(cpu.rssi_dB, gpu.rssi_dB, 0.2);
