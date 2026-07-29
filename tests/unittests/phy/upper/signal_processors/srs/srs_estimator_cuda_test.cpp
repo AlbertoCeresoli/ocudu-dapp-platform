@@ -25,9 +25,12 @@
 #include <array>
 #include <cmath>
 #include <complex>
+#include <cstdlib>
 #include <gtest/gtest.h>
 #include <numeric>
+#include <optional>
 #include <random>
+#include <string>
 #include <string>
 #include <vector>
 
@@ -36,6 +39,37 @@ using namespace ocudu;
 namespace {
 
 enum class grid_mode { host, cuda_visible };
+
+/// \brief Sets an environment variable for the current scope and restores its previous state on destruction.
+class scoped_env_var
+{
+public:
+  explicit scoped_env_var(const char* name_) : name(name_)
+  {
+    const char* value = std::getenv(name.c_str());
+    if (value != nullptr) {
+      original_value = value;
+    }
+  }
+
+  ~scoped_env_var()
+  {
+    if (original_value.has_value()) {
+      (void)setenv(name.c_str(), original_value->c_str(), 1);
+    } else {
+      (void)unsetenv(name.c_str());
+    }
+  }
+
+  scoped_env_var(const scoped_env_var&)            = delete;
+  scoped_env_var& operator=(const scoped_env_var&) = delete;
+
+  bool set(const char* value) { return setenv(name.c_str(), value, 1) == 0; }
+
+private:
+  std::string                name;
+  std::optional<std::string> original_value;
+};
 
 struct srs_test_profile {
   unsigned                nof_rx_ports        = 1;
@@ -130,6 +164,12 @@ std::unique_ptr<resource_grid> create_test_grid(const srs_estimator_configuratio
   EXPECT_NE(fallback_factory, nullptr);
 
   if (mode == grid_mode::cuda_visible) {
+    // Managed CUDA-visible grids are only auto-selected on integrated GPUs, where device and host memory are physically
+    // shared. Request them explicitly so the CUDA-visible path is also covered on discrete GPUs, where the auto policy
+    // prefers pinned host memory instead.
+    scoped_env_var grid_mode_var("OCUDU_UL_CUDA_VISIBLE_GRID");
+    EXPECT_TRUE(grid_mode_var.set("managed"));
+
     std::shared_ptr<resource_grid_factory> accelerated_factory = create_phy_acceleration_resource_grid_factory(
         fallback_factory, phy_acceleration_resource_grid_direction::uplink, true);
     EXPECT_NE(accelerated_factory, nullptr);
