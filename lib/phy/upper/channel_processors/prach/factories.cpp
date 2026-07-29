@@ -131,8 +131,10 @@ public:
     dft_processor::configuration idft_short_config;
     idft_short_config.size = config.idft_short_size;
     idft_short_config.dir  = dft_processor::direction::INVERSE;
-    auto fallback          = std::make_unique<prach_detector_generic_impl>(
-        dft_factory->create(idft_long_config), dft_factory->create(idft_short_config), prach_gen_factory->create());
+    auto fallback          = std::make_unique<prach_detector_generic_impl>(dft_factory->create(idft_long_config),
+                                                                  dft_factory->create(idft_short_config),
+                                                                  prach_gen_factory->create(),
+                                                                  config.threshold_scaling);
     return std::make_unique<prach_detector_cuda_impl>(
         prach_gen_factory->create(), std::move(fallback), force_gpu_path, nvcuda_device_id);
   }
