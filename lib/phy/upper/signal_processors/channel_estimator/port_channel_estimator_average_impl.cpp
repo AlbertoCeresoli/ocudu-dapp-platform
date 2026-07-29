@@ -22,6 +22,13 @@ using namespace ocudu;
 static const unsigned& MAX_LAYERS   = port_channel_estimator_average_impl::MAX_LAYERS;
 static const unsigned& MAX_V_PILOTS = port_channel_estimator_average_impl::MAX_V_PILOTS;
 
+static constexpr bounded_bitset<NOF_SUBCARRIERS_PER_RB> RE_PATTERN_TYPE2_DELTA0 =
+    {true, true, false, false, false, false, true, true, false, false, false, false};
+static constexpr bounded_bitset<NOF_SUBCARRIERS_PER_RB> RE_PATTERN_TYPE2_DELTA2 =
+    {false, false, true, true, false, false, false, false, true, true, false, false};
+static constexpr bounded_bitset<NOF_SUBCARRIERS_PER_RB> RE_PATTERN_TYPE2_DELTA4 =
+    {false, false, false, false, true, true, false, false, false, false, true, true};
+
 /// \brief Gets the time-domain characteristics of the DM-RS pattern for the current hop, common to all layers.
 /// \param[in] cfg  The channel estimator configuration.
 /// \param[in] hop  The current hop index (0 or 1).
@@ -101,6 +108,78 @@ static void setup_auxiliary_buffers(
 /// \param[in] second Second vector.
 /// \param[in] weight Interpolation weight.
 static void simd_vector_interpolate(span<cbf16_t> out, span<const cf_t> first, span<const cf_t> second, float weight);
+
+/// \brief Identifies a PUSCH/PDSCH Type-2 DM-RS CDM-group pattern.
+/// \param[out] cdm_group CDM group index.
+/// \param[in] re_pattern RE pattern within a PRB.
+/// \return True if the pattern is one of the three Type-2 CDM group masks.
+static bool get_type2_cdm_group(unsigned& cdm_group, const bounded_bitset<NOF_SUBCARRIERS_PER_RB>& re_pattern)
+{
+  if (re_pattern == RE_PATTERN_TYPE2_DELTA0) {
+    cdm_group = 0;
+    return true;
+  }
+  if (re_pattern == RE_PATTERN_TYPE2_DELTA2) {
+    cdm_group = 1;
+    return true;
+  }
+  if (re_pattern == RE_PATTERN_TYPE2_DELTA4) {
+    cdm_group = 2;
+    return true;
+  }
+
+  return false;
+}
+
+static unsigned get_type2_pilot_sc(unsigned cdm_group, unsigned i_pilot)
+{
+  ocudu_assert(cdm_group < 3, "Invalid Type-2 CDM group {}.", cdm_group);
+  ocudu_assert(i_pilot < 4, "Invalid Type-2 pilot index {}.", i_pilot);
+  return 2 * cdm_group + (i_pilot & 1U) + 6 * (i_pilot / 2U);
+}
+
+static unsigned get_type2_pilot_abs_sc(unsigned cdm_group, unsigned i_pilot)
+{
+  static constexpr unsigned NOF_TYPE2_DMRS_PER_RB = 4;
+  return (i_pilot / NOF_TYPE2_DMRS_PER_RB) * NOF_SUBCARRIERS_PER_RB +
+         get_type2_pilot_sc(cdm_group, i_pilot % NOF_TYPE2_DMRS_PER_RB);
+}
+
+/// \brief Interpolates Type-2 DM-RS pilot estimates over the full allocated bandwidth.
+///
+/// Type-2 pilot locations inside a PRB are not expressible as a single offset/stride pair, so they cannot use the
+/// regular interpolator configuration used by Type-1 PUSCH.
+static void interpolate_type2_dmrs(span<cf_t> out, span<const cf_t> pilots, unsigned nof_rb, unsigned cdm_group)
+{
+  static constexpr unsigned NOF_TYPE2_DMRS_PER_RB = 4;
+  unsigned                  nof_expected_pilots   = nof_rb * NOF_TYPE2_DMRS_PER_RB;
+  unsigned                  nof_expected_re       = nof_rb * NOF_SUBCARRIERS_PER_RB;
+
+  ocudu_assert(pilots.size() == nof_expected_pilots,
+               "Expected {} Type-2 DM-RS pilots, provided {}.",
+               nof_expected_pilots,
+               pilots.size());
+  ocudu_assert(
+      out.size() == nof_expected_re, "Expected {} channel estimates, provided {}.", nof_expected_re, out.size());
+
+  unsigned left_pilot = 0;
+  for (unsigned i_re = 0; i_re != nof_expected_re; ++i_re) {
+    while ((left_pilot + 1 != nof_expected_pilots) && (get_type2_pilot_abs_sc(cdm_group, left_pilot + 1) <= i_re)) {
+      ++left_pilot;
+    }
+
+    unsigned left_sc = get_type2_pilot_abs_sc(cdm_group, left_pilot);
+    if ((i_re <= left_sc) || (left_pilot + 1 == nof_expected_pilots)) {
+      out[i_re] = pilots[left_pilot];
+      continue;
+    }
+
+    unsigned right_pilot = left_pilot + 1;
+    unsigned right_sc    = get_type2_pilot_abs_sc(cdm_group, right_pilot);
+    float    weight      = static_cast<float>(i_re - left_sc) / static_cast<float>(right_sc - left_sc);
+    out[i_re]            = pilots[left_pilot] * (1.0F - weight) + pilots[right_pilot] * weight;
+  }
+}
 
 void port_channel_estimator_average_impl::get_symbol_ch_estimate(span<cbf16_t> symbol,
                                                                  unsigned      i_symbol,
@@ -395,7 +474,12 @@ void port_channel_estimator_average_impl::compute_hop(const ocudu::resource_grid
     const auto& hop_rb_mask = (hop == 0) ? pattern.rb_mask : pattern.rb_mask2;
 
     // Prepare frequency domain interpolation.
-    interpolator::configuration interpolator_cfg = configure_interpolator(pattern.re_pattern);
+    unsigned                    type2_cdm_group = 0;
+    bool                        is_type2_dmrs   = get_type2_cdm_group(type2_cdm_group, pattern.re_pattern);
+    interpolator::configuration interpolator_cfg;
+    if (!is_type2_dmrs) {
+      interpolator_cfg = configure_interpolator(pattern.re_pattern);
+    }
 
     // Calculate total scaling accounting for the symbol accumulation and the DM-RS-to-data gain.
     float total_scaling = 1.0F / beta_scaling;
@@ -413,7 +497,7 @@ void port_channel_estimator_average_impl::compute_hop(const ocudu::resource_grid
       apply_fd_smoothing(enlarged_filtered_pilots_lse.get_symbol(i_symbol, i_layer),
                          enlarged_pilots_lse.get_symbol(i_symbol, i_layer),
                          hop_rb_mask.count(),
-                         interpolator_cfg.stride,
+                         is_type2_dmrs ? 1 : interpolator_cfg.stride,
                          fd_smoothing_strategy);
 
       // Energy of the DM-RS in the current symbol and layer.
@@ -429,9 +513,16 @@ void port_channel_estimator_average_impl::compute_hop(const ocudu::resource_grid
       rsrp[i_layer] += avg;
 
       // Interpolate frequency response for this symbol.
-      freq_interpolator->interpolate(freq_response.get_symbol(i_symbol, i_layer),
-                                     filtered_pilots_lse.get_symbol(i_symbol, i_layer),
-                                     interpolator_cfg);
+      if (is_type2_dmrs) {
+        interpolate_type2_dmrs(freq_response.get_symbol(i_symbol, i_layer),
+                               filtered_pilots_lse.get_symbol(i_symbol, i_layer),
+                               hop_rb_mask.count(),
+                               type2_cdm_group);
+      } else {
+        freq_interpolator->interpolate(freq_response.get_symbol(i_symbol, i_layer),
+                                       filtered_pilots_lse.get_symbol(i_symbol, i_layer),
+                                       interpolator_cfg);
+      }
     }
   }
 

@@ -65,6 +65,9 @@ public:
   virtual std::unique_ptr<pdsch_processor>     create()           = 0;
   virtual std::unique_ptr<pdsch_pdu_validator> create_validator() = 0;
   virtual std::unique_ptr<pdsch_processor>     create(ocudulog::basic_logger& logger, bool enable_logging_broadcast);
+  /// Hook invoked before building a new outer PDSCH processor pool so factories
+  /// with scoped shared resources can reset per-pool state.
+  virtual void on_new_processor_pool_scope() {}
 };
 
 std::shared_ptr<pdsch_processor_factory>
@@ -107,6 +110,27 @@ create_pdsch_flexible_processor_factory_sw(std::shared_ptr<ldpc_segmenter_tx_fac
                                            unsigned                                       cb_batch_length = 0);
 
 std::shared_ptr<pdsch_processor_factory>
-create_pdsch_processor_pool(std::shared_ptr<pdsch_processor_factory> pdsch_proc_factory, unsigned max_nof_processors);
+create_pdsch_processor_pool(std::shared_ptr<pdsch_processor_factory> pdsch_proc_factory,
+                            unsigned                                 max_nof_processors,
+                            bool                                     block_on_exhaustion = false);
+
+/// \brief Creates an accelerated PDSCH block processor factory.
+/// \return Shared pointer to the factory, or nullptr if acceleration is unavailable.
+std::shared_ptr<pdsch_block_processor_factory>
+create_pdsch_block_processor_factory_accelerated(int nvcuda_device_id = 0);
+
+/// \brief Checks if accelerated PDSCH block processing is available.
+/// \return True if a block-processing acceleration backend is available.
+bool is_pdsch_block_processor_acceleration_available();
+
+/// \brief Hybrid GPU/SW block processor: host path for small/medium TBs, GPU for large traffic.
+///
+/// GPU encode of sub-~4 KiB TBs often costs hundreds of us (launch + residency) and exceeds a 500 us
+/// slot on GB10 OTA, which starves DL PRB packing. Host LDPC is ~20-50 us for RAR and small data
+/// grants. Override with OCUDU_PDSCH_GPU_MIN_TB_BYTES (default 4096). Set 0 to force GPU for all sizes.
+std::shared_ptr<pdsch_block_processor_factory>
+create_pdsch_block_processor_factory_hybrid(std::shared_ptr<pdsch_block_processor_factory> accelerated_factory,
+                                            std::shared_ptr<pdsch_block_processor_factory> sw_factory,
+                                            unsigned                                       min_gpu_tb_bytes = 4096);
 
 } // namespace ocudu

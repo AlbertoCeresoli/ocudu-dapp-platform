@@ -4,6 +4,7 @@
 #pragma once
 
 #include "ofh_data_flow_uplane_downlink_data.h"
+#include "ocudu/adt/static_vector.h"
 #include "ocudu/phy/support/shared_resource_grid.h"
 #include "ocudu/support/executors/task_executor.h"
 #include "ocudu/support/rtsan.h"
@@ -51,6 +52,33 @@ public:
       logger.warning("Sector#{}: failed to dispatch message in the downlink data flow User-Plane for slot '{}'",
                      sector_id,
                      context.slot);
+    }
+  }
+
+  // See interface for documentation.
+  void enqueue_section_type_1_messages(const data_flow_uplane_resource_grid_context& base_context,
+                                       unsigned                                      first_port,
+                                       span<const unsigned>                          eaxcs,
+                                       const shared_resource_grid&                   grid) override
+  {
+    // Do not process User Plane if the stop was requested.
+    auto token = stop_manager.get_token();
+    if (OCUDU_UNLIKELY(token.is_stop_requested())) {
+      return;
+    }
+
+    static_vector<unsigned, MAX_NOF_SUPPORTED_EAXC> eaxcs_copy(eaxcs.begin(), eaxcs.end());
+    if (!executor.defer([this,
+                         base_context,
+                         first_port,
+                         eaxcs_copy = std::move(eaxcs_copy),
+                         rg         = grid.copy(),
+                         tk         = std::move(token)]() noexcept OCUDU_RTSAN_NONBLOCKING {
+          data_flow_uplane->enqueue_section_type_1_messages(base_context, first_port, eaxcs_copy, rg);
+        })) {
+      logger.warning("Sector#{}: failed to dispatch message batch in the downlink data flow User-Plane for slot '{}'",
+                     sector_id,
+                     base_context.slot);
     }
   }
 

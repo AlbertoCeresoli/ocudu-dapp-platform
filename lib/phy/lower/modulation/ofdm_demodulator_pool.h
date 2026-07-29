@@ -38,6 +38,9 @@ public:
   }
 
   // See the interface for documentation.
+  unsigned get_max_ci16_symbol_batch_size() const override { return base->get_max_ci16_symbol_batch_size(); }
+
+  // See the interface for documentation.
   void
   demodulate(resource_grid_writer& grid, span<const cf_t> input, unsigned port_index, unsigned symbol_index) override
   {
@@ -54,6 +57,82 @@ public:
     }
 
     demodulator->demodulate(grid, input, port_index, symbol_index);
+  }
+
+  // See the interface for documentation.
+  bool demodulate_ci16(resource_grid_writer& grid,
+                       span<const ci16_t>    input,
+                       float                 input_scale,
+                       unsigned              port_index,
+                       unsigned              symbol_index) override
+  {
+    auto demodulator = demodulators->get();
+    if (!demodulator) {
+      ocuduvec::zero(grid.get_view(port_index, symbol_index));
+      logger.error("Insufficient number of OFDM demodulator instances.");
+      return true;
+    }
+
+    double current_center_frequency_Hz = center_frequency_Hz.load(std::memory_order_relaxed);
+    if (std::isnormal(current_center_frequency_Hz)) {
+      demodulator->set_center_frequency(current_center_frequency_Hz);
+    }
+
+    return demodulator->demodulate_ci16(grid, input, input_scale, port_index, symbol_index);
+  }
+
+  // See the interface for documentation.
+  bool demodulate_ci16_ports(resource_grid_writer&     grid,
+                             span<const ci16_t* const> inputs,
+                             unsigned                  nof_samples,
+                             float                     input_scale,
+                             span<const unsigned>      port_indices,
+                             unsigned                  symbol_index) override
+  {
+    auto demodulator = demodulators->get();
+    if (!demodulator) {
+      for (unsigned port_index : port_indices) {
+        ocuduvec::zero(grid.get_view(port_index, symbol_index));
+      }
+      logger.error("Insufficient number of OFDM demodulator instances.");
+      return true;
+    }
+
+    double current_center_frequency_Hz = center_frequency_Hz.load(std::memory_order_relaxed);
+    if (std::isnormal(current_center_frequency_Hz)) {
+      demodulator->set_center_frequency(current_center_frequency_Hz);
+    }
+
+    return demodulator->demodulate_ci16_ports(grid, inputs, nof_samples, input_scale, port_indices, symbol_index);
+  }
+
+  // See the interface for documentation.
+  bool demodulate_ci16_symbol_batch_ports(resource_grid_writer&     grid,
+                                          span<const ci16_t* const> inputs,
+                                          span<const unsigned>      symbol_sample_counts,
+                                          float                     input_scale,
+                                          span<const unsigned>      port_indices,
+                                          unsigned                  first_symbol_index,
+                                          unsigned                  nof_symbols) override
+  {
+    auto demodulator = demodulators->get();
+    if (!demodulator) {
+      for (unsigned i_symbol = 0; i_symbol != nof_symbols; ++i_symbol) {
+        for (unsigned port_index : port_indices) {
+          ocuduvec::zero(grid.get_view(port_index, (first_symbol_index + i_symbol) % grid.get_nof_symbols()));
+        }
+      }
+      logger.error("Insufficient number of OFDM demodulator instances.");
+      return true;
+    }
+
+    double current_center_frequency_Hz = center_frequency_Hz.load(std::memory_order_relaxed);
+    if (std::isnormal(current_center_frequency_Hz)) {
+      demodulator->set_center_frequency(current_center_frequency_Hz);
+    }
+
+    return demodulator->demodulate_ci16_symbol_batch_ports(
+        grid, inputs, symbol_sample_counts, input_scale, port_indices, first_symbol_index, nof_symbols);
   }
 
 private:

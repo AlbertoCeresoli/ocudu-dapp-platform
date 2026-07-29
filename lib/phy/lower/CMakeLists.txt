@@ -21,3 +21,6 @@ target_link_libraries(ocudu_lower_phy
         ocudu_lower_phy_prach_processor
         ocudu_lower_phy_puxch_processor
         ocudu_lower_phy_uplink_processor)
+if(CUDA_ACCEL_FOUND)
+    target_compile_definitions(ocudu_lower_phy PRIVATE ENABLE_CUDA)
+endif()

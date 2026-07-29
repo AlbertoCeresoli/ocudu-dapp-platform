@@ -22,3 +22,6 @@ set(SOURCES
 
 add_library(ocudu_ru_sdr STATIC ${SOURCES})
 target_link_libraries(ocudu_ru_sdr ocudu_lower_phy ocudu_radio ocudulog)
+if(CUDA_ACCEL_FOUND)
+    target_compile_definitions(ocudu_ru_sdr PRIVATE ENABLE_CUDA)
+endif()

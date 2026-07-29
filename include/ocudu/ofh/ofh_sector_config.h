@@ -90,6 +90,8 @@ struct sector_configuration {
   ru_compression_params dl_compression_params;
   /// PRACH compression parameters.
   ru_compression_params prach_compression_params;
+  /// Open Fronthaul IQ compression/decompression acceleration mode.
+  std::string compression_acceleration_mode = "auto";
   /// Downlink static compression header flag.
   bool is_downlink_static_compr_hdr_enabled = true;
   /// Uplink static compression header flag.

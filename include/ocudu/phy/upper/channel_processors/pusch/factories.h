@@ -28,6 +28,9 @@ class pusch_decoder_factory
 public:
   virtual ~pusch_decoder_factory()                = default;
   virtual std::unique_ptr<pusch_decoder> create() = 0;
+
+  /// Performs any expensive decoder initialization that should not happen in the slot processing path.
+  virtual void warmup() {}
 };
 
 /// \brief Creates a factory for the empty PUSCH decoder.
@@ -48,6 +51,14 @@ struct pusch_decoder_factory_sw_configuration {
   task_executor*                               executor                  = nullptr;
   unsigned                                     nof_prb;
   unsigned                                     nof_layers;
+  /// Enable resident accelerated decoding for efficient multi-codeblock processing.
+  bool enable_resident_acceleration_decoder = false;
+  /// Maximum number of resident accelerated decoders in the shared pool. Decoders are created lazily.
+  unsigned nof_resident_acceleration_decoders = 0;
+  /// Accelerated LDPC decoder algorithm: "auto", "boxplus", or "min_sum".
+  std::string ldpc_decoder_algorithm = "auto";
+  /// NVIDIA CUDA device ID the resident accelerated decoders bind to.
+  int nvcuda_device_id = 0;
 };
 
 std::shared_ptr<pusch_decoder_factory> create_pusch_decoder_factory_sw(pusch_decoder_factory_sw_configuration config);
@@ -80,6 +91,29 @@ create_pusch_demodulator_factory_sw(std::shared_ptr<channel_equalizer_factory>  
                                     unsigned                                         max_nof_prb,
                                     bool                                             enable_post_eq_sinr = false);
 
+/// \brief Accelerated PUSCH demodulator factory configuration.
+struct pusch_demodulator_factory_accelerated_configuration {
+  std::shared_ptr<channel_equalizer_factory>       equalizer_factory;
+  std::shared_ptr<transform_precoder_factory>      precoder_factory;
+  std::shared_ptr<demodulation_mapper_factory>     demodulation_factory;
+  std::shared_ptr<evm_calculator_factory>          evm_calc_factory;
+  std::shared_ptr<pseudo_random_generator_factory> prg_factory;
+  unsigned                                         max_nof_prb         = 273;
+  bool                                             enable_post_eq_sinr = false;
+  bool                                             compensate_cfo      = true;
+  channel_equalizer_algorithm_type                 equalizer_algorithm = channel_equalizer_algorithm_type::mmse;
+  /// NVIDIA CUDA device ID the accelerated demodulator binds to.
+  int nvcuda_device_id = 0;
+};
+
+/// \brief Creates an accelerated PUSCH demodulator factory.
+/// \return Shared pointer to the factory, or nullptr if acceleration is unavailable.
+std::shared_ptr<pusch_demodulator_factory>
+create_pusch_demodulator_factory_accelerated(const pusch_demodulator_factory_accelerated_configuration& config);
+
+/// \brief Checks if accelerated PUSCH demodulation is available on the given NVIDIA CUDA device.
+bool is_pusch_demodulator_acceleration_available(int nvcuda_device_id = 0);
+
 class pusch_processor_factory
 {
 public:
@@ -87,6 +121,7 @@ public:
   virtual std::unique_ptr<pusch_processor>     create()           = 0;
   virtual std::unique_ptr<pusch_pdu_validator> create_validator() = 0;
   virtual std::unique_ptr<pusch_processor>     create(ocudulog::basic_logger& logger);
+  virtual void                                 on_new_processor_pool_scope() {}
 };
 
 struct pusch_processor_factory_sw_configuration {

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_decoder_buffer.h"
+#include <vector>
 
 namespace ocudu {
 
@@ -13,9 +14,10 @@ class pusch_decoder_buffer_dummy : public pusch_decoder_buffer
 {
 public:
   // See interface for documentation.
-  span<log_likelihood_ratio> get_next_block_view(unsigned /* block_size */) override
+  span<log_likelihood_ratio> get_next_block_view(unsigned block_size) override
   {
-    return span<log_likelihood_ratio>();
+    softbit_sink.resize(block_size);
+    return span<log_likelihood_ratio>(softbit_sink);
   }
 
   // See interface for documentation.
@@ -29,6 +31,9 @@ public:
   {
     // Ignore.
   }
+
+private:
+  std::vector<log_likelihood_ratio> softbit_sink;
 };
 
 } // namespace ocudu

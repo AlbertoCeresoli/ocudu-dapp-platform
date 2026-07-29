@@ -178,6 +178,48 @@ TEST_F(UplinkProcessorFixture, prach_normal_workflow)
   ASSERT_EQ(tap_spy->get_handle_quiet_grid_count(), 0);
 }
 
+TEST_F(UplinkProcessorFixture, prach_long_format_detector_config_uses_long_preamble_scs)
+{
+  ul_processor->get_pdu_slot_repository(slot);
+
+  auto prach_buffer_pool = create_spy_prach_buffer_pool(true, 1, 1);
+
+  prach_buffer_context context = {};
+  context.slot                 = slot;
+  context.format               = prach_format_type::zero;
+  context.pusch_scs            = subcarrier_spacing::kHz30;
+  context.nof_preamble_indices = 64;
+  context.ports.push_back(0);
+
+  ul_processor->get_slot_processor(slot).process_prach(prach_buffer_pool->get(), context);
+  ASSERT_TRUE(prach_executor.run_pending_tasks());
+
+  ASSERT_TRUE(prach_spy->has_detect_method_been_called());
+  ASSERT_TRUE(prach_spy->get_last_config().has_value());
+  ASSERT_EQ(prach_spy->get_last_config()->ra_scs, prach_subcarrier_spacing::kHz1_25);
+}
+
+TEST_F(UplinkProcessorFixture, prach_format_three_detector_config_uses_five_khz_scs)
+{
+  ul_processor->get_pdu_slot_repository(slot);
+
+  auto prach_buffer_pool = create_spy_prach_buffer_pool(true, 1, 1);
+
+  prach_buffer_context context = {};
+  context.slot                 = slot;
+  context.format               = prach_format_type::three;
+  context.pusch_scs            = subcarrier_spacing::kHz30;
+  context.nof_preamble_indices = 64;
+  context.ports.push_back(0);
+
+  ul_processor->get_slot_processor(slot).process_prach(prach_buffer_pool->get(), context);
+  ASSERT_TRUE(prach_executor.run_pending_tasks());
+
+  ASSERT_TRUE(prach_spy->has_detect_method_been_called());
+  ASSERT_TRUE(prach_spy->get_last_config().has_value());
+  ASSERT_EQ(prach_spy->get_last_config()->ra_scs, prach_subcarrier_spacing::kHz5);
+}
+
 TEST_F(UplinkProcessorFixture, prach_fail_defer_workflow)
 {
   ul_processor->get_pdu_slot_repository(slot);

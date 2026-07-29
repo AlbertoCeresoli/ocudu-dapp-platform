@@ -50,7 +50,7 @@ public:
     for (unsigned i_sector = 0; i_sector != config.nof_sectors; ++i_sector) {
       task_executor& dl_exec    = inline_executor;
       task_executor& ul_exec    = inline_executor;
-      task_executor& prach_exec = inline_executor;
+      task_executor& prach_exec = *config.common_exec;
       task_executor& tx_exec    = *config.common_exec;
       task_executor& rx_exec    = *config.common_exec;
       sectors.emplace_back(dl_exec, ul_exec, prach_exec, tx_exec, rx_exec);
@@ -69,7 +69,7 @@ public:
 
       task_executor& dl_exec    = *config.high_prio_executor;
       task_executor& ul_exec    = inline_executor;
-      task_executor& prach_exec = *config.high_prio_executor;
+      task_executor& prach_exec = *baseband_exec;
       task_executor& tx_exec    = *baseband_exec;
       task_executor& rx_exec    = *baseband_exec;
 
@@ -88,11 +88,12 @@ public:
       ocudu_assert(baseband_exec.rx_exec != nullptr, "Invalid receive baseband cell executor.");
       ocudu_assert(baseband_exec.tx_exec != nullptr, "Invalid transmit baseband cell executor.");
 
-      task_executor& dl_exec    = *config.high_prio_executor;
-      task_executor& ul_exec    = inline_executor;
-      task_executor& prach_exec = *config.high_prio_executor;
-      task_executor& tx_exec    = *baseband_exec.tx_exec;
-      task_executor& rx_exec    = *baseband_exec.rx_exec;
+      task_executor& dl_exec = *config.high_prio_executor;
+      task_executor& ul_exec = inline_executor;
+      task_executor& prach_exec =
+          (baseband_exec.prach_exec != nullptr) ? *baseband_exec.prach_exec : *baseband_exec.rx_exec;
+      task_executor& tx_exec = *baseband_exec.tx_exec;
+      task_executor& rx_exec = *baseband_exec.rx_exec;
 
       sectors.emplace_back(dl_exec, ul_exec, prach_exec, tx_exec, rx_exec);
     }
@@ -110,11 +111,12 @@ public:
       ocudu_assert(baseband_exec.tx_exec != nullptr, "Invalid transmit baseband cell executor.");
       ocudu_assert(baseband_exec.ul_exec != nullptr, "Invalid baseband demodulator cell executor.");
 
-      task_executor& dl_exec    = *config.high_prio_executor;
-      task_executor& ul_exec    = *baseband_exec.ul_exec;
-      task_executor& prach_exec = *config.high_prio_executor;
-      task_executor& tx_exec    = *baseband_exec.tx_exec;
-      task_executor& rx_exec    = *baseband_exec.rx_exec;
+      task_executor& dl_exec = *config.high_prio_executor;
+      task_executor& ul_exec = *baseband_exec.ul_exec;
+      task_executor& prach_exec =
+          (baseband_exec.prach_exec != nullptr) ? *baseband_exec.prach_exec : *baseband_exec.ul_exec;
+      task_executor& tx_exec = *baseband_exec.tx_exec;
+      task_executor& rx_exec = *baseband_exec.rx_exec;
 
       sectors.emplace_back(dl_exec, ul_exec, prach_exec, tx_exec, rx_exec);
     }

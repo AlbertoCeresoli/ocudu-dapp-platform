@@ -119,8 +119,8 @@ channel_emulator::channel_emulator(std::string        delay_profile,
     return acc + convert_dB_to_power(tap.second);
   });
 
-  // Calculate power normalization coefficient.
-  float norm_coefficient = 1.0F / std::sqrt(nof_rx_ports * taps_power);
+  // Normalize channel taps to unit power per port (Es/N0 convention).
+  float norm_coefficient = 1.0F / std::sqrt(taps_power);
 
   // Generate frequency response of each tap.
   taps_channel_response.resize({nof_subc, static_cast<unsigned>(taps.size())});

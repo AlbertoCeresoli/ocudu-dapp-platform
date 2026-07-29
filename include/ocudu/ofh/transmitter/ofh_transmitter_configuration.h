@@ -14,6 +14,7 @@
 #include "ocudu/ran/bs_channel_bandwidth.h"
 #include "ocudu/ran/cyclic_prefix.h"
 #include "ocudu/ran/tdd/tdd_ul_dl_config.h"
+#include <string>
 
 namespace ocudu {
 namespace ofh {
@@ -60,6 +61,8 @@ struct transmitter_config {
   ru_compression_params ul_compr_params;
   /// PRACH compression parameters.
   ru_compression_params prach_compr_params;
+  /// Open Fronthaul IQ compression/decompression acceleration mode.
+  std::string compression_acceleration_mode = "auto";
   /// Downlink static compression header flag.
   bool is_downlink_static_compr_hdr_enabled;
   /// Uplink static compression header flag.

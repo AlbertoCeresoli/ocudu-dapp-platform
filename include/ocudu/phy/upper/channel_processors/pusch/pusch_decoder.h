@@ -8,9 +8,11 @@
 #pragma once
 
 #include "ocudu/adt/span.h"
+#include "ocudu/phy/upper/acceleration/phy_acceleration.h"
 #include "ocudu/phy/upper/log_likelihood_ratio.h"
 #include "ocudu/ran/sch/ldpc_base_graph.h"
 #include "ocudu/ran/sch/modulation_scheme.h"
+#include <functional>
 
 namespace ocudu {
 
@@ -78,6 +80,50 @@ public:
   ///
   /// \param[in] nof_softbits Number of codeword softbits, parameter \f$G^\textup{UL-SCH}\f$ in TS38.212 Section 6.2.7.
   virtual void set_nof_softbits(units::bits nof_softbits) = 0;
+
+  /// \brief Attempts to decode a resident accelerator softbit buffer.
+  virtual bool try_decode_resident(const resident_softbit_buffer& codeword)
+  {
+    (void)codeword;
+    return false;
+  }
+
+  /// \brief Checks if resident accelerator decode is supported by this decoder.
+  virtual bool supports_resident_decode() const { return false; }
+
+  /// \brief Enables resident accelerator decode mode.
+  virtual void enable_resident_decode() {}
+
+  /// \brief Disables resident accelerator decode mode.
+  virtual void disable_resident_decode() {}
+
+  /// \brief Pass demodulator gap timing for inclusion in decode results.
+  virtual void set_demod_gap_timing(float grid_staging_us, float demod_sync_us)
+  {
+    (void)grid_staging_us;
+    (void)demod_sync_us;
+  }
+
+  /// \brief Pass processor-side timing stages for inclusion in decode results.
+  virtual void set_processor_stage_timing(float ch_estimate_us, float process_data_setup_us, float demod_call_us)
+  {
+    (void)ch_estimate_us;
+    (void)process_data_setup_us;
+    (void)demod_call_us;
+  }
+
+  /// \brief Pass detailed gap timing from processor for inclusion in decode results.
+  virtual void set_detailed_gap_timing(float decode_call_us, float sinr_readback_us)
+  {
+    (void)decode_call_us;
+    (void)sinr_readback_us;
+  }
+
+  /// \brief Set a callback to be invoked after resident decode completion but before join_and_notify.
+  ///
+  /// Used for deferred metric readback: after the resident backend synchronizes the demodulation work, metric memory is
+  /// valid. The callback reads the metrics and sets them on the notifier before join_and_notify() consumes CSI data.
+  virtual void set_pre_join_callback(std::function<void()> callback) { (void)callback; }
 };
 
 } // namespace ocudu

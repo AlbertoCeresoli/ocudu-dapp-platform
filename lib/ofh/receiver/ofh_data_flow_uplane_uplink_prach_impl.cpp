@@ -90,6 +90,21 @@ bool data_flow_uplane_uplink_prach_impl::should_uplane_packet_be_filtered(
 
 void data_flow_uplane_uplink_prach_impl::decode_type1_message(unsigned eaxc, span<const uint8_t> message)
 {
+  uplane_message_decoder_results compressed_results;
+  if (uplane_decoder->supports_prach_buffer_decompression() &&
+      uplane_decoder->decode_with_compressed_iq(compressed_results, message)) {
+    if (should_uplane_packet_be_filtered(eaxc, compressed_results)) {
+      metrics_collector.increase_dropped_messages();
+
+      return;
+    }
+
+    if (prach_iq_writter.write_compressed_to_prach_buffer(eaxc, compressed_results, *uplane_decoder)) {
+      notification_sender.notify_prach(compressed_results.params.slot);
+      return;
+    }
+  }
+
   uplane_message_decoder_results results;
   if (!uplane_decoder->decode(results, message)) {
     metrics_collector.increase_dropped_messages();

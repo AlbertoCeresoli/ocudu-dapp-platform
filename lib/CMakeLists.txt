@@ -5,6 +5,15 @@
 # Do not build by default.
 set_directory_properties(PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
+if (CUDA_FOUND)
+    message(STATUS "Adding in-tree CUDA accelerated PHY kernels")
+    add_subdirectory(phy/cuda)
+else ()
+    set(CUDA_ACCEL_FOUND FALSE CACHE BOOL "CUDA acceleration library not found" FORCE)
+    set(CUDA_ACCEL_INCLUDE_DIRS "" CACHE PATH "CUDA acceleration include dirs" FORCE)
+    set(CUDA_ACCEL_LIBRARIES "" CACHE STRING "CUDA acceleration library target" FORCE)
+endif ()
+
 add_subdirectory(asn1)
 add_subdirectory(cu_cp)
 add_subdirectory(cu_up)

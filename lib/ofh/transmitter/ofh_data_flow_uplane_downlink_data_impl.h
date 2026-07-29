@@ -16,6 +16,7 @@
 
 namespace ocudu {
 struct resource_grid_context;
+class resource_grid_reader;
 
 namespace ether {
 class eth_frame_pool;
@@ -92,6 +93,12 @@ public:
                                       const shared_resource_grid&                   grid) override;
 
   // See interface for documentation.
+  void enqueue_section_type_1_messages(const data_flow_uplane_resource_grid_context& base_context,
+                                       unsigned                                      first_port,
+                                       span<const unsigned>                          eaxcs,
+                                       const shared_resource_grid&                   grid) override;
+
+  // See interface for documentation.
   operation_controller& get_operation_controller() override { return controller; }
 
 private:
@@ -99,11 +106,37 @@ private:
   void enqueue_section_type_1_message_symbol_burst(const data_flow_uplane_resource_grid_context& context,
                                                    const shared_resource_grid&                   grid);
 
+  /// Enqueues a User-Plane message burst for contiguous resource-grid ports using a batched device-grid path.
+  bool enqueue_section_type_1_messages_symbol_burst(const data_flow_uplane_resource_grid_context& base_context,
+                                                    unsigned                                      first_port,
+                                                    span<const unsigned>                          eaxcs,
+                                                    const shared_resource_grid&                   grid);
+
+  /// Enqueues a User-Plane message burst for contiguous resource-grid ports and symbols using a batched device-grid
+  /// path.
+  bool enqueue_section_type_1_messages_slot_burst(const data_flow_uplane_resource_grid_context& base_context,
+                                                  unsigned                                      first_port,
+                                                  span<const unsigned>                          eaxcs,
+                                                  const shared_resource_grid&                   grid);
+
   /// Enqueues an User-Plane message symbol with the given context and grid.
   unsigned enqueue_section_type_1_message_symbol(span<const cbf16_t>          iq_symbol_data,
                                                  const uplane_message_params& params,
                                                  unsigned                     eaxc,
                                                  span<uint8_t>                buffer);
+
+  /// Enqueues an User-Plane message symbol directly from a device-visible resource grid when supported.
+  unsigned enqueue_section_type_1_message_symbol(const resource_grid_reader&  reader,
+                                                 const uplane_message_params& params,
+                                                 unsigned                     port,
+                                                 unsigned                     eaxc,
+                                                 span<uint8_t>                buffer);
+
+  /// Adds eCPRI and Ethernet headers after the User-Plane payload has been serialized.
+  unsigned finish_section_type_1_message_symbol(unsigned                     up_bytes_written,
+                                                const uplane_message_params& params,
+                                                unsigned                     eaxc,
+                                                span<uint8_t>                buffer);
 
   // See interface for documentation.
   data_flow_message_encoding_metrics_collector* get_metrics_collector() override;

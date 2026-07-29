@@ -34,13 +34,15 @@ if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
     # If the compiler does not support the crypto features with the default compiler flags, try to append +crypto to -march.
     if (NOT HAVE_ARM_CRYPTO)
         message(STATUS "Current compile options do not support crypto features.")
-        set(MARCH "native" CACHE STRING "Compiler -march flag. Default value is 'native' for aarch64.")
         message(STATUS "Current CPU value is ${MCPU}")
-        message(STATUS "Current MARCH value is ${MARCH}")
 
-        # Append +crypto to the required flags.
-        set(CMAKE_REQUIRED_FLAGS "-march=${MARCH}+crypto")
+        set(CMAKE_REQUIRED_FLAGS "-mcpu=${MCPU}+crypto")
         check_cxx_source_compiles("${CHECK_ARM_CRYPTO_CODE}" HAVE_PLUS_CRYPTO)
+
+        if (NOT HAVE_PLUS_CRYPTO)
+            set(CMAKE_REQUIRED_FLAGS "-march=armv8-a+crypto")
+            check_cxx_source_compiles("${CHECK_ARM_CRYPTO_CODE}" HAVE_PLUS_CRYPTO)
+        endif()
 
         # Print a fatal error if the +crypto appending is not supported.
         if (NOT HAVE_PLUS_CRYPTO)

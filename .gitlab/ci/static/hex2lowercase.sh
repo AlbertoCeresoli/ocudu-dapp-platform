@@ -5,4 +5,4 @@
 
 
 # for actual source and header files
-find . -type f \( -name "*.c" -o -name "*.cc" -o -name "*.cpp" -o -name "*.h" -o -name "*.h.in" \) \( ! -path "*/bundled/*" ! -path "*/external/*" \) -exec sed -i 's/0x[0-9a-fA-F]*/\L&/g' {} \;
+find . -type f \( -name "*.c" -o -name "*.cc" -o -name "*.cpp" -o -name "*.h" -o -name "*.h.in" \) \( ! -path "*/bundled/*" ! -path "*/external/*" ! -path "*/third_party/*" \) -exec sed -i 's/0x[0-9a-fA-F]*/\L&/g' {} \;

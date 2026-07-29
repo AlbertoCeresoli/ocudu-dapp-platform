@@ -71,6 +71,8 @@ public:
   // See interface for documentation.
   std::unique_ptr<PhyBlockValidator> create_validator() override { return base_factory->create_validator(); }
 
+  void on_new_processor_pool_scope() override { base_factory->on_new_processor_pool_scope(); }
+
 private:
   std::shared_ptr<Factory> base_factory;
   Notifier&                notifier;

@@ -13,10 +13,16 @@ add_subdirectory(signal_processors)
 
 add_library(ocudu_downlink_processor
         downlink_processor_multi_executor_impl.cpp
-        downlink_processor_pool_impl.cpp)
+        downlink_processor_pool_impl.cpp
+        pdsch_grid_output_strategy.cpp)
 target_link_libraries(ocudu_downlink_processor
         ocudu_instrumentation
         ocudu_channel_processors)
+if(CUDA_ACCEL_FOUND)
+    target_compile_definitions(ocudu_downlink_processor PRIVATE ENABLE_CUDA)
+    target_include_directories(ocudu_downlink_processor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/channel_coding/ldpc)
+    target_link_libraries(ocudu_downlink_processor ocudu_ldpc_cuda CUDA::cudart)
+endif()
 
 add_library(ocudu_uplink_processor
         uplink_processor_impl.cpp
@@ -25,6 +31,8 @@ add_library(ocudu_uplink_processor
 target_link_libraries(ocudu_uplink_processor ocudu_channel_processors)
 
 add_library(ocudu_upper_phy
+        phy_acceleration_prach_buffer_factory.cpp
+        phy_acceleration_resource_grid_factory.cpp
         upper_phy_error_handler_impl.cpp
         upper_phy_factories.cpp
         upper_phy_impl.cpp
@@ -43,10 +51,15 @@ target_link_libraries(ocudu_upper_phy
         ocudu_phy_support
         ocudu_transform_precoding
         ocudu_uplink_processor
-        ocudu_upper_phy_metrics)
+        ocudu_upper_phy_metrics
+        $<$<BOOL:${CUDA_ACCEL_FOUND}>:CUDA::cudart>)
+if(CUDA_ACCEL_FOUND)
+    target_compile_definitions(ocudu_upper_phy PRIVATE ENABLE_CUDA)
+endif()
 
 add_library(log_likelihood_ratio log_likelihood_ratio.cpp)
 target_link_libraries(log_likelihood_ratio ocuduvec)
+
 
 add_library(ocudu_upper_phy_support
         rx_buffer_pool_impl.cpp

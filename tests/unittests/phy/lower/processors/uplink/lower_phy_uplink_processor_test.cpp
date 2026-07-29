@@ -306,6 +306,103 @@ TEST_P(LowerPhyUplinkProcessorFixture, Flow)
   }
 }
 
+TEST_P(LowerPhyUplinkProcessorFixture, ReportsMetricsFromPackedSamplesWithoutCfo)
+{
+  unsigned           nof_rx_ports = std::get<0>(GetParam());
+  sampling_rate      srate        = std::get<1>(GetParam());
+  subcarrier_spacing scs          = std::get<2>(GetParam());
+  cyclic_prefix      cp           = std::get<3>(GetParam());
+
+  unsigned base_symbol_size = srate.get_dft_size(scs);
+  unsigned cp_size          = cp.get_length(0, scs).to_samples(srate.to_Hz());
+
+  baseband_gateway_buffer_dynamic buffer(nof_rx_ports, cp_size + base_symbol_size);
+  for (unsigned i_port = 0; i_port != nof_rx_ports; ++i_port) {
+    span<ci16_t> port_buffer = buffer[i_port];
+    std::fill(port_buffer.begin(), port_buffer.end(), (i_port == 0) ? ci16_t(INT16_MAX, 0) : ci16_t(0, INT16_MAX / 2));
+  }
+
+  uplink_processor_notifier_spy uplink_proc_notifier_spy;
+  prach_processor_notifier_spy  prach_proc_notifier_spy;
+  puxch_processor_notifier_spy  puxch_proc_notifier_spy;
+  ul_processor->connect(uplink_proc_notifier_spy, prach_proc_notifier_spy, puxch_proc_notifier_spy);
+
+  ul_processor->get_baseband().process(buffer.get_reader(), 0);
+
+  const auto& metrics_entries = uplink_proc_notifier_spy.get_metrics();
+  ASSERT_EQ(metrics_entries.size(), 1);
+  const lower_phy_baseband_metrics& metrics = metrics_entries.front();
+
+  const float scale          = static_cast<float>(INT16_MAX);
+  const float low_port_power = static_cast<float>(INT16_MAX / 2) * static_cast<float>(INT16_MAX / 2) / (scale * scale);
+  const float expected_avg_power = (nof_rx_ports == 1) ? 1.0F : ((1.0F + low_port_power) / 2.0F);
+  EXPECT_NEAR(metrics.avg_power, expected_avg_power, 1e-5F);
+  EXPECT_NEAR(metrics.peak_power, 1.0F, 1e-5F);
+  ASSERT_TRUE(metrics.clipping.has_value());
+  EXPECT_EQ(metrics.clipping->nof_clipped_samples, buffer.get_nof_samples());
+  EXPECT_EQ(metrics.clipping->nof_processed_samples, nof_rx_ports * buffer.get_nof_samples());
+}
+
+TEST_P(LowerPhyUplinkProcessorFixture, ProcessesHalfSlotPackedSamplesWithoutCfo)
+{
+  unsigned           nof_rx_ports = std::get<0>(GetParam());
+  sampling_rate      srate        = std::get<1>(GetParam());
+  subcarrier_spacing scs          = std::get<2>(GetParam());
+  cyclic_prefix      cp           = std::get<3>(GetParam());
+
+  unsigned              base_symbol_size     = srate.get_dft_size(scs);
+  unsigned              nof_symbols_per_slot = get_nsymb_per_slot(cp);
+  unsigned              nof_symbols          = nof_symbols_per_slot / 2;
+  std::vector<unsigned> symbol_sizes(nof_symbols);
+  unsigned              nof_samples = 0;
+  for (unsigned i_symbol = 0; i_symbol != nof_symbols; ++i_symbol) {
+    unsigned cp_size       = cp.get_length(i_symbol, scs).to_samples(srate.to_Hz());
+    symbol_sizes[i_symbol] = cp_size + base_symbol_size;
+    nof_samples += symbol_sizes[i_symbol];
+  }
+
+  baseband_gateway_buffer_dynamic buffer(nof_rx_ports, nof_samples);
+  for (unsigned i_port = 0; i_port != nof_rx_ports; ++i_port) {
+    span<ci16_t> port_buffer = buffer[i_port];
+    std::generate(port_buffer.begin(), port_buffer.end(), []() {
+      return to_ci16(cf_t(dist_sample(rgen) * INT16_MAX, dist_sample(rgen) * INT16_MAX));
+    });
+  }
+
+  uplink_processor_notifier_spy uplink_proc_notifier_spy;
+  prach_processor_notifier_spy  prach_proc_notifier_spy;
+  puxch_processor_notifier_spy  puxch_proc_notifier_spy;
+  ul_processor->connect(uplink_proc_notifier_spy, prach_proc_notifier_spy, puxch_proc_notifier_spy);
+
+  ul_processor->get_baseband().process(buffer.get_reader(), 0);
+
+  const auto& prach_entries = prach_proc_spy->get_baseband_entries();
+  const auto& puxch_entries = puxch_proc_spy->get_baseband_entries();
+  ASSERT_EQ(prach_entries.size(), nof_symbols);
+  ASSERT_EQ(puxch_entries.size(), nof_symbols);
+
+  for (unsigned i_symbol = 0; i_symbol != nof_symbols; ++i_symbol) {
+    prach_processor_baseband::symbol_context expected_prach_context;
+    expected_prach_context.slot   = slot_point(to_numerology_value(scs), 0);
+    expected_prach_context.symbol = i_symbol;
+    expected_prach_context.sector = config.sector_id;
+    EXPECT_EQ(prach_entries[i_symbol].context, expected_prach_context);
+    EXPECT_EQ(prach_entries[i_symbol].samples.get_nof_samples(), symbol_sizes[i_symbol]);
+
+    lower_phy_rx_symbol_context expected_puxch_context;
+    expected_puxch_context.slot        = slot_point(to_numerology_value(scs), 0);
+    expected_puxch_context.sector      = config.sector_id;
+    expected_puxch_context.nof_symbols = i_symbol;
+    EXPECT_EQ(puxch_entries[i_symbol].context, expected_puxch_context);
+    EXPECT_EQ(puxch_entries[i_symbol].samples.get_nof_samples(), symbol_sizes[i_symbol]);
+  }
+
+  EXPECT_EQ(uplink_proc_notifier_spy.get_half_slots().size(), 1);
+  EXPECT_EQ(uplink_proc_notifier_spy.get_full_slots().size(), 0);
+  EXPECT_EQ(prach_proc_notifier_spy.get_nof_notifications(), 0);
+  EXPECT_EQ(puxch_proc_notifier_spy.get_nof_notifications(), 0);
+}
+
 // Creates test suite that combines all possible parameters.
 INSTANTIATE_TEST_SUITE_P(LowerPhyUplinkProcessor,
                          LowerPhyUplinkProcessorFixture,

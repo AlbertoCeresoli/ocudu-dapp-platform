@@ -117,6 +117,24 @@ public:
   /// \param[in]  port    Port index.
   /// \param[in]  l       OFDM symbol index.
   virtual span<const cbf16_t> get_view(unsigned port, unsigned l) const = 0;
+
+  /// Returns true if the reader can expose a device-visible BF16 resource grid.
+  virtual bool supports_device_grid_reading() const { return false; }
+
+  /// Returns a device-visible BF16 resource grid pointer with layout `[port][symbol][subcarrier]`.
+  virtual const void* get_device_grid_cbf16() const { return nullptr; }
+
+  /// Returns an opaque completion token recorded after the device-visible grid is ready, if available.
+  virtual void* get_device_grid_ready_event() const { return nullptr; }
+
+  /// Prepares the device-visible grid for consumption on an opaque execution stream.
+  virtual bool prepare_device_grid_reading(void*) const { return true; }
+
+  /// Records that device-grid reading has been enqueued on an opaque execution stream.
+  virtual bool on_device_grid_reading_enqueued(void*) const { return true; }
+
+  /// Prepares any device-visible writes for host-side resource-grid consumption.
+  virtual bool synchronize_device_grid_reading() const { return true; }
 };
 
 } // namespace ocudu

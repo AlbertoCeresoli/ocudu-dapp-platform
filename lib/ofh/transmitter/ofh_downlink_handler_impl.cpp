@@ -4,6 +4,7 @@
 #include "ofh_downlink_handler_impl.h"
 #include "../support/logger_utils.h"
 #include "helpers.h"
+#include "ocudu/adt/span.h"
 #include "ocudu/instrumentation/traces/ofh_traces.h"
 #include "ocudu/ofh/ofh_error_notifier.h"
 #include "ocudu/phy/support/resource_grid_context.h"
@@ -111,12 +112,11 @@ void downlink_handler_impl::handle_dl_data(const resource_grid_context& context,
     cplane_context.eaxc = dl_eaxc[cell_port_id];
     // Control-Plane data flow.
     data_flow_cplane->enqueue_section_type_1_message(cplane_context);
-
-    // User-Plane data flow.
-    uplane_context.port = cell_port_id;
-    uplane_context.eaxc = dl_eaxc[cell_port_id];
-    data_flow_uplane->enqueue_section_type_1_message(uplane_context, grid);
   }
+
+  // User-Plane data flow.
+  data_flow_uplane->enqueue_section_type_1_messages(
+      uplane_context, 0, span<const unsigned>(dl_eaxc.data(), reader.get_nof_ports()), grid);
 
   ofh_tracer << trace_event("ofh_handle_downlink", tp);
 }

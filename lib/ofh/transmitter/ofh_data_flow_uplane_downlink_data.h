@@ -4,6 +4,7 @@
 #pragma once
 
 #include "ofh_data_flow_cuplane_encoding_metrics_collector.h"
+#include "ocudu/adt/span.h"
 #include "ocudu/ofh/transmitter/ofh_transmitter_data_flow_metrics.h"
 #include "ocudu/ran/resource_allocation/ofdm_symbol_range.h"
 #include "ocudu/ran/slot_point.h"
@@ -43,6 +44,20 @@ public:
   /// Enqueues the User-Plane downlink data messages with the given context and resource grid.
   virtual void enqueue_section_type_1_message(const data_flow_uplane_resource_grid_context& context,
                                               const shared_resource_grid&                   grid) = 0;
+
+  /// Enqueues User-Plane downlink data messages for contiguous resource-grid ports.
+  virtual void enqueue_section_type_1_messages(const data_flow_uplane_resource_grid_context& base_context,
+                                               unsigned                                      first_port,
+                                               span<const unsigned>                          eaxcs,
+                                               const shared_resource_grid&                   grid)
+  {
+    for (unsigned i_port = 0, e = eaxcs.size(); i_port != e; ++i_port) {
+      data_flow_uplane_resource_grid_context context = base_context;
+      context.port                                   = first_port + i_port;
+      context.eaxc                                   = eaxcs[i_port];
+      enqueue_section_type_1_message(context, grid);
+    }
+  }
 
   /// Returns the performance metrics collector of this data flow.
   virtual data_flow_message_encoding_metrics_collector* get_metrics_collector() = 0;

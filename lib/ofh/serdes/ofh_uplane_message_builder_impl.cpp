@@ -6,7 +6,10 @@
 #include "../support/network_order_binary_serializer.h"
 #include "ocudu/ofh/compression/compression_properties.h"
 #include "ocudu/ofh/compression/iq_compressor.h"
+#include "ocudu/phy/support/resource_grid_reader.h"
 #include "ocudu/ran/resource_block.h"
+#include <algorithm>
+#include <vector>
 
 using namespace ocudu;
 using namespace ofh;
@@ -122,6 +125,39 @@ void uplane_message_builder_impl::serialize_iq_data(network_order_binary_seriali
   compressor.compress(compr_prb_view, iq_data, compr_params);
 }
 
+bool uplane_message_builder_impl::serialize_iq_data(network_order_binary_serializer& serializer,
+                                                    const resource_grid_reader&      grid,
+                                                    unsigned                         port,
+                                                    const uplane_message_params&     params)
+{
+  const ru_compression_params& compr_params = params.compression_params;
+
+  if (OCUDU_UNLIKELY(logger.debug.enabled())) {
+    logger.debug("Packing '{}' PRBs directly from device grid inside a User-Plane message using compression type '{}' "
+                 "and bitwidth '{}'",
+                 params.nof_prb,
+                 to_string(compr_params.type),
+                 compr_params.data_width);
+  }
+
+  serialize_compression_header(serializer, compr_params);
+
+  if (ud_comp_length_support) {
+    if (compr_params.type == compression_type::bfp_selective || compr_params.type == compression_type::mod_selective) {
+      units::bits prb_iq_data_size_bits(NOF_SUBCARRIERS_PER_RB * 2U * compr_params.data_width);
+      uint16_t    udCompLen = prb_iq_data_size_bits.round_up_to_bytes().value();
+      serializer.write(udCompLen);
+    }
+  }
+
+  units::bytes prb_size           = get_compressed_prb_size(compr_params);
+  units::bytes bytes_to_serialize = prb_size * params.nof_prb;
+
+  span<uint8_t> compr_prb_view = serializer.get_view_and_advance(bytes_to_serialize.value());
+  return compressor.compress_device_symbol(
+      compr_prb_view, grid, port, params.symbol_id, params.start_prb, params.nof_prb, compr_params);
+}
+
 unsigned uplane_message_builder_impl::build_message(span<uint8_t>                buffer,
                                                     span<const cbf16_t>          iq_data,
                                                     const uplane_message_params& params)
@@ -139,4 +175,235 @@ unsigned uplane_message_builder_impl::build_message(span<uint8_t>               
   serialize_iq_data(serializer, iq_data, params.nof_prb, params.compression_params);
 
   return serializer.get_offset();
+}
+
+bool uplane_message_builder_impl::build_message(span<uint8_t>                buffer,
+                                                const resource_grid_reader&  grid,
+                                                unsigned                     port,
+                                                const uplane_message_params& params,
+                                                unsigned&                    bytes_written)
+{
+  bytes_written = 0;
+  ocudu_assert(params.sect_type == section_type::type_1, "Unsupported section type");
+  if (params.start_prb + params.nof_prb > grid.get_nof_subc() / NOF_SUBCARRIERS_PER_RB) {
+    return false;
+  }
+
+  network_order_binary_serializer serializer(buffer.data());
+
+  build_radio_app_header(serializer, params);
+  build_section1_header(serializer, params);
+  if (!serialize_iq_data(serializer, grid, port, params)) {
+    return false;
+  }
+
+  bytes_written = serializer.get_offset();
+  return true;
+}
+
+bool uplane_message_builder_impl::build_messages(span<span<uint8_t>>          buffers,
+                                                 const resource_grid_reader&  grid,
+                                                 unsigned                     first_port,
+                                                 const uplane_message_params& params,
+                                                 span<unsigned>               bytes_written)
+{
+  for (unsigned& value : bytes_written) {
+    value = 0;
+  }
+
+  ocudu_assert(params.sect_type == section_type::type_1, "Unsupported section type");
+  if (buffers.empty() || (bytes_written.size() < buffers.size())) {
+    return false;
+  }
+  if (params.start_prb + params.nof_prb > grid.get_nof_subc() / NOF_SUBCARRIERS_PER_RB) {
+    return false;
+  }
+
+  const ru_compression_params& compr_params = params.compression_params;
+  if (OCUDU_UNLIKELY(logger.debug.enabled())) {
+    logger.debug("Packing '{}' PRBs directly from device grid for '{}' contiguous User-Plane ports using compression "
+                 "type '{}' and bitwidth '{}'",
+                 params.nof_prb,
+                 buffers.size(),
+                 to_string(compr_params.type),
+                 compr_params.data_width);
+  }
+
+  units::bytes prb_size    = get_compressed_prb_size(compr_params);
+  unsigned     port_bytes  = (prb_size * params.nof_prb).value();
+  unsigned     port_stride = port_bytes;
+  unsigned     nof_ports   = buffers.size();
+
+  thread_local std::vector<span<uint8_t>> payload_views;
+  payload_views.resize(nof_ports);
+  for (unsigned i_port = 0; i_port != nof_ports; ++i_port) {
+    network_order_binary_serializer serializer(buffers[i_port].data());
+
+    build_radio_app_header(serializer, params);
+    build_section1_header(serializer, params);
+    serialize_compression_header(serializer, compr_params);
+
+    if (ud_comp_length_support) {
+      if (compr_params.type == compression_type::bfp_selective ||
+          compr_params.type == compression_type::mod_selective) {
+        units::bits prb_iq_data_size_bits(NOF_SUBCARRIERS_PER_RB * 2U * compr_params.data_width);
+        uint16_t    udCompLen = prb_iq_data_size_bits.round_up_to_bytes().value();
+        serializer.write(udCompLen);
+      }
+    }
+
+    payload_views[i_port] = serializer.get_view_and_advance(port_bytes);
+    bytes_written[i_port] = serializer.get_offset();
+  }
+
+  if (compressor.compress_device_symbols_to_buffers(span<span<uint8_t>>(payload_views.data(), nof_ports),
+                                                    grid,
+                                                    first_port,
+                                                    nof_ports,
+                                                    params.symbol_id,
+                                                    params.start_prb,
+                                                    params.nof_prb,
+                                                    compr_params)) {
+    return true;
+  }
+
+  size_t                            batch_nofbytes = static_cast<size_t>(nof_ports) * port_stride;
+  thread_local std::vector<uint8_t> batch_payload;
+  batch_payload.resize(batch_nofbytes);
+
+  if (!compressor.compress_device_symbols(span<uint8_t>(batch_payload.data(), batch_payload.size()),
+                                          port_stride,
+                                          grid,
+                                          first_port,
+                                          nof_ports,
+                                          params.symbol_id,
+                                          params.start_prb,
+                                          params.nof_prb,
+                                          compr_params)) {
+    for (unsigned& value : bytes_written) {
+      value = 0;
+    }
+    return false;
+  }
+
+  for (unsigned i_port = 0; i_port != nof_ports; ++i_port) {
+    std::copy_n(
+        batch_payload.data() + static_cast<size_t>(i_port) * port_stride, port_bytes, payload_views[i_port].data());
+  }
+
+  return true;
+}
+
+bool uplane_message_builder_impl::build_symbol_batch_messages(span<span<uint8_t>>          buffers,
+                                                              const resource_grid_reader&  grid,
+                                                              unsigned                     first_port,
+                                                              unsigned                     first_symbol,
+                                                              unsigned                     nof_symbols,
+                                                              const uplane_message_params& params,
+                                                              span<unsigned>               bytes_written)
+{
+  for (unsigned& value : bytes_written) {
+    value = 0;
+  }
+
+  ocudu_assert(params.sect_type == section_type::type_1, "Unsupported section type");
+  if ((nof_symbols == 0) || buffers.empty() || (bytes_written.size() < buffers.size())) {
+    return false;
+  }
+  if ((buffers.size() % nof_symbols) != 0) {
+    return false;
+  }
+  if (params.start_prb + params.nof_prb > grid.get_nof_subc() / NOF_SUBCARRIERS_PER_RB) {
+    return false;
+  }
+
+  const unsigned               nof_ports    = buffers.size() / nof_symbols;
+  const ru_compression_params& compr_params = params.compression_params;
+  if (OCUDU_UNLIKELY(logger.debug.enabled())) {
+    logger.debug("Packing '{}' PRBs directly from device grid for '{}' symbols and '{}' contiguous User-Plane ports "
+                 "using compression type '{}' and bitwidth '{}'",
+                 params.nof_prb,
+                 nof_symbols,
+                 nof_ports,
+                 to_string(compr_params.type),
+                 compr_params.data_width);
+  }
+
+  units::bytes prb_size      = get_compressed_prb_size(compr_params);
+  unsigned     port_bytes    = (prb_size * params.nof_prb).value();
+  unsigned     port_stride   = port_bytes;
+  unsigned     symbol_stride = nof_ports * port_stride;
+
+  thread_local std::vector<span<uint8_t>> payload_views;
+  payload_views.resize(buffers.size());
+  for (unsigned i_symbol = 0; i_symbol != nof_symbols; ++i_symbol) {
+    for (unsigned i_port = 0; i_port != nof_ports; ++i_port) {
+      const unsigned        buffer_index  = i_symbol * nof_ports + i_port;
+      uplane_message_params symbol_params = params;
+      symbol_params.symbol_id             = first_symbol + i_symbol;
+
+      network_order_binary_serializer serializer(buffers[buffer_index].data());
+
+      build_radio_app_header(serializer, symbol_params);
+      build_section1_header(serializer, symbol_params);
+      serialize_compression_header(serializer, compr_params);
+
+      if (ud_comp_length_support) {
+        if (compr_params.type == compression_type::bfp_selective ||
+            compr_params.type == compression_type::mod_selective) {
+          units::bits prb_iq_data_size_bits(NOF_SUBCARRIERS_PER_RB * 2U * compr_params.data_width);
+          uint16_t    udCompLen = prb_iq_data_size_bits.round_up_to_bytes().value();
+          serializer.write(udCompLen);
+        }
+      }
+
+      payload_views[buffer_index] = serializer.get_view_and_advance(port_bytes);
+      bytes_written[buffer_index] = serializer.get_offset();
+    }
+  }
+
+  if (compressor.compress_device_symbol_batch_to_buffers(
+          span<span<uint8_t>>(payload_views.data(), payload_views.size()),
+          grid,
+          first_port,
+          nof_ports,
+          first_symbol,
+          nof_symbols,
+          params.start_prb,
+          params.nof_prb,
+          compr_params)) {
+    return true;
+  }
+
+  size_t                            batch_nofbytes = static_cast<size_t>(nof_symbols) * symbol_stride;
+  thread_local std::vector<uint8_t> batch_payload;
+  batch_payload.resize(batch_nofbytes);
+
+  if (!compressor.compress_device_symbol_batch(span<uint8_t>(batch_payload.data(), batch_payload.size()),
+                                               symbol_stride,
+                                               port_stride,
+                                               grid,
+                                               first_port,
+                                               nof_ports,
+                                               first_symbol,
+                                               nof_symbols,
+                                               params.start_prb,
+                                               params.nof_prb,
+                                               compr_params)) {
+    for (unsigned& value : bytes_written) {
+      value = 0;
+    }
+    return false;
+  }
+
+  for (unsigned i_symbol = 0; i_symbol != nof_symbols; ++i_symbol) {
+    for (unsigned i_port = 0; i_port != nof_ports; ++i_port) {
+      const unsigned buffer_index = i_symbol * nof_ports + i_port;
+      const size_t   payload_offset =
+          static_cast<size_t>(i_symbol) * symbol_stride + static_cast<size_t>(i_port) * port_stride;
+      std::copy_n(batch_payload.data() + payload_offset, port_bytes, payload_views[buffer_index].data());
+    }
+  }
+
+  return true;
 }

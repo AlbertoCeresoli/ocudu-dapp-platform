@@ -279,7 +279,7 @@ include-guards:
       - INPUT_PATH: "include/ocudu"
         INPUT_IGNORE: "/bundled/"
       - INPUT_PATH: "."
-        INPUT_IGNORE: "^\\(include\\|docs\\|external\\)/.*"
+        INPUT_IGNORE: "^\\(include\\|docs\\|external\\)/.*\\|third_party/"
   needs:
     - job: trigger static
       optional: true

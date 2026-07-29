@@ -10,6 +10,7 @@ namespace ocudu {
 namespace ofh {
 
 struct uplane_message_decoder_results;
+class uplane_message_decoder;
 
 /// \brief Open Fronthaul User-Plane uplink received symbol data flow writer.
 ///
@@ -33,6 +34,12 @@ public:
   /// Writes the given decoder results in the corresponding resource grid using the given eAxC. Returns true on success,
   /// otherwise false.
   bool write_to_resource_grid(unsigned eaxc, const uplane_message_decoder_results& results);
+
+  /// Writes compressed decoder results directly into the corresponding resource grid when the grid and decompressor
+  /// support a device-resident path. Returns false when the direct path is unavailable or fails.
+  bool write_compressed_to_resource_grid(unsigned                              eaxc,
+                                         const uplane_message_decoder_results& results,
+                                         uplane_message_decoder&               decoder);
 
 private:
   const static_vector<unsigned, MAX_NOF_SUPPORTED_EAXC> ul_eaxc;

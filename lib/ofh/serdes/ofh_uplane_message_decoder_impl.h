@@ -62,16 +62,51 @@ public:
   // See interface for documentation.
   bool decode(uplane_message_decoder_results& results, span<const uint8_t> message) override;
 
+  // See interface for documentation.
+  bool supports_resource_grid_decompression() const override;
+
+  // See interface for documentation.
+  bool supports_prach_buffer_decompression() const override;
+
+  // See interface for documentation.
+  bool decode_with_compressed_iq(uplane_message_decoder_results& results, span<const uint8_t> message) override;
+
+  // See interface for documentation.
+  bool decompress_to_resource_grid(resource_grid_writer&        grid,
+                                   unsigned                     port,
+                                   unsigned                     symbol,
+                                   unsigned                     start_prb,
+                                   unsigned                     nof_prbs,
+                                   const uplane_section_params& section) override;
+
+  // See interface for documentation.
+  bool decompress_to_prach_buffer(prach_buffer&                buffer,
+                                  unsigned                     port,
+                                  unsigned                     td_occasion,
+                                  unsigned                     fd_occasion,
+                                  unsigned                     symbol,
+                                  unsigned                     start_re,
+                                  unsigned                     input_start_re,
+                                  unsigned                     nof_re,
+                                  unsigned                     nof_prbs,
+                                  const uplane_section_params& section) override;
+
 private:
+  /// Decodes the given message. Optionally keeps section IQ payloads compressed.
+  bool decode_impl(uplane_message_decoder_results& results, span<const uint8_t> message, bool decompress_iq_data);
+
   /// Decodes the User-Plane message header and returns true on success, otherwise false.
   bool decode_header(uplane_message_params& params, network_order_binary_deserializer& deserializer);
 
   /// Decodes all sections and returns true on success, otherwise false.
-  bool decode_all_sections(uplane_message_decoder_results& results, network_order_binary_deserializer& deserializer);
+  bool decode_all_sections(uplane_message_decoder_results&    results,
+                           network_order_binary_deserializer& deserializer,
+                           bool                               decompress_iq_data);
 
   /// Decodes a single section and returns the decoded section status.
   decoded_section_status decode_section(uplane_message_decoder_results&    results,
-                                        network_order_binary_deserializer& deserializer);
+                                        network_order_binary_deserializer& deserializer,
+                                        bool                               decompress_iq_data);
 
   /// Decodes the section header and returns the decoded section status.
   decoded_section_status decode_section_header(decoder_uplane_section_params&     results,
@@ -85,7 +120,8 @@ private:
   /// Decodes the IQ data from the given deserializer.
   void decode_iq_data(uplane_section_params&             results,
                       network_order_binary_deserializer& deserializer,
-                      const ru_compression_params&       compression_params);
+                      const ru_compression_params&       compression_params,
+                      bool                               decompress_iq_data);
 
   /// Decodes the compression header and returns the decoded section status.
   virtual decoded_section_status decode_compression_header(decoder_uplane_section_params&     results,

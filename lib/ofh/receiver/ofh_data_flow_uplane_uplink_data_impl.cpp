@@ -28,6 +28,25 @@ void data_flow_uplane_uplink_data_impl::decode_type1_message(unsigned eaxc, span
 {
   trace_point decode_tp = ofh_tracer.now();
 
+  uplane_message_decoder_results compressed_results;
+  if (uplane_decoder->supports_resource_grid_decompression() &&
+      uplane_decoder->decode_with_compressed_iq(compressed_results, message)) {
+    ofh_tracer << trace_event("ofh_receiver_uplane_decode", decode_tp);
+
+    if (should_uplane_packet_be_filtered(eaxc, compressed_results)) {
+      metrics_collector.increase_dropped_messages();
+
+      return;
+    }
+
+    if (rx_symbol_writer.write_compressed_to_resource_grid(eaxc, compressed_results, *uplane_decoder)) {
+      notification_sender.notify_received_symbol(compressed_results.params.slot, compressed_results.params.symbol_id);
+      return;
+    }
+  }
+
+  decode_tp = ofh_tracer.now();
+
   uplane_message_decoder_results results;
   if (!uplane_decoder->decode(results, message)) {
     metrics_collector.increase_dropped_messages();

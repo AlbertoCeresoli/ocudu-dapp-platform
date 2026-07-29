@@ -4,6 +4,7 @@
 #pragma once
 
 #include "ocudu/adt/complex.h"
+#include "ocudu/adt/span.h"
 #include "ocudu/adt/static_vector.h"
 #include "ocudu/ofh/serdes/ofh_uplane_message_properties.h"
 #include "ocudu/ran/resource_block.h"
@@ -35,6 +36,8 @@ struct uplane_section_params {
   /// User data compression parameter.
   /// \note For simplicity, all the PRBs use the same compression parameters.
   std::optional<unsigned> ud_comp_param;
+  /// Compressed IQ bytes for the section. The view is valid for the lifetime of the decoded packet buffer.
+  span<const uint8_t> compressed_iq_data;
   /// IQ samples for the number of PRBs indicated by \c nof_prbs.
   static_vector<cbf16_t, MAX_NOF_SUBCARRIERS> iq_samples;
 };

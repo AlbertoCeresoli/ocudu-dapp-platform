@@ -32,6 +32,12 @@ static void configure_cli11_ru_sdr_expert_args(CLI::App& app, ru_sdr_unit_expert
     }
     return "Invalid transmission mode. Accepted values [continuous,discontinuous,same-port]";
   };
+  auto acceleration_mode_check = [](const std::string& value) -> std::string {
+    if ((value == "auto") || (value == "enabled") || (value == "disabled")) {
+      return {};
+    }
+    return "Invalid acceleration mode. Accepted values [auto,enabled,disabled]";
+  };
 
   add_option(app,
              "--low_phy_dl_throttling",
@@ -58,6 +64,24 @@ static void configure_cli11_ru_sdr_expert_args(CLI::App& app, ru_sdr_unit_expert
              "Specifies the power ramping time in microseconds, it proactively initiates the transmission and \n"
              "mitigates transient effects.")
       ->capture_default_str();
+  add_option(app,
+             "--low_phy_tx_acceleration_mode",
+             config.low_phy_tx_acceleration_mode,
+             "Acceleration mode for lower-PHY transmit baseband processing: auto, enabled, disabled.")
+      ->capture_default_str()
+      ->check(acceleration_mode_check);
+  add_option(app,
+             "--low_phy_rx_acceleration_mode",
+             config.low_phy_rx_acceleration_mode,
+             "Acceleration mode for lower-PHY receive OFDM demodulation: auto, enabled, disabled.")
+      ->capture_default_str()
+      ->check(acceleration_mode_check);
+  add_option(app,
+             "--low_phy_prach_demodulation_acceleration_mode",
+             config.low_phy_prach_demodulation_acceleration_mode,
+             "Acceleration mode for lower-PHY PRACH OFDM demodulation: auto, enabled, disabled.")
+      ->capture_default_str()
+      ->check(acceleration_mode_check);
 }
 
 static void configure_cli11_ru_sdr_args(CLI::App& app, ru_sdr_unit_config& config)

@@ -37,6 +37,9 @@ add_backward(odu)
 target_include_directories(odu PRIVATE ${CMAKE_SOURCE_DIR})
 install(TARGETS odu RUNTIME)
 target_link_libraries(odu PRIVATE odu_base ocudu_flexible_o_du_split_dynamic)
+if (ENABLE_CUDA)
+    target_compile_definitions(odu PRIVATE ENABLE_CUDA)
+endif (ENABLE_CUDA)
 notify_binary_target(odu)
 
 
@@ -51,6 +54,9 @@ foreach (NAME LIB IN ZIP_LISTS EXTENSIONS LIBRARIES)
     add_backward(${TARGET})
     target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
     target_link_libraries(${TARGET} PRIVATE odu_base ${LIB})
+    if (ENABLE_CUDA)
+        target_compile_definitions(${TARGET} PRIVATE ENABLE_CUDA)
+    endif (ENABLE_CUDA)
     set_target_properties(${TARGET} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/../${NAME}"  # Path to the binary.
             RUNTIME_OUTPUT_NAME "odu"                                        # Binary name.

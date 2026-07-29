@@ -11,11 +11,144 @@
 #include "pusch_processor_pool.h"
 #include "pusch_processor_validator_impl.h"
 #include "ulsch_demultiplex_impl.h"
+#include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/phy/upper/channel_processors/pusch/factories.h"
+#include <algorithm>
+#include <condition_variable>
+#include <mutex>
+#include <vector>
+
+#ifdef ENABLE_CUDA
+#include "../../channel_coding/ldpc/cuda/ldpc_cuda_factories.h"
+#include "cuda/pusch_codeblock_decoder_cuda_batch.h"
+#endif
 
 using namespace ocudu;
 
 namespace {
+
+#ifdef ENABLE_CUDA
+class bounded_pusch_batch_gpu_decoder_pool : public pusch_decoder_impl::batch_gpu_decoder_pool,
+                                             public std::enable_shared_from_this<bounded_pusch_batch_gpu_decoder_pool>
+{
+public:
+  bounded_pusch_batch_gpu_decoder_pool(std::shared_ptr<ldpc_rate_dematcher_factory> dematcher_factory_,
+                                       std::shared_ptr<crc_calculator_factory>      crc_factory_,
+                                       std::string                                  ldpc_decoder_algorithm_,
+                                       unsigned                                     max_decoders_,
+                                       int                                          cuda_device_id_) :
+    dematcher_factory(std::move(dematcher_factory_)),
+    crc_factory(std::move(crc_factory_)),
+    ldpc_decoder_algorithm(std::move(ldpc_decoder_algorithm_)),
+    max_decoders(max_decoders_),
+    nvcuda_device_id(cuda_device_id_)
+  {
+    ocudu_assert(dematcher_factory, "Invalid LDPC dematcher factory.");
+    ocudu_assert(crc_factory, "Invalid CRC calculator factory.");
+    ocudu_assert(max_decoders > 0, "Invalid maximum number of batch GPU decoders.");
+    entries.reserve(max_decoders);
+  }
+
+  decoder_ptr get() override
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+
+    for (unsigned i = 0, e = entries.size(); i != e; ++i) {
+      if (!entries[i].busy) {
+        entries[i].busy = true;
+        return make_ptr(i);
+      }
+    }
+
+    if (entries.size() < max_decoders) {
+      const unsigned index = entries.size();
+      entries.emplace_back(create_decoder(), true);
+      return make_ptr(index);
+    }
+
+    if (!saturation_warning_logged) {
+      ocudulog::fetch_basic_logger("PHY").warning(
+          "PUSCH resident GPU decoder pool exhausted ({} decoders); blocking until a decoder is released. Increase "
+          "the pool size or reduce PUSCH concurrency if this warning appears during OTA traffic.",
+          max_decoders);
+      saturation_warning_logged = true;
+    }
+
+    available.wait(lock, [this]() {
+      return std::any_of(entries.begin(), entries.end(), [](const entry& item) { return !item.busy; });
+    });
+
+    for (unsigned i = 0, e = entries.size(); i != e; ++i) {
+      if (!entries[i].busy) {
+        entries[i].busy = true;
+        return make_ptr(i);
+      }
+    }
+
+    ocudu_assert(false, "PUSCH resident GPU decoder pool woke without an available decoder.");
+    return decoder_ptr(nullptr, [](pusch_resident_codeblock_decoder*) {});
+  }
+
+  void warmup() override
+  {
+    std::vector<decoder_ptr> decoders;
+    decoders.reserve(max_decoders);
+    for (unsigned i = 0; i != max_decoders; ++i) {
+      decoders.push_back(get());
+    }
+  }
+
+private:
+  struct entry {
+    std::unique_ptr<pusch_codeblock_decoder_cuda_batch> decoder;
+    bool                                                busy = false;
+
+    entry(std::unique_ptr<pusch_codeblock_decoder_cuda_batch> decoder_, bool busy_) :
+      decoder(std::move(decoder_)), busy(busy_)
+    {
+    }
+  };
+
+  std::unique_ptr<pusch_codeblock_decoder_cuda_batch> create_decoder()
+  {
+    pusch_codeblock_decoder_cuda_batch::sch_crc batch_crcs;
+    batch_crcs.crc16  = crc_factory->create(crc_generator_poly::CRC16);
+    batch_crcs.crc24A = crc_factory->create(crc_generator_poly::CRC24A);
+    batch_crcs.crc24B = crc_factory->create(crc_generator_poly::CRC24B);
+
+    auto decoder = std::make_unique<pusch_codeblock_decoder_cuda_batch>(
+        dematcher_factory->create(), std::move(batch_crcs), nvcuda_device_id);
+    decoder->set_ldpc_decoder_algorithm(ldpc_decoder_algorithm);
+    return decoder;
+  }
+
+  decoder_ptr make_ptr(unsigned index)
+  {
+    auto self = shared_from_this();
+    return decoder_ptr(entries[index].decoder.get(),
+                       [self, index](pusch_resident_codeblock_decoder*) { self->release(index); });
+  }
+
+  void release(unsigned index)
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    ocudu_assert(index < entries.size(), "Invalid batch GPU decoder pool index.");
+    ocudu_assert(entries[index].busy, "Releasing an idle batch GPU decoder.");
+    entries[index].busy = false;
+    available.notify_one();
+  }
+
+  std::shared_ptr<ldpc_rate_dematcher_factory> dematcher_factory;
+  std::shared_ptr<crc_calculator_factory>      crc_factory;
+  std::string                                  ldpc_decoder_algorithm;
+  unsigned                                     max_decoders;
+  int                                          nvcuda_device_id;
+  bool                                         saturation_warning_logged = false;
+  std::mutex                                   mutex;
+  std::condition_variable                      available;
+  std::vector<entry>                           entries;
+};
+#endif
 
 /// \brief Factory for empty PUSCH decoders.
 ///
@@ -46,14 +179,21 @@ class pusch_decoder_factory_generic : public pusch_decoder_factory
 public:
   explicit pusch_decoder_factory_generic(pusch_decoder_factory_sw_configuration config) :
     crc_factory(std::move(config.crc_factory)),
+    dematcher_factory(std::move(config.dematcher_factory)),
     segmenter_factory(std::move(config.segmenter_factory)),
     executor(config.executor),
     nof_prb(config.nof_prb),
-    nof_layers(config.nof_layers)
+    nof_layers(config.nof_layers),
+    ldpc_decoder_algorithm(config.ldpc_decoder_algorithm)
+#ifdef ENABLE_CUDA
+    ,
+    enable_resident_acceleration_decoder(config.enable_resident_acceleration_decoder),
+    nvcuda_device_id(config.nvcuda_device_id)
+#endif
   {
     ocudu_assert(crc_factory, "Invalid CRC calculator factory.");
     ocudu_assert(config.decoder_factory, "Invalid LDPC decoder factory.");
-    ocudu_assert(config.dematcher_factory, "Invalid LDPC dematcher factory.");
+    ocudu_assert(dematcher_factory, "Invalid LDPC dematcher factory.");
     ocudu_assert(segmenter_factory, "Invalid LDPC segmenter factory.");
 
     std::vector<std::unique_ptr<pusch_codeblock_decoder>> codeblock_decoders(
@@ -65,10 +205,32 @@ public:
       crcs1.crc24B = crc_factory->create(crc_generator_poly::CRC24B);
 
       codeblock_decoder = std::make_unique<pusch_codeblock_decoder>(
-          config.dematcher_factory->create(), config.decoder_factory->create(), crcs1);
+          dematcher_factory->create(), config.decoder_factory->create(), crcs1);
     }
 
     decoder_pool = std::make_unique<pusch_decoder_impl::codeblock_decoder_pool>(codeblock_decoders);
+
+#ifdef ENABLE_CUDA
+    if (enable_resident_acceleration_decoder && (nof_layers <= pusch_constants::MAX_NOF_LAYERS) &&
+        is_cuda_available()) {
+      unsigned nof_resident_acceleration_decoders = config.nof_resident_acceleration_decoders;
+      if (nof_resident_acceleration_decoders == 0) {
+        nof_resident_acceleration_decoders = std::max(1U, config.nof_pusch_decoder_threads);
+      }
+      if (nof_resident_acceleration_decoders > MAX_BATCH_GPU_DECODERS) {
+        ocudulog::fetch_basic_logger("PHY").warning(
+            "PUSCH resident GPU decoder pool requested {} decoders; capping at {}. Reduce PUSCH concurrency or "
+            "increase the pool cap to avoid runtime blocking.",
+            nof_resident_acceleration_decoders,
+            MAX_BATCH_GPU_DECODERS);
+        nof_resident_acceleration_decoders = MAX_BATCH_GPU_DECODERS;
+      }
+      batch_gpu_decoder_pool = std::make_shared<bounded_pusch_batch_gpu_decoder_pool>(
+          dematcher_factory, crc_factory, ldpc_decoder_algorithm, nof_resident_acceleration_decoders, nvcuda_device_id);
+    } else if (enable_resident_acceleration_decoder) {
+      ocudulog::fetch_basic_logger("PHY").warning("PUSCH resident GPU decoder disabled because CUDA is not available.");
+    }
+#endif
   }
 
   std::unique_ptr<pusch_decoder> create() override
@@ -78,17 +240,45 @@ public:
     crcs.crc24A = crc_factory->create(crc_generator_poly::CRC24A);
     crcs.crc24B = crc_factory->create(crc_generator_poly::CRC24B);
 
+#ifdef ENABLE_CUDA
+    return std::make_unique<pusch_decoder_impl>(segmenter_factory->create(),
+                                                decoder_pool,
+                                                batch_gpu_decoder_pool,
+                                                std::move(crcs),
+                                                executor,
+                                                nof_prb,
+                                                nof_layers);
+#else
     return std::make_unique<pusch_decoder_impl>(
         segmenter_factory->create(), decoder_pool, std::move(crcs), executor, nof_prb, nof_layers);
+#endif
+  }
+
+  void warmup() override
+  {
+#ifdef ENABLE_CUDA
+    if (batch_gpu_decoder_pool) {
+      batch_gpu_decoder_pool->warmup();
+    }
+#endif
   }
 
 private:
   std::shared_ptr<pusch_decoder_impl::codeblock_decoder_pool> decoder_pool;
   std::shared_ptr<crc_calculator_factory>                     crc_factory;
+  std::shared_ptr<ldpc_rate_dematcher_factory>                dematcher_factory;
   std::shared_ptr<ldpc_segmenter_rx_factory>                  segmenter_factory;
   task_executor*                                              executor;
   unsigned                                                    nof_prb;
   unsigned                                                    nof_layers;
+  std::string                                                 ldpc_decoder_algorithm;
+#ifdef ENABLE_CUDA
+  bool                                                        enable_resident_acceleration_decoder;
+  int                                                         nvcuda_device_id = 0;
+  std::shared_ptr<pusch_decoder_impl::batch_gpu_decoder_pool> batch_gpu_decoder_pool;
+  /// Maximum number of batch GPU decoders to create (~48 MB each).
+  static constexpr unsigned MAX_BATCH_GPU_DECODERS = 32;
+#endif
 };
 
 /// HW-accelerated PUSCH decoder factory.
@@ -163,6 +353,9 @@ public:
 
     // Create common dependencies pool.
     dependencies_pool = std::make_shared<pusch_processor_impl::concurrent_dependencies_pool_type>(dependencies);
+
+    // Warm decoder-side GPU resources after demodulator instances have initialized their CUDA handles.
+    decoder_factory->warmup();
   }
 
   std::unique_ptr<pusch_processor> create() override

@@ -73,11 +73,14 @@ public:
   /// Increments the CFO sample offset by a number of samples.
   void advance(unsigned nof_samples) { sample_offset += nof_samples; }
 
+  /// Returns true when applying CFO would modify the signal.
+  bool is_active() const { return std::isnormal(current_cfo); }
+
   /// Applies carrier frequency offset in-place to a baseband buffer.
   void process(span<cf_t> buffer) const
   {
     // Skip CFO process if the current CFO is zero, NaN or infinity.
-    if (!std::isnormal(current_cfo)) {
+    if (!is_active()) {
       return;
     }
 

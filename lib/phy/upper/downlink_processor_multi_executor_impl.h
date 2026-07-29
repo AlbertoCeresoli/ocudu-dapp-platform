@@ -17,6 +17,7 @@
 
 namespace ocudu {
 
+class pdsch_grid_output_strategy;
 class upper_phy_rg_gateway;
 class task_executor;
 
@@ -78,7 +79,10 @@ public:
                                          task_executor&                        ssb_executor_,
                                          task_executor&                        csi_rs_executor_,
                                          task_executor&                        prs_executor_,
-                                         ocudulog::basic_logger&               logger_);
+                                         ocudulog::basic_logger&               logger_,
+                                         bool                                  use_pdsch_device_grid_writer_ = false);
+
+  ~downlink_processor_multi_executor_impl() override;
 
   // See downlink_processor_base interface for documentation.
   downlink_processor_controller& get_controller() override { return *this; }
@@ -200,6 +204,8 @@ private:
   /// @}
   /// Logger.
   ocudulog::basic_logger& logger;
+  /// Optional implementation-specific PDSCH grid output strategy.
+  std::unique_ptr<pdsch_grid_output_strategy> pdsch_grid_output;
   /// DL processor internal state.
   downlink_processor_multi_executor_state state;
   /// PDSCH notifier wrapper.

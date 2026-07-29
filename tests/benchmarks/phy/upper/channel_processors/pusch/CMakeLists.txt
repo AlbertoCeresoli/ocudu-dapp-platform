@@ -21,6 +21,7 @@ if (ENABLE_PUSCH_HWACC)
 endif (ENABLE_PUSCH_HWACC)
 
 add_executable(pusch_processor_benchmark pusch_processor_benchmark.cpp)
+target_include_directories(pusch_processor_benchmark PRIVATE ${PROJECT_SOURCE_DIR}/lib)
 set(PUSCH_PROCESSOR_LIBRARIES ocudu_phy_support
         ocudu_pusch_processor
         ocudu_channel_equalizer
@@ -29,6 +30,11 @@ set(PUSCH_PROCESSOR_LIBRARIES ocudu_phy_support
         ocudu_transform_precoding
         ocudulog
         ocuduvec)
+
+if (CUDA_ACCEL_FOUND)
+    list(APPEND PUSCH_PROCESSOR_LIBRARIES ocudu_ldpc_cuda)
+    target_compile_definitions(pusch_processor_benchmark PRIVATE ENABLE_CUDA)
+endif ()
 
 if (ENABLE_PUSCH_HWACC)
     set_source_files_properties(pusch_processor_benchmark.cpp PROPERTIES COMPILE_DEFINITIONS "HWACC_PUSCH_ENABLED")

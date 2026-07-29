@@ -15,8 +15,10 @@
 #include "ocudu/phy/upper/upper_phy.h"
 #include "ocudu/phy/upper/upper_phy_execution_configuration.h"
 #include "ocudu/ran/tdd/tdd_ul_dl_config.h"
+#include <cstdint>
 #include <memory>
 #include <variant>
+#include <vector>
 
 namespace ocudu {
 
@@ -91,6 +93,8 @@ struct downlink_processor_config {
   unsigned id;
   /// Resource grid gateway.
   upper_phy_rg_gateway* gateway;
+  /// DU-local cell index (used for per-cell PDSCH executor affinity).
+  unsigned cell_id = 0;
 };
 
 /// Factory that allows to create downlink processors.
@@ -155,14 +159,25 @@ struct downlink_processor_factory_sw_config {
   /// - \c generic: for using unoptimized PDSCH processing, or
   /// - \c flexible: for using configurable processor that optimizes memory or performance via concurrency.
   std::variant<pdsch_processor_generic_configuration, pdsch_processor_flexible_configuration> pdsch_processor;
+  /// Acceleration mode for PDSCH processing: "auto", "enabled", or "disabled".
+  ///
+  /// The accelerated PDSCH block processor requires a block-processor capable PDSCH processor configuration.
+  std::string pdsch_acceleration_mode = "auto";
+  /// Number of concurrent PDSCH acceleration lanes. Zero selects the default policy.
+  unsigned pdsch_acceleration_nof_lanes = 0;
+  /// NVIDIA CUDA device ID the accelerated PDSCH block processor binds to.
+  int nvcuda_device_id = 0;
+
   /// \brief Optional hardware-accelerated PDSCH encoder factory.
   ///
   /// if the optional is not set, a software PDSCH encoder factory will be used.
   std::optional<std::shared_ptr<hal::hw_accelerator_pdsch_enc_factory>> hw_encoder_factory;
   /// Task executor for processing PDCCH.
   upper_phy_executor pdcch_executor;
-  /// Task executor for processing PDSCH.
+  /// Task executor for processing PDSCH (shared fallback when per-cell list is empty).
   upper_phy_executor pdsch_executor;
+  /// Optional per-cell PDSCH executors (cell_id % size). Empty uses \c pdsch_executor for all cells.
+  std::vector<task_executor*> pdsch_cell_executors;
   /// Task executor for processing SSB.
   upper_phy_executor ssb_executor;
   /// Task executor for processing NZP-CSI-RS.
@@ -242,6 +257,8 @@ struct upper_phy_dependencies {
   upper_phy_rg_gateway* rg_gateway;
   /// Received symbol request notifier.
   upper_phy_rx_symbol_request_notifier* rx_symbol_request_notifier;
+  /// DU-local cell index used for per-cell executor affinity (e.g. PDSCH fair lanes).
+  uint32_t cell_id = 0;
 };
 
 /// Returns true if the given upper PHY configuration is valid, otherwise false.
@@ -353,6 +370,27 @@ struct upper_phy_factory_configuration {
   bool ldpc_decoder_early_stop;
   /// Set to true for forcing the LDPC decoder to decode even if the number of soft bits is insufficient.
   bool ldpc_decoder_force_decoding;
+  /// Acceleration mode for PUSCH processing: "auto", "enabled", or "disabled".
+  std::string pusch_acceleration_mode = "auto";
+  /// Acceleration mode for SRS channel estimation: "auto", "enabled", or "disabled".
+  std::string srs_acceleration_mode = "auto";
+  /// Acceleration mode for PDSCH processing: "auto", "enabled", or "disabled".
+  ///
+  /// The accelerated PDSCH block processor requires a block-processor capable PDSCH processor configuration.
+  std::string pdsch_acceleration_mode = "auto";
+  /// Acceleration mode for PRACH detection: "auto", "enabled", or "disabled".
+  std::string prach_acceleration_mode = "auto";
+  /// Number of concurrent PDSCH acceleration lanes. Zero selects the default policy.
+  unsigned pdsch_acceleration_nof_lanes = 0;
+  /// Accelerated LDPC decoder algorithm: "auto", "boxplus", or "min_sum".
+  std::string ldpc_decoder_algorithm = "auto";
+
+  /// \brief NVIDIA CUDA device ID used by all accelerated upper-PHY components.
+  ///
+  /// Selects which GPU the accelerated PUSCH, SRS, PRACH, PDSCH, resource-grid, and PRACH-buffer components bind to.
+  /// Defaults to 0. Validated at runtime against the number of visible NVIDIA CUDA devices.
+  int nvcuda_device_id = 0;
+
   /// Number of receive antenna ports.
   unsigned nof_rx_ports;
   /// Number of RBs for uplink.

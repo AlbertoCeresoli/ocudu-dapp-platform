@@ -110,6 +110,12 @@ private:
   /// Synchronous CB processing.
   void sync_pdsch_cb_processing();
 
+  /// Maps host-generated reference signals before any PDSCH data device-grid writes.
+  bool map_reference_signals();
+
+  /// Creates reference signal tasks for host-only grids.
+  void fork_reference_signal_tasks();
+
   /// Creates code block processing batches and starts the asynchronous processing.
   void fork_codeword_processing(unsigned i_cw);
 

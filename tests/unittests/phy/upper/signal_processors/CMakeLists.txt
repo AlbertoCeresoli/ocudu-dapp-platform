@@ -16,3 +16,18 @@ add_test(sss_processor_test sss_processor_test)
 add_executable(prs_generator_validator_test prs/prs_generator_validator_test.cpp)
 target_link_libraries(prs_generator_validator_test ocudu_prs_generator ocudu_ran ocuduvec ocudu_sequence_generators ocudu_channel_precoder ocudulog GTest::gtest GTest::gtest_main)
 add_test(prs_generator_validator_test prs_generator_validator_test)
+
+if(CUDA_ACCEL_FOUND)
+    add_executable(srs_estimator_cuda_test srs/srs_estimator_cuda_test.cpp)
+    target_include_directories(srs_estimator_cuda_test PRIVATE ${PROJECT_SOURCE_DIR}/lib/phy/upper)
+    target_link_libraries(srs_estimator_cuda_test
+            ocudu_srs_estimator
+            ocudu_upper_phy
+            ocudu_phy_support
+            ocudu_sequence_generators
+            ocudu_dft
+            ocudulog
+            GTest::gtest
+            GTest::gtest_main)
+    gtest_discover_tests(srs_estimator_cuda_test)
+endif()

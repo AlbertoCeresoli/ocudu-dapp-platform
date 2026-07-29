@@ -11,6 +11,8 @@
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_decoder_result.h"
 #include "ocudu/phy/upper/rx_buffer.h"
 #include "ocudu/ran/sch/sch_segmentation.h"
+#include "fmt/format.h"
+#include <chrono>
 
 using namespace ocudu;
 
@@ -92,6 +94,21 @@ pusch_decoder_buffer& pusch_decoder_impl::new_data(span<uint8_t>                
   current_config   = cfg;
   softbits_count   = 0;
   codeblock_llrs.clear();
+
+#ifdef ENABLE_CUDA
+  resident_decode_enabled      = false;
+  collect_acceleration_timing_ = false;
+  gpu_tb_crc_result_.reset();
+  last_acceleration_timing_stats_ = {};
+  demod_grid_staging_us_          = 0;
+  demod_sync_us_                  = 0;
+  ch_estimate_us_                 = 0;
+  process_data_setup_us_          = 0;
+  demod_call_us_                  = 0;
+  decode_call_us_                 = 0;
+  sinr_readback_us_               = 0;
+  pre_join_callback_              = nullptr;
+#endif
 
   // Unset the expected number of UL-SCH softbits.
   nof_ulsch_softbits.reset();
@@ -182,6 +199,15 @@ void pusch_decoder_impl::set_nof_softbits(units::bits nof_softbits)
   // Compute the number of currently available codeblocks.
   available_cb_counter = get_nof_available_codeblocks(codeblock_llrs, softbits_count);
 
+#ifdef ENABLE_CUDA
+  // When this decoder owns a batch GPU decoder, skip incremental dispatch and process all codeblocks in batch when
+  // on_end_softbits() is called. Shared pooled decoders are reserved for GPU-resident decode; using them for the
+  // host-demux path serializes common UCI traffic and regresses latency.
+  if (batch_gpu_decoder) {
+    return;
+  }
+#endif
+
   // If there are available codeblocks, start as many decoding tasks as possible.
   if (available_cb_counter > 0) {
     // Fork tasks for new codeblocks.
@@ -209,6 +235,15 @@ void pusch_decoder_impl::on_new_softbits(span<const log_likelihood_ratio> softbi
   softbits_count += softbits.size();
 
   if (nof_ulsch_softbits.has_value()) {
+#ifdef ENABLE_CUDA
+    // See set_nof_softbits(): only owned batch decoders take over the host-demux softbit path.
+    if (batch_gpu_decoder) {
+      // Still update available_cb_counter for tracking, but don't dispatch.
+      available_cb_counter = get_nof_available_codeblocks(codeblock_llrs, softbits_count);
+      return;
+    }
+#endif
+
     // Codeblocks that have already been dispatched to the decoder.
     unsigned dispatched_codeblocks = available_cb_counter;
 
@@ -235,6 +270,28 @@ void pusch_decoder_impl::on_end_softbits()
                "The number of soft bits (i.e., {}) must be multiple of the modulation order (i.e., {}).",
                units::bits(softbits_count),
                modulation_order);
+
+#ifdef ENABLE_CUDA
+  // When this decoder owns a batch GPU decoder, all softbits are collected before batch processing. Shared pooled
+  // decoders are intentionally not used here; they are for GPU-resident decode where SCH LLRs stay on device.
+  if (batch_gpu_decoder && nof_ulsch_softbits.has_value()) {
+    ocudu_assert(nof_ulsch_softbits->value() == softbits_count,
+                 "The number of provided softbits (i.e., {}), does not match the expected number (i.e. {}).",
+                 units::bits(softbits_count),
+                 *nof_ulsch_softbits);
+
+    // Transition to decoding.
+    internal_states previous_state = current_state.exchange(internal_states::decoding);
+    ocudu_assert(previous_state == internal_states::collecting,
+                 "Invalid state. It was expected to be {} but it was {}.",
+                 to_string(internal_states::collecting),
+                 to_string(previous_state));
+
+    // Process all codeblocks in batch.
+    fork_batch_gpu_task();
+    return;
+  }
+#endif
 
   // Skip processing if all codeblock decoding tasks have already been dispatched. This should be the case if the
   // number of CW softbits has been provided by calling set_nof_sofbits.
@@ -286,7 +343,16 @@ void pusch_decoder_impl::on_end_softbits()
       codeblock_llrs.size(),
       nof_codeblocks);
 
-  // Iterate for each remaining code block.
+#ifdef ENABLE_CUDA
+  // Use an owned batch GPU decoder if available - more efficient for multiple codeblocks without cross-processor
+  // contention.
+  if (batch_gpu_decoder) {
+    fork_batch_gpu_task();
+    return;
+  }
+#endif
+
+  // Iterate for each remaining code block (CPU path).
   for (unsigned cb_id = 0; cb_id != nof_codeblocks; ++cb_id) {
     fork_codeblock_task(cb_id);
   }
@@ -380,8 +446,146 @@ void pusch_decoder_impl::fork_codeblock_task(unsigned cb_id)
   }
 }
 
+#ifdef ENABLE_CUDA
+pusch_decoder_impl::batch_gpu_decoder_pool::decoder_ptr pusch_decoder_impl::acquire_batch_gpu_decoder()
+{
+  if (batch_gpu_decoder) {
+    return batch_gpu_decoder_pool::decoder_ptr(batch_gpu_decoder.get(), [](pusch_resident_codeblock_decoder*) {});
+  }
+
+  if (batch_gpu_decoder_pool_) {
+    return batch_gpu_decoder_pool_->get();
+  }
+
+  return batch_gpu_decoder_pool::decoder_ptr(nullptr, [](pusch_resident_codeblock_decoder*) {});
+}
+
+void pusch_decoder_impl::fork_batch_gpu_task()
+{
+  auto batch_process_task = [this]() {
+    trace_point tp = l1_ul_tracer.now();
+
+    auto gpu_decoder = acquire_batch_gpu_decoder();
+    if (!gpu_decoder) {
+      logger.warning("No batch GPU PUSCH decoder available. Falling back to per-codeblock CPU decode.");
+      for (unsigned cb_id = 0; cb_id != nof_codeblocks; ++cb_id) {
+        fork_codeblock_task(cb_id);
+      }
+      return;
+    }
+
+    span<bool> cb_crcs = unique_rm_buffer->get_codeblocks_crc();
+
+    // Separate codeblocks into those that need decoding and those that already have OK CRC.
+    std::vector<unsigned> cbs_to_decode;
+    std::vector<unsigned> cbs_already_ok;
+    cbs_to_decode.reserve(nof_codeblocks);
+    cbs_already_ok.reserve(nof_codeblocks);
+
+    for (unsigned cb_id = 0; cb_id < nof_codeblocks; ++cb_id) {
+      if (cb_crcs[cb_id]) {
+        cbs_already_ok.push_back(cb_id);
+      } else {
+        cbs_to_decode.push_back(cb_id);
+      }
+    }
+
+    // Handle codeblocks that need rate-dematching only (CRC already OK).
+    for (unsigned cb_id : cbs_already_ok) {
+      span<const log_likelihood_ratio> cb_llrs = codeblock_llrs[cb_id].first;
+      const codeblock_metadata&        cb_meta = codeblock_llrs[cb_id].second;
+
+      // Get codeblock length without rate matching.
+      unsigned cb_length = cb_meta.cb_specific.full_length;
+
+      // Get the LLRs from previous transmissions, if any, or a clean buffer.
+      span<log_likelihood_ratio> rm_buffer = unique_rm_buffer->get_codeblock_soft_bits(cb_id, cb_length);
+
+      // Rate dematch only - CRC already OK from previous transmission.
+      gpu_decoder->rate_dematch_only(cb_llrs, rm_buffer, current_config.new_data, cb_meta);
+    }
+
+    // Decode codeblocks that need decoding using batch GPU decoder.
+    if (!cbs_to_decode.empty()) {
+      // Build a vector of described_rx_codeblock for codeblocks that need decoding.
+      std::vector<described_rx_codeblock>     batch_described_cbs;
+      std::vector<bit_buffer>                 batch_outputs;
+      std::vector<span<log_likelihood_ratio>> batch_rm_buffers;
+      batch_described_cbs.reserve(cbs_to_decode.size());
+      batch_outputs.reserve(cbs_to_decode.size());
+      batch_rm_buffers.reserve(cbs_to_decode.size());
+
+      for (unsigned cb_id : cbs_to_decode) {
+        const codeblock_metadata& cb_meta = codeblock_llrs[cb_id].second;
+
+        // Compute message length.
+        constexpr unsigned INVERSE_BG1_RATE = 3;
+        constexpr unsigned INVERSE_BG2_RATE = 5;
+        unsigned           inverse_rate =
+            (cb_meta.tb_common.base_graph == ldpc_base_graph_type::BG1) ? INVERSE_BG1_RATE : INVERSE_BG2_RATE;
+        unsigned cb_length  = cb_meta.cb_specific.full_length;
+        unsigned msg_length = cb_length / inverse_rate;
+
+        batch_described_cbs.push_back(codeblock_llrs[cb_id]);
+        batch_outputs.push_back(unique_rm_buffer->get_codeblock_data_bits(cb_id, msg_length));
+        batch_rm_buffers.push_back(unique_rm_buffer->get_codeblock_soft_bits(cb_id, cb_length));
+      }
+
+      // Perform batch decode.
+      auto results = gpu_decoder->decode_batch(batch_described_cbs,
+                                               batch_outputs,
+                                               batch_rm_buffers,
+                                               current_config.new_data,
+                                               block_crc->get_generator_poly(),
+                                               current_config.use_early_stop,
+                                               current_config.nof_ldpc_iterations);
+
+      // Update CRC status and stats.
+      for (size_t i = 0; i < cbs_to_decode.size(); ++i) {
+        unsigned cb_id = cbs_to_decode[i];
+        if (results[i].crc_ok) {
+          cb_crcs[cb_id]  = true;
+          cb_stats[cb_id] = results[i].nof_iterations;
+        } else {
+          cb_stats[cb_id] = current_config.nof_ldpc_iterations;
+        }
+      }
+    }
+
+    // Set stats for already-OK codeblocks.
+    for (unsigned cb_id : cbs_already_ok) {
+      cb_stats[cb_id] = 0; // No iterations needed
+    }
+
+    // All codeblocks processed - call join.
+    last_acceleration_timing_stats_ = gpu_decoder->get_last_timing_stats();
+    cb_task_counter                 = 1; // Set to 1 so fetch_sub(1) triggers join.
+    if (cb_task_counter.fetch_sub(1) == 1) {
+      join_and_notify();
+    }
+
+    l1_ul_tracer << trace_event("batch_gpu_decode", tp);
+  };
+
+  // Execute task asynchronously if an executor is available.
+  bool enqueued = false;
+  if (executor != nullptr) {
+    enqueued = executor->defer(batch_process_task);
+  }
+
+  // Process synchronously if not enqueued.
+  if (!enqueued) {
+    batch_process_task();
+  }
+}
+#endif // ENABLE_CUDA
+
 void pusch_decoder_impl::join_and_notify()
 {
+#ifdef ENABLE_CUDA
+  auto join_start = std::chrono::steady_clock::now();
+#endif
+
   // Transition to decoded if the current state is collecting. In this case, skip notifying.
   internal_states expected_state_collecting = internal_states::collecting;
   if (current_state.compare_exchange_strong(expected_state_collecting, internal_states::decoded)) {
@@ -400,11 +604,22 @@ void pusch_decoder_impl::join_and_notify()
   // Calculate statistics.
   std::for_each_n(cb_stats.begin(), nof_cbs, [&stats](unsigned element) { stats.ldpc_decoder_stats.update(element); });
 
-  if (nof_cbs == 1) {
+#ifdef ENABLE_CUDA
+  if (gpu_tb_crc_result_.has_value()) {
+    // GPU TB reassembly path: TB bytes already written to transport_block, TB CRC already checked on GPU.
+    stats.tb_crc_ok = gpu_tb_crc_result_.value();
+    if (!stats.tb_crc_ok) {
+      // TB CRC failed on GPU — at least one CB is a false negative. Reset all CB CRCs.
+      unique_rm_buffer->reset_codeblocks_crc();
+    }
+    gpu_tb_crc_result_.reset();
+  } else
+#endif
+      if (nof_cbs == 1) {
     // When only one codeblock, the CRC of codeblock and transport block are the same.
     stats.tb_crc_ok = cb_crcs[0];
 
-    // Copy the code block only nif the CRC is OK.
+    // Copy the code block only if the CRC is OK.
     if (stats.tb_crc_ok) {
       const bit_buffer cb_data = unique_rm_buffer->get_codeblock_data_bits(0, transport_block.size() * BITS_PER_BYTE);
       ocuduvec::copy(transport_block, cb_data.get_buffer());
@@ -414,14 +629,47 @@ void pusch_decoder_impl::join_and_notify()
     // compute the CRC if any of the codeblocks was not decoded correctly.
     unsigned tb_checksum = concatenate_codeblocks();
 
-    bit_buffer tb_data = bit_buffer::from_bytes(transport_block);
-    if (crc_set.crc24A->calculate(tb_data) == tb_checksum) {
+    bit_buffer tb_data      = bit_buffer::from_bytes(transport_block);
+    unsigned   computed_crc = crc_set.crc24A->calculate(tb_data);
+    if (computed_crc == tb_checksum) {
       stats.tb_crc_ok = true;
     } else {
       // If the checksum is wrong, then at least one of the codeblocks is a false negative. Reset all of them.
       unique_rm_buffer->reset_codeblocks_crc();
     }
   }
+
+  // Populate pipeline phase timing for OTA "PUSCH phase" logs.
+  // Host stages (chest/setup/demod/decode/join) are always filled on the resident path.
+  // CUDA-event sub-phases are only present when OCUDU_PUSCH_ACCELERATION_TIMING is set.
+#ifdef ENABLE_CUDA
+  if (supports_resident_decode() && collect_acceleration_timing_) {
+    const auto& t                                            = last_acceleration_timing_stats_;
+    stats.acceleration_pipeline_timing.ch_estimate_us        = ch_estimate_us_;
+    stats.acceleration_pipeline_timing.process_data_setup_us = process_data_setup_us_;
+    stats.acceleration_pipeline_timing.demod_call_us         = demod_call_us_;
+    stats.acceleration_pipeline_timing.grid_staging_us       = demod_grid_staging_us_;
+    stats.acceleration_pipeline_timing.demod_sync_us         = demod_sync_us_;
+    stats.acceleration_pipeline_timing.decode_call_us        = decode_call_us_;
+    stats.acceleration_pipeline_timing.sinr_readback_us      = sinr_readback_us_;
+    stats.acceleration_pipeline_timing.nof_cbs               = t.nof_cbs != 0 ? t.nof_cbs : nof_cbs;
+    stats.acceleration_pipeline_timing.valid                 = true;
+    if (t.timing_enabled) {
+      stats.acceleration_pipeline_timing.deinterleave_us      = t.deinterleave_us;
+      stats.acceleration_pipeline_timing.rate_dematch_us      = t.rate_dematch_us;
+      stats.acceleration_pipeline_timing.ldpc_decode_us       = t.ldpc_decode_us;
+      stats.acceleration_pipeline_timing.crc_check_us         = t.crc_check_us;
+      stats.acceleration_pipeline_timing.d2h_transfer_us      = t.d2h_transfer_us;
+      stats.acceleration_pipeline_timing.total_e2e_us         = t.total_e2e_us;
+      stats.acceleration_pipeline_timing.extract_bits_us      = t.extract_bits_us;
+      stats.acceleration_pipeline_timing.decoder_config_us    = t.decoder_config_us;
+      stats.acceleration_pipeline_timing.rate_match_config_us = t.rate_match_config_us;
+      stats.acceleration_pipeline_timing.completion_wait_us   = t.completion_wait_us;
+      stats.acceleration_pipeline_timing.tb_output_copy_us    = t.tb_output_copy_us;
+      stats.acceleration_pipeline_timing.avg_iters_query_us   = t.avg_iters_query_us;
+    }
+  }
+#endif
 
   // Release soft buffer if the CRC is OK, otherwise unlock.
   if (stats.tb_crc_ok) {
@@ -441,6 +689,13 @@ void pusch_decoder_impl::join_and_notify()
                to_string(previous_state));
 
   // Finally report decoding result.
+#ifdef ENABLE_CUDA
+  if (stats.acceleration_pipeline_timing.valid) {
+    const float join_notify_us =
+        std::chrono::duration<float, std::micro>(std::chrono::steady_clock::now() - join_start).count();
+    stats.acceleration_pipeline_timing.join_notify_us = join_notify_us;
+  }
+#endif
   result_notifier->on_sch_data(stats);
 }
 
@@ -492,3 +747,121 @@ unsigned pusch_decoder_impl::concatenate_codeblocks()
 
   return tb_checksum;
 }
+
+#ifdef ENABLE_CUDA
+bool pusch_decoder_impl::try_decode_resident(const resident_softbit_buffer& codeword)
+{
+  auto decode_call_start =
+      collect_acceleration_timing_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
+  // Check if resident decode mode is enabled and batch decoder is available.
+  if (!resident_decode_enabled || !supports_resident_decode()) {
+    return false;
+  }
+
+  if (!codeword.valid || (codeword.data == nullptr) || (codeword.execution_context == nullptr)) {
+    logger.warning("Resident PUSCH decode called with an invalid resident softbit buffer.");
+    return false;
+  }
+
+  // Verify we're in the correct state.
+  internal_states state = current_state.load();
+  if (state != internal_states::collecting) {
+    logger.warning("Resident PUSCH decode called in invalid state: {}", to_string(state));
+    return false;
+  }
+
+  // Ensure segmentation is complete (set_nof_softbits must have been called).
+  if (!nof_ulsch_softbits.has_value()) {
+    logger.warning("Resident PUSCH decode: nof_softbits not set");
+    return false;
+  }
+
+  auto gpu_decoder = acquire_batch_gpu_decoder();
+  if (!gpu_decoder) {
+    logger.warning("Resident PUSCH decode requested but no batch PUSCH decoder is available.");
+    return false;
+  }
+
+  // Transition to decoding state.
+  internal_states previous_state = current_state.exchange(internal_states::decoding);
+  if (previous_state != internal_states::collecting) {
+    logger.warning("Resident PUSCH decode: unexpected state transition from {}", to_string(previous_state));
+    current_state = previous_state;
+    return false;
+  }
+
+  // Build metadata structures for batch decoder.
+  // Use tb_common from the first codeblock (they all share the same tb_common).
+  const codeblock_metadata::tb_common_metadata& tb_common = codeblock_llrs[0].second.tb_common;
+
+  // Build per-codeblock metadata (use static_vector to avoid heap allocation).
+  static_vector<codeblock_metadata::cb_specific_metadata, MAX_NOF_SEGMENTS> cb_specific_vec;
+  for (unsigned cb_id = 0; cb_id < nof_codeblocks; ++cb_id) {
+    cb_specific_vec.push_back(codeblock_llrs[cb_id].second.cb_specific);
+  }
+
+  // Use GPU TB reassembly path: GPU does LDPC decode + CB CRC + TB deseg + TB CRC.
+  // This eliminates per-CB D2H transfer and CPU-side TB concatenation.
+  auto tb_result =
+      gpu_decoder->decode_resident_softbits(codeword.data,
+                                            codeword.nof_softbits,
+                                            nullptr, // No scrambling needed - already descrambled by E2E kernel
+                                            tb_common,
+                                            cb_specific_vec,
+                                            transport_block,
+                                            block_crc->get_generator_poly(),
+                                            current_config.nof_ldpc_iterations,
+                                            codeword.execution_context,
+                                            codeword.buffer_index);
+
+  // Store GPU TB CRC result for join_and_notify() to use.
+  gpu_tb_crc_result_              = tb_result.tb_crc_ok;
+  last_acceleration_timing_stats_ = gpu_decoder->get_last_timing_stats();
+
+  // Update per-CB CRC status and stats.
+  span<bool> cb_crcs = unique_rm_buffer->get_codeblocks_crc();
+  for (unsigned cb_id = 0; cb_id < nof_codeblocks; ++cb_id) {
+    cb_crcs[cb_id]  = tb_result.all_cb_crcs_ok;
+    cb_stats[cb_id] = tb_result.nof_iterations;
+  }
+
+  // Set task counter to trigger join.
+  cb_task_counter = 1;
+  cb_task_counter.fetch_sub(1);
+
+  // Invoke pre-join callback (e.g., deferred SINR readback) after GPU sync but before notification.
+  if (pre_join_callback_) {
+    pre_join_callback_();
+    pre_join_callback_ = nullptr;
+  }
+
+  // GPU decoding complete - notify results.
+  if (collect_acceleration_timing_) {
+    decode_call_us_ =
+        std::chrono::duration<float, std::micro>(std::chrono::steady_clock::now() - decode_call_start).count();
+  }
+  join_and_notify();
+
+  return true;
+}
+
+bool pusch_decoder_impl::supports_resident_decode() const
+{
+  return (batch_gpu_decoder != nullptr) || (batch_gpu_decoder_pool_ != nullptr);
+}
+
+void pusch_decoder_impl::enable_resident_decode()
+{
+  if (supports_resident_decode()) {
+    resident_decode_enabled = true;
+    logger.debug("Resident decode mode ENABLED");
+  }
+}
+
+void pusch_decoder_impl::disable_resident_decode()
+{
+  resident_decode_enabled = false;
+  logger.debug("Resident decode mode reset after PDU");
+}
+#endif // ENABLE_CUDA

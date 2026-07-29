@@ -20,4 +20,7 @@ code by [Doxygen](https://www.doxygen.nl/). For application features, build
 instructions and user guides see the [OCUDU
 documentation](https://docs.srsran.com/projects/project).
 
+Architecture notes for optional PHY acceleration are available in
+\ref phy_acceleration_architecture.
+
 */

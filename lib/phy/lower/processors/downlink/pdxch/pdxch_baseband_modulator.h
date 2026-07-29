@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "pdxch_baseband_modulator_accelerator.h"
 #include "pdxch_processor_modulator_notifier.h"
 #include "ocudu/adt/scope_exit.h"
 #include "ocudu/gateways/baseband/buffer/baseband_gateway_buffer_dynamic.h"
@@ -29,6 +30,7 @@
 #include "ocudu/support/executors/task_executor.h"
 #include "ocudu/support/math/stats.h"
 #include "ocudu/support/memory_pool/bounded_object_pool.h"
+#include <memory>
 #include <thread>
 
 namespace ocudu {
@@ -45,14 +47,15 @@ class pdxch_baseband_modulator
 {
 public:
   /// Creates a physical downlink channel modulator from all the required parameters.
-  pdxch_baseband_modulator(subcarrier_spacing                  scs,
-                           cyclic_prefix                       cp,
-                           sampling_rate                       srate,
-                           unsigned                            nof_ports_,
-                           task_executor&                      executor_,
-                           ofdm_symbol_modulator&              modulator_,
-                           amplitude_controller&               amplitude_control_,
-                           pdxch_processor_modulator_notifier& notifier_) :
+  pdxch_baseband_modulator(subcarrier_spacing                                    scs,
+                           cyclic_prefix                                         cp,
+                           sampling_rate                                         srate,
+                           unsigned                                              nof_ports_,
+                           task_executor&                                        executor_,
+                           ofdm_symbol_modulator&                                modulator_,
+                           amplitude_controller&                                 amplitude_control_,
+                           pdxch_processor_modulator_notifier&                   notifier_,
+                           std::unique_ptr<pdxch_baseband_modulator_accelerator> accelerator_ = nullptr) :
     logger(ocudulog::fetch_basic_logger("PHY")),
     nof_ports(nof_ports_),
     nof_symbols_per_slot(get_nsymb_per_slot(cp)),
@@ -60,6 +63,7 @@ public:
     modulator(modulator_),
     amplitude_control(amplitude_control_),
     notifier(notifier_),
+    accelerator(std::move(accelerator_)),
     cf_buffer({srate.to_kHz(), nof_ports})
   {
     unsigned nof_slots_per_subframe = get_nof_slots_per_subframe(scs);
@@ -79,6 +83,24 @@ public:
     while (current_state.load(std::memory_order_relaxed)) {
       std::this_thread::sleep_for(std::chrono::microseconds(10));
     }
+  }
+
+  void set_center_frequency(double center_frequency_Hz)
+  {
+    if (accelerator) {
+      accelerator->set_center_frequency(center_frequency_Hz);
+    }
+  }
+
+  bool prepare_output_buffer(baseband_gateway_buffer_dynamic& output)
+  {
+    if (!accelerator) {
+      return true;
+    }
+    if (output.get_nof_channels() != nof_ports) {
+      return false;
+    }
+    return accelerator->prepare_output_buffer(output);
   }
 
   /// \brief Handles a transmission request.
@@ -133,6 +155,21 @@ public:
 
     // Prepare metrics.
     metrics_collection.resize(nof_symbols_per_slot * nof_ports);
+
+    if (accelerator) {
+      span<const unsigned> symbol_sizes_slot(symbol_sizes_sf.data() + i_symbol_sf_begin, nof_symbols_per_slot);
+      if (accelerator->enqueue(
+              *current_result.buffer, current_grid.get_reader(), i_symbol_sf_begin, symbol_sizes_slot)) {
+        bool success = executor.defer([this]() { complete_accelerated_task(); });
+        if (!success) {
+          logger.error(current_context.slot.sfn(),
+                       current_context.slot.slot_index(),
+                       "Failed to enqueue accelerated modulation completion task.");
+          complete_accelerated_task();
+        }
+        return true;
+      }
+    }
 
     unsigned i_symbol_start = 0;
     for (unsigned i_symbol = 0, i_metric = 0; i_symbol != nof_symbols_per_slot; ++i_symbol) {
@@ -235,6 +272,23 @@ private:
     ocudu_assert(expected_mask == state_modulate_mask, "Unexpected state 0x{:08x}.", prev);
   }
 
+  void complete_accelerated_task()
+  {
+    if (!accelerator->wait()) {
+      logger.error(current_context.slot.sfn(),
+                   current_context.slot.slot_index(),
+                   "Accelerated PDxCH modulation failed to complete.");
+    }
+
+    current_grid           = {};
+    current_result.metrics = accelerator->collect_metrics();
+    notifier.on_modulation_completion(std::move(current_result), current_context);
+
+    [[maybe_unused]] uint32_t expected_mask = current_state.exchange(state_idle);
+    ocudu_assert(
+        (expected_mask & state_modulate_mask) == state_modulate_mask, "Unexpected state 0x{:08x}.", expected_mask);
+  }
+
   /// State value for when the modulator is not processing any transmisson request.
   static constexpr uint32_t state_idle = 0x0;
   /// State mask for when the modulator is processing a transmission request and has not completed all the tasks yet.
@@ -276,6 +330,8 @@ private:
   amplitude_controller& amplitude_control;
   /// Notifier containing the completion notification callback.
   pdxch_processor_modulator_notifier& notifier;
+  /// Optional full-slot accelerator.
+  std::unique_ptr<pdxch_baseband_modulator_accelerator> accelerator;
   /// Buffer to hold complex floating-point based samples for processing.
   dynamic_tensor<2, cf_t> cf_buffer;
 };

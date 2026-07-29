@@ -47,6 +47,31 @@ public:
     notifier.on_new_metric(metrics);
   }
 
+  bool supports_resident_mode() const override { return base->supports_resident_mode(); }
+
+  void enable_resident_mode() override { base->enable_resident_mode(); }
+
+  void disable_resident_mode() override { base->disable_resident_mode(); }
+
+  bool is_resident_mode_enabled() const override { return base->is_resident_mode_enabled(); }
+
+  resident_softbit_buffer get_resident_softbits() const override { return base->get_resident_softbits(); }
+
+  bool used_host_codeword_fallback() const override { return base->used_host_codeword_fallback(); }
+
+  resident_uci_buffer get_resident_uci() const override { return base->get_resident_uci(); }
+
+  void finalize_resident_uci() override { base->finalize_resident_uci(); }
+
+  float get_last_grid_staging_us() const override { return base->get_last_grid_staging_us(); }
+
+  float get_last_demod_sync_us() const override { return base->get_last_demod_sync_us(); }
+
+  float report_deferred_sinr(pusch_demodulator_notifier& demodulator_notifier) override
+  {
+    return base->report_deferred_sinr(demodulator_notifier);
+  }
+
 private:
   // See pusch_codeword_buffer interface for documentation.
   span<log_likelihood_ratio> get_next_block_view(unsigned block_size) override

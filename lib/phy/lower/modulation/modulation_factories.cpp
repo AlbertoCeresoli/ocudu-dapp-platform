@@ -7,11 +7,101 @@
 #include "ofdm_demodulator_pool.h"
 #include "ofdm_modulator_impl.h"
 #include "ofdm_modulator_pool.h"
+#ifdef ENABLE_CUDA
+#include "ofdm_demodulator_cuda_impl.h"
+#include "ofdm_prach_demodulator_cuda_impl.h"
+#include <cuda_runtime.h>
+#endif
 #include "ofdm_prach_demodulator_impl.h"
+#include "ocudu/support/error_handling.h"
+#include <cstdlib>
+#include <cstring>
 
 using namespace ocudu;
 
 namespace {
+
+#ifdef ENABLE_CUDA
+bool is_disabled_value(const char* value)
+{
+  return (std::strcmp(value, "0") == 0) || (std::strcmp(value, "false") == 0) || (std::strcmp(value, "off") == 0) ||
+         (std::strcmp(value, "no") == 0) || (std::strcmp(value, "disabled") == 0);
+}
+
+bool is_enabled_value(const char* value)
+{
+  return (std::strcmp(value, "1") == 0) || (std::strcmp(value, "true") == 0) || (std::strcmp(value, "on") == 0) ||
+         (std::strcmp(value, "yes") == 0) || (std::strcmp(value, "enabled") == 0);
+}
+
+std::string resolve_lowphy_rx_acceleration_mode(const std::string& configured_mode)
+{
+  if (configured_mode != "auto") {
+    return configured_mode;
+  }
+  const char* env_value = std::getenv("OCUDU_LOWPHY_RX_ACCELERATION");
+  if (env_value == nullptr) {
+    env_value = std::getenv("OCUDU_LOWPHY_PUXCH_DEMODULATION_ACCELERATION");
+  }
+  if (env_value == nullptr) {
+    return configured_mode;
+  }
+  if (is_disabled_value(env_value)) {
+    return "disabled";
+  }
+  if (is_enabled_value(env_value)) {
+    return "enabled";
+  }
+  if ((std::strcmp(env_value, "auto") == 0) || (std::strcmp(env_value, "AUTO") == 0)) {
+    return "auto";
+  }
+  return configured_mode;
+}
+
+std::string resolve_lowphy_prach_demodulation_acceleration_mode(const std::string& configured_mode)
+{
+  if (configured_mode != "auto") {
+    return configured_mode;
+  }
+  const char* env_value = std::getenv("OCUDU_LOWPHY_PRACH_DEMODULATION_ACCELERATION");
+  if (env_value == nullptr) {
+    env_value = std::getenv("OCUDU_LOWPHY_PRACH_ACCELERATION");
+  }
+  if (env_value == nullptr) {
+    return configured_mode;
+  }
+  if (is_disabled_value(env_value)) {
+    return "disabled";
+  }
+  if (is_enabled_value(env_value)) {
+    return "enabled";
+  }
+  if ((std::strcmp(env_value, "auto") == 0) || (std::strcmp(env_value, "AUTO") == 0)) {
+    return "auto";
+  }
+  return configured_mode;
+}
+
+bool lowphy_prach_gpu_available()
+{
+  int device_count = 0;
+  if ((cudaGetDeviceCount(&device_count) != cudaSuccess) || (device_count == 0)) {
+    cudaGetLastError();
+    return false;
+  }
+  return true;
+}
+#else
+std::string resolve_lowphy_rx_acceleration_mode(const std::string& configured_mode)
+{
+  return configured_mode;
+}
+
+std::string resolve_lowphy_prach_demodulation_acceleration_mode(const std::string& configured_mode)
+{
+  return configured_mode;
+}
+#endif
 
 class ofdm_modulator_factory_generic : public ofdm_modulator_factory
 {
@@ -137,6 +227,35 @@ public:
   }
 };
 
+#ifdef ENABLE_CUDA
+class ofdm_demodulator_factory_cuda : public ofdm_demodulator_factory
+{
+public:
+  ofdm_demodulator_factory_cuda(std::shared_ptr<ofdm_demodulator_factory> fallback_factory_, bool force_gpu_path_) :
+    fallback_factory(std::move(fallback_factory_)), force_gpu_path(force_gpu_path_)
+  {
+    ocudu_assert(fallback_factory, "Invalid fallback OFDM demodulator factory.");
+  }
+
+  std::unique_ptr<ofdm_symbol_demodulator>
+  create_ofdm_symbol_demodulator(const ofdm_demodulator_configuration& config) override
+  {
+    return std::make_unique<ofdm_symbol_demodulator_cuda_impl>(
+        fallback_factory->create_ofdm_symbol_demodulator(config), config, force_gpu_path);
+  }
+
+  std::unique_ptr<ofdm_slot_demodulator>
+  create_ofdm_slot_demodulator(const ofdm_demodulator_configuration& config) override
+  {
+    return std::make_unique<ofdm_slot_demodulator_impl>(config, create_ofdm_symbol_demodulator(config));
+  }
+
+private:
+  std::shared_ptr<ofdm_demodulator_factory> fallback_factory;
+  bool                                      force_gpu_path;
+};
+#endif
+
 class ofdm_prach_demodulator_factory_sw : public ofdm_prach_demodulator_factory
 {
   std::shared_ptr<dft_processor_factory> dft_factory;
@@ -189,6 +308,30 @@ public:
   }
 };
 
+#ifdef ENABLE_CUDA
+class ofdm_prach_demodulator_factory_cuda : public ofdm_prach_demodulator_factory
+{
+public:
+  ofdm_prach_demodulator_factory_cuda(std::shared_ptr<ofdm_prach_demodulator_factory> fallback_factory_,
+                                      sampling_rate                                   srate_,
+                                      bool                                            force_gpu_path_) :
+    fallback_factory(std::move(fallback_factory_)), srate(srate_), force_gpu_path(force_gpu_path_)
+  {
+    ocudu_assert(fallback_factory, "Invalid fallback PRACH demodulator factory.");
+  }
+
+  std::unique_ptr<ofdm_prach_demodulator> create() override
+  {
+    return std::make_unique<ofdm_prach_demodulator_cuda_impl>(fallback_factory->create(), srate, force_gpu_path);
+  }
+
+private:
+  std::shared_ptr<ofdm_prach_demodulator_factory> fallback_factory;
+  sampling_rate                                   srate;
+  bool                                            force_gpu_path;
+};
+#endif
+
 } // namespace
 
 std::shared_ptr<ofdm_modulator_factory>
@@ -210,6 +353,31 @@ ocudu::create_ofdm_demodulator_factory_generic(ofdm_factory_generic_configuratio
 }
 
 std::shared_ptr<ofdm_demodulator_factory>
+ocudu::create_ofdm_demodulator_factory_accelerated(ofdm_factory_generic_configuration& config,
+                                                   std::string                         acceleration_mode)
+{
+  std::string                               resolved_mode    = resolve_lowphy_rx_acceleration_mode(acceleration_mode);
+  std::shared_ptr<ofdm_demodulator_factory> fallback_factory = create_ofdm_demodulator_factory_generic(config);
+
+#ifdef ENABLE_CUDA
+  if (resolved_mode == "enabled") {
+    report_fatal_error_if_not(lowphy_prach_gpu_available(),
+                              "Accelerated lower-PHY RX demodulator requested but CUDA is not available.");
+    return std::make_shared<ofdm_demodulator_factory_cuda>(std::move(fallback_factory), true);
+  }
+  if ((resolved_mode == "auto") && lowphy_prach_gpu_available()) {
+    return std::make_shared<ofdm_demodulator_factory_cuda>(std::move(fallback_factory), false);
+  }
+#else
+  if (resolved_mode == "enabled") {
+    report_fatal_error("Accelerated lower-PHY RX demodulator requested but CUDA support is not compiled.");
+  }
+#endif
+
+  return fallback_factory;
+}
+
+std::shared_ptr<ofdm_demodulator_factory>
 ocudu::create_ofdm_demodulator_pool_factory(std::shared_ptr<ofdm_demodulator_factory> base, unsigned max_nof_threads)
 {
   return std::make_shared<ofdm_demodulator_pool_factory>(std::move(base), max_nof_threads);
@@ -221,4 +389,32 @@ ocudu::create_ofdm_prach_demodulator_factory_sw(std::shared_ptr<dft_processor_fa
                                                 frequency_range                        fr)
 {
   return std::make_shared<ofdm_prach_demodulator_factory_sw>(std::move(dft_factory), srate, fr);
+}
+
+std::shared_ptr<ofdm_prach_demodulator_factory>
+ocudu::create_ofdm_prach_demodulator_factory_accelerated(std::shared_ptr<dft_processor_factory> dft_factory,
+                                                         sampling_rate                          srate,
+                                                         frequency_range                        fr,
+                                                         std::string                            acceleration_mode)
+{
+  std::string resolved_mode = resolve_lowphy_prach_demodulation_acceleration_mode(acceleration_mode);
+  std::shared_ptr<ofdm_prach_demodulator_factory> fallback_factory =
+      create_ofdm_prach_demodulator_factory_sw(std::move(dft_factory), srate, fr);
+
+#ifdef ENABLE_CUDA
+  if (resolved_mode == "enabled") {
+    report_fatal_error_if_not(lowphy_prach_gpu_available(),
+                              "Accelerated lower-PHY PRACH demodulator requested but CUDA is not available.");
+    return std::make_shared<ofdm_prach_demodulator_factory_cuda>(std::move(fallback_factory), srate, true);
+  }
+  if ((resolved_mode == "auto") && lowphy_prach_gpu_available()) {
+    return std::make_shared<ofdm_prach_demodulator_factory_cuda>(std::move(fallback_factory), srate, false);
+  }
+#else
+  if (resolved_mode == "enabled") {
+    report_fatal_error("Accelerated lower-PHY PRACH demodulator requested but CUDA support is not compiled.");
+  }
+#endif
+
+  return fallback_factory;
 }

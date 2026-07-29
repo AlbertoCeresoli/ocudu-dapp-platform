@@ -31,6 +31,11 @@ add_executable(hard_decision_test hard_decision_test.cpp)
 target_link_libraries(hard_decision_test log_likelihood_ratio ocudulog GTest::gtest GTest::gtest_main)
 gtest_discover_tests(hard_decision_test)
 
+add_executable(phy_acceleration_runtime_options_test phy_acceleration_runtime_options_test.cpp)
+target_include_directories(phy_acceleration_runtime_options_test PRIVATE ${PROJECT_SOURCE_DIR}/lib/phy/upper)
+target_link_libraries(phy_acceleration_runtime_options_test GTest::gtest GTest::gtest_main)
+gtest_discover_tests(phy_acceleration_runtime_options_test)
+
 add_executable(log_likelihood_ratio_test log_likelihood_ratio_test.cpp)
 target_include_directories(log_likelihood_ratio_test PRIVATE ${CMAKE_SOURCE_DIR}/tests/unittests)
 target_link_libraries(log_likelihood_ratio_test log_likelihood_ratio ocudulog GTest::gtest GTest::gtest_main)
@@ -52,3 +57,31 @@ gtest_discover_tests(uplink_request_processor_test)
 add_executable(upper_phy_rx_symbol_handler_test upper_phy_rx_symbol_handler_test.cpp)
 target_link_libraries(upper_phy_rx_symbol_handler_test ocudu_upper_phy ocudu_phy_support ocudulog GTest::gtest GTest::gtest_main)
 gtest_discover_tests(upper_phy_rx_symbol_handler_test)
+
+if(CUDA_ACCEL_FOUND)
+  add_executable(pdsch_grid_output_strategy_test pdsch_grid_output_strategy_test.cpp)
+  target_include_directories(pdsch_grid_output_strategy_test PRIVATE
+          ${PROJECT_SOURCE_DIR}/lib/phy/upper
+          ${PROJECT_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc)
+  target_link_libraries(pdsch_grid_output_strategy_test
+          ocudu_downlink_processor
+          ocudu_upper_phy
+          ocudu_phy_support
+          ocudulog
+          CUDA::cudart
+          GTest::gtest
+          GTest::gtest_main)
+  target_compile_definitions(pdsch_grid_output_strategy_test PRIVATE ENABLE_CUDA)
+  gtest_discover_tests(pdsch_grid_output_strategy_test)
+
+  add_executable(cuda_visible_phy_support_test cuda_visible_phy_support_test.cpp)
+  target_include_directories(cuda_visible_phy_support_test PRIVATE ${PROJECT_SOURCE_DIR}/lib/phy/upper)
+  target_link_libraries(cuda_visible_phy_support_test
+          ocudu_upper_phy
+          ocudu_phy_support
+          CUDA::cudart
+          GTest::gtest
+          GTest::gtest_main)
+  target_compile_definitions(cuda_visible_phy_support_test PRIVATE ENABLE_CUDA)
+  gtest_discover_tests(cuda_visible_phy_support_test)
+endif()

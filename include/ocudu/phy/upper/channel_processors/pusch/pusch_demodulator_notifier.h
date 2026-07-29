@@ -18,6 +18,14 @@ public:
     std::optional<float> sinr_dB;
     /// Measured EVM.
     std::optional<float> evm;
+    /// Energy Per Resource Element (EPRE) in dB.
+    std::optional<float> epre_dB;
+    /// Reference Signal Received Power (RSRP) in dB.
+    std::optional<float> rsrp_dB;
+    /// Time Alignment in seconds.
+    std::optional<float> time_alignment_s;
+    /// Carrier Frequency Offset in Hz.
+    std::optional<float> cfo_Hz;
   };
 
   /// Default destructor.

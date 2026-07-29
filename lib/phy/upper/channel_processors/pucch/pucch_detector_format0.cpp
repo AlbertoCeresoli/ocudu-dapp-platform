@@ -164,16 +164,14 @@ pucch_detector_format0::detect(const ocudu::resource_grid_reader&           grid
   const pucch_uci_message* best_message = &default_message;
   float                    best_metric  = 0.0F;
   float                    best_rsrp    = 0.0F;
+  unsigned                 u            = 0;
+  unsigned                 v            = 0;
+  std::tie(u, v)                        = helper.compute_group_sequence(pucch_group_hopping::NEITHER, config.n_id);
   for (const auto& m_cs_entry : m_cs_table) {
     float sum_corr      = 0.0F;
     float sum_noise_var = 0.0F;
 
     for (unsigned i_symbol = 0; i_symbol != nof_symbols; ++i_symbol) {
-      // Compute group sequence.
-      unsigned u;
-      unsigned v;
-      std::tie(u, v) = helper.compute_group_sequence(pucch_group_hopping::NEITHER, config.n_id);
-
       // Calculate cyclic shift.
       unsigned         alpha    = helper.get_alpha_index(config.slot,
                                               config.cp,

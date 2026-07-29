@@ -15,10 +15,12 @@ namespace ocudu {
 
 namespace pusch_constants {
 
-/// \brief Maximum number of RE per resource block in a PUSCH transmission.
+/// \brief Maximum number of data RE per resource block in a PUSCH transmission.
 ///
-/// As per TS38.214 Section 6.1.4.2.
-constexpr unsigned MAX_NRE_PER_RB = 156;
+/// A single-symbol Type-2 DM-RS allocation with one CDM group leaves 164 data RE per RB over a full 14-symbol
+/// allocation. Size CPU demodulator/decoder buffers for that worst case instead of the lower transport-block sizing cap
+/// from TS38.214 Section 6.1.4.2.
+constexpr unsigned MAX_NRE_PER_RB = 164;
 
 /// \brief Maximum modulation order supported on PUSCH transmissions.
 ///

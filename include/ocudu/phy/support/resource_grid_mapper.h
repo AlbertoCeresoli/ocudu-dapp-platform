@@ -11,6 +11,7 @@
 #include "ocudu/phy/support/resource_grid_writer.h"
 #include "ocudu/ran/resource_allocation/ofdm_symbol_range.h"
 #include "ocudu/support/ocudu_assert.h"
+#include <cstdint>
 
 namespace ocudu {
 
@@ -42,6 +43,33 @@ public:
 
     /// Pops \c block_size number of symbols.
     virtual span<const ci8_t> pop_symbols(unsigned block_size) = 0;
+
+    /// Returns true if this buffer can map its device-resident symbols to a device grid.
+    virtual bool supports_device_grid_mapping() const { return false; }
+
+    /// Optionally maps device-resident symbols into a device resource grid.
+    ///
+    /// The RE offsets are linear offsets within one port of a host-compatible
+    /// full resource-grid layout, ordered exactly as this buffer would be
+    /// consumed by \ref pop_symbols.
+    virtual bool map_to_device_grid(span<const uint32_t> re_offsets,
+                                    void*                device_grid,
+                                    unsigned             grid_nof_symbols,
+                                    unsigned             grid_nof_subc,
+                                    unsigned             port,
+                                    float                amplitude_scale)
+    {
+      (void)re_offsets;
+      (void)device_grid;
+      (void)grid_nof_symbols;
+      (void)grid_nof_subc;
+      (void)port;
+      (void)amplitude_scale;
+      return false;
+    }
+
+    /// Returns the opaque execution stream used by \ref map_to_device_grid.
+    virtual void* get_device_grid_mapping_stream() const { return nullptr; }
   };
 
   /// Adapts an existing symbol vector to a symbol buffer interface.

@@ -14,7 +14,16 @@
 #include "pdsch_processor_pool.h"
 #include "pdsch_processor_validator_impl.h"
 #include "ocudu/phy/support/support_factories.h"
+#include "ocudu/support/error_handling.h"
+#include <algorithm>
+#include <cstdlib>
+#include <limits>
 #include <memory>
+
+#ifdef ENABLE_CUDA
+#include "cuda/pdsch_tb_encoder_cuda.h"
+#include "pdsch_block_processor_gpu_impl.h"
+#endif
 
 using namespace ocudu;
 
@@ -213,11 +222,16 @@ public:
       // Create vector of PDSCH block processors.
       std::vector<std::unique_ptr<pdsch_block_processor>> instances(nof_concurrent_threads);
       std::generate(instances.begin(), instances.end(), [this]() { return block_processor_factory->create(); });
+      report_fatal_error_if_not(
+          std::all_of(instances.begin(), instances.end(), [](const auto& instance) { return instance != nullptr; }),
+          "Failed to create one or more PDSCH block processors.");
       pool = std::make_shared<pdsch_processor_flexible_impl::pdsch_block_processor_pool>(instances);
     }
 
     return pool;
   }
+
+  void reset() { pool.reset(); }
 
 private:
   std::shared_ptr<pdsch_processor_flexible_impl::pdsch_block_processor_pool> pool;
@@ -242,10 +256,15 @@ public:
       // Create vector of PDSCH DM-RS generators.
       std::vector<std::unique_ptr<dmrs_pdsch_processor>> instances(nof_concurrent_threads);
       std::generate(instances.begin(), instances.end(), [this]() { return dmrs_factory->create(); });
+      report_fatal_error_if_not(
+          std::all_of(instances.begin(), instances.end(), [](const auto& instance) { return instance != nullptr; }),
+          "Failed to create one or more PDSCH DM-RS generators.");
       pool = std::make_shared<pdsch_processor_flexible_impl::pdsch_dmrs_generator_pool>(instances);
     }
     return pool;
   }
+
+  void reset() { pool.reset(); }
 
 private:
   std::shared_ptr<pdsch_processor_flexible_impl::pdsch_dmrs_generator_pool> pool;
@@ -270,10 +289,15 @@ public:
       // Create vector of PDSCH PT-RS generators.
       std::vector<std::unique_ptr<ptrs_pdsch_generator>> instances(nof_concurrent_threads);
       std::generate(instances.begin(), instances.end(), [this]() { return ptrs_factory->create(); });
+      report_fatal_error_if_not(
+          std::all_of(instances.begin(), instances.end(), [](const auto& instance) { return instance != nullptr; }),
+          "Failed to create one or more PDSCH PT-RS generators.");
       pool = std::make_shared<pdsch_processor_flexible_impl::pdsch_ptrs_generator_pool>(instances);
     }
     return pool;
   }
+
+  void reset() { pool.reset(); }
 
 private:
   std::shared_ptr<pdsch_processor_flexible_impl::pdsch_ptrs_generator_pool> pool;
@@ -322,6 +346,15 @@ public:
     return std::make_unique<pdsch_processor_validator_impl>();
   }
 
+  void on_new_processor_pool_scope() override
+  {
+    // The flexible processor wrappers inside one outer pool are meant to share
+    // these helpers. A new downlink-processor instance needs its own pool.
+    block_pool_factory.reset();
+    dmrs_pool_factory.reset();
+    ptrs_pool_factory.reset();
+  }
+
 private:
   std::shared_ptr<ldpc_segmenter_tx_factory>    segmenter_factory;
   std::shared_ptr<resource_grid_mapper_factory> rg_mapper_factory;
@@ -336,8 +369,9 @@ class pdsch_processor_asynchronous_pool_factory : public pdsch_processor_factory
 {
 public:
   pdsch_processor_asynchronous_pool_factory(std::shared_ptr<pdsch_processor_factory> factory_,
-                                            unsigned                                 max_nof_processors_) :
-    factory(std::move(factory_)), max_nof_processors(max_nof_processors_)
+                                            unsigned                                 max_nof_processors_,
+                                            bool                                     block_on_exhaustion_) :
+    factory(std::move(factory_)), max_nof_processors(max_nof_processors_), block_on_exhaustion(block_on_exhaustion_)
   {
     ocudu_assert(factory, "Invalid PDSCH processor factory.");
     ocudu_assert(max_nof_processors >= 1,
@@ -347,24 +381,28 @@ public:
 
   std::unique_ptr<pdsch_processor> create() override
   {
+    factory->on_new_processor_pool_scope();
+
     // Create processors.
     std::vector<std::unique_ptr<pdsch_processor_wrapper>> processors(max_nof_processors);
     for (std::unique_ptr<pdsch_processor_wrapper>& processor : processors) {
       processor = std::make_unique<pdsch_processor_wrapper>(factory->create());
     }
 
-    return std::make_unique<pdsch_processor_pool>(processors);
+    return std::make_unique<pdsch_processor_pool>(processors, block_on_exhaustion);
   }
 
   std::unique_ptr<pdsch_processor> create(ocudulog::basic_logger& logger, bool enable_logging_broadcast) override
   {
+    factory->on_new_processor_pool_scope();
+
     // Create processors.
     std::vector<std::unique_ptr<pdsch_processor_wrapper>> processors(max_nof_processors);
     for (std::unique_ptr<pdsch_processor_wrapper>& processor : processors) {
       processor = std::make_unique<pdsch_processor_wrapper>(factory->create(logger, enable_logging_broadcast));
     }
 
-    return std::make_unique<pdsch_processor_pool>(processors);
+    return std::make_unique<pdsch_processor_pool>(processors, block_on_exhaustion);
   }
 
   std::unique_ptr<pdsch_pdu_validator> create_validator() override { return factory->create_validator(); }
@@ -372,6 +410,7 @@ public:
 private:
   std::shared_ptr<pdsch_processor_factory> factory;
   unsigned                                 max_nof_processors;
+  bool                                     block_on_exhaustion;
 };
 
 } // namespace
@@ -450,13 +489,166 @@ std::shared_ptr<pdsch_processor_factory> ocudu::create_pdsch_flexible_processor_
 
 std::shared_ptr<pdsch_processor_factory>
 ocudu::create_pdsch_processor_pool(std::shared_ptr<pdsch_processor_factory> pdsch_proc_factory,
-                                   unsigned                                 max_nof_processors)
+                                   unsigned                                 max_nof_processors,
+                                   bool                                     block_on_exhaustion)
 {
-  return std::make_shared<pdsch_processor_asynchronous_pool_factory>(std::move(pdsch_proc_factory), max_nof_processors);
+  return std::make_shared<pdsch_processor_asynchronous_pool_factory>(
+      std::move(pdsch_proc_factory), max_nof_processors, block_on_exhaustion);
 }
 
 std::unique_ptr<pdsch_processor> pdsch_processor_factory::create(ocudulog::basic_logger& logger,
                                                                  bool                    enable_logging_broadcast)
 {
   return std::make_unique<logging_pdsch_processor_decorator>(logger, enable_logging_broadcast, create());
+}
+
+// ============================================================================
+// Accelerated PDSCH block processor factory.
+// ============================================================================
+
+#ifdef ENABLE_CUDA
+
+namespace {
+
+class pdsch_block_processor_factory_accelerated : public pdsch_block_processor_factory
+{
+public:
+  explicit pdsch_block_processor_factory_accelerated(int cuda_device_id_) : nvcuda_device_id(cuda_device_id_) {}
+
+  std::unique_ptr<pdsch_block_processor> create() override
+  {
+    auto tb_encoder = create_pdsch_tb_encoder_cuda();
+    if (!tb_encoder || !tb_encoder->is_gpu_available()) {
+      return nullptr;
+    }
+    return std::make_unique<pdsch_block_processor_gpu_impl>(std::move(tb_encoder), nvcuda_device_id);
+  }
+
+private:
+  int nvcuda_device_id;
+};
+
+} // namespace
+
+std::shared_ptr<pdsch_block_processor_factory>
+ocudu::create_pdsch_block_processor_factory_accelerated(int nvcuda_device_id)
+{
+  if (!is_pdsch_tb_encoder_gpu_available()) {
+    return nullptr;
+  }
+  return std::make_shared<pdsch_block_processor_factory_accelerated>(nvcuda_device_id);
+}
+
+bool ocudu::is_pdsch_block_processor_acceleration_available()
+{
+  return is_pdsch_tb_encoder_gpu_available();
+}
+
+#else // ENABLE_CUDA
+
+std::shared_ptr<pdsch_block_processor_factory>
+ocudu::create_pdsch_block_processor_factory_accelerated(int /*nvcuda_device_id*/)
+{
+  return nullptr;
+}
+
+bool ocudu::is_pdsch_block_processor_acceleration_available()
+{
+  return false;
+}
+
+#endif // ENABLE_CUDA
+
+namespace {
+
+/// Dispatches small transport blocks to SW (low latency) and large ones to GPU.
+class pdsch_block_processor_hybrid_impl final : public pdsch_block_processor
+{
+public:
+  pdsch_block_processor_hybrid_impl(std::unique_ptr<pdsch_block_processor> accelerated_,
+                                    std::unique_ptr<pdsch_block_processor> sw_,
+                                    unsigned                               min_gpu_tb_bytes_) :
+    accelerated(std::move(accelerated_)), sw(std::move(sw_)), min_gpu_tb_bytes(min_gpu_tb_bytes_)
+  {
+    ocudu_assert(accelerated, "Invalid accelerated PDSCH block processor.");
+    ocudu_assert(sw, "Invalid SW PDSCH block processor.");
+  }
+
+  resource_grid_mapper::symbol_buffer& configure_new_transmission(span<const uint8_t>          data,
+                                                                  unsigned                     i_cw,
+                                                                  const configuration&         config,
+                                                                  const ldpc_segmenter_buffer& segment_buffer,
+                                                                  unsigned                     start_i_cb,
+                                                                  unsigned                     cb_batch_len) override
+  {
+    // Host for small/medium TBs (RAR + typical OTA data grants): GPU launch often >500 us and
+    // collapses DL scheduling. min_gpu_tb_bytes==0 forces GPU for all sizes (debug/A-B).
+    const bool             use_sw = (min_gpu_tb_bytes > 0) && (data.size() < min_gpu_tb_bytes);
+    pdsch_block_processor& chosen = use_sw ? *sw : *accelerated;
+    return chosen.configure_new_transmission(data, i_cw, config, segment_buffer, start_i_cb, cb_batch_len);
+  }
+
+private:
+  std::unique_ptr<pdsch_block_processor> accelerated;
+  std::unique_ptr<pdsch_block_processor> sw;
+  unsigned                               min_gpu_tb_bytes;
+};
+
+class pdsch_block_processor_factory_hybrid final : public pdsch_block_processor_factory
+{
+public:
+  pdsch_block_processor_factory_hybrid(std::shared_ptr<pdsch_block_processor_factory> accelerated_factory_,
+                                       std::shared_ptr<pdsch_block_processor_factory> sw_factory_,
+                                       unsigned                                       min_gpu_tb_bytes_) :
+    accelerated_factory(std::move(accelerated_factory_)),
+    sw_factory(std::move(sw_factory_)),
+    min_gpu_tb_bytes(min_gpu_tb_bytes_)
+  {
+    ocudu_assert(accelerated_factory, "Invalid accelerated factory.");
+    ocudu_assert(sw_factory, "Invalid SW factory.");
+  }
+
+  std::unique_ptr<pdsch_block_processor> create() override
+  {
+    auto accelerated = accelerated_factory->create();
+    auto sw          = sw_factory->create();
+    if (!accelerated || !sw) {
+      return nullptr;
+    }
+    return std::make_unique<pdsch_block_processor_hybrid_impl>(std::move(accelerated), std::move(sw), min_gpu_tb_bytes);
+  }
+
+private:
+  std::shared_ptr<pdsch_block_processor_factory> accelerated_factory;
+  std::shared_ptr<pdsch_block_processor_factory> sw_factory;
+  unsigned                                       min_gpu_tb_bytes;
+};
+
+unsigned get_pdsch_gpu_min_tb_bytes(unsigned default_bytes)
+{
+  const char* value = std::getenv("OCUDU_PDSCH_GPU_MIN_TB_BYTES");
+  if (value == nullptr || value[0] == '\0') {
+    return default_bytes;
+  }
+  char*         end    = nullptr;
+  unsigned long parsed = std::strtoul(value, &end, 10);
+  if (end == value || *end != '\0' || parsed > static_cast<unsigned long>(std::numeric_limits<unsigned>::max())) {
+    return default_bytes;
+  }
+  return static_cast<unsigned>(parsed);
+}
+
+} // namespace
+
+std::shared_ptr<pdsch_block_processor_factory>
+ocudu::create_pdsch_block_processor_factory_hybrid(std::shared_ptr<pdsch_block_processor_factory> accelerated_factory,
+                                                   std::shared_ptr<pdsch_block_processor_factory> sw_factory,
+                                                   unsigned                                       min_gpu_tb_bytes)
+{
+  if (!accelerated_factory || !sw_factory) {
+    return nullptr;
+  }
+  const unsigned threshold = get_pdsch_gpu_min_tb_bytes(min_gpu_tb_bytes);
+  return std::make_shared<pdsch_block_processor_factory_hybrid>(
+      std::move(accelerated_factory), std::move(sw_factory), threshold);
 }

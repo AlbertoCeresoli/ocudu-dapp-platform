@@ -428,6 +428,8 @@ public:
 
   void set_all_zero() override { ++set_all_zero_count; }
 
+  bool is_empty() const override { return empty; }
+
   void set_empty(bool empty_) { empty = empty_; }
 
   resource_grid_writer& get_writer() override { return writer; }
@@ -501,6 +503,8 @@ public:
   const resource_grid_reader& get_reader() const override { return reader; }
 
   void set_all_zero() override { ++set_all_zero_count; }
+
+  bool is_empty() const override { return reader.is_empty(); }
 
   unsigned get_reader_writer_count() const { return reader.get_count() + writer.get_count(); }
 

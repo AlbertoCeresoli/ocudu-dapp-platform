@@ -96,7 +96,8 @@ create_data_flow_uplane_data(const transmitter_config&              tx_config,
 
   std::array<std::unique_ptr<iq_compressor>, NOF_COMPRESSION_TYPES_SUPPORTED> compressors;
   for (unsigned i = 0; i != NOF_COMPRESSION_TYPES_SUPPORTED; ++i) {
-    compressors[i] = create_iq_compressor(static_cast<compression_type>(i), logger, tx_config.iq_scaling);
+    compressors[i] = create_iq_compressor(
+        static_cast<compression_type>(i), logger, tx_config.iq_scaling, tx_config.compression_acceleration_mode);
   }
   dependencies.compressor_sel = create_iq_compressor_selector(std::move(compressors));
 
@@ -135,7 +136,7 @@ static std::shared_ptr<ether::eth_frame_pool> create_eth_frame_pool(const transm
 
   std::array<std::unique_ptr<iq_compressor>, NOF_COMPRESSION_TYPES_SUPPORTED> compressors;
   for (unsigned i = 0; i != NOF_COMPRESSION_TYPES_SUPPORTED; ++i) {
-    compressors[i] = create_iq_compressor(compression_type::none, logger);
+    compressors[i] = create_iq_compressor(compression_type::none, logger, 1.0F, "disabled");
   }
   auto compressor_sel = create_iq_compressor_selector(std::move(compressors));
 

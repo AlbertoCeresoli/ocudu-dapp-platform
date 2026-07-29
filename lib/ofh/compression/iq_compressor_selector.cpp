@@ -26,3 +26,85 @@ void iq_compressor_selector::compress(span<uint8_t>                buffer,
   auto& compressor = compressors[static_cast<unsigned>(params.type)];
   compressor->compress(buffer, iq_data, params);
 }
+
+bool iq_compressor_selector::compress_device_symbol(span<uint8_t>                buffer,
+                                                    const resource_grid_reader&  grid,
+                                                    unsigned                     port,
+                                                    unsigned                     symbol,
+                                                    unsigned                     start_prb,
+                                                    unsigned                     nof_prbs,
+                                                    const ru_compression_params& params)
+{
+  auto& compressor = compressors[static_cast<unsigned>(params.type)];
+  return compressor->compress_device_symbol(buffer, grid, port, symbol, start_prb, nof_prbs, params);
+}
+
+bool iq_compressor_selector::compress_device_symbols(span<uint8_t>                buffer,
+                                                     unsigned                     port_stride_bytes,
+                                                     const resource_grid_reader&  grid,
+                                                     unsigned                     first_port,
+                                                     unsigned                     nof_ports,
+                                                     unsigned                     symbol,
+                                                     unsigned                     start_prb,
+                                                     unsigned                     nof_prbs,
+                                                     const ru_compression_params& params)
+{
+  auto& compressor = compressors[static_cast<unsigned>(params.type)];
+  return compressor->compress_device_symbols(
+      buffer, port_stride_bytes, grid, first_port, nof_ports, symbol, start_prb, nof_prbs, params);
+}
+
+bool iq_compressor_selector::compress_device_symbols_to_buffers(span<span<uint8_t>>          buffers,
+                                                                const resource_grid_reader&  grid,
+                                                                unsigned                     first_port,
+                                                                unsigned                     nof_ports,
+                                                                unsigned                     symbol,
+                                                                unsigned                     start_prb,
+                                                                unsigned                     nof_prbs,
+                                                                const ru_compression_params& params)
+{
+  auto& compressor = compressors[static_cast<unsigned>(params.type)];
+  return compressor->compress_device_symbols_to_buffers(
+      buffers, grid, first_port, nof_ports, symbol, start_prb, nof_prbs, params);
+}
+
+bool iq_compressor_selector::compress_device_symbol_batch(span<uint8_t>                buffer,
+                                                          unsigned                     symbol_stride_bytes,
+                                                          unsigned                     port_stride_bytes,
+                                                          const resource_grid_reader&  grid,
+                                                          unsigned                     first_port,
+                                                          unsigned                     nof_ports,
+                                                          unsigned                     first_symbol,
+                                                          unsigned                     nof_symbols,
+                                                          unsigned                     start_prb,
+                                                          unsigned                     nof_prbs,
+                                                          const ru_compression_params& params)
+{
+  auto& compressor = compressors[static_cast<unsigned>(params.type)];
+  return compressor->compress_device_symbol_batch(buffer,
+                                                  symbol_stride_bytes,
+                                                  port_stride_bytes,
+                                                  grid,
+                                                  first_port,
+                                                  nof_ports,
+                                                  first_symbol,
+                                                  nof_symbols,
+                                                  start_prb,
+                                                  nof_prbs,
+                                                  params);
+}
+
+bool iq_compressor_selector::compress_device_symbol_batch_to_buffers(span<span<uint8_t>>          buffers,
+                                                                     const resource_grid_reader&  grid,
+                                                                     unsigned                     first_port,
+                                                                     unsigned                     nof_ports,
+                                                                     unsigned                     first_symbol,
+                                                                     unsigned                     nof_symbols,
+                                                                     unsigned                     start_prb,
+                                                                     unsigned                     nof_prbs,
+                                                                     const ru_compression_params& params)
+{
+  auto& compressor = compressors[static_cast<unsigned>(params.type)];
+  return compressor->compress_device_symbol_batch_to_buffers(
+      buffers, grid, first_port, nof_ports, first_symbol, nof_symbols, start_prb, nof_prbs, params);
+}

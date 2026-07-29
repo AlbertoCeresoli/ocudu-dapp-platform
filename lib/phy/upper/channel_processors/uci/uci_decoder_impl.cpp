@@ -46,7 +46,7 @@ uci_status uci_decoder_impl::decode_codeword_polar(span<uint8_t> output, span<co
   // Decode second codeblock if present.
   if ((status == uci_status::valid) && (nof_codeblocks > 1)) {
     unsigned   codeblock1_size     = divide_ceil(message_length, nof_codeblocks);
-    unsigned   enc_codeblock1_size = (codeword_length / nof_codeblocks);
+    unsigned   enc_codeblock1_size = codeword_length - enc_codeblock0_size;
     uci_status cb1_status          = decode_codeblock_polar(output.subspan(codeblock0_size, codeblock1_size),
                                                    input.subspan(enc_codeblock0_size, enc_codeblock1_size),
                                                    0,

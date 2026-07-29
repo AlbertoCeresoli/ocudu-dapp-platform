@@ -8,8 +8,29 @@
 #include "ocudu/ocuduvec/conversion.h"
 #include "ocudu/ocuduvec/copy.h"
 #include "ocudu/ran/prach/prach_preamble_information.h"
+#include <chrono>
+#include <cstdlib>
 
 using namespace ocudu;
+
+static std::chrono::microseconds get_prach_latency_warn_threshold()
+{
+  static const std::chrono::microseconds threshold = []() {
+    static constexpr unsigned default_threshold_us = 0;
+    const char*               value                = std::getenv("OCUDU_PRACH_LATENCY_WARN_US");
+    if ((value == nullptr) || (*value == '\0')) {
+      return std::chrono::microseconds(default_threshold_us);
+    }
+    char*         end    = nullptr;
+    unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value) {
+      return std::chrono::microseconds(default_threshold_us);
+    }
+    return std::chrono::microseconds(parsed);
+  }();
+
+  return threshold;
+}
 
 void prach_processor_worker::run_state_wait(const baseband_gateway_buffer_reader&           samples,
                                             const prach_processor_baseband::symbol_context& context,
@@ -97,8 +118,11 @@ void prach_processor_worker::accumulate_samples(const baseband_gateway_buffer_re
   // Otherwise, transition to processing.
   state = states::processing;
 
-  if (!async_task_executor.defer([this, nof_ports, moved_token = std::move(token)]() {
-        trace_point tp = ru_tracer.now();
+  // Dispatch the complete PRACH handoff once the window is collected. Production SDR mappings use a dedicated PRACH
+  // executor so the GPU demodulation and upper-PHY detection wait do not block the lower RX/TX slot path.
+  if (!async_task_executor.execute([this, nof_ports, moved_token = std::move(token)]() {
+        trace_point tp       = ru_tracer.now();
+        const auto  start_tp = std::chrono::steady_clock::now();
 
         for (unsigned i_port = 0; i_port != nof_ports; ++i_port) {
           // Prepare PRACH demodulator configuration.
@@ -113,20 +137,32 @@ void prach_processor_worker::accumulate_samples(const baseband_gateway_buffer_re
 
           // Make a view of the first samples in the buffer.
           baseband_gateway_buffer_reader_view buffered_samples(temp_baseband.get_reader(), 0, nof_samples);
-          // Get a view over the temporary buffer holding float-based complex samples.
-          span<cf_t> cf_buf = temp_cf_baseband.get_view({i_port}).subspan(0, nof_samples);
+          span<const ci16_t>                  ci16_buf = buffered_samples.get_channel_buffer(i_port);
 
-          // Convert them into floating-point samples using the temporary buffer.
-          ocuduvec::convert(cf_buf, buffered_samples.get_channel_buffer(i_port), scaling_factor_ci16_to_cf);
-
-          // Demodulate all candidates.
-          demodulator->demodulate(*buffer, cf_buf, config);
+          // Accelerated implementations can consume packed radio samples directly. The fallback path keeps the
+          // existing host conversion for generic software demodulators.
+          if (!demodulator->demodulate_ci16(*buffer, ci16_buf, scaling_factor_ci16_to_cf, config)) {
+            span<cf_t> cf_buf = temp_cf_baseband.get_view({i_port}).subspan(0, nof_samples);
+            ocuduvec::convert(cf_buf, ci16_buf, scaling_factor_ci16_to_cf);
+            demodulator->demodulate(*buffer, cf_buf, config);
+          }
         }
 
         ru_tracer << trace_event("prach_demodulate", tp);
 
         // Notify PRACH window reception.
         notifier->on_rx_prach_window(std::move(buffer), prach_context);
+
+        const std::chrono::microseconds elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start_tp);
+        const std::chrono::microseconds threshold = get_prach_latency_warn_threshold();
+        if ((threshold.count() != 0) && (elapsed > threshold)) {
+          logger.warning(prach_context.slot.sfn(),
+                         prach_context.slot.slot_index(),
+                         "Lower-PHY PRACH demodulation plus notification took {} usec for {} ports.",
+                         elapsed.count(),
+                         nof_ports);
+        }
 
         // Transition to idle.
         state = states::idle;

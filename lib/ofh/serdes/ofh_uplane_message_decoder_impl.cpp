@@ -7,6 +7,8 @@
 #include "ocudu/adt/expected.h"
 #include "ocudu/ofh/compression/compression_properties.h"
 #include "ocudu/ofh/compression/iq_decompressor.h"
+#include "ocudu/phy/support/prach_buffer.h"
+#include "ocudu/phy/support/resource_grid_writer.h"
 #include "ocudu/support/units.h"
 
 using namespace ocudu;
@@ -20,6 +22,72 @@ static constexpr unsigned SECTION_ID_HEADER_NO_COMPRESSION_SIZE = 4U;
 
 bool uplane_message_decoder_impl::decode(uplane_message_decoder_results& results, span<const uint8_t> message)
 {
+  return decode_impl(results, message, true);
+}
+
+bool uplane_message_decoder_impl::supports_resource_grid_decompression() const
+{
+  return decompressor->supports_resource_grid_decompression();
+}
+
+bool uplane_message_decoder_impl::supports_prach_buffer_decompression() const
+{
+  return decompressor->supports_prach_buffer_decompression();
+}
+
+bool uplane_message_decoder_impl::decode_with_compressed_iq(uplane_message_decoder_results& results,
+                                                            span<const uint8_t>             message)
+{
+  return decode_impl(results, message, false);
+}
+
+bool uplane_message_decoder_impl::decompress_to_resource_grid(resource_grid_writer&        grid,
+                                                              unsigned                     port,
+                                                              unsigned                     symbol,
+                                                              unsigned                     start_prb,
+                                                              unsigned                     nof_prbs,
+                                                              const uplane_section_params& section)
+{
+  if (section.compressed_iq_data.empty() || (start_prb != section.start_prb) || (nof_prbs > section.nof_prbs)) {
+    return false;
+  }
+
+  return decompressor->decompress_to_resource_grid(
+      grid, port, symbol, start_prb, nof_prbs, section.compressed_iq_data, section.ud_comp_hdr);
+}
+
+bool uplane_message_decoder_impl::decompress_to_prach_buffer(prach_buffer&                buffer,
+                                                             unsigned                     port,
+                                                             unsigned                     td_occasion,
+                                                             unsigned                     fd_occasion,
+                                                             unsigned                     symbol,
+                                                             unsigned                     start_re,
+                                                             unsigned                     input_start_re,
+                                                             unsigned                     nof_re,
+                                                             unsigned                     nof_prbs,
+                                                             const uplane_section_params& section)
+{
+  if (section.compressed_iq_data.empty() || (nof_prbs > section.nof_prbs)) {
+    return false;
+  }
+
+  return decompressor->decompress_to_prach_buffer(buffer,
+                                                  port,
+                                                  td_occasion,
+                                                  fd_occasion,
+                                                  symbol,
+                                                  start_re,
+                                                  input_start_re,
+                                                  nof_re,
+                                                  nof_prbs,
+                                                  section.compressed_iq_data,
+                                                  section.ud_comp_hdr);
+}
+
+bool uplane_message_decoder_impl::decode_impl(uplane_message_decoder_results& results,
+                                              span<const uint8_t>             message,
+                                              bool                            decompress_iq_data)
+{
   network_order_binary_deserializer deserializer(message);
 
   // Decode the header.
@@ -28,7 +96,7 @@ bool uplane_message_decoder_impl::decode(uplane_message_decoder_results& results
   }
 
   // Decode the sections from the message.
-  if (!decode_all_sections(results, deserializer)) {
+  if (!decode_all_sections(results, deserializer, decompress_iq_data)) {
     return false;
   }
 
@@ -132,12 +200,13 @@ bool uplane_message_decoder_impl::decode_header(uplane_message_params&          
 }
 
 bool uplane_message_decoder_impl::decode_all_sections(uplane_message_decoder_results&    results,
-                                                      network_order_binary_deserializer& deserializer)
+                                                      network_order_binary_deserializer& deserializer,
+                                                      bool                               decompress_iq_data)
 {
   // Decode sections while the message has bytes remaining.
   while (deserializer.remaining_bytes()) {
     // Try to decode section.
-    decoded_section_status status = decode_section(results, deserializer);
+    decoded_section_status status = decode_section(results, deserializer, decompress_iq_data);
 
     // Incomplete sections force the exit of the loop.
     if (OCUDU_UNLIKELY(status == decoded_section_status::incomplete)) {
@@ -229,7 +298,8 @@ static bool check_iq_data_size(unsigned                           nof_prb,
 
 uplane_message_decoder_impl::decoded_section_status
 uplane_message_decoder_impl::decode_section(uplane_message_decoder_results&    results,
-                                            network_order_binary_deserializer& deserializer)
+                                            network_order_binary_deserializer& deserializer,
+                                            bool                               decompress_iq_data)
 {
   // Add a section to the results.
   decoder_uplane_section_params decoder_ofh_up_section;
@@ -261,7 +331,7 @@ uplane_message_decoder_impl::decode_section(uplane_message_decoder_results&    r
   fill_results_from_decoder_section(section, decoder_ofh_up_section);
 
   // Decode the IQ data.
-  decode_iq_data(section, deserializer, section.ud_comp_hdr);
+  decode_iq_data(section, deserializer, section.ud_comp_hdr, decompress_iq_data);
 
   return decoded_section_status::ok;
 }
@@ -334,7 +404,8 @@ uplane_message_decoder_impl::decode_compression_length(decoder_uplane_section_pa
 
 void uplane_message_decoder_impl::decode_iq_data(uplane_section_params&             results,
                                                  network_order_binary_deserializer& deserializer,
-                                                 const ru_compression_params&       compression_params)
+                                                 const ru_compression_params&       compression_params,
+                                                 bool                               decompress_iq_data)
 {
   units::bits prb_iq_data_size_bits(NOF_SUBCARRIERS_PER_RB * 2 * compression_params.data_width);
 
@@ -344,6 +415,12 @@ void uplane_message_decoder_impl::decode_iq_data(uplane_section_params&         
   }
   span<const uint8_t> compressed_data =
       deserializer.get_view_and_advance(results.nof_prbs * prb_iq_data_size_bits.round_up_to_bytes().value());
+  results.compressed_iq_data = compressed_data;
+
+  if (!decompress_iq_data) {
+    results.iq_samples.clear();
+    return;
+  }
 
   // Decompress the samples.
   results.iq_samples.resize(results.nof_prbs * NOF_SUBCARRIERS_PER_RB);

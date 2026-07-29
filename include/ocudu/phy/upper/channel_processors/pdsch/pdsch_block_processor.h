@@ -43,6 +43,8 @@ public:
     units::bits Nref;
     /// Number of layers the codeword is mapped onto.
     unsigned nof_layers;
+    /// Number of antenna ports the transmission is mapped onto.
+    unsigned nof_ports;
   };
 
   /// \brief Configures a new transmission.

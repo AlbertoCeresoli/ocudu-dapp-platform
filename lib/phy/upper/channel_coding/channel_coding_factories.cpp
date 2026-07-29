@@ -118,6 +118,33 @@ public:
     }
     return {};
   }
+
+  /// Returns the name of the decoder implementation that will be created based on dec_type and available CPU features.
+  std::string get_selected_type() const
+  {
+#ifdef __x86_64__
+    bool supports_avx2   = cpu_supports_feature(cpu_feature::avx2);
+    bool supports_avx512 = cpu_supports_feature(cpu_feature::avx512f) && cpu_supports_feature(cpu_feature::avx512bw);
+
+    if (((dec_type == "avx512") || (dec_type == "auto")) && supports_avx512) {
+      return "avx512";
+    }
+    if (((dec_type == "avx2") || (dec_type == "auto")) && supports_avx2) {
+      return "avx2";
+    }
+#endif // __x86_64__
+#ifdef __aarch64__
+    bool support_neon = cpu_supports_feature(cpu_feature::neon);
+
+    if (((dec_type == "neon") || (dec_type == "auto")) && support_neon) {
+      return "neon";
+    }
+#endif // __aarch64__
+    if ((dec_type == "auto") || (dec_type == "generic")) {
+      return "generic";
+    }
+    return "unknown";
+  }
 };
 
 class ldpc_encoder_factory_sw : public ldpc_encoder_factory
@@ -268,6 +295,12 @@ ocudu::create_ldpc_decoder_factory_sw(const std::string&                        
                                       const ldpc_decoder_factory::ldpc_decoder_factory_configuration& cfg)
 {
   return std::make_unique<ldpc_decoder_factory_sw>(dec_type, cfg);
+}
+
+std::string ocudu::get_ldpc_decoder_type_str(const std::string& dec_type)
+{
+  ldpc_decoder_factory_sw factory(dec_type, {.force_decoding = false});
+  return factory.get_selected_type();
 }
 
 std::shared_ptr<ldpc_encoder_factory> ocudu::create_ldpc_encoder_factory_sw(const std::string& enc_type)

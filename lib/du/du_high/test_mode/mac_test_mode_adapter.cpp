@@ -174,6 +174,7 @@ mac_test_mode_cell_adapter::mac_test_mode_cell_adapter(const du_test_mode_config
   dl_bs_notifier(std::move(dl_bs_notifier_)),
   ev_notifier(ev_notifier_),
   logger(ocudulog::fetch_basic_logger("MAC")),
+  tdd_cfg(cell_cfg.sched_req.ran.tdd_cfg),
   history(cell_cfg),
   event_handler(event_handler_),
   ue_info_mgr(ue_info_mgr_)
@@ -224,7 +225,7 @@ void mac_test_mode_cell_adapter::handle_slot_indication(const mac_cell_timing_co
 
       // Forward UCI indication to real MAC.
       forward_uci_ind_to_mac(uci_ind);
-    } else {
+    } else if (ul_history_expected(sl_rx)) {
       logger.warning("TEST_MODE: Failed to generate UCI and CRC for slot={}. Cause: Overflow of the test mode internal "
                      "storage detected",
                      sl_rx);
@@ -232,6 +233,15 @@ void mac_test_mode_cell_adapter::handle_slot_indication(const mac_cell_timing_co
   }
 
   slot_handler.handle_slot_indication(context);
+}
+
+bool mac_test_mode_cell_adapter::ul_history_expected(slot_point sl_rx) const
+{
+  if (not tdd_cfg.has_value()) {
+    // FDD: every slot can carry UL.
+    return true;
+  }
+  return has_active_tdd_ul_symbols(*tdd_cfg, sl_rx.slot_index());
 }
 
 void mac_test_mode_cell_adapter::handle_error_indication(slot_point sl_tx, error_event event)
@@ -411,6 +421,12 @@ void mac_test_mode_cell_adapter::on_new_downlink_scheduler_results(const mac_dl_
     last_slot_ind = dl_res.slot;
   }
 
+  // The MAC notifies an empty result with a null \c dl_res when it fails to compute the scheduling result.
+  if (dl_res.dl_res == nullptr) {
+    result_notifier.on_new_downlink_scheduler_results(dl_res);
+    return;
+  }
+
   for (auto& grant : dl_res.dl_res->ue_grants) {
     rnti_t crnti = grant.pdsch_cfg.rnti;
     if (not ue_info_mgr.is_cell_test_ue(cell_index, crnti) or ue_info_mgr.is_msg4_rxed(crnti)) {
@@ -463,19 +479,22 @@ void mac_test_mode_cell_adapter::on_new_uplink_scheduler_results(const mac_ul_sc
     last_slot_ind = ul_res.slot;
   }
 
-  // Update history.
+  // Update history. Note: the MAC notifies an empty result with a null \c ul_res when it fails to compute the
+  // scheduling result for a slot, in which case an empty history entry is stored.
   {
     auto entry = history.write(ul_res.slot);
     if (entry != nullptr) {
-      // Fill the ring element with the scheduler decisions.
-      for (const pucch_info& pucch : ul_res.ul_res->pucchs) {
-        if (ue_info_mgr.is_cell_test_ue(cell_index, pucch.crnti)) {
-          entry->pucchs.push_back(pucch);
+      if (ul_res.ul_res != nullptr) {
+        // Fill the ring element with the scheduler decisions.
+        for (const pucch_info& pucch : ul_res.ul_res->pucchs) {
+          if (ue_info_mgr.is_cell_test_ue(cell_index, pucch.crnti)) {
+            entry->pucchs.push_back(pucch);
+          }
         }
-      }
-      for (const ul_sched_info& pusch : ul_res.ul_res->puschs) {
-        if (ue_info_mgr.is_cell_test_ue(cell_index, pusch.pusch_cfg.rnti)) {
-          entry->puschs.push_back(pusch);
+        for (const ul_sched_info& pusch : ul_res.ul_res->puschs) {
+          if (ue_info_mgr.is_cell_test_ue(cell_index, pusch.pusch_cfg.rnti)) {
+            entry->puschs.push_back(pusch);
+          }
         }
       }
     } else {

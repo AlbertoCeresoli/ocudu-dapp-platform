@@ -22,6 +22,34 @@ public:
   void
   decompress(span<cbf16_t> iq_data, span<const uint8_t> compressed_data, const ru_compression_params& params) override;
 
+  // See interface for documentation.
+  bool supports_resource_grid_decompression() const override;
+
+  // See interface for documentation.
+  bool supports_prach_buffer_decompression() const override;
+
+  // See interface for documentation.
+  bool decompress_to_resource_grid(resource_grid_writer&        grid,
+                                   unsigned                     port,
+                                   unsigned                     symbol,
+                                   unsigned                     start_prb,
+                                   unsigned                     nof_prbs,
+                                   span<const uint8_t>          compressed_data,
+                                   const ru_compression_params& params) override;
+
+  // See interface for documentation.
+  bool decompress_to_prach_buffer(prach_buffer&                buffer,
+                                  unsigned                     port,
+                                  unsigned                     td_occasion,
+                                  unsigned                     fd_occasion,
+                                  unsigned                     symbol,
+                                  unsigned                     start_re,
+                                  unsigned                     input_start_re,
+                                  unsigned                     nof_re,
+                                  unsigned                     nof_prbs,
+                                  span<const uint8_t>          compressed_data,
+                                  const ru_compression_params& params) override;
+
 private:
   std::array<std::unique_ptr<iq_decompressor>, NOF_COMPRESSION_TYPES_SUPPORTED> decompressors;
 };

@@ -27,6 +27,7 @@ set(SOURCES
         synchronization/futex_util.cpp
         tracing/resource_usage.cpp
         tracing/event_tracing.cpp
+        tracing/scoped_trace.cpp
         backtrace.cpp
         bit_encoding.cpp
         byte_buffer.cpp
@@ -46,7 +47,7 @@ set(SOURCES
 
 add_library(ocudu_support STATIC ${SOURCES})
 target_link_libraries(ocudu_support
-        PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${NUMA_LIBRARIES} ocudulog
+        PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${NUMA_LIBRARIES} ${CMAKE_DL_LIBS} ocudulog
         INTERFACE ocudu_support_math)
 add_backward(ocudu_support)
 

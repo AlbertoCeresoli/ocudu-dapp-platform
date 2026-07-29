@@ -56,6 +56,58 @@ public:
   /// \return A read-only view of a PRACH OFDM symbol.
   virtual span<const cbf16_t>
   get_symbol(unsigned i_port, unsigned i_td_occasion, unsigned i_fd_occasion, unsigned i_symbol) const = 0;
+
+  /// Returns true if the buffer can be consumed directly by an implementation-specific device backend.
+  virtual bool supports_device_prach_buffer_reading() const { return false; }
+
+  /// Returns true if the buffer can be produced directly by an implementation-specific device backend.
+  virtual bool supports_device_prach_buffer_mapping() const { return false; }
+
+  /// Gets an implementation-specific device pointer to the first PRACH buffer element.
+  virtual const void* get_device_prach_buffer_cbf16() const { return nullptr; }
+
+  /// Gets an implementation-specific device pointer to the first PRACH buffer element.
+  virtual void* get_device_prach_buffer_cbf16() { return nullptr; }
+
+  /// Gets the linear element offset of a PRACH symbol in the device buffer.
+  virtual unsigned get_device_prach_symbol_offset(unsigned i_port,
+                                                  unsigned i_td_occasion,
+                                                  unsigned i_fd_occasion,
+                                                  unsigned i_symbol) const
+  {
+    (void)i_port;
+    (void)i_td_occasion;
+    (void)i_fd_occasion;
+    (void)i_symbol;
+    return 0;
+  }
+
+  /// Prepares the buffer for implementation-specific device reads on the supplied stream.
+  virtual bool prepare_device_prach_buffer_reading(void* stream) const
+  {
+    (void)stream;
+    return false;
+  }
+
+  /// Prepares the buffer for implementation-specific device writes on the supplied stream.
+  virtual bool prepare_device_prach_buffer_mapping(void* stream)
+  {
+    (void)stream;
+    return false;
+  }
+
+  /// Records that device writes have been enqueued on the supplied stream.
+  virtual bool on_device_prach_buffer_mapping_enqueued(void* stream)
+  {
+    (void)stream;
+    return false;
+  }
+
+  /// Cancels a pending device mapping operation.
+  virtual bool cancel_device_prach_buffer_mapping() { return true; }
+
+  /// Synchronizes pending device writes before host access.
+  virtual bool synchronize_device_prach_buffer_mapping() const { return true; }
 };
 
 } // namespace ocudu

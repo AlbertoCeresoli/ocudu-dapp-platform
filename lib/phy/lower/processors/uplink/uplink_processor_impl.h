@@ -100,6 +100,12 @@ private:
   /// \param[in] timestamp Time instant in which the first sample within \c samples was received.
   void process_collecting(const baseband_gateway_buffer_reader& samples, baseband_gateway_timestamp timestamp);
 
+  /// Processes a complete OFDM symbol already presented as a baseband reader.
+  void process_complete_symbol(const baseband_gateway_buffer_reader& symbol_samples, bool cfo_active);
+
+  /// Returns true when receive metrics should be reported for this processed symbol.
+  bool should_report_receive_metrics();
+
   /// Scaling factor for converting from 16-bit complex integer to complex float.
   static constexpr float scaling_factor_ci16_to_cf = std::numeric_limits<int16_t>::max();
   /// Scaling factor for converting from complex float to 16-bit complex integer.
@@ -148,6 +154,8 @@ private:
   baseband_cfo_processor cfo_processor;
   /// Buffer to hold complex floating-point based samples for demodulation.
   dynamic_tensor<2, cf_t> temp_cf_buffer;
+  /// Counts complete symbols that produced lower-PHY receive metrics.
+  uint64_t receive_metrics_symbol_counter = 0;
 };
 
 } // namespace ocudu

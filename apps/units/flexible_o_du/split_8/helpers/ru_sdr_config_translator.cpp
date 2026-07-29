@@ -61,6 +61,7 @@ static lower_phy_configuration generate_lower_phy_config(const flexible_o_du_ru_
     // samples must arrive to the baseband device before the transmission time passes.
     out_cfg.baseband_rx_buffer_size_policy = lower_phy_baseband_buffer_size_policy::single_packet;
   } else {
+    // Keep SDR OTA callbacks small enough to avoid bunching multiple demodulation windows into one receive task.
     out_cfg.baseband_rx_buffer_size_policy = lower_phy_baseband_buffer_size_policy::single_packet;
   }
 
@@ -75,7 +76,10 @@ static lower_phy_configuration generate_lower_phy_config(const flexible_o_du_ru_
   out_cfg.amplitude_config.enable_clipping = ru_cfg.amplitude_cfg.enable_clipping;
 
   // Set the full scale amplitude reference to 1.
-  out_cfg.amplitude_config.full_scale_lin = 1.0F;
+  out_cfg.amplitude_config.full_scale_lin      = 1.0F;
+  out_cfg.tx_acceleration_mode                 = ru_cfg.expert_cfg.low_phy_tx_acceleration_mode;
+  out_cfg.rx_acceleration_mode                 = ru_cfg.expert_cfg.low_phy_rx_acceleration_mode;
+  out_cfg.prach_demodulation_acceleration_mode = ru_cfg.expert_cfg.low_phy_prach_demodulation_acceleration_mode;
 
   if (!is_valid_lower_phy_config(out_cfg)) {
     report_error("Invalid lower PHY configuration.\n");

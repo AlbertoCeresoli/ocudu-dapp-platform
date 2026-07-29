@@ -52,12 +52,28 @@ add_library(ocudu_ptrs_generator STATIC
     ptrs/ptrs_pdsch_generator_impl.cpp
 )
 
-add_library(ocudu_srs_estimator STATIC
+set(SRS_ESTIMATOR_SOURCES
     srs/srs_estimator_factory.cpp
     srs/srs_estimator_generic_impl.cpp
     srs/srs_validator_generic_impl.cpp
 )
+
+if(CUDA_ACCEL_FOUND)
+    list(APPEND SRS_ESTIMATOR_SOURCES srs/srs_estimator_cuda_impl.cpp)
+endif()
+
+add_library(ocudu_srs_estimator STATIC
+    ${SRS_ESTIMATOR_SOURCES}
+)
 target_link_libraries(ocudu_srs_estimator ocudu_ran)
+
+if(CUDA_ACCEL_FOUND)
+    target_include_directories(ocudu_srs_estimator PRIVATE
+        ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc
+    )
+    target_link_libraries(ocudu_srs_estimator ocudu_ldpc_cuda CUDA::cudart)
+    target_compile_definitions(ocudu_srs_estimator PRIVATE ENABLE_CUDA)
+endif()
 
 add_library(ocudu_ssb_generators STATIC
     ssb/factories.cpp

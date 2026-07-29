@@ -18,6 +18,7 @@
 #include "ocudu/ran/n_ta_offset.h"
 #include "ocudu/ran/subcarrier_spacing.h"
 #include "ocudu/support/executors/task_executor.h"
+#include <string>
 
 namespace ocudu {
 
@@ -88,6 +89,30 @@ struct lower_phy_configuration {
   lower_phy_baseband_buffer_size_policy baseband_rx_buffer_size_policy;
   /// Amplitude control parameters, including baseband gain and clipping.
   amplitude_controller_clipping_config amplitude_config;
+  /// \brief Acceleration mode for lower-PHY transmit baseband processing.
+  ///
+  /// Use one of these options:
+  /// - \c auto: enable acceleration if available (default),
+  /// - \c enabled: require acceleration (fail if unavailable),
+  /// - \c disabled: use CPU only.
+  std::string tx_acceleration_mode = "auto";
+  /// \brief Acceleration mode for lower-PHY receive OFDM demodulation.
+  ///
+  /// Applies to the regular PUxCH receive path that feeds PUSCH, PUCCH and SRS processing. PRACH has a separate
+  /// demodulation mode because it uses different waveform timing and FFT sizes.
+  ///
+  /// Use one of these options:
+  /// - \c auto: enable acceleration if available (default),
+  /// - \c enabled: require acceleration (fail if unavailable),
+  /// - \c disabled: use CPU only.
+  std::string rx_acceleration_mode = "auto";
+  /// \brief Acceleration mode for lower-PHY PRACH OFDM demodulation.
+  ///
+  /// Use one of these options:
+  /// - \c auto: enable acceleration if available (default),
+  /// - \c enabled: require acceleration (fail if unavailable),
+  /// - \c disabled: use CPU only.
+  std::string prach_demodulation_acceleration_mode = "auto";
 };
 
 /// Lower physical layer dependencies.
@@ -119,9 +144,13 @@ struct lower_phy_dependencies {
 /// Returns true if the given lower PHY configuration is valid, otherwise false.
 inline bool is_valid_lower_phy_config(const lower_phy_configuration& config)
 {
-  // :TODO: Implement me!
+  auto is_valid_acceleration_mode = [](const std::string& value) {
+    return (value == "auto") || (value == "enabled") || (value == "disabled");
+  };
 
-  return true;
+  return is_valid_acceleration_mode(config.tx_acceleration_mode) &&
+         is_valid_acceleration_mode(config.rx_acceleration_mode) &&
+         is_valid_acceleration_mode(config.prach_demodulation_acceleration_mode);
 }
 
 } // namespace ocudu

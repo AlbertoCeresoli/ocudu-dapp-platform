@@ -76,6 +76,15 @@ static void fill_du_low_expert_section(YAML::Node node, const du_low_unit_expert
   node["allow_request_on_empty_uplink_slot"]       = config.allow_request_on_empty_uplink_slot;
   node["enable_phy_tap"]                           = config.enable_phy_tap;
   node["phy_tap_arguments"]                        = config.phy_tap_arguments;
+  node["pusch_acceleration_mode"]                  = config.pusch_acceleration_mode;
+  node["srs_acceleration_mode"]                    = config.srs_acceleration_mode;
+  node["pdsch_acceleration_mode"]                  = config.pdsch_acceleration_mode;
+  node["prach_acceleration_mode"]                  = config.prach_acceleration_mode;
+  node["pdsch_acceleration_nof_lanes"]             = config.pdsch_acceleration_nof_lanes;
+  node["ldpc_decoder_algorithm"]                   = config.ldpc_decoder_algorithm;
+#ifdef ENABLE_CUDA
+  node["nvcuda_device_id"] = config.nvcuda_device_id;
+#endif
 }
 
 static void fill_du_low_bbdev_pdsch_enc_section(YAML::Node node, const hwacc_pdsch_appconfig& config)

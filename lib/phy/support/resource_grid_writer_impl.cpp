@@ -150,6 +150,10 @@ void resource_grid_writer_impl::put(unsigned            port,
                                     span<const cbf16_t> symbols)
 {
   unsigned nof_symbols = symbols.size();
+  if (nof_symbols == 0) {
+    return;
+  }
+
   ocudu_assert(k_init + ((nof_symbols - 1) * stride) < get_nof_subc(),
                "The initial subcarrier index (i.e., {}) plus the number of RE (i.e., {}) exceeds the maximum number of "
                "subcarriers (i.e., {})",
@@ -167,6 +171,12 @@ void resource_grid_writer_impl::put(unsigned            port,
 
   // Insert symbols.
   span<cbf16_t> rg_symbol = data.get_view({l, port});
+  if (stride == 1) {
+    ocuduvec::copy(rg_symbol.subspan(k_init, nof_symbols), symbols);
+    alloc_mask.update_crb_range(port, l, subc_range_to_crb_range(k_init, k_init + nof_symbols));
+    return;
+  }
+
   for (unsigned i_symbol = 0, i_re = k_init; i_symbol != nof_symbols; ++i_symbol) {
     rg_symbol[i_re] = symbols[i_symbol];
     i_re += stride;

@@ -39,3 +39,8 @@ endif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
 add_library(ocudu_ldpc STATIC ${ldpc_sources})
 
 target_link_libraries(ocudu_ldpc log_likelihood_ratio)
+
+# CUDA accelerated LDPC integration.
+if(CUDA_ACCEL_FOUND)
+    add_subdirectory(cuda)
+endif()

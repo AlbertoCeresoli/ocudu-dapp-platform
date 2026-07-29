@@ -76,6 +76,52 @@ struct du_low_unit_expert_upper_phy_config {
   bool enable_phy_tap = false;
   /// PHY tap plugin arguments.
   std::string phy_tap_arguments;
+  /// \brief Acceleration mode for PUSCH.
+  ///
+  /// Use one of these options:
+  /// - \c auto: enable acceleration if available (default),
+  /// - \c enabled: require acceleration (fail if unavailable),
+  /// - \c disabled: use CPU only.
+  std::string pusch_acceleration_mode = "auto";
+  /// \brief Acceleration mode for SRS channel estimation.
+  ///
+  /// Use one of these options:
+  /// - \c auto: enable acceleration if available (default),
+  /// - \c enabled: require acceleration (fail if unavailable),
+  /// - \c disabled: use CPU only.
+  std::string srs_acceleration_mode = "auto";
+  /// \brief Acceleration mode for PDSCH.
+  ///
+  /// Use one of these options:
+  /// - \c auto: enable acceleration if available and the PDSCH processor type is auto or flexible (default),
+  /// - \c enabled: require acceleration and PDSCH processor type auto or flexible (fail if unavailable),
+  /// - \c disabled: use CPU only or configured hardware encoder path.
+  std::string pdsch_acceleration_mode = "auto";
+  /// \brief Acceleration mode for PRACH detection.
+  ///
+  /// Use one of these options:
+  /// - \c auto: enable acceleration if available and profitable (default),
+  /// - \c enabled: require acceleration (fail if unavailable),
+  /// - \c disabled: use CPU only.
+  std::string prach_acceleration_mode = "auto";
+  /// \brief Number of concurrent PDSCH acceleration lanes.
+  ///
+  /// Set to zero for the default policy. A lane owns an independent accelerated block processor and bounds how many
+  /// PDSCH accelerated transmissions can be active at once, independently from the number of CPU PDSCH worker threads.
+  unsigned pdsch_acceleration_nof_lanes = 0;
+  /// \brief Accelerated LDPC decoder algorithm.
+  ///
+  /// Use one of these options:
+  /// - \c auto: select the lower-latency accelerated algorithm for the current codeblock batch size,
+  /// - \c boxplus: use boxplus (binary tree min.xorsign.abs),
+  /// - \c min_sum: use standard normalized min-sum.
+  std::string ldpc_decoder_algorithm = "auto";
+
+  /// \brief NVIDIA CUDA device ID used by all accelerated upper-PHY components.
+  ///
+  /// Selects which GPU the accelerated PUSCH, SRS, PRACH, PDSCH, resource-grid, and PRACH-buffer components bind to.
+  /// Defaults to 0.
+  int nvcuda_device_id = 0;
 };
 
 /// DU low logging functionalities.

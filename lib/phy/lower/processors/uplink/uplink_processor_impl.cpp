@@ -4,6 +4,7 @@
 
 #include "uplink_processor_impl.h"
 #include "ocudu/gateways/baseband/buffer/baseband_gateway_buffer_reader_view.h"
+#include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/ocuduvec/compare.h"
 #include "ocudu/ocuduvec/conversion.h"
 #include "ocudu/ocuduvec/copy.h"
@@ -15,8 +16,149 @@
 #include "ocudu/phy/lower/processors/uplink/puxch/puxch_processor_baseband.h"
 #include "ocudu/phy/lower/processors/uplink/uplink_processor_notifier.h"
 #include "ocudu/support/math/stats.h"
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 using namespace ocudu;
+
+namespace {
+
+unsigned parse_unsigned_env(const char* name, unsigned default_value, unsigned max_value)
+{
+  const char* value = std::getenv(name);
+  if ((value == nullptr) || (*value == '\0')) {
+    return default_value;
+  }
+
+  char*         end    = nullptr;
+  unsigned long parsed = std::strtoul(value, &end, 10);
+  if (end == value) {
+    return default_value;
+  }
+
+  return static_cast<unsigned>(std::min<unsigned long>(parsed, max_value));
+}
+
+unsigned get_ul_detail_timing_warn_threshold_us()
+{
+  static const unsigned threshold_us = parse_unsigned_env("OCUDU_LOWPHY_UL_DETAIL_TIMING_WARN_US", 0, 1000000);
+  return threshold_us;
+}
+
+unsigned get_ul_detail_timing_warn_max_logs()
+{
+  static const unsigned max_logs = parse_unsigned_env("OCUDU_LOWPHY_UL_DETAIL_TIMING_WARN_MAX_LOGS", 128, 1000000);
+  return max_logs;
+}
+
+unsigned get_ul_metrics_period_symbols()
+{
+  static const unsigned period = std::max(1U, parse_unsigned_env("OCUDU_LOWPHY_UL_METRICS_PERIOD_SYMBOLS", 1, 1000000));
+  return period;
+}
+
+std::atomic<unsigned>& get_ul_detail_timing_counter(const char* phase)
+{
+  static std::atomic<unsigned> host_copy{0};
+  static std::atomic<unsigned> direct_symbol{0};
+  static std::atomic<unsigned> cfo{0};
+  static std::atomic<unsigned> prach{0};
+  static std::atomic<unsigned> puxch{0};
+  static std::atomic<unsigned> metrics{0};
+  static std::atomic<unsigned> other{0};
+
+  if (std::strcmp(phase, "host copy") == 0) {
+    return host_copy;
+  }
+  if (std::strcmp(phase, "direct symbol") == 0) {
+    return direct_symbol;
+  }
+  if (std::strcmp(phase, "CFO") == 0) {
+    return cfo;
+  }
+  if (std::strcmp(phase, "PRACH") == 0) {
+    return prach;
+  }
+  if (std::strcmp(phase, "PUxCH") == 0) {
+    return puxch;
+  }
+  if (std::strcmp(phase, "metrics") == 0) {
+    return metrics;
+  }
+
+  return other;
+}
+
+void log_ul_detail_timing_if_slow(const char*                         phase,
+                                  std::chrono::steady_clock::duration duration,
+                                  const slot_point&                   slot,
+                                  unsigned                            symbol_index,
+                                  unsigned                            nof_samples)
+{
+  const unsigned threshold_us = get_ul_detail_timing_warn_threshold_us();
+  if (threshold_us == 0) {
+    return;
+  }
+
+  const auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(duration);
+  if (duration_us.count() <= static_cast<std::chrono::microseconds::rep>(threshold_us)) {
+    return;
+  }
+
+  std::atomic<unsigned>& nof_logs  = get_ul_detail_timing_counter(phase);
+  const unsigned         log_index = nof_logs.fetch_add(1, std::memory_order_relaxed);
+  if (log_index >= get_ul_detail_timing_warn_max_logs()) {
+    return;
+  }
+
+  ocudulog::fetch_basic_logger("PHY").warning(
+      "Lower-PHY UL detail timing: {} took {} us at slot {} symbol {} for {} samples.",
+      phase,
+      duration_us.count(),
+      slot,
+      symbol_index,
+      nof_samples);
+}
+
+void update_ci16_metrics(sample_statistics<float>& avg_power,
+                         sample_statistics<float>& peak_power,
+                         uint64_t&                 nof_clipped_samples,
+                         uint64_t&                 total_processed_samples,
+                         span<const ci16_t>        channel_buffer,
+                         float                     scale)
+{
+  if (channel_buffer.empty()) {
+    return;
+  }
+
+  const float   inv_scale          = 1.0F / scale;
+  const float   inv_scale_squared  = inv_scale * inv_scale;
+  const int16_t clipping_threshold = static_cast<int16_t>(std::round(0.95F * scale));
+  double        power_sum          = 0.0;
+  unsigned      max_abs_squared    = 0;
+  uint64_t      clipped            = 0;
+
+  for (ci16_t sample : channel_buffer) {
+    int re = sample.real();
+    int im = sample.imag();
+
+    unsigned abs_squared = static_cast<unsigned>(static_cast<int64_t>(re) * re + static_cast<int64_t>(im) * im);
+    power_sum += static_cast<double>(abs_squared);
+    max_abs_squared = std::max(max_abs_squared, abs_squared);
+    clipped += ((std::abs(re) > clipping_threshold) || (std::abs(im) > clipping_threshold)) ? 1U : 0U;
+  }
+
+  avg_power.update(static_cast<float>(power_sum * inv_scale_squared / static_cast<double>(channel_buffer.size())));
+  peak_power.update(static_cast<float>(max_abs_squared) * inv_scale_squared);
+  nof_clipped_samples += clipped;
+  total_processed_samples += channel_buffer.size();
+}
+
+} // namespace
 
 lower_phy_uplink_processor_impl::lower_phy_uplink_processor_impl(std::unique_ptr<prach_processor> prach_proc_,
                                                                  std::unique_ptr<puxch_processor> puxch_proc_,
@@ -179,10 +321,45 @@ void lower_phy_uplink_processor_impl::process_collecting(const baseband_gateway_
   // Get the number of input samples.
   unsigned nof_input_samples = samples.get_nof_samples();
 
+  const bool cfo_active = cfo_processor.is_active();
+
+  // Fast path for larger SDR receive buffers: when the current input already contains a complete OFDM symbol and no
+  // CFO correction is active, process the symbol directly from the radio buffer. This avoids an extra host copy before
+  // PRACH/PUxCH processing and lets an accelerated demodulator stage the FFT window from the original buffer.
+  if (!cfo_active && (temp_buffer_write_index == 0) && (nof_input_samples >= current_symbol_size)) {
+    const bool detail_timing_enabled = get_ul_detail_timing_warn_threshold_us() != 0;
+    auto       phase_start           = std::chrono::steady_clock::time_point{};
+    if (detail_timing_enabled) {
+      phase_start = std::chrono::steady_clock::now();
+    }
+
+    baseband_gateway_buffer_reader_view symbol_samples(samples, 0, current_symbol_size);
+    cfo_processor.advance(current_symbol_size);
+    process_complete_symbol(symbol_samples, false);
+
+    if (detail_timing_enabled) {
+      log_ul_detail_timing_if_slow("direct symbol",
+                                   std::chrono::steady_clock::now() - phase_start,
+                                   current_slot,
+                                   current_symbol_index,
+                                   current_symbol_size);
+    }
+
+    // Process next symbol with the remainder samples.
+    baseband_gateway_buffer_reader_view samples2(samples, current_symbol_size, nof_input_samples - current_symbol_size);
+    process_symbol_boundary(samples2, timestamp + current_symbol_size);
+    return;
+  }
+
   // Select the minimum among the remainder of samples to process and the number of samples to complete the buffer.
   unsigned nof_samples = std::min(nof_input_samples, current_symbol_size - temp_buffer_write_index);
 
   // For each port, concatenate samples.
+  const bool detail_timing_enabled = get_ul_detail_timing_warn_threshold_us() != 0;
+  auto       phase_start           = std::chrono::steady_clock::time_point{};
+  if (detail_timing_enabled) {
+    phase_start = std::chrono::steady_clock::now();
+  }
   for (unsigned i_port = 0; i_port != nof_rx_ports; ++i_port) {
     // Select view of the temporary buffer.
     span<ci16_t> temp_buffer_dst = temp_buffer[i_port].subspan(temp_buffer_write_index, nof_samples);
@@ -192,6 +369,10 @@ void lower_phy_uplink_processor_impl::process_collecting(const baseband_gateway_
 
     // Append input samples into the temporary buffer.
     ocuduvec::copy(temp_buffer_dst, temp_buffer_src);
+  }
+  if (detail_timing_enabled) {
+    log_ul_detail_timing_if_slow(
+        "host copy", std::chrono::steady_clock::now() - phase_start, current_slot, current_symbol_index, nof_samples);
   }
 
   // Increment the count of samples stored in the temporal buffer.
@@ -203,47 +384,112 @@ void lower_phy_uplink_processor_impl::process_collecting(const baseband_gateway_
     return;
   }
 
-  // View over the temporary float-based complex samples for CFO processor.
-  span<cf_t> view;
-  // Perform carrier frequency offset compensation.
-  for (unsigned i_channel = 0; i_channel != temp_buffer.get_nof_channels(); ++i_channel) {
-    // The CFO compensation is not currently supported for 16-bit complex integer samples. So, it must convert it to
-    // single-precision complex floating-point samples.
-    span<ci16_t> channel_buffer = temp_buffer.get_writer().get_channel_buffer(i_channel);
-    view                        = temp_cf_buffer.get_view({i_channel}).subspan(0, channel_buffer.size());
-    ocuduvec::convert(view, channel_buffer, scaling_factor_ci16_to_cf);
-    cfo_processor.process(view);
-    ocuduvec::convert(channel_buffer, view, scaling_factor_cf_to_ci16);
+  // Perform carrier frequency offset compensation only when there is an active CFO command. The common zero-CFO path
+  // can skip a full ci16->cf32->ci16 round trip before OFDM demodulation.
+  if (cfo_active) {
+    if (detail_timing_enabled) {
+      phase_start = std::chrono::steady_clock::now();
+    }
+    for (unsigned i_channel = 0; i_channel != temp_buffer.get_nof_channels(); ++i_channel) {
+      // The CFO compensation is not currently supported for 16-bit complex integer samples. So, it must convert it to
+      // single-precision complex floating-point samples.
+      span<ci16_t> channel_buffer = temp_buffer.get_writer().get_channel_buffer(i_channel);
+      span<cf_t>   view           = temp_cf_buffer.get_view({i_channel}).subspan(0, channel_buffer.size());
+      ocuduvec::convert(view, channel_buffer, scaling_factor_ci16_to_cf);
+      cfo_processor.process(view);
+      ocuduvec::convert(channel_buffer, view, scaling_factor_cf_to_ci16);
+    }
+    if (detail_timing_enabled) {
+      log_ul_detail_timing_if_slow("CFO",
+                                   std::chrono::steady_clock::now() - phase_start,
+                                   current_slot,
+                                   current_symbol_index,
+                                   current_symbol_size);
+    }
   }
 
   // Advance CFO processor number of samples.
   cfo_processor.advance(temp_buffer.get_nof_samples());
 
+  process_complete_symbol(temp_buffer.get_reader(), cfo_active);
+
+  // Process next symbol with the remainder samples.
+  baseband_gateway_buffer_reader_view samples2(samples, nof_samples, nof_input_samples - nof_samples);
+  process_symbol_boundary(samples2, timestamp + nof_samples);
+}
+
+bool lower_phy_uplink_processor_impl::should_report_receive_metrics()
+{
+  const unsigned period = get_ul_metrics_period_symbols();
+  bool           report = (receive_metrics_symbol_counter % period) == 0;
+  ++receive_metrics_symbol_counter;
+  return report;
+}
+
+void lower_phy_uplink_processor_impl::process_complete_symbol(const baseband_gateway_buffer_reader& symbol_samples,
+                                                              bool                                  cfo_active)
+{
+  const bool detail_timing_enabled = get_ul_detail_timing_warn_threshold_us() != 0;
+  auto       phase_start           = std::chrono::steady_clock::time_point{};
+
   // Process symbol by PRACH processor.
   prach_processor_baseband::symbol_context prach_context = {
       .slot = current_slot, .symbol = current_symbol_index, .sector = sector_id};
-  prach_proc->get_baseband().process_symbol(temp_buffer.get_reader(), prach_context);
+  if (detail_timing_enabled) {
+    phase_start = std::chrono::steady_clock::now();
+  }
+  prach_proc->get_baseband().process_symbol(symbol_samples, prach_context);
+  if (detail_timing_enabled) {
+    log_ul_detail_timing_if_slow("PRACH",
+                                 std::chrono::steady_clock::now() - phase_start,
+                                 current_slot,
+                                 current_symbol_index,
+                                 symbol_samples.get_nof_samples());
+  }
 
   // Process symbol by PUxCH processor.
   lower_phy_rx_symbol_context puxch_context = {
       .slot = current_slot, .sector = sector_id, .nof_symbols = current_symbol_index};
-  bool processed = puxch_proc->get_baseband().process_symbol(temp_buffer.get_reader(), puxch_context);
+  if (detail_timing_enabled) {
+    phase_start = std::chrono::steady_clock::now();
+  }
+  bool processed = puxch_proc->get_baseband().process_symbol(symbol_samples, puxch_context);
+  if (detail_timing_enabled) {
+    log_ul_detail_timing_if_slow("PUxCH",
+                                 std::chrono::steady_clock::now() - phase_start,
+                                 current_slot,
+                                 current_symbol_index,
+                                 symbol_samples.get_nof_samples());
+  }
 
-  if (processed) {
+  if (processed && should_report_receive_metrics()) {
+    if (detail_timing_enabled) {
+      phase_start = std::chrono::steady_clock::now();
+    }
+
     sample_statistics<float> avg_power;
     sample_statistics<float> peak_power;
-    unsigned                 nof_channels = temp_buffer.get_nof_channels();
+    unsigned                 nof_channels = symbol_samples.get_nof_channels();
 
     uint64_t total_processed_samples = 0;
     uint64_t nof_clipped_samples     = 0;
 
-    // Process received signal before demodulation.
     for (unsigned i_channel = 0; i_channel != nof_channels; ++i_channel) {
-      // Perform signal measurements. Reuse the previous view of the float-based complex samples.
-      avg_power.update(ocuduvec::average_power(view));
-      peak_power.update(ocuduvec::max_abs_element(view).second);
-      nof_clipped_samples += ocuduvec::count_if_part_abs_greater_than(view, 0.95);
-      total_processed_samples += view.size();
+      span<const ci16_t> channel_buffer = symbol_samples.get_channel_buffer(i_channel);
+      if (cfo_active) {
+        span<const cf_t> view = temp_cf_buffer.get_view({i_channel}).subspan(0, channel_buffer.size());
+        avg_power.update(ocuduvec::average_power(view));
+        peak_power.update(ocuduvec::max_abs_element(view).second);
+        nof_clipped_samples += ocuduvec::count_if_part_abs_greater_than(view, 0.95);
+        total_processed_samples += view.size();
+      } else {
+        update_ci16_metrics(avg_power,
+                            peak_power,
+                            nof_clipped_samples,
+                            total_processed_samples,
+                            channel_buffer,
+                            scaling_factor_ci16_to_cf);
+      }
     }
 
     lower_phy_baseband_metrics metrics = {.avg_power  = avg_power.get_mean(),
@@ -252,6 +498,13 @@ void lower_phy_uplink_processor_impl::process_collecting(const baseband_gateway_
                                               clipping_counters{.nof_clipped_samples   = nof_clipped_samples,
                                                                 .nof_processed_samples = total_processed_samples}};
     notifier->on_new_metrics(metrics);
+    if (detail_timing_enabled) {
+      log_ul_detail_timing_if_slow("metrics",
+                                   std::chrono::steady_clock::now() - phase_start,
+                                   current_slot,
+                                   current_symbol_index,
+                                   symbol_samples.get_nof_samples());
+    }
   }
 
   // Detect half-slot boundary.
@@ -265,10 +518,6 @@ void lower_phy_uplink_processor_impl::process_collecting(const baseband_gateway_
     // Notify full slot boundary.
     notifier->on_full_slot(lower_phy_timing_context{.slot = slot_point_extended(current_slot), .time_point = {}});
   }
-
-  // Process next symbol with the remainder samples.
-  baseband_gateway_buffer_reader_view samples2(samples, nof_samples, nof_input_samples - nof_samples);
-  process_symbol_boundary(samples2, timestamp + nof_samples);
 }
 
 baseband_cfo_processor& lower_phy_uplink_processor_impl::get_cfo_control()

@@ -13,7 +13,9 @@
 #include "ocudu/ran/cyclic_prefix.h"
 #include "ocudu/ran/precoding/precoding_codebooks.h"
 #include "fmt/ostream.h"
+#include <array>
 #include <gtest/gtest.h>
+#include <numeric>
 #include <random>
 
 using namespace ocudu;
@@ -104,6 +106,31 @@ static void assert_grid(const re_buffer_reader<>&   golden,
                         unsigned                    nof_grid_rb)
 {
   assert_grid(golden, allocation, re_pattern_list(), grid, nof_grid_rb);
+}
+
+static void assert_grids_equal(const resource_grid_reader& expected,
+                               const resource_grid_reader& actual,
+                               unsigned                    nof_ports,
+                               unsigned                    nof_symbols,
+                               unsigned                    nof_subc)
+{
+  std::vector<cf_t> expected_symbol(nof_subc);
+  std::vector<cf_t> actual_symbol(nof_subc);
+
+  for (unsigned i_port = 0; i_port != nof_ports; ++i_port) {
+    for (unsigned i_symbol = 0; i_symbol != nof_symbols; ++i_symbol) {
+      expected.get(expected_symbol, i_port, i_symbol, 0);
+      actual.get(actual_symbol, i_port, i_symbol, 0);
+
+      for (unsigned i_subc = 0; i_subc != nof_subc; ++i_subc) {
+        float tolerance = get_tolerance(expected_symbol[i_subc]);
+        ASSERT_NEAR(expected_symbol[i_subc].real(), actual_symbol[i_subc].real(), tolerance)
+            << "Mismatch at port=" << i_port << " symbol=" << i_symbol << " subcarrier=" << i_subc;
+        ASSERT_NEAR(expected_symbol[i_subc].imag(), actual_symbol[i_subc].imag(), tolerance)
+            << "Mismatch at port=" << i_port << " symbol=" << i_symbol << " subcarrier=" << i_subc;
+      }
+    }
+  }
 }
 
 namespace {
@@ -302,6 +329,55 @@ protected:
     return config;
   }
 
+  const re_buffer_reader<>&
+  generate_symbol_buffer_data(std::vector<ci8_t>& symbols, unsigned nof_layers, unsigned nof_re)
+  {
+    random_data.resize(nof_layers, nof_re);
+    symbols.resize(nof_layers * nof_re);
+
+    for (unsigned i_re = 0; i_re != nof_re; ++i_re) {
+      for (unsigned i_layer = 0; i_layer != nof_layers; ++i_layer) {
+        ci8_t value(static_cast<int8_t>(static_cast<int>((3 * i_re + 7 * i_layer) % 31) - 15),
+                    static_cast<int8_t>(static_cast<int>((5 * i_re + 11 * i_layer) % 29) - 14));
+        symbols[nof_layers * i_re + i_layer] = value;
+        random_data.get_slice(i_layer)[i_re] = to_cf(value);
+      }
+    }
+
+    return random_data;
+  }
+
+  static unsigned count_allocation_re(const resource_grid_mapper::allocation_configuration& allocation,
+                                      const re_pattern_list&                                reserved)
+  {
+    auto crb_indices = allocation.freq_alloc.get_crb_indices(allocation.bwp.start(), allocation.bwp.length());
+
+    bounded_bitset<MAX_NOF_SUBCARRIERS> base_crb_re_mask(allocation.bwp.stop() * NOF_SUBCARRIERS_PER_RB);
+    std::for_each(crb_indices.begin(), crb_indices.end(), [&base_crb_re_mask](uint16_t crb_idx) {
+      base_crb_re_mask.fill(crb_idx * NOF_SUBCARRIERS_PER_RB, (crb_idx + 1) * NOF_SUBCARRIERS_PER_RB);
+    });
+
+    unsigned count = 0;
+    for (unsigned i_symbol = allocation.time_alloc.start(), i_symbol_end = allocation.time_alloc.stop();
+         i_symbol != i_symbol_end;
+         ++i_symbol) {
+      bounded_bitset<MAX_NOF_SUBCARRIERS> symbol_re_mask = base_crb_re_mask;
+      reserved.get_exclusion_mask(symbol_re_mask, i_symbol);
+      count += symbol_re_mask.count();
+    }
+    return count;
+  }
+
+  static precoding_configuration
+  make_repeated_prg_precoding(const precoding_weight_matrix& weights, unsigned nof_prg, unsigned prg_size)
+  {
+    precoding_configuration config(weights.get_nof_layers(), weights.get_nof_ports(), nof_prg, prg_size);
+    for (unsigned i_prg = 0; i_prg != nof_prg; ++i_prg) {
+      config.set_prg_coefficients(weights, i_prg);
+    }
+    return config;
+  }
+
 private:
   // Buffer for holding randomly generated data.
   static_re_buffer<precoding_constants::MAX_NOF_LAYERS, MAX_NOF_SUBCARRIERS * MAX_NSYMB_PER_SLOT> random_data;
@@ -465,6 +541,140 @@ TEST_F(ResourceGridMapperFixture, Identity)
     // Assert resource grid contents.
     assert_grid(golden, allocation, grid->get_reader(), MAX_NOF_PRBS);
   }
+}
+
+TEST_F(ResourceGridMapperFixture, SymbolBufferOneLayerAllPortsMatchesGenericWithReSkip)
+{
+  constexpr unsigned nof_layers = 1;
+  constexpr unsigned nof_ports  = 4;
+  constexpr unsigned prg_size   = precoding_constants::MIN_PRG_SIZE;
+  constexpr unsigned nof_rb     = 2 * prg_size;
+  constexpr unsigned nof_subc   = nof_rb * NOF_SUBCARRIERS_PER_RB;
+  constexpr unsigned re_skip    = 19;
+
+  re_prb_mask reserved_re;
+  reserved_re.set(0);
+  reserved_re.set(5);
+  reserved_re.set(11);
+  symbol_slot_mask reserved_symbols(MAX_NSYMB_PER_SLOT);
+  reserved_symbols.set(2);
+  reserved_symbols.set(4);
+  re_pattern_list reserved(re_pattern(0, nof_rb, 1, reserved_re, reserved_symbols));
+
+  resource_grid_mapper::allocation_configuration allocation = {
+      .bwp = crb_interval{0, nof_rb}, .freq_alloc = rb_allocation::make_type1(0, nof_rb), .time_alloc = {1, 5}};
+
+  unsigned           nof_data_re = count_allocation_re(allocation, reserved);
+  std::vector<ci8_t> symbols;
+  generate_symbol_buffer_data(symbols, nof_layers, nof_data_re - re_skip);
+
+  precoding_weight_matrix weights           = make_one_layer_all_ports(nof_ports);
+  precoding_configuration fast_precoding    = precoding_configuration::make_wideband(weights);
+  precoding_configuration generic_precoding = make_repeated_prg_precoding(weights, nof_rb / prg_size, prg_size);
+
+  std::unique_ptr<resource_grid> fast_grid    = rg_factory->create(nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
+  std::unique_ptr<resource_grid> generic_grid = rg_factory->create(nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
+  fast_grid->set_all_zero();
+  generic_grid->set_all_zero();
+
+  resource_grid_mapper::symbol_buffer_adapter fast_buffer{span<const ci8_t>(symbols)};
+  resource_grid_mapper::symbol_buffer_adapter generic_buffer{span<const ci8_t>(symbols)};
+
+  std::array<uint8_t, nof_ports> ports;
+  std::iota(ports.begin(), ports.end(), 0);
+
+  std::unique_ptr<resource_grid_mapper> mapper = mapper_factory->create();
+  mapper->map(fast_grid->get_writer(), fast_buffer, allocation, reserved, ports, fast_precoding, re_skip);
+  mapper->map(generic_grid->get_writer(), generic_buffer, allocation, reserved, ports, generic_precoding, re_skip);
+
+  assert_grids_equal(generic_grid->get_reader(), fast_grid->get_reader(), nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
+}
+
+TEST_F(ResourceGridMapperFixture, SymbolBufferOneLayerOnePortClearsInactivePorts)
+{
+  constexpr unsigned nof_layers = 1;
+  constexpr unsigned nof_ports  = 4;
+  constexpr unsigned prg_size   = precoding_constants::MIN_PRG_SIZE;
+  constexpr unsigned nof_rb     = 2 * prg_size;
+  constexpr unsigned nof_subc   = nof_rb * NOF_SUBCARRIERS_PER_RB;
+
+  resource_grid_mapper::allocation_configuration allocation = {
+      .bwp = crb_interval{0, nof_rb}, .freq_alloc = rb_allocation::make_type1(0, nof_rb), .time_alloc = {0, 2}};
+
+  unsigned           nof_data_re = count_allocation_re(allocation, re_pattern_list());
+  std::vector<ci8_t> symbols;
+  generate_symbol_buffer_data(symbols, nof_layers, nof_data_re);
+
+  precoding_weight_matrix weights           = make_one_layer_one_port(nof_ports, 2);
+  precoding_configuration fast_precoding    = precoding_configuration::make_wideband(weights);
+  precoding_configuration generic_precoding = make_repeated_prg_precoding(weights, nof_rb / prg_size, prg_size);
+
+  std::unique_ptr<resource_grid> fast_grid    = rg_factory->create(nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
+  std::unique_ptr<resource_grid> generic_grid = rg_factory->create(nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
+
+  std::vector<cf_t> stale_symbol(nof_subc, {17.0F, -9.0F});
+  for (unsigned i_port = 0; i_port != nof_ports; ++i_port) {
+    for (unsigned i_symbol = 0; i_symbol != MAX_NSYMB_PER_SLOT; ++i_symbol) {
+      fast_grid->get_writer().put(i_port, i_symbol, 0, stale_symbol);
+      generic_grid->get_writer().put(i_port, i_symbol, 0, stale_symbol);
+    }
+  }
+
+  resource_grid_mapper::symbol_buffer_adapter fast_buffer{span<const ci8_t>(symbols)};
+  resource_grid_mapper::symbol_buffer_adapter generic_buffer{span<const ci8_t>(symbols)};
+
+  std::array<uint8_t, nof_ports> ports;
+  std::iota(ports.begin(), ports.end(), 0);
+
+  std::unique_ptr<resource_grid_mapper> mapper = mapper_factory->create();
+  mapper->map(fast_grid->get_writer(), fast_buffer, allocation, re_pattern_list(), ports, fast_precoding);
+  mapper->map(generic_grid->get_writer(), generic_buffer, allocation, re_pattern_list(), ports, generic_precoding);
+
+  assert_grids_equal(generic_grid->get_reader(), fast_grid->get_reader(), nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
+}
+
+TEST_F(ResourceGridMapperFixture, SymbolBufferDiagonalLayersMatchesGeneric)
+{
+  constexpr unsigned nof_layers = 4;
+  constexpr unsigned nof_ports  = 4;
+  constexpr unsigned prg_size   = precoding_constants::MIN_PRG_SIZE;
+  constexpr unsigned nof_rb     = 2 * prg_size;
+  constexpr unsigned nof_subc   = nof_rb * NOF_SUBCARRIERS_PER_RB;
+
+  re_prb_mask reserved_re;
+  reserved_re.set(1);
+  reserved_re.set(7);
+  symbol_slot_mask reserved_symbols(MAX_NSYMB_PER_SLOT);
+  reserved_symbols.set(1);
+  re_pattern_list reserved(re_pattern(0, nof_rb, 1, reserved_re, reserved_symbols));
+
+  resource_grid_mapper::allocation_configuration allocation = {
+      .bwp = crb_interval{0, nof_rb}, .freq_alloc = rb_allocation::make_type1(0, nof_rb), .time_alloc = {1, 4}};
+
+  unsigned           nof_data_re = count_allocation_re(allocation, reserved);
+  std::vector<ci8_t> symbols;
+  generate_symbol_buffer_data(symbols, nof_layers, nof_data_re);
+
+  precoding_weight_matrix weights           = make_identity(nof_layers);
+  precoding_configuration fast_precoding    = precoding_configuration::make_wideband(weights);
+  precoding_configuration generic_precoding = make_repeated_prg_precoding(weights, nof_rb / prg_size, prg_size);
+
+  std::unique_ptr<resource_grid> fast_grid    = rg_factory->create(nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
+  std::unique_ptr<resource_grid> generic_grid = rg_factory->create(nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
+  fast_grid->set_all_zero();
+  generic_grid->set_all_zero();
+
+  resource_grid_mapper::symbol_buffer_adapter fast_buffer{span<const ci8_t>(symbols)};
+  resource_grid_mapper::symbol_buffer_adapter generic_buffer{span<const ci8_t>(symbols)};
+
+  std::array<uint8_t, nof_ports> ports;
+  std::iota(ports.begin(), ports.end(), 0);
+
+  std::unique_ptr<resource_grid_mapper> mapper = mapper_factory->create();
+  mapper->map(fast_grid->get_writer(), fast_buffer, allocation, reserved, ports, fast_precoding);
+  mapper->map(generic_grid->get_writer(), generic_buffer, allocation, reserved, ports, generic_precoding);
+
+  assert_grids_equal(generic_grid->get_reader(), fast_grid->get_reader(), nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
 }
 
 // Tests mapping for a one layer to two antenna ports configuration, generated by the function

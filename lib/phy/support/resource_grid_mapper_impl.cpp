@@ -7,11 +7,78 @@
 #include "ocudu/phy/antenna_ports.h"
 #include "ocudu/phy/support/precoding_configuration.h"
 #include "ocudu/phy/support/re_pattern.h"
+#include <array>
+#include <cstdlib>
+#include <cstring>
 
 using namespace ocudu;
 
 namespace {
 using precoding_buffer_type = static_re_buffer<precoding_constants::MAX_NOF_PORTS, MAX_NOF_SUBCARRIERS, cbf16_t>;
+
+static bool is_same_real_weight_one_layer(const precoding_weight_matrix& prg_weights, float& weight_real)
+{
+  if (prg_weights.get_nof_layers() != 1) {
+    return false;
+  }
+
+  cf_t first_weight = prg_weights.get_coefficient(0, 0);
+  if (first_weight.imag() != 0.0F) {
+    return false;
+  }
+
+  for (unsigned i_port = 1, nof_ports = prg_weights.get_nof_ports(); i_port != nof_ports; ++i_port) {
+    if (prg_weights.get_coefficient(0, i_port) != first_weight) {
+      return false;
+    }
+  }
+
+  weight_real = first_weight.real();
+  return true;
+}
+
+static bool is_same_real_weight_diagonal(const precoding_weight_matrix& prg_weights, float& weight_real)
+{
+  unsigned nof_layers = prg_weights.get_nof_layers();
+  if ((nof_layers < 2) || (nof_layers != prg_weights.get_nof_ports())) {
+    return false;
+  }
+
+  cf_t first_weight = prg_weights.get_coefficient(0, 0);
+  if (first_weight.imag() != 0.0F) {
+    return false;
+  }
+
+  for (unsigned i_layer = 0; i_layer != nof_layers; ++i_layer) {
+    for (unsigned i_port = 0; i_port != nof_layers; ++i_port) {
+      cf_t coefficient = prg_weights.get_coefficient(i_layer, i_port);
+      if (i_layer == i_port) {
+        if (coefficient != first_weight) {
+          return false;
+        }
+      } else if (coefficient != cf_t()) {
+        return false;
+      }
+    }
+  }
+
+  weight_real = first_weight.real();
+  return true;
+}
+
+static bool skip_host_mapping_after_device_grid_mapping()
+{
+  static const bool skip = []() {
+    const char* value = std::getenv("OCUDU_PDSCH_DEVICE_MAP_SKIP_HOST");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+  }();
+  return skip;
+}
+
+static bool should_try_device_grid_mapping(const resource_grid_writer& writer)
+{
+  return writer.supports_device_grid_mapping() || skip_host_mapping_after_device_grid_mapping();
+}
 } // namespace
 
 /// Resource element allocation patterns within a resource block for PDSCH DM-RS type 1.
@@ -158,6 +225,251 @@ void resource_grid_mapper_impl::map_re_block(resource_grid_writer&              
       writer.put(i_port, i_symbol, i_subc, block_mask, precoding_buffer.get().get_slice(i_slice));
     }
   }
+}
+
+static void map_ci8_layer_to_port(resource_grid_writer&                      writer,
+                                  const bounded_bitset<MAX_NOF_SUBCARRIERS>& block_mask,
+                                  cf_t                                       weight,
+                                  span<const ci8_t>                          block,
+                                  unsigned                                   nof_layers,
+                                  unsigned                                   i_layer,
+                                  unsigned                                   i_port,
+                                  unsigned                                   i_symbol,
+                                  unsigned                                   i_subc)
+{
+  unsigned nof_re_block = block_mask.count();
+  if (nof_re_block == 0) {
+    return;
+  }
+
+  float weight_real = weight.real();
+  float weight_imag = weight.imag();
+
+  bool          is_contiguous = block_mask.is_contiguous();
+  unsigned      first_subc    = is_contiguous ? block_mask.find_lowest() : 0;
+  span<cbf16_t> symbol        = writer.get_view(i_port, i_symbol).subspan(i_subc, block_mask.size());
+
+  if (OCUDU_LIKELY(is_contiguous)) {
+    span<cbf16_t> out = symbol.subspan(first_subc, nof_re_block);
+
+    if ((weight_real == 0.0F) && (weight_imag == 0.0F)) {
+      std::fill(out.begin(), out.end(), cbf16_t());
+    } else if (weight_imag == 0.0F) {
+      for (unsigned i_re = 0; i_re != nof_re_block; ++i_re) {
+        const ci8_t& in = block[nof_layers * i_re + i_layer];
+        out[i_re] = cbf16_t(static_cast<float>(in.real()) * weight_real, static_cast<float>(in.imag()) * weight_real);
+      }
+    } else if (weight_real == 0.0F) {
+      for (unsigned i_re = 0; i_re != nof_re_block; ++i_re) {
+        const ci8_t& in = block[nof_layers * i_re + i_layer];
+        out[i_re] = cbf16_t(-static_cast<float>(in.imag()) * weight_imag, static_cast<float>(in.real()) * weight_imag);
+      }
+    } else {
+      for (unsigned i_re = 0; i_re != nof_re_block; ++i_re) {
+        out[i_re] = to_cf(block[nof_layers * i_re + i_layer]) * weight;
+      }
+    }
+    return;
+  }
+
+  unsigned i_re = 0;
+  if ((weight_real == 0.0F) && (weight_imag == 0.0F)) {
+    block_mask.for_each(0, block_mask.size(), [&](unsigned i_subcarrier) {
+      symbol[i_subcarrier] = cbf16_t();
+      ++i_re;
+    });
+  } else if (weight_imag == 0.0F) {
+    block_mask.for_each(0, block_mask.size(), [&](unsigned i_subcarrier) {
+      const ci8_t& in = block[nof_layers * i_re + i_layer];
+      symbol[i_subcarrier] =
+          cbf16_t(static_cast<float>(in.real()) * weight_real, static_cast<float>(in.imag()) * weight_real);
+      ++i_re;
+    });
+  } else if (weight_real == 0.0F) {
+    block_mask.for_each(0, block_mask.size(), [&](unsigned i_subcarrier) {
+      const ci8_t& in = block[nof_layers * i_re + i_layer];
+      symbol[i_subcarrier] =
+          cbf16_t(-static_cast<float>(in.imag()) * weight_imag, static_cast<float>(in.real()) * weight_imag);
+      ++i_re;
+    });
+  } else {
+    block_mask.for_each(0, block_mask.size(), [&](unsigned i_subcarrier) {
+      symbol[i_subcarrier] = to_cf(block[nof_layers * i_re + i_layer]) * weight;
+      ++i_re;
+    });
+  }
+}
+
+static void map_re_block_single_layer(resource_grid_writer&                      writer,
+                                      const bounded_bitset<MAX_NOF_SUBCARRIERS>& block_mask,
+                                      span<const uint8_t>                        ports,
+                                      const precoding_weight_matrix&             prg_weights,
+                                      span<const ci8_t>                          block,
+                                      unsigned                                   i_symbol,
+                                      unsigned                                   i_subc)
+{
+  unsigned nof_ports = prg_weights.get_nof_ports();
+  if (nof_ports > 1) {
+    cf_t first_weight = prg_weights.get_coefficient(0, 0);
+    bool same_weight  = true;
+    for (unsigned i_port = 1; i_port != nof_ports; ++i_port) {
+      same_weight = same_weight && (prg_weights.get_coefficient(0, i_port) == first_weight);
+    }
+
+    if (same_weight) {
+      map_ci8_layer_to_port(writer, block_mask, first_weight, block, 1, 0, ports[0], i_symbol, i_subc);
+
+      unsigned nof_re_block = block_mask.count();
+      if (nof_re_block == 0) {
+        return;
+      }
+
+      bool                is_contiguous = block_mask.is_contiguous();
+      span<const cbf16_t> src_symbol    = writer.get_view(ports[0], i_symbol).subspan(i_subc, block_mask.size());
+      bounded_bitset<MAX_NOF_SUBCARRIERS> active_subc = block_mask;
+      if (OCUDU_LIKELY(is_contiguous)) {
+        unsigned first_subc = block_mask.find_lowest();
+        src_symbol          = src_symbol.subspan(first_subc, nof_re_block);
+        for (unsigned i_port = 1; i_port != nof_ports; ++i_port) {
+          span<cbf16_t> dst_symbol =
+              writer.get_view(ports[i_port], i_symbol).subspan(i_subc + first_subc, nof_re_block);
+          std::copy(src_symbol.begin(), src_symbol.end(), dst_symbol.begin());
+        }
+        return;
+      }
+
+      for (unsigned i_port = 1; i_port != nof_ports; ++i_port) {
+        span<cbf16_t> dst_symbol = writer.get_view(ports[i_port], i_symbol).subspan(i_subc, block_mask.size());
+        active_subc.for_each(
+            0, active_subc.size(), [&](unsigned i_subcarrier) { dst_symbol[i_subcarrier] = src_symbol[i_subcarrier]; });
+      }
+      return;
+    }
+  }
+
+  for (unsigned i_port = 0; i_port != nof_ports; ++i_port) {
+    map_ci8_layer_to_port(
+        writer, block_mask, prg_weights.get_coefficient(0, i_port), block, 1, 0, ports[i_port], i_symbol, i_subc);
+  }
+}
+
+static bool is_diagonal_precoding(const precoding_weight_matrix& prg_weights)
+{
+  unsigned nof_layers = prg_weights.get_nof_layers();
+  if (nof_layers != prg_weights.get_nof_ports()) {
+    return false;
+  }
+
+  for (unsigned i_layer = 0; i_layer != nof_layers; ++i_layer) {
+    for (unsigned i_port = 0; i_port != nof_layers; ++i_port) {
+      if ((i_layer != i_port) && (prg_weights.get_coefficient(i_layer, i_port) != cf_t())) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static void map_re_block_diagonal_layers(resource_grid_writer&                      writer,
+                                         const bounded_bitset<MAX_NOF_SUBCARRIERS>& block_mask,
+                                         span<const uint8_t>                        ports,
+                                         const precoding_weight_matrix&             prg_weights,
+                                         span<const ci8_t>                          block,
+                                         unsigned                                   i_symbol,
+                                         unsigned                                   i_subc)
+{
+  for (unsigned i_layer = 0, nof_layers = prg_weights.get_nof_layers(); i_layer != nof_layers; ++i_layer) {
+    map_ci8_layer_to_port(writer,
+                          block_mask,
+                          prg_weights.get_coefficient(i_layer, i_layer),
+                          block,
+                          nof_layers,
+                          i_layer,
+                          ports[i_layer],
+                          i_symbol,
+                          i_subc);
+  }
+}
+
+static bool try_map_device_grid(resource_grid_mapper::symbol_buffer&                  buffer,
+                                resource_grid_writer&                                 writer,
+                                const resource_grid_mapper::allocation_configuration& allocation,
+                                const re_pattern_list&                                reserved,
+                                const bounded_bitset<MAX_NOF_SUBCARRIERS>&            base_crb_re_mask,
+                                const precoding_weight_matrix&                        prg_weights,
+                                unsigned                                              nof_ports,
+                                unsigned                                              nof_grid_symbols,
+                                unsigned                                              nof_grid_subc,
+                                unsigned                                              re_skip)
+{
+  if (!buffer.supports_device_grid_mapping()) {
+    return false;
+  }
+
+  float    weight_real = 0.0F;
+  unsigned nof_layers  = prg_weights.get_nof_layers();
+  if (!is_same_real_weight_one_layer(prg_weights, weight_real) &&
+      !is_same_real_weight_diagonal(prg_weights, weight_real)) {
+    return false;
+  }
+
+  if ((nof_layers == 0) || ((buffer.get_max_block_size() % nof_layers) != 0)) {
+    return false;
+  }
+
+  unsigned nof_re_to_map = buffer.get_max_block_size() / nof_layers;
+
+  static thread_local std::array<uint32_t, MAX_NSYMB_PER_SLOT * MAX_NOF_SUBCARRIERS> re_offsets;
+  if (nof_re_to_map > re_offsets.size()) {
+    return false;
+  }
+
+  unsigned re_count        = 0;
+  unsigned re_offset_count = 0;
+  for (unsigned i_symbol = allocation.time_alloc.start(), i_symbol_end = allocation.time_alloc.stop();
+       i_symbol != i_symbol_end && re_offset_count != nof_re_to_map;
+       ++i_symbol) {
+    bounded_bitset<MAX_NOF_SUBCARRIERS> symbol_re_mask = base_crb_re_mask;
+    reserved.get_exclusion_mask(symbol_re_mask, i_symbol);
+
+    symbol_re_mask.for_each(0, symbol_re_mask.size(), [&](unsigned i_subcarrier) {
+      if ((re_count >= re_skip) && (re_offset_count != nof_re_to_map)) {
+        re_offsets[re_offset_count++] = i_symbol * nof_grid_subc + i_subcarrier;
+      }
+      ++re_count;
+    });
+  }
+
+  if (re_offset_count != nof_re_to_map) {
+    return false;
+  }
+
+  void* device_grid    = writer.supports_device_grid_mapping() ? writer.get_device_grid_bf16() : nullptr;
+  void* mapping_stream = buffer.get_device_grid_mapping_stream();
+  bool  writer_device_mapping_prepared = writer.supports_device_grid_mapping();
+  if (writer_device_mapping_prepared && !writer.prepare_device_grid_mapping(mapping_stream)) {
+    return false;
+  }
+  if (!buffer.map_to_device_grid(span<const uint32_t>(re_offsets.data(), re_offset_count),
+                                 device_grid,
+                                 nof_ports,
+                                 nof_layers,
+                                 nof_grid_symbols * nof_grid_subc,
+                                 weight_real)) {
+    if (writer_device_mapping_prepared) {
+      writer.cancel_device_grid_mapping();
+    }
+    return false;
+  }
+
+  if (!writer_device_mapping_prepared) {
+    return true;
+  }
+  if (!writer.on_device_grid_mapping_enqueued(mapping_stream)) {
+    writer.cancel_device_grid_mapping();
+    return false;
+  }
+  return true;
 }
 
 resource_grid_mapper_impl::resource_grid_mapper_impl(std::unique_ptr<channel_precoder> precoder_) :
@@ -309,7 +621,10 @@ void resource_grid_mapper_impl::map(resource_grid_writer&           writer,
   unsigned nof_antennas = precoding.get_nof_ports();
 
   // Get the precoding matrix for the first PRG (only one precoding PRG is supported).
-  const precoding_weight_matrix& prg_weights = precoding.get_prg_coefficients(0);
+  const precoding_weight_matrix& prg_weights                 = precoding.get_prg_coefficients(0);
+  bool                           use_single_layer_direct_map = (nof_layers == 1) && (precoding.get_nof_prg() == 1);
+  bool                           use_diagonal_direct_map =
+      !use_single_layer_direct_map && (precoding.get_nof_prg() == 1) && is_diagonal_precoding(prg_weights);
 
   // Verify that the number of layers is consistent with the number of ports.
   interval<unsigned, true> nof_antennas_range(1, writer.get_nof_ports());
@@ -344,6 +659,24 @@ void resource_grid_mapper_impl::map(resource_grid_writer&           writer,
   std::for_each(crb_indices.begin(), crb_indices.end(), [&base_crb_re_mask](uint16_t crb_idx) {
     base_crb_re_mask.fill(crb_idx * NOF_SUBCARRIERS_PER_RB, (crb_idx + 1) * NOF_SUBCARRIERS_PER_RB);
   });
+
+  // The device-grid mapping fast path maps onto ports [0, nof_antennas) implicitly and does not honor an arbitrary
+  // 'ports' remapping. All current callers pass an identity port list (ports[i] == i), so this is equivalent.
+  if ((use_single_layer_direct_map || use_diagonal_direct_map) && should_try_device_grid_mapping(writer) &&
+      (precoding.get_nof_prg() == 1) &&
+      try_map_device_grid(buffer,
+                          writer,
+                          allocation,
+                          reserved,
+                          base_crb_re_mask,
+                          prg_weights,
+                          nof_antennas,
+                          writer.get_nof_symbols(),
+                          writer.get_nof_subc(),
+                          re_skip) &&
+      (writer.supports_device_grid_mapping() || skip_host_mapping_after_device_grid_mapping())) {
+    return;
+  }
 
   // Iterate each allocated OFDM symbol.
   unsigned re_count = 0;
@@ -432,8 +765,16 @@ void resource_grid_mapper_impl::map(resource_grid_writer&           writer,
           // Prepare destination of the modulation buffer.
           span<const ci8_t> block = buffer.pop_symbols(nof_symbols_block);
 
-          // Apply layer mapping, precoding and map the resources in the grid.
-          map_re_block(writer, block_mask, ports, prg_weights, block, i_symbol, map_subc_interval.start());
+          if (use_single_layer_direct_map) {
+            map_re_block_single_layer(
+                writer, block_mask, ports, prg_weights, block, i_symbol, map_subc_interval.start());
+          } else if (use_diagonal_direct_map) {
+            map_re_block_diagonal_layers(
+                writer, block_mask, ports, prg_weights, block, i_symbol, map_subc_interval.start());
+          } else {
+            // Apply layer mapping, precoding and map the resources in the grid.
+            map_re_block(writer, block_mask, ports, prg_weights, block, i_symbol, map_subc_interval.start());
+          }
         }
 
         // Advance subcarrier interval.

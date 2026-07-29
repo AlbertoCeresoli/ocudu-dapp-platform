@@ -6,4 +6,5 @@ REUSE\.toml$
 ^build/
 ^docs/doxygen/
 ^external/
+lib/phy/cuda/third_party/
 ^plugins/

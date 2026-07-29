@@ -33,7 +33,7 @@ std::unique_ptr<lower_phy> ocudu::create_lower_phy(const lower_phy_configuration
 
   // Create OFDM PRACH demodulator factory.
   std::shared_ptr<ofdm_prach_demodulator_factory> prach_demodulator_factory =
-      create_ofdm_prach_demodulator_factory_sw(dft_factory, config.srate, fr);
+      create_ofdm_prach_demodulator_factory_accelerated(dft_factory, config.srate, fr, "auto");
 
   // Create amplitude control factory.
   std::shared_ptr<amplitude_controller_factory> amplitude_control_factory =

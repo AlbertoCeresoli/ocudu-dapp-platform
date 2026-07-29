@@ -11,8 +11,30 @@
 #include "ocudu/phy/upper/upper_phy_rx_results_notifier.h"
 #include "ocudu/ran/sch/sch_segmentation.h"
 #include "ocudu/support/rtsan.h"
+#include "ocudu/support/tracing/scoped_trace.h"
+#include <chrono>
+#include <cstdlib>
 
 using namespace ocudu;
+
+static std::chrono::microseconds get_prach_latency_warn_threshold()
+{
+  static const std::chrono::microseconds threshold = []() {
+    static constexpr unsigned default_threshold_us = 0;
+    const char*               value                = std::getenv("OCUDU_PRACH_LATENCY_WARN_US");
+    if ((value == nullptr) || (*value == '\0')) {
+      return std::chrono::microseconds(default_threshold_us);
+    }
+    char*         end    = nullptr;
+    unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value) {
+      return std::chrono::microseconds(default_threshold_us);
+    }
+    return std::chrono::microseconds(parsed);
+  }();
+
+  return threshold;
+}
 
 /// \brief Returns a PRACH detector slot configuration using the given PRACH buffer context.
 static prach_detector::configuration get_prach_dectector_config_from_prach_context(const prach_buffer_context& context)
@@ -246,11 +268,24 @@ void uplink_processor_impl::process_prach(shared_prach_buffer buffer, const prac
 
   bool success = task_executors.prach_executor.execute(
       [this, buffer_ = std::move(buffer), context_]() noexcept OCUDU_RTSAN_NONBLOCKING {
-        trace_point tp = l1_ul_tracer.now();
+        trace_point tp       = l1_ul_tracer.now();
+        const auto  start_tp = std::chrono::steady_clock::now();
 
         ul_prach_results ul_results;
         ul_results.context = context_;
         ul_results.result  = prach->detect(*buffer_, get_prach_dectector_config_from_prach_context(context_));
+
+        const std::chrono::microseconds elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start_tp);
+        const std::chrono::microseconds threshold = get_prach_latency_warn_threshold();
+        if ((threshold.count() != 0) && (elapsed > threshold)) {
+          logger.warning(context_.slot.sfn(),
+                         context_.slot.slot_index(),
+                         "Upper-PHY PRACH detection took {} usec for {} ports and {} preamble indices.",
+                         elapsed.count(),
+                         context_.ports.size(),
+                         context_.nof_preamble_indices);
+        }
 
         // Notify the PRACH results.
         notifier.on_new_prach_results(ul_results);
@@ -269,6 +304,8 @@ void uplink_processor_impl::process_prach(shared_prach_buffer buffer, const prac
 
 void uplink_processor_impl::process_pusch(const uplink_pdu_slot_repository::pusch_pdu& pdu)
 {
+  auto enqueue_scope = make_scoped_trace(l1_ul_tracer, "L1.UL.PUSCH.enqueue");
+
   // Notify the creation of the execution task.
   if (!state_machine.on_create_pdu_task()) {
     return;
@@ -312,6 +349,8 @@ void uplink_processor_impl::process_pusch(const uplink_pdu_slot_repository::pusc
 
   // Try to enqueue asynchronous processing.
   bool success = task_executors.pusch_executor.defer([this, data, rm_buffer2 = std::move(rm_buffer), &pdu]() mutable {
+    auto task_scope = make_scoped_trace(l1_ul_tracer, "L1.UL.PUSCH.task");
+
     // Select and configure notifier adaptor.
     // Assume that count_pusch_adaptors will not exceed MAX_PUSCH_PDUS_PER_SLOT.
     unsigned                         notifier_adaptor_id = count_pusch_adaptors.fetch_add(1, std::memory_order_acq_rel);
@@ -322,7 +361,10 @@ void uplink_processor_impl::process_pusch(const uplink_pdu_slot_repository::pusc
 
     trace_point tp = l1_ul_tracer.now();
 
-    pusch_proc->process(data, std::move(rm_buffer2), processor_notifier, grid->get_reader(), pdu.pdu);
+    {
+      auto process_scope = make_scoped_trace(l1_ul_tracer, "L1.UL.PUSCH.processor");
+      pusch_proc->process(data, std::move(rm_buffer2), processor_notifier, grid->get_reader(), pdu.pdu);
+    }
 
     l1_ul_tracer << trace_event("process_pusch", tp);
   });

@@ -10,6 +10,7 @@
 #include "ocudu/ran/sch/sch_segmentation.h"
 #include "ocudu/support/rtsan.h"
 #include "ocudu/support/tracing/event_tracing.h"
+#include "ocudu/support/tracing/scoped_trace.h"
 
 using namespace ocudu;
 
@@ -30,80 +31,56 @@ void pdsch_processor_flexible_impl::process(resource_grid_writer&               
                                             static_vector<shared_transport_block, MAX_NOF_TRANSPORT_BLOCKS> data_,
                                             const pdsch_processor::pdu_t&                                   pdu_)
 {
+  auto scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.process");
+
   // Makes sure the PDU is valid.
   [[maybe_unused]] std::string msg;
   ocudu_assert(handle_validation(msg, pdsch_processor_validator_impl().is_valid(pdu_)), "{}", msg);
 
   // Initialize transmission and save inputs.
-  initialize_new_transmission(grid_, notifier_, std::move(data_), pdu_);
+  {
+    auto init_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.initialize");
+    initialize_new_transmission(grid_, notifier_, std::move(data_), pdu_);
+  }
 
   if (!async_proc) {
     trace_point process_pdsch_tp = l1_dl_tracer.now();
 
     // Synchronous CB processing.
-    sync_pdsch_cb_processing();
+    {
+      auto cb_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.sync_cb");
+      sync_pdsch_cb_processing();
+    }
 
     l1_dl_tracer << trace_event("sync_pdsch_cb_processing", process_pdsch_tp);
   } else {
-    // Set the number of asynchronous tasks. It counts as CB processing and DM-RS generation.
-    async_task_counter = 2;
-
-    // Add PT-RS to the asynchronous tasks.
-    if (config.ptrs) {
-      ++async_task_counter;
-
-      // Process PT-RS concurrently.
-      auto ptrs_task = [this]() noexcept OCUDU_RTSAN_NONBLOCKING {
-        auto execute_on_exit = make_scope_exit([this]() {
-          // Decrement asynchronous task counter.
-          if (async_task_counter.fetch_sub(1) == 1) {
-            // Notify end of the processing.
-            notifier->on_finish_processing();
-          }
-        });
-
-        auto ptrs_generator = ptrs_generator_pool->get();
-        if (!ptrs_generator) {
-          logger.error("Failed to retrieve PT-RS generator (async).");
-          return;
+    if (grid->device_grid_mapping_aliases_host_grid()) {
+      // Host-generated reference signals must be in the grid before GPU PDSCH data mapping starts. This avoids a
+      // host-after-device sync when the device destination aliases the host-visible resource grid.
+      if (!map_reference_signals()) {
+        for (unsigned i_cw = 0; i_cw != nof_codewords; ++i_cw) {
+          processor_context[i_cw].data.release();
         }
-
-        pdsch_process_ptrs(*grid, *ptrs_generator, config);
-      };
-
-      bool success_ptrs = executor.defer(ptrs_task);
-      if (!success_ptrs) {
-        ptrs_task();
-      }
-    }
-
-    // Process DM-RS concurrently.
-    auto dmrs_task = [this]() noexcept OCUDU_RTSAN_NONBLOCKING {
-      auto execute_on_exit = make_scope_exit([this]() {
-        // Decrement asynchronous task counter.
-        if (async_task_counter.fetch_sub(1) == 1) {
-          // Notify end of the processing.
-          notifier->on_finish_processing();
-        }
-      });
-
-      auto dmrs_generator = dmrs_generator_pool->get();
-      if (!dmrs_generator) {
-        logger.error("Failed to retrieve DM-RS generator (async).");
+        notifier->on_finish_processing();
         return;
       }
 
-      pdsch_process_dmrs(*grid, *dmrs_generator, config);
-    };
-
-    bool success_dmrs = executor.defer(dmrs_task);
-    if (!success_dmrs) {
-      dmrs_task();
+      // Set the number of asynchronous tasks. It counts as CB processing only, since the reference signals have
+      // already been mapped synchronously above.
+      async_task_counter = 1;
+    } else {
+      // Keep the previous overlap for host grids and sidecar device-grid writers. It counts as CB processing and
+      // DM-RS generation, plus PT-RS generation when configured.
+      async_task_counter = config.ptrs ? 3 : 2;
+      fork_reference_signal_tasks();
     }
 
     // Fork codeblock processing tasks.
-    for (unsigned i_cw = 0; i_cw != nof_codewords; ++i_cw) {
-      fork_codeword_processing(i_cw);
+    {
+      auto fork_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.fork_cb_batches");
+      for (unsigned i_cw = 0; i_cw != nof_codewords; ++i_cw) {
+        fork_codeword_processing(i_cw);
+      }
     }
   }
 }
@@ -187,7 +164,8 @@ void pdsch_processor_flexible_impl::initialize_codeword(unsigned i_cw, shared_tr
                                                                        .ldpc_base_graph = ldpc_base_graph,
                                                                        .nof_re_pdsch    = nof_re_pdsch,
                                                                        .Nref            = Nref,
-                                                                       .nof_layers      = nof_layers_cw};
+                                                                       .nof_layers      = nof_layers_cw,
+                                                                       .nof_ports       = nof_ports};
 
   // Initialize the segmenter.
   segmenter_config segmenter_cfg = {.transport_block_size = units::bytes(codeword_context.data.get_buffer().size()),
@@ -283,6 +261,7 @@ void pdsch_processor_flexible_impl::initialize_new_transmission(
 
   // Reserved REs, including DM-RS and CSI-RS.
   reserved = re_pattern_list(config.reserved);
+  pdsch_reserve_ptrs_re(reserved, config, pdu.freq_alloc.get_crb_mask(pdu.bwp_start_rb, pdu.bwp_size_rb));
 
   // Get DM-RS RE pattern.
   re_pattern dmrs_pattern = get_dmrs_pattern(config.dmrs,
@@ -319,7 +298,10 @@ void pdsch_processor_flexible_impl::sync_pdsch_cb_processing()
   });
 
   // Select codeblock processor.
-  auto block_processor = block_processor_pool->get();
+  auto block_processor = [&]() {
+    auto pool_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.block_pool_get");
+    return block_processor_pool->get();
+  }();
   if (!block_processor) {
     logger.error("Failed to retrieve PDSCH block processor.");
     return;
@@ -329,32 +311,112 @@ void pdsch_processor_flexible_impl::sync_pdsch_cb_processing()
   const ldpc_segmenter_buffer* segment_buffer = codeword_context.segment_buffer;
 
   // Configure the new transmission. Codeword index, start CB index and CB batch length are fixed.
-  resource_grid_mapper::symbol_buffer& grid_buffer = block_processor->configure_new_transmission(
-      data.get_buffer(), 0, codeword_context.block_config, *segment_buffer, 0, codeword_context.nof_cb);
+  resource_grid_mapper::symbol_buffer& grid_buffer = [&]() -> resource_grid_mapper::symbol_buffer& {
+    auto configure_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.configure_tb");
+    return block_processor->configure_new_transmission(
+        data.get_buffer(), 0, codeword_context.block_config, *segment_buffer, 0, codeword_context.nof_cb);
+  }();
+
+  // If the device destination aliases the host grid, reference signals must be written before the data mapping so the
+  // data mapper excludes them. Other writers preserve the original data-first order.
+  const bool map_ref_signals_before_data = grid->device_grid_mapping_aliases_host_grid();
+
+  if (map_ref_signals_before_data && !map_reference_signals()) {
+    return;
+  }
 
   // Map PDSCH.
-  mapper->map(*grid, grid_buffer, allocation, reserved, codeword_context.ports, codeword_context.precoding);
+  {
+    auto map_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.map_grid");
+    mapper->map(*grid, grid_buffer, allocation, reserved, codeword_context.ports, codeword_context.precoding);
+  }
 
+  if (!map_ref_signals_before_data) {
+    (void)map_reference_signals();
+  }
+}
+
+bool pdsch_processor_flexible_impl::map_reference_signals()
+{
   // Prepare PT-RS configuration and generate.
   if (config.ptrs) {
     auto ptrs_generator = ptrs_generator_pool->get();
     if (!ptrs_generator) {
       logger.error("Failed to retrieve PT-RS generator.");
-      return;
+      return false;
     }
 
+    auto ptrs_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.ptrs");
     pdsch_process_ptrs(*grid, *ptrs_generator, config);
   }
 
   // Process DM-RS.
-  {
+  auto dmrs_generator = dmrs_generator_pool->get();
+  if (!dmrs_generator) {
+    logger.error("Failed to retrieve DM-RS generator.");
+    return false;
+  }
+
+  auto dmrs_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.dmrs");
+  pdsch_process_dmrs(*grid, *dmrs_generator, config);
+  return true;
+}
+
+void pdsch_processor_flexible_impl::fork_reference_signal_tasks()
+{
+  // Add PT-RS to the asynchronous tasks.
+  if (config.ptrs) {
+    // Process PT-RS concurrently.
+    auto ptrs_task = [this]() noexcept OCUDU_RTSAN_NONBLOCKING {
+      auto task_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.ptrs_task");
+
+      auto execute_on_exit = make_scope_exit([this]() {
+        // Decrement asynchronous task counter.
+        if (async_task_counter.fetch_sub(1) == 1) {
+          // Notify end of the processing.
+          notifier->on_finish_processing();
+        }
+      });
+
+      auto ptrs_generator = ptrs_generator_pool->get();
+      if (!ptrs_generator) {
+        logger.error("Failed to retrieve PT-RS generator (async).");
+        return;
+      }
+
+      pdsch_process_ptrs(*grid, *ptrs_generator, config);
+    };
+
+    bool success_ptrs = executor.defer(ptrs_task);
+    if (!success_ptrs) {
+      ptrs_task();
+    }
+  }
+
+  // Process DM-RS concurrently.
+  auto dmrs_task = [this]() noexcept OCUDU_RTSAN_NONBLOCKING {
+    auto task_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.dmrs_task");
+
+    auto execute_on_exit = make_scope_exit([this]() {
+      // Decrement asynchronous task counter.
+      if (async_task_counter.fetch_sub(1) == 1) {
+        // Notify end of the processing.
+        notifier->on_finish_processing();
+      }
+    });
+
     auto dmrs_generator = dmrs_generator_pool->get();
     if (!dmrs_generator) {
-      logger.error("Failed to retrieve DM-RS generator.");
+      logger.error("Failed to retrieve DM-RS generator (async).");
       return;
     }
 
     pdsch_process_dmrs(*grid, *dmrs_generator, config);
+  };
+
+  bool success_dmrs = executor.defer(dmrs_task);
+  if (!success_dmrs) {
+    dmrs_task();
   }
 }
 
@@ -371,6 +433,8 @@ void pdsch_processor_flexible_impl::fork_codeword_processing(unsigned i_cw)
 
     // Create asynchronous task for the codeblock batch.
     auto async_task = [this, i_batch, i_cw, &codeword_ctx]() noexcept OCUDU_RTSAN_NONBLOCKING {
+      auto task_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.cb_task");
+
       // Start PDSCH codeblock batch tracing.
       trace_point cb_batch_pdsch_tp = l1_dl_tracer.now();
 
@@ -389,7 +453,10 @@ void pdsch_processor_flexible_impl::fork_codeword_processing(unsigned i_cw)
       });
 
       // Select codeblock processor.
-      auto block_processor = block_processor_pool->get();
+      auto block_processor = [&]() {
+        auto pool_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.cb_block_pool_get");
+        return block_processor_pool->get();
+      }();
       if (!block_processor) {
         logger.error("Failed to retrieve PDSCH codeblock processor.");
         return;
@@ -405,13 +472,15 @@ void pdsch_processor_flexible_impl::fork_codeword_processing(unsigned i_cw)
       const ldpc_segmenter_buffer* segmenter_buffer = codeword_ctx.segment_buffer;
 
       // Configure new transmission.
-      resource_grid_mapper::symbol_buffer& grid_buffer =
-          block_processor->configure_new_transmission(codeword_ctx.data.get_buffer(),
-                                                      i_cw,
-                                                      codeword_ctx.block_config,
-                                                      *segmenter_buffer,
-                                                      first_cb_index,
-                                                      next_cb_batch_length);
+      resource_grid_mapper::symbol_buffer& grid_buffer = [&]() -> resource_grid_mapper::symbol_buffer& {
+        auto configure_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.cb_configure_tb");
+        return block_processor->configure_new_transmission(codeword_ctx.data.get_buffer(),
+                                                          i_cw,
+                                                          codeword_ctx.block_config,
+                                                          *segmenter_buffer,
+                                                          first_cb_index,
+                                                          next_cb_batch_length);
+      }();
 
       // Map PDSCH.
       mapper->map(*grid,

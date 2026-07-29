@@ -134,7 +134,7 @@ public:
         .nof_tx_ports           = config.nof_tx_ports,
         .nof_rx_ports           = config.nof_rx_ports,
         .tx_time_offset         = static_cast<baseband_gateway_timestamp>(tx_time_offset),
-        .rx_to_tx_max_delay     = config.srate.to_kHz() + proc_bb_adaptor_config.tx_time_offset,
+        .rx_to_tx_max_delay     = rx_to_tx_max_delay,
         .rx_buffer_size         = rx_buffer_size,
         .nof_rx_buffers         = std::max(4U, rx_to_tx_max_delay / rx_buffer_size),
         .system_time_throttling = config.system_time_throttling,

@@ -8,7 +8,6 @@
 #include "ocudu/adt/mpmc_queue.h"
 #include "ocudu/adt/unique_function.h"
 #include "ocudu/ocudulog/logger.h"
-#include "ocudu/ocuduvec/copy.h"
 #include "ocudu/ofh/ofh_constants.h"
 #include "ocudu/phy/support/resource_grid.h"
 #include "ocudu/phy/support/resource_grid_context.h"
@@ -19,6 +18,7 @@
 #include "ocudu/ran/resource_allocation/ofdm_symbol_range.h"
 #include "ocudu/ran/resource_block.h"
 #include <mutex>
+#include <utility>
 
 namespace ocudu {
 namespace ofh {
@@ -82,9 +82,25 @@ public:
     if (port >= writer.get_nof_ports()) {
       return;
     }
-    span<cbf16_t> grid_view = grid.grid->get_writer().get_view(port, symbol).subspan(start_re, re_iq_buffer.size());
-    ocuduvec::copy(grid_view, re_iq_buffer);
+    writer.put(port, symbol, start_re, 1U, re_iq_buffer);
     re_written[port].fill(start_re, start_re + re_iq_buffer.size());
+  }
+
+  /// Writes the given RE range through a device-capable resource grid writer.
+  template <typename WriteFunc>
+  bool write_grid_device(unsigned port, unsigned start_re, unsigned nof_re, WriteFunc&& write_func)
+  {
+    ocudu_assert(grid.grid, "Invalid resource grid");
+    resource_grid_writer& writer = grid.grid->get_writer();
+
+    if ((port >= writer.get_nof_ports()) || !writer.supports_device_grid_mapping()) {
+      return false;
+    }
+    if (!write_func(writer)) {
+      return false;
+    }
+    re_written[port].fill(start_re, start_re + nof_re);
+    return true;
   }
 
   /// Tries to get a complete resource grid. A resource grid is considered completed when all the PRBs for all the ports
@@ -185,6 +201,19 @@ public:
   {
     std::lock_guard<std::mutex> lock(mutex);
     entry(slot, symbol).write_grid(port, start_re, re_iq_buffer);
+  }
+
+  /// Writes to the grid at the given slot, port, symbol and RE range using a device-capable writer callback.
+  template <typename WriteFunc>
+  bool write_grid_device(slot_point  slot,
+                         unsigned    port,
+                         unsigned    symbol,
+                         unsigned    start_re,
+                         unsigned    nof_re,
+                         WriteFunc&& write_func)
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    return entry(slot, symbol).write_grid_device(port, start_re, nof_re, std::forward<WriteFunc>(write_func));
   }
 
   /// Returns the entry of the repository for the given slot and symbol.

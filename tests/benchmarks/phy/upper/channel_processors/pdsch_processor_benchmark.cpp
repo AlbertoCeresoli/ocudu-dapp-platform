@@ -22,10 +22,15 @@
 #include "ocudu/hal/phy/upper/channel_processors/hw_accelerator_factories.h"
 #include "ocudu/hal/phy/upper/channel_processors/hw_accelerator_pdsch_enc_factory.h"
 #endif // HWACC_PDSCH_ENABLED
+#include "slot_latency_collector.h"
+#include <condition_variable>
 #include <getopt.h>
 #include <random>
 
 using namespace ocudu;
+
+// Per-slot latency collector for true latency measurement.
+static std::unique_ptr<slot_latency_collector> latency_collector = nullptr;
 
 // A test case consists of a PDSCH PDU configuration and a Transport Block Size.
 using test_case_type = std::tuple<pdsch_processor::pdu_t, unsigned>;
@@ -110,16 +115,17 @@ static constexpr concurrent_queue_policy queue_policy = concurrent_queue_policy:
 static constexpr auto sleep_duration = std::chrono::microseconds(10);
 
 // General test configuration parameters.
-static uint64_t                           nof_repetitions       = 10;
-static uint64_t                           nof_threads           = max_nof_threads;
-static uint64_t                           batch_size_per_thread = 100;
-static std::string                        selected_profile_name = "default";
-static std::string                        ldpc_encoder_type     = "auto";
-static std::string                        pdsch_processor_type  = "flexible";
-static benchmark_modes                    benchmark_mode        = benchmark_modes::throughput_total;
+static uint64_t                           nof_repetitions               = 10;
+static uint64_t                           nof_threads                   = max_nof_threads;
+static uint64_t                           batch_size_per_thread         = 100;
+static std::string                        selected_profile_name         = "default";
+static std::string                        ldpc_encoder_type             = "auto";
+static std::string                        pdsch_processor_type          = "flexible";
+static bool                               use_gpu_pdsch_block_processor = false;
+static benchmark_modes                    benchmark_mode                = benchmark_modes::throughput_total;
 static std::string                        tracing_filename;
-static dmrs_config_type                   dmrs                        = dmrs_config_type::type1;
-static unsigned                           nof_cdm_groups_without_data = 2;
+static dmrs_config_type                   dmrs                          = dmrs_config_type::type1;
+static unsigned                           nof_cdm_groups_without_data   = 2;
 static bounded_bitset<MAX_NSYMB_PER_SLOT> dmrs_single_mask =
     {false, false, true, false, false, false, false, true, false, false, false, true, false, false};
 static bounded_bitset<MAX_NSYMB_PER_SLOT> dmrs_double_mask =
@@ -393,8 +399,7 @@ static const std::vector<test_profile> profile_set = {
 static void usage(const char* prog)
 {
   fmt::print("Usage: {} [-m benchmark mode] [-R repetitions] [-B Batch size per thread] [-T number of threads] [-D "
-             "LDPC type] [-M rate "
-             "matcher type] [-P profile] [-w] [-x] [-y] [-z error|warning|info|debug] [-h] [eal_args ...]\n",
+             "LDPC type] [-G] [-P profile] [-w] [-x] [-y] [-z error|warning|info|debug] [-h] [eal_args ...]\n",
              prog);
   fmt::print("\t-m Benchmark mode. [Default {}]\n", to_string(benchmark_mode));
   fmt::print("\t\t {:<20}It does not print any result.\n", to_string(benchmark_modes::silent));
@@ -408,6 +413,8 @@ static void usage(const char* prog)
   fmt::print("\t-B Batch size [Default {}]\n", batch_size_per_thread);
   fmt::print("\t-T Number of threads [Default {}, max. {}]\n", nof_threads, max_nof_threads);
   fmt::print("\t-D LDPC encoder type. [Default {}]\n", ldpc_encoder_type);
+  fmt::print("\t-G Use CUDA GPU PDSCH block processor. [Default {}]\n",
+             use_gpu_pdsch_block_processor ? "enabled" : "disabled");
   fmt::print("\t-t PDSCH processor type. [Default {}]\n", pdsch_processor_type);
   fmt::print("\t\t generic        Unoptimized generic implementation.\n");
   fmt::print("\t\t lite           Flexible implementation configured for memory-optimized single thread.\n");
@@ -464,7 +471,7 @@ static std::string capture_eal_args(int* argc, char*** argv)
 static int parse_args(int argc, char** argv)
 {
   int opt = 0;
-  while ((opt = getopt(argc, argv, "R:T:B:D:P:m:t:o:wxyz:h")) != -1) {
+  while ((opt = getopt(argc, argv, "R:T:B:D:GP:m:t:o:wxyz:h")) != -1) {
     switch (opt) {
       case 'R':
         nof_repetitions = std::strtol(optarg, nullptr, 10);
@@ -477,6 +484,9 @@ static int parse_args(int argc, char** argv)
         break;
       case 'D':
         ldpc_encoder_type = std::string(optarg);
+        break;
+      case 'G':
+        use_gpu_pdsch_block_processor = true;
         break;
       case 't':
         pdsch_processor_type = std::string(optarg);
@@ -646,7 +656,7 @@ static std::vector<test_case_type> generate_test_cases(const test_profile& profi
                                          .n_id                        = 0,
                                          .ref_point                   = pdsch_processor::pdu_t::CRB0,
                                          .dmrs_symbol_mask            = dmrs_mask,
-                                         .dmrs                        = dmrs_config_type::type1,
+                                         .dmrs                        = dmrs,
                                          .scrambling_id               = 0,
                                          .n_scid                      = false,
                                          .nof_cdm_groups_without_data = nof_cdm_groups_without_data,
@@ -831,8 +841,13 @@ static pdsch_processor_factory& get_processor_factory()
 
   // Create PDSCH block processor factory.
   if (ldpc_encoder_type != "acc100") {
-    block_processor_factory = create_pdsch_block_processor_factory_sw(
-        ldpc_enc_factory, ldpc_rm_factory, prg_factory, chan_modulation_factory);
+    if (use_gpu_pdsch_block_processor) {
+      block_processor_factory = create_pdsch_block_processor_factory_accelerated();
+      TESTASSERT(block_processor_factory, "Failed to create a GPU PDSCH block processor factory.");
+    } else {
+      block_processor_factory = create_pdsch_block_processor_factory_sw(
+          ldpc_enc_factory, ldpc_rm_factory, prg_factory, chan_modulation_factory);
+    }
   } else {
     std::shared_ptr<hal::hw_accelerator_pdsch_enc_factory> hw_encoder_factory =
         create_hw_accelerator_pdsch_enc_factory();
@@ -855,6 +870,11 @@ static pdsch_processor_factory& get_processor_factory()
 
   cb_executor = std::make_unique<task_worker_pool_executor<queue_policy>>(*cb_worker_pool);
 
+  // The GPU PDSCH block processor encodes a full TB per invocation. Keep GPU benchmarking synchronous to avoid
+  // re-encoding the same TB once per codeblock batch.
+  unsigned effective_cb_batch_length =
+      use_gpu_pdsch_block_processor ? std::numeric_limits<unsigned>::max() : cb_batch_length;
+
   // Create flexible PDSCH processor.
   pdsch_proc_factory = create_pdsch_flexible_processor_factory_sw(ldpc_segm_tx_factory,
                                                                   block_processor_factory,
@@ -863,7 +883,7 @@ static pdsch_processor_factory& get_processor_factory()
                                                                   ptrs_pdsch_gen_factory,
                                                                   *cb_executor,
                                                                   nof_concurrent_pdsch,
-                                                                  cb_batch_length);
+                                                                  effective_cb_batch_length);
 
   // Wrap the PDSCH processor with a pool. It assumes that each thread will only spawn one PDSCH transmission.
   pdsch_proc_factory = create_pdsch_processor_pool(std::move(pdsch_proc_factory), nof_threads);
@@ -977,6 +997,14 @@ int main(int argc, char** argv)
   // Prepare PDSCH processor notifiers.
   std::vector<pdsch_processor_notifier_spy> notifiers(nof_threads);
 
+  // Initialize per-slot latency collector.
+  latency_collector = std::make_unique<slot_latency_collector>(nof_threads, batch_size_per_thread * nof_repetitions);
+
+  // Print per-slot latency header if latency mode is enabled.
+  if ((benchmark_mode == benchmark_modes::latency) || (benchmark_mode == benchmark_modes::all)) {
+    fmt::print("\n--- Per-Slot Latency (process to completion) ---\n");
+  }
+
   for (const test_case_type& test_case : test_case_set) {
     // Get the PDSCH configuration.
     pdsch_processor::pdu_t config = std::get<0>(test_case);
@@ -1025,6 +1053,11 @@ int main(int argc, char** argv)
 
     std::atomic<unsigned> completion_counter = 0;
 
+    // Clear latency collector for this test case.
+    if (latency_collector) {
+      latency_collector->clear();
+    }
+
     // Create benchmark routine.
     auto benchmark_task = [&notifiers,
                            &grids,
@@ -1045,7 +1078,8 @@ int main(int argc, char** argv)
                                                 &transport_blocks,
                                                 &config,
                                                 &proc,
-                                                &completion_counter]() noexcept OCUDU_RTSAN_NONBLOCKING {
+                                                &completion_counter,
+                                                i_thread]() noexcept OCUDU_RTSAN_NONBLOCKING {
           // Get a resource grid.
           auto grid = grids.get();
           report_fatal_error_if_not(grid, "Failed to retrieve resource grid.");
@@ -1055,11 +1089,21 @@ int main(int argc, char** argv)
             // Reset notifier.
             notifier.reset();
 
+            // Record slot start time for per-slot latency measurement.
+            auto slot_start = slot_latency_collector::clock_type::now();
+
             // Process PDSCH transmission.
             proc->process(grid->get_writer(), notifier, transport_blocks, config);
 
             // Wait for notifier before starting next PDSCH transmission.
             notifier.wait_for_finished();
+
+            // Record slot end time and store latency.
+            auto slot_end = slot_latency_collector::clock_type::now();
+            if (latency_collector) {
+              latency_collector->record(
+                  i_thread, std::chrono::duration_cast<std::chrono::nanoseconds>(slot_end - slot_start));
+            }
           }
           // Count the completion of the thread.
           ++completion_counter;
@@ -1076,12 +1120,13 @@ int main(int argc, char** argv)
 
     // Run the benchmark.
     perf_meas.new_measure(to_string(meas_description), nof_threads * batch_size_per_thread * tbs, benchmark_task);
-  }
 
-  // Print latency.
-  if ((benchmark_mode == benchmark_modes::latency) || (benchmark_mode == benchmark_modes::all)) {
-    fmt::print("\n--- Average latency ---\n");
-    perf_meas.print_percentiles_time("microseconds", 1e-3 / static_cast<double>(nof_threads * batch_size_per_thread));
+    // Print per-slot latency for this test case immediately after completion.
+    if ((benchmark_mode == benchmark_modes::latency) || (benchmark_mode == benchmark_modes::all)) {
+      if (latency_collector) {
+        latency_collector->print_percentiles(to_string(meas_description));
+      }
+    }
   }
 
   // Print total aggregated throughput.

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "ocudu/adt/complex.h"
 #include "ocudu/phy/support/prach_buffer.h"
 #include "ocudu/ran/prach/prach_format_type.h"
 #include "ocudu/ran/slot_point.h"
@@ -29,7 +30,7 @@ public:
     unsigned nof_td_occasions;
     /// Number of frequency-domain occasions.
     unsigned nof_fd_occasions;
-    /// Starting symbol index for the first PRACH TD occasion within the slot {0, ..., 13} at \c pusch_scs.
+    /// Starting symbol index for the first PRACH TD occasion within the slot {0, ..., 13}.
     unsigned start_symbol;
     /// PRACH frequency location (see \ref prach_buffer_context::rb_offset).
     unsigned rb_offset;
@@ -47,7 +48,8 @@ public:
   /// For long preambles, the input shall contain the cyclic prefix of length \f$N_{CP,l}^{RA}\f$) and a time-domain
   /// sequence of length \f$N_u\f$. Also, the number of time-domain occasions must be one.
   ///
-  /// For short preamble formats, the input shall correspond to one slot at \ref configuration::pusch_scs.
+  /// For short preamble formats, the input shall correspond to one slot at the uplink subcarrier spacing of
+  /// \c config.slot.
   ///
   /// An assertion is triggered if:
   /// - the input samples are not sufficient,
@@ -58,5 +60,25 @@ public:
   /// \param[in] input      PRACH receive window baseband samples.
   /// \param[in] config     PRACH demodulator configuration parameters.
   virtual void demodulate(prach_buffer& buffer, span<const cf_t> input, const configuration& config) = 0;
+
+  /// \brief Demodulates a PRACH occasion from packed 16-bit complex samples if the implementation supports it.
+  ///
+  /// This optional fast path lets accelerated implementations avoid an intermediate host-side conversion to \c cf_t.
+  /// Implementations that do not support packed integer input return false and leave \c buffer unchanged.
+  ///
+  /// \param[out] buffer       Frequency-domain signal corresponding to one PRACH receive occasion.
+  /// \param[in] input         PRACH receive window packed 16-bit complex baseband samples.
+  /// \param[in] input_scale   Scale used to convert integer components to floating point.
+  /// \param[in] config        PRACH demodulator configuration parameters.
+  /// \return True if the packed input was consumed by this implementation, otherwise false.
+  virtual bool
+  demodulate_ci16(prach_buffer& buffer, span<const ci16_t> input, float input_scale, const configuration& config)
+  {
+    (void)buffer;
+    (void)input;
+    (void)input_scale;
+    (void)config;
+    return false;
+  }
 };
 } // namespace ocudu

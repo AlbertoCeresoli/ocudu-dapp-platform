@@ -10,11 +10,105 @@
 #include "ocudu/support/executors/strand_executor.h"
 #include "ocudu/support/executors/task_fork_limiter.h"
 #include "ocudu/support/ocudu_assert.h"
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <optional>
+#include <vector>
 
 using namespace ocudu;
 using namespace odu;
 
 namespace {
+
+unsigned get_positive_env_unsigned(const char* env_name, unsigned default_value)
+{
+  const char* value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0') {
+    return default_value;
+  }
+
+  char*         end    = nullptr;
+  unsigned long parsed = std::strtoul(value, &end, 10);
+  if ((end == value) || (*end != '\0') || (parsed == 0) || (parsed > std::numeric_limits<unsigned>::max())) {
+    ocudulog::fetch_basic_logger("CONFIG").warning(
+        "Ignoring invalid {}={}; using default value {}.", env_name, value, default_value);
+    return default_value;
+  }
+
+  return static_cast<unsigned>(parsed);
+}
+
+/// Parses env as unsigned including 0. Returns nullopt when unset/invalid.
+std::optional<unsigned> get_optional_env_unsigned(const char* env_name)
+{
+  const char* value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0') {
+    return std::nullopt;
+  }
+
+  char*         end    = nullptr;
+  unsigned long parsed = std::strtoul(value, &end, 10);
+  if ((end == value) || (*end != '\0') || (parsed > std::numeric_limits<unsigned>::max())) {
+    ocudulog::fetch_basic_logger("CONFIG").warning("Ignoring invalid {}={}.", env_name, value);
+    return std::nullopt;
+  }
+
+  return static_cast<unsigned>(parsed);
+}
+
+/// Spreads tasks across independent executors for multi-cell fairness (avoids one deep FIFO).
+class round_robin_task_executor final : public task_executor
+{
+public:
+  explicit round_robin_task_executor(std::vector<task_executor*> lanes_) : lanes(std::move(lanes_))
+  {
+    ocudu_assert(!lanes.empty(), "Round-robin executor needs at least one lane.");
+  }
+
+  [[nodiscard]] bool execute(unique_task task) override
+  {
+    const unsigned i = next.fetch_add(1U, std::memory_order_relaxed) % static_cast<unsigned>(lanes.size());
+    return lanes[i]->execute(std::move(task));
+  }
+
+  [[nodiscard]] bool defer(unique_task task) override
+  {
+    const unsigned i = next.fetch_add(1U, std::memory_order_relaxed) % static_cast<unsigned>(lanes.size());
+    return lanes[i]->defer(std::move(task));
+  }
+
+private:
+  std::vector<task_executor*> lanes;
+  std::atomic<unsigned>       next{0};
+};
+
+upper_phy_executor get_pdsch_base_executor(const du_low_executor_mapper_flexible_exec_config& flexible)
+{
+  const char* value = std::getenv("OCUDU_DU_LOW_PDSCH_EXECUTOR");
+  if ((value == nullptr) || (value[0] == '\0') || (std::strcmp(value, "rt") == 0) ||
+      (std::strcmp(value, "rt_high") == 0) || (std::strcmp(value, "rt-high") == 0)) {
+    return flexible.rt_hi_prio_exec;
+  }
+
+  if ((std::strcmp(value, "high") == 0) || (std::strcmp(value, "non_rt_high") == 0) ||
+      (std::strcmp(value, "non-rt-high") == 0)) {
+    ocudulog::fetch_basic_logger("CONFIG").info("Routing PDSCH data processing to the non-RT high-priority executor.");
+    return flexible.non_rt_hi_prio_exec;
+  }
+
+  if ((std::strcmp(value, "medium") == 0) || (std::strcmp(value, "non_rt_medium") == 0) ||
+      (std::strcmp(value, "non-rt-medium") == 0)) {
+    ocudulog::fetch_basic_logger("CONFIG").info(
+        "Routing PDSCH data processing to the non-RT medium-priority executor.");
+    return flexible.non_rt_medium_prio_exec;
+  }
+
+  ocudulog::fetch_basic_logger("CONFIG").warning(
+      "Ignoring invalid OCUDU_DU_LOW_PDSCH_EXECUTOR={}; using the RT high-priority executor.", value);
+  return flexible.rt_hi_prio_exec;
+}
 
 /// Helper class to decorate executors with extra functionalities.
 struct executor_decorator {
@@ -85,9 +179,11 @@ public:
       phy_config.pdsch_codeblock_executor = {};
       phy_config.pusch_decoder_executor   = {};
     } else if (std::holds_alternative<du_low_executor_mapper_flexible_exec_config>(config.executors)) {
-      const unsigned                           max_pucch_batch_size = 16;
-      const unsigned                           max_pusch_batch_size = 1;
-      const unsigned                           max_pdsch_batch_size = 16;
+      const unsigned max_pucch_batch_size = 16;
+      const unsigned max_pusch_batch_size = 1;
+      // Default batch size of 1 improves multi-sector RT interleaving versus larger batches.
+      // Override with OCUDU_DU_LOW_PDSCH_EXECUTOR_MAX_BATCH when a larger batch is preferred.
+      const unsigned max_pdsch_batch_size = get_positive_env_unsigned("OCUDU_DU_LOW_PDSCH_EXECUTOR_MAX_BATCH", 1);
       static constexpr std::array<unsigned, 1> pdsch_queue_sizes{default_queue_size};
       static constexpr std::array<unsigned, 1> pucch_queue_sizes{default_queue_size};
       static constexpr std::array<unsigned, 3> pusch_srs_queue_sizes{
@@ -101,25 +197,146 @@ public:
           flexible.max_pusch_and_srs_concurrency,
           flexible.non_rt_medium_prio_exec.max_concurrency);
 
-      auto pdsch_executors = create_task_fork_limiter(
-          flexible.rt_hi_prio_exec, flexible.max_pdsch_concurrency, pdsch_queue_sizes, max_pdsch_batch_size);
+      upper_phy_executor pdsch_base_executor = get_pdsch_base_executor(flexible);
+
+      // Optional round-robin multi-lane dispatch: OCUDU_DU_LOW_PDSCH_FAIR_LANES=N.
+      // Spreads PDSCH tasks across N single-concurrency lanes (no per-cell affinity).
+      unsigned rr_fair_lanes = 0;
+      if (const auto env_lanes = get_optional_env_unsigned("OCUDU_DU_LOW_PDSCH_FAIR_LANES")) {
+        rr_fair_lanes = *env_lanes;
+      }
+      if (rr_fair_lanes > flexible.max_pdsch_concurrency) {
+        rr_fair_lanes = flexible.max_pdsch_concurrency;
+      }
+
+      // Per-cell PDSCH fairness (opt-in): OCUDU_DU_LOW_PDSCH_CELL_FAIR=N creates one
+      // lane per max_pdsch slot with N tasks in flight each; cells bind by cell_id % lanes.
+      // N=1 ("on"/"auto") serializes each cell; N>1 relaxes the per-cell serialization tax
+      // while keeping cross-cell isolation.
+      unsigned cell_fair_lanes    = 0;
+      unsigned cell_fair_inflight = 1;
+      {
+        const char* cell_fair = std::getenv("OCUDU_DU_LOW_PDSCH_CELL_FAIR");
+        if (cell_fair != nullptr && (std::strcmp(cell_fair, "on") == 0 || std::strcmp(cell_fair, "auto") == 0)) {
+          cell_fair_lanes = flexible.max_pdsch_concurrency;
+        } else if (cell_fair != nullptr && cell_fair[0] != '\0' && std::strcmp(cell_fair, "0") != 0) {
+          char*         end    = nullptr;
+          unsigned long parsed = std::strtoul(cell_fair, &end, 10);
+          if ((end != cell_fair) && (*end == '\0') && (parsed > 0) &&
+              (parsed <= std::numeric_limits<unsigned>::max())) {
+            cell_fair_lanes    = flexible.max_pdsch_concurrency;
+            cell_fair_inflight = static_cast<unsigned>(parsed);
+          } else {
+            ocudulog::fetch_basic_logger("CONFIG").warning(
+                "Ignoring invalid OCUDU_DU_LOW_PDSCH_CELL_FAIR={}; expected 0, on, auto or a positive in-flight count.",
+                cell_fair);
+          }
+        }
+      }
+
+      upper_phy_executor pdsch_exec;
+      if (cell_fair_lanes > 1) {
+        // True per-cell affinity: cell_id % N selects a dedicated bounded-flight lane.
+        phy_config.pdsch_cell_executors.clear();
+        phy_config.pdsch_cell_executors.reserve(cell_fair_lanes);
+        for (unsigned i = 0; i != cell_fair_lanes; ++i) {
+          auto lane = create_task_fork_limiter(
+              pdsch_base_executor, cell_fair_inflight, pdsch_queue_sizes, max_pdsch_batch_size);
+          phy_config.pdsch_cell_executors.push_back(lane[0].executor);
+        }
+        pdsch_exec = upper_phy_executor{.executor        = phy_config.pdsch_cell_executors.front(),
+                                        .max_concurrency = cell_fair_lanes * cell_fair_inflight};
+        ocudulog::fetch_basic_logger("CONFIG").info(
+            "PDSCH per-cell fair lanes enabled: lanes={} ({} in-flight/cell-group, batch={}). "
+            "Disable with OCUDU_DU_LOW_PDSCH_CELL_FAIR=0.",
+            cell_fair_lanes,
+            cell_fair_inflight,
+            max_pdsch_batch_size);
+      } else if (rr_fair_lanes > 1) {
+        std::vector<task_executor*> lane_ptrs;
+        lane_ptrs.reserve(rr_fair_lanes);
+        for (unsigned i = 0; i != rr_fair_lanes; ++i) {
+          auto lane = create_task_fork_limiter(pdsch_base_executor, 1, pdsch_queue_sizes, max_pdsch_batch_size);
+          lane_ptrs.push_back(lane[0].executor);
+        }
+        executors.emplace_back(std::make_unique<round_robin_task_executor>(std::move(lane_ptrs)));
+        pdsch_exec = upper_phy_executor{.executor = executors.back().get(), .max_concurrency = rr_fair_lanes};
+        ocudulog::fetch_basic_logger("CONFIG").info(
+            "PDSCH RR multi-lane dispatch enabled: lanes={} (each concurrency=1, batch={}).",
+            rr_fair_lanes,
+            max_pdsch_batch_size);
+      } else {
+        auto pdsch_executors = create_task_fork_limiter(
+            pdsch_base_executor, flexible.max_pdsch_concurrency, pdsch_queue_sizes, max_pdsch_batch_size);
+        pdsch_exec = pdsch_executors[0];
+      }
 
       phy_config.pdcch_executor           = flexible.rt_hi_prio_exec;
-      phy_config.pdsch_executor           = pdsch_executors[0];
+      phy_config.pdsch_executor           = pdsch_exec;
       phy_config.ssb_executor             = flexible.rt_hi_prio_exec;
       phy_config.csi_rs_executor          = flexible.rt_hi_prio_exec;
       phy_config.prs_executor             = flexible.rt_hi_prio_exec;
       phy_config.dl_grid_executor         = flexible.non_rt_hi_prio_exec;
-      phy_config.pdsch_codeblock_executor = pdsch_executors[0];
+      phy_config.pdsch_codeblock_executor = pdsch_exec;
       phy_config.prach_executor           = flexible.non_rt_hi_prio_exec;
       phy_config.pucch_executor =
           create_task_fork_limiter(
               flexible.non_rt_hi_prio_exec, flexible.max_pucch_concurrency, pucch_queue_sizes, max_pucch_batch_size)
               .front();
-      auto pusch_srs_execs                   = create_task_fork_limiter(flexible.non_rt_medium_prio_exec,
-                                                      flexible.max_pusch_and_srs_concurrency,
-                                                      pusch_srs_queue_sizes,
-                                                      max_pusch_batch_size);
+
+      // Optional PUSCH/SRS routing. Default remains non-rt-medium (shared with PDSCH when PDSCH is
+      // also on medium). Explicit OCUDU_DU_LOW_PUSCH_EXECUTOR=high|low|rt|medium overrides.
+      // OCUDU_DU_LOW_PUSCH_AUTO_SEPARATE=1 moves PUSCH off medium only when PDSCH is also on medium;
+      // left opt-in because enabling it by default raised multi-sector RU late in A/B tests.
+      const bool         pdsch_on_medium = (pdsch_base_executor.executor == flexible.non_rt_medium_prio_exec.executor);
+      upper_phy_executor pusch_base      = flexible.non_rt_medium_prio_exec;
+      if (const char* pusch_route = std::getenv("OCUDU_DU_LOW_PUSCH_EXECUTOR")) {
+        if ((std::strcmp(pusch_route, "low") == 0) || (std::strcmp(pusch_route, "non_rt_low") == 0) ||
+            (std::strcmp(pusch_route, "non-rt-low") == 0)) {
+          pusch_base = flexible.non_rt_low_prio_exec;
+          ocudulog::fetch_basic_logger("CONFIG").info("Routing PUSCH/SRS to non-RT low-priority executor.");
+        } else if ((std::strcmp(pusch_route, "high") == 0) || (std::strcmp(pusch_route, "non_rt_high") == 0) ||
+                   (std::strcmp(pusch_route, "non-rt-high") == 0)) {
+          pusch_base = flexible.non_rt_hi_prio_exec;
+          ocudulog::fetch_basic_logger("CONFIG").info("Routing PUSCH/SRS to non-RT high-priority executor.");
+        } else if ((std::strcmp(pusch_route, "rt") == 0) || (std::strcmp(pusch_route, "rt_high") == 0) ||
+                   (std::strcmp(pusch_route, "rt-high") == 0)) {
+          pusch_base = flexible.rt_hi_prio_exec;
+          ocudulog::fetch_basic_logger("CONFIG").info("Routing PUSCH/SRS to RT high-priority executor.");
+        } else if ((std::strcmp(pusch_route, "medium") == 0) || (std::strcmp(pusch_route, "non_rt_medium") == 0) ||
+                   (std::strcmp(pusch_route, "non-rt-medium") == 0)) {
+          pusch_base = flexible.non_rt_medium_prio_exec;
+          ocudulog::fetch_basic_logger("CONFIG").info("Routing PUSCH/SRS to non-RT medium-priority executor.");
+        } else {
+          ocudulog::fetch_basic_logger("CONFIG").warning(
+              "Ignoring invalid OCUDU_DU_LOW_PUSCH_EXECUTOR={}; keeping default non-rt-medium.", pusch_route);
+        }
+      } else if (pdsch_on_medium) {
+        const char* auto_sep = std::getenv("OCUDU_DU_LOW_PUSCH_AUTO_SEPARATE");
+        if (auto_sep != nullptr && auto_sep[0] != '\0' && std::strcmp(auto_sep, "0") != 0) {
+          if ((std::strcmp(auto_sep, "low") == 0) || (std::strcmp(auto_sep, "non-rt-low") == 0)) {
+            pusch_base = flexible.non_rt_low_prio_exec;
+            ocudulog::fetch_basic_logger("CONFIG").info(
+                "Auto-separating PUSCH/SRS to non-RT low-priority executor (prefer DL on medium).");
+          } else {
+            pusch_base = flexible.non_rt_hi_prio_exec;
+            ocudulog::fetch_basic_logger("CONFIG").info("Auto-separating PUSCH/SRS to non-RT high-priority executor "
+                                                        "(OCUDU_DU_LOW_PUSCH_AUTO_SEPARATE={}).",
+                                                        auto_sep);
+          }
+        }
+      }
+      // Optional UL concurrency cap: OCUDU_DU_LOW_PUSCH_CONCURRENCY_CAP=N (default: no cap).
+      unsigned pusch_conc = flexible.max_pusch_and_srs_concurrency;
+      if (const auto cap = get_optional_env_unsigned("OCUDU_DU_LOW_PUSCH_CONCURRENCY_CAP")) {
+        if (*cap > 0 && *cap < pusch_conc) {
+          ocudulog::fetch_basic_logger("CONFIG").info(
+              "Capping PUSCH/SRS concurrency {} → {} (OCUDU_DU_LOW_PUSCH_CONCURRENCY_CAP).", pusch_conc, *cap);
+          pusch_conc = *cap;
+        }
+      }
+      auto pusch_srs_execs =
+          create_task_fork_limiter(pusch_base, pusch_conc, pusch_srs_queue_sizes, max_pusch_batch_size);
       phy_config.pusch_ch_estimator_executor = pusch_srs_execs[0];
       phy_config.pusch_executor              = pusch_srs_execs[1];
       phy_config.pusch_decoder_executor      = pusch_srs_execs[2];

@@ -162,6 +162,12 @@ static void configure_cli11_ru_ofh_base_cell_args(CLI::App& app, ru_ofh_unit_bas
       ->capture_default_str()
       ->check(CLI::Range(1, 16));
   add_option(app,
+             "--compression_acceleration_mode",
+             config.compression_acceleration_mode,
+             "Open Fronthaul IQ compression/decompression acceleration mode")
+      ->capture_default_str()
+      ->check(CLI::IsMember({"auto", "enabled", "disabled"}));
+  add_option(app,
              "--enable_ul_static_compr_hdr",
              config.is_uplink_static_comp_hdr_enabled,
              "Uplink static compression header enabled flag")

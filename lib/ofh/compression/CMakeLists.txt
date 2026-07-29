@@ -30,5 +30,14 @@ if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
     list(APPEND SOURCES iq_compression_none_neon.cpp)
 endif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
 
+if (CUDA_ACCEL_FOUND)
+    list(APPEND SOURCES iq_compression_cuda.cpp)
+endif()
+
 add_library(ocudu_ofh_compression STATIC ${SOURCES})
 target_link_libraries(ocudu_ofh_compression ocuduvec)
+
+if (CUDA_ACCEL_FOUND)
+    target_compile_definitions(ocudu_ofh_compression PUBLIC ENABLE_CUDA)
+    target_link_libraries(ocudu_ofh_compression ${CUDA_ACCEL_LIBRARIES})
+endif()

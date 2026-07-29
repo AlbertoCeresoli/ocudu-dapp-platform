@@ -15,6 +15,7 @@
 #include "ocudu/phy/upper/unique_rx_buffer.h"
 #include "ocudu/ran/pusch/pusch_constants.h"
 #include "ocudu/support/memory_pool/bounded_object_pool.h"
+#include <chrono>
 #include <memory>
 
 namespace ocudu {
@@ -108,6 +109,10 @@ public:
                const resource_grid_reader&      grid,
                const pdu_t&                     pdu) override;
 
+  /// \brief Get access to the decoder for profiling/diagnostics.
+  /// \return Pointer to the decoder, or nullptr if not available.
+  pusch_decoder* get_decoder() { return decoder.get(); }
+
 private:
   /// \brief Notifier for the PUSCH channel estimator.
   ///
@@ -138,7 +143,8 @@ private:
                                              const resource_grid_reader&            grid_,
                                              const pdu_t&                           pdu_,
                                              dmrs_config_type                       dmrs_type_,
-                                             unsigned                               cdm_)
+                                             unsigned                               cdm_,
+                                             bool collect_acceleration_timing_ = false)
     {
       // Set new PUSCH reception parameters. Use exchange for verifying that previous receptions are not overwritten.
       [[maybe_unused]] auto        prev_data         = std::exchange(data, data_);
@@ -149,6 +155,8 @@ private:
       [[maybe_unused]] const auto* prev_pdu          = std::exchange(pdu, &pdu_);
       used_dmrs_type                                 = dmrs_type_;
       nof_cdm_groups_without_data                    = cdm_;
+      collect_acceleration_timing                    = collect_acceleration_timing_;
+      estimate_start                                 = std::chrono::steady_clock::now();
 
       // Ensure that no parameter was overwritten.
       ocudu_assert(prev_data.data() == nullptr, "Detected data overwrite.");
@@ -179,6 +187,11 @@ private:
       ocudu_assert((current_data.data() != nullptr) && (!current_data.empty()), "Invalid data.");
 
       // Keep processing the PUSCH reception. The notifier can be configured for a different reception before returning.
+      float ch_estimate_us = 0.0f;
+      if (collect_acceleration_timing) {
+        auto estimate_end = std::chrono::steady_clock::now();
+        ch_estimate_us    = std::chrono::duration<float, std::micro>(estimate_end - estimate_start).count();
+      }
       notified_processor.process_data(current_data,
                                       std::move(rm_buffer),
                                       std::move(dependencies),
@@ -187,7 +200,8 @@ private:
                                       *current_grid,
                                       *current_pdu,
                                       used_dmrs_type,
-                                      nof_cdm_groups_without_data);
+                                      nof_cdm_groups_without_data,
+                                      ch_estimate_us);
     }
 
     /// Reference to the PUSCH processor waiting for notification.
@@ -208,6 +222,10 @@ private:
     dmrs_config_type used_dmrs_type = dmrs_config_type::type1;
     /// Number of CDM groups without data.
     unsigned nof_cdm_groups_without_data = 2;
+    /// True if processor-side GPU timing collection is enabled for this reception.
+    bool collect_acceleration_timing = false;
+    /// Timestamp taken immediately before estimator.estimate().
+    std::chrono::steady_clock::time_point estimate_start = {};
   };
   /// Channel estimator notifier configurator.
   dmrs_pusch_estimator_notifier_impl estimator_notifier_configurator;
@@ -248,7 +266,8 @@ private:
                     const resource_grid_reader&            grid,
                     const pdu_t&                           pdu,
                     dmrs_config_type                       dmrs_type,
-                    unsigned                               nof_cdm_groups_without_data);
+                    unsigned                               nof_cdm_groups_without_data,
+                    float                                  ch_estimate_us = 0.0f);
 };
 
 } // namespace ocudu

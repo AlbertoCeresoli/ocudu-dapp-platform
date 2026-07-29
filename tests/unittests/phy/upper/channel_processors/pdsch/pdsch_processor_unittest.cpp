@@ -15,8 +15,13 @@
 #include "ocudu/ran/precoding/precoding_codebooks.h"
 #include "ocudu/ran/sch/sch_segmentation.h"
 #include "fmt/ostream.h"
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <gtest/gtest.h>
+#include <mutex>
 #include <random>
+#include <thread>
 
 using namespace ocudu;
 
@@ -285,6 +290,93 @@ TEST_P(PdschProcessorFixture, UnitTest)
   {
     ASSERT_EQ(ptrs_spy->get_nof_entries(), 0);
   }
+}
+
+struct blocking_pdsch_processor_state {
+  std::mutex              mutex;
+  std::condition_variable cvar;
+  bool                    allow_finish = false;
+  std::atomic<unsigned>   nof_started  = 0;
+};
+
+class blocking_pdsch_processor : public pdsch_processor
+{
+public:
+  explicit blocking_pdsch_processor(std::shared_ptr<blocking_pdsch_processor_state> state_) : state(std::move(state_))
+  {
+  }
+
+  void process(resource_grid_writer&,
+               pdsch_processor_notifier& notifier,
+               static_vector<shared_transport_block, MAX_NOF_TRANSPORT_BLOCKS>,
+               const pdu_t&) override
+  {
+    state->nof_started.fetch_add(1, std::memory_order_release);
+
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->cvar.wait(lock, [this]() { return state->allow_finish; });
+    notifier.on_finish_processing();
+  }
+
+private:
+  std::shared_ptr<blocking_pdsch_processor_state> state;
+};
+
+class blocking_pdsch_processor_factory : public pdsch_processor_factory
+{
+public:
+  explicit blocking_pdsch_processor_factory(std::shared_ptr<blocking_pdsch_processor_state> state_) :
+    state(std::move(state_))
+  {
+  }
+
+  std::unique_ptr<pdsch_processor> create() override { return std::make_unique<blocking_pdsch_processor>(state); }
+
+  std::unique_ptr<pdsch_pdu_validator> create_validator() override { return nullptr; }
+
+private:
+  std::shared_ptr<blocking_pdsch_processor_state> state;
+};
+
+TEST(PdschProcessorPool, BlocksInsteadOfDroppingWhenBackpressureIsEnabled)
+{
+  auto                                     state        = std::make_shared<blocking_pdsch_processor_state>();
+  auto                                     base_factory = std::make_shared<blocking_pdsch_processor_factory>(state);
+  std::shared_ptr<pdsch_processor_factory> pool_factory = create_pdsch_processor_pool(base_factory, 1, true);
+  ASSERT_NE(pool_factory, nullptr);
+
+  std::unique_ptr<pdsch_processor> processor = pool_factory->create();
+  ASSERT_NE(processor, nullptr);
+
+  resource_grid_dummy                                                              rg_dummy;
+  pdsch_processor_notifier_spy                                                     notifier0;
+  pdsch_processor_notifier_spy                                                     notifier1;
+  static_vector<shared_transport_block, pdsch_processor::MAX_NOF_TRANSPORT_BLOCKS> data;
+  pdsch_processor::pdu_t                                                           pdu;
+  pdu.slot = {0, 0};
+
+  std::thread first([&]() { processor->process(rg_dummy.get_writer(), notifier0, data, pdu); });
+  while (state->nof_started.load(std::memory_order_acquire) != 1) {
+    std::this_thread::sleep_for(std::chrono::microseconds(10));
+  }
+
+  std::thread second([&]() { processor->process(rg_dummy.get_writer(), notifier1, data, pdu); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_EQ(state->nof_started.load(std::memory_order_acquire), 1);
+  EXPECT_FALSE(notifier1.is_finished());
+
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->allow_finish = true;
+  }
+  state->cvar.notify_all();
+
+  first.join();
+  second.join();
+
+  EXPECT_TRUE(notifier0.is_finished());
+  EXPECT_TRUE(notifier1.is_finished());
+  EXPECT_EQ(state->nof_started.load(std::memory_order_acquire), 2);
 }
 
 INSTANTIATE_TEST_SUITE_P(PdschProcessorUnittest,

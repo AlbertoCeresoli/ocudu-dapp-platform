@@ -42,6 +42,23 @@ public:
   }
 
   // See interface for documentation.
+  void enqueue_section_type_1_messages(const data_flow_uplane_resource_grid_context& base_context,
+                                       unsigned                                      first_port,
+                                       span<const unsigned>                          eaxcs,
+                                       const shared_resource_grid&                   grid) override
+  {
+    resource_usage_utils::measurements m;
+    {
+      // Use scoped resource usage class to measure CPU usage of this block.
+      resource_usage_utils::scoped_resource_usage rusage_tracker(m);
+      data_flow_uplane->enqueue_section_type_1_messages(base_context, first_port, eaxcs, grid);
+    }
+    count.fetch_add(eaxcs.size(), std::memory_order_relaxed);
+    sum_elapsed_ns.fetch_add(m.duration.count(), std::memory_order_relaxed);
+    update_minmax(static_cast<uint32_t>(m.duration.count()), max_latency_ns, min_latency_ns);
+  }
+
+  // See interface for documentation.
   data_flow_message_encoding_metrics_collector* get_metrics_collector() override { return this; }
 
   // See interface for documentation.

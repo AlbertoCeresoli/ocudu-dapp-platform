@@ -36,6 +36,11 @@ void resource_grid_impl::set_all_zero()
   alloc_mask.reset_all();
 }
 
+bool resource_grid_impl::is_empty() const
+{
+  return reader.is_empty();
+}
+
 resource_grid_writer& resource_grid_impl::get_writer()
 {
   return writer;

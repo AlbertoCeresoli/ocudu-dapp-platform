@@ -108,6 +108,26 @@ static bool validate_ru_sdr_appconfig(const ru_sdr_unit_config&                 
     return false;
   }
 
+  auto is_valid_acceleration_mode = [](const std::string& value) {
+    return (value == "auto") || (value == "enabled") || (value == "disabled");
+  };
+  if (!is_valid_acceleration_mode(config.expert_cfg.low_phy_tx_acceleration_mode)) {
+    fmt::print("Invalid lower-PHY TX acceleration mode '{}'. Valid modes are: auto, enabled, disabled.\n",
+               config.expert_cfg.low_phy_tx_acceleration_mode);
+    return false;
+  }
+  if (!is_valid_acceleration_mode(config.expert_cfg.low_phy_rx_acceleration_mode)) {
+    fmt::print("Invalid lower-PHY RX acceleration mode '{}'. Valid modes are: auto, enabled, disabled.\n",
+               config.expert_cfg.low_phy_rx_acceleration_mode);
+    return false;
+  }
+  if (!is_valid_acceleration_mode(config.expert_cfg.low_phy_prach_demodulation_acceleration_mode)) {
+    fmt::print(
+        "Invalid lower-PHY PRACH demodulation acceleration mode '{}'. Valid modes are: auto, enabled, disabled.\n",
+        config.expert_cfg.low_phy_prach_demodulation_acceleration_mode);
+    return false;
+  }
+
   return true;
 }
 

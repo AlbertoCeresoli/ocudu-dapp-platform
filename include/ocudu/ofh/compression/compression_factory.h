@@ -16,7 +16,9 @@ namespace ofh {
 /// \param[in] type       Compression type.
 /// \param[in] logger     Logger object.
 /// \param[in] iq_scaling Scaling factor applied to IQ data prior to quantization.
-/// \param[in] impl_type  Request for a specific implementation type ("auto", "avx2", "avx512", "generic").
+/// \param[in] impl_type  Request for a specific implementation type ("auto", "enabled", "disabled", "avx2",
+///                       "avx512", "neon", "generic", "cuda"). "auto" selects NVIDIA CUDA when available, otherwise the
+///                       best CPU implementation.
 /// \return IQ data compressor.
 std::unique_ptr<iq_compressor> create_iq_compressor(compression_type        type,
                                                     ocudulog::basic_logger& logger,
@@ -30,7 +32,9 @@ create_iq_compressor_selector(std::array<std::unique_ptr<iq_compressor>, NOF_COM
 /// \brief Creates and returns an IQ data decompressor.
 ///
 /// \param[in] type       Compression type.
-/// \param[in] impl_type  Request for a specific implementation type ("auto", "avx2", "avx512", "generic").
+/// \param[in] impl_type  Request for a specific implementation type ("auto", "enabled", "disabled", "avx2",
+///                       "avx512", "neon", "generic", "cuda"). "auto" selects NVIDIA CUDA when available, otherwise the
+///                       best CPU implementation.
 /// \return IQ data decompressor.
 std::unique_ptr<iq_decompressor>
 create_iq_decompressor(compression_type type, ocudulog::basic_logger& logger, const std::string& impl_type = "auto");

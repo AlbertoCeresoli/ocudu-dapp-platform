@@ -39,3 +39,142 @@ target_link_libraries(pxsch_chain_test
         gtest_main
 )
 gtest_discover_tests(pxsch_chain_test)
+
+add_executable(pusch_gpu_cpu_comparison_test pusch_gpu_cpu_comparison_test.cpp)
+target_link_libraries(pusch_gpu_cpu_comparison_test ocudu_pxsch_bler_test_helpers)
+add_test(pusch_gpu_cpu_comparison_test pusch_gpu_cpu_comparison_test -R 10)
+
+add_executable(pdsch_gpu_e2e_test pdsch_gpu_e2e_test.cpp)
+target_link_libraries(pdsch_gpu_e2e_test
+        ocudu_ran
+        ocudu_channel_processors
+        ocudu_phy_support
+        ocudu_upper_phy_support
+        ocudu_channel_precoder
+        ocudulog
+        ocuduvec
+        gtest
+        gtest_main
+)
+add_test(pdsch_gpu_e2e_test pdsch_gpu_e2e_test)
+if(CUDA_ACCEL_FOUND)
+  target_include_directories(pdsch_gpu_e2e_test PRIVATE
+          ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc)
+  target_link_libraries(pdsch_gpu_e2e_test ocudu_ldpc_cuda CUDA::cudart)
+  target_compile_definitions(pdsch_gpu_e2e_test PRIVATE ENABLE_CUDA)
+endif()
+
+add_executable(pdsch_gpu_latency_benchmark pdsch_gpu_latency_benchmark.cpp)
+target_link_libraries(pdsch_gpu_latency_benchmark
+        ocudu_ran
+        ocudu_channel_processors
+        ocudu_phy_support
+        ocudu_upper_phy_support
+        ocudu_channel_precoder
+        ocudulog
+        ocuduvec
+)
+if(CUDA_ACCEL_FOUND)
+  target_include_directories(pdsch_gpu_latency_benchmark PRIVATE
+          ${CMAKE_SOURCE_DIR}/lib/phy/upper
+          ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc)
+  target_link_libraries(pdsch_gpu_latency_benchmark ocudu_ldpc_cuda CUDA::cudart)
+  target_compile_definitions(pdsch_gpu_latency_benchmark PRIVATE ENABLE_CUDA)
+endif()
+
+add_executable(pusch_gpu_cpu_result_parity_test pusch_gpu_cpu_result_parity_test.cpp)
+target_link_libraries(pusch_gpu_cpu_result_parity_test ocudu_pxsch_bler_test_helpers)
+add_test(pusch_gpu_cpu_result_parity_test pusch_gpu_cpu_result_parity_test)
+
+add_executable(pusch_64qam_stress_test pusch_64qam_stress_test.cpp)
+target_link_libraries(pusch_64qam_stress_test ocudu_pxsch_bler_test_helpers)
+if(CUDA_ACCEL_FOUND)
+  target_compile_definitions(pusch_64qam_stress_test PRIVATE ENABLE_CUDA)
+  # Add include paths to access internal headers for timing profiling
+  target_include_directories(pusch_64qam_stress_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc
+  )
+endif()
+add_test(pusch_64qam_stress_test pusch_64qam_stress_test)
+
+
+add_executable(pusch_e2e_pipeline_test pusch_e2e_pipeline_test.cpp)
+target_link_libraries(pusch_e2e_pipeline_test ocudu_pxsch_bler_test_helpers)
+if(CUDA_ACCEL_FOUND)
+  target_compile_definitions(pusch_e2e_pipeline_test PRIVATE ENABLE_CUDA)
+  target_include_directories(pusch_e2e_pipeline_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc
+  )
+  target_link_libraries(pusch_e2e_pipeline_test ocudu_ldpc_cuda CUDA::cudart)
+endif()
+add_test(pusch_e2e_pipeline_test pusch_e2e_pipeline_test)
+
+if(CUDA_ACCEL_FOUND)
+  add_executable(pusch_resident_dematch_scramble_test pusch_resident_dematch_scramble_test.cpp)
+  target_include_directories(pusch_resident_dematch_scramble_test PRIVATE
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    ${CUDA_ACCEL_INCLUDE_DIRS}
+  )
+  target_link_libraries(pusch_resident_dematch_scramble_test ocudu_ldpc_cuda CUDA::cudart)
+  target_compile_definitions(pusch_resident_dematch_scramble_test PRIVATE ENABLE_CUDA)
+  add_test(pusch_resident_dematch_scramble_test pusch_resident_dematch_scramble_test)
+endif()
+
+add_executable(pusch_mimo_eq_parity_test pusch_mimo_eq_parity_test.cpp)
+target_link_libraries(pusch_mimo_eq_parity_test
+  ocudu_pxsch_bler_test_helpers
+  ocudu_channel_processors
+  ocudu_phy_support
+  ocudu_upper_phy_support
+  ocudu_channel_precoder
+  ocudu_channel_equalizer
+  ocudu_dft
+  ocudulog
+  ocuduvec
+)
+if(CUDA_ACCEL_FOUND)
+  target_compile_definitions(pusch_mimo_eq_parity_test PRIVATE ENABLE_CUDA)
+  target_include_directories(pusch_mimo_eq_parity_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    ${CUDA_ACCEL_INCLUDE_DIRS}
+  )
+  target_link_libraries(pusch_mimo_eq_parity_test ocudu_ldpc_cuda CUDA::cudart)
+endif()
+
+add_executable(pusch_e2e_correctness_sweep pusch_e2e_correctness_sweep.cpp)
+target_link_libraries(pusch_e2e_correctness_sweep ocudu_pxsch_bler_test_helpers)
+target_include_directories(pusch_e2e_correctness_sweep PRIVATE
+  ${CMAKE_SOURCE_DIR}
+  ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc
+)
+if(CUDA_ACCEL_FOUND)
+  target_compile_definitions(pusch_e2e_correctness_sweep PRIVATE ENABLE_CUDA)
+  target_include_directories(pusch_e2e_correctness_sweep PRIVATE
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    ${CUDA_ACCEL_INCLUDE_DIRS}
+  )
+endif()
+add_test(pusch_e2e_correctness_sweep pusch_e2e_correctness_sweep)
+
+add_executable(pusch_e2e_sensitivity_sweep pusch_e2e_sensitivity_sweep.cpp)
+target_link_libraries(pusch_e2e_sensitivity_sweep ocudu_pxsch_bler_test_helpers)
+target_include_directories(pusch_e2e_sensitivity_sweep PRIVATE
+  ${CMAKE_SOURCE_DIR}
+  ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc
+)
+if(CUDA_ACCEL_FOUND)
+  target_compile_definitions(pusch_e2e_sensitivity_sweep PRIVATE ENABLE_CUDA)
+  target_include_directories(pusch_e2e_sensitivity_sweep PRIVATE
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    ${CUDA_ACCEL_INCLUDE_DIRS}
+  )
+endif()
+# The built-in default sweep covers 8 PRB/MCS configs up to 273PRB and takes hours: run a reduced set in CI and
+# leave the full sweep for manual invocation. See --help for the knobs.
+add_test(NAME pusch_e2e_sensitivity_sweep
+         COMMAND pusch_e2e_sensitivity_sweep --nof_prb 25 --mcs_index 11,27 --nof_frames 20)
+set_tests_properties(pusch_e2e_sensitivity_sweep PROPERTIES TIMEOUT 600)

@@ -47,6 +47,12 @@ std::shared_ptr<ldpc_decoder_factory>
 create_ldpc_decoder_factory_sw(const std::string&                                              dec_type,
                                const ldpc_decoder_factory::ldpc_decoder_factory_configuration& cfg);
 
+/// Returns the name of the LDPC decoder implementation that will be selected for the given type.
+/// This is useful for diagnostic logging to confirm which SIMD path is being used.
+/// \param[in] dec_type Decoder type requested ("auto", "generic", "neon", "avx2", "avx512").
+/// \return Implementation name that will be used (e.g., "neon", "avx512", "generic").
+std::string get_ldpc_decoder_type_str(const std::string& dec_type);
+
 class ldpc_encoder_factory
 {
 public:

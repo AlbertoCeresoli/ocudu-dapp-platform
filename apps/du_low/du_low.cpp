@@ -134,6 +134,14 @@ int main(int argc, char** argv)
 
   // Setup and configure config parsing.
   CLI::App app("OCUDU DU low application");
+
+  // Optional NVIDIA GPU related help text
+#ifdef ENABLE_CUDA
+  app.footer("GPU acceleration:\n"
+             "  Select the NVIDIA CUDA device for all accelerated upper-PHY components (PUSCH, SRS, PRACH, PDSCH,\n"
+             "  resource grid, PRACH buffer) with 'expert_phy --nvcuda_device_id <N>' (default: 0).");
+#endif
+
   app.config_formatter(create_yaml_config_parser());
   app.allow_config_extras(CLI::config_extras_mode::error);
   // Fill the generic application arguments to parse.

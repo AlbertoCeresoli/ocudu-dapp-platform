@@ -102,10 +102,14 @@ static void fill_ru_sdr_section(YAML::Node node, const ru_sdr_unit_config& confi
   }
 
   {
-    YAML::Node expert_node               = node["expert_cfg"];
-    expert_node["low_phy_dl_throttling"] = config.expert_cfg.lphy_dl_throttling;
-    expert_node["tx_mode"]               = config.expert_cfg.transmission_mode;
-    expert_node["power_ramping_time_us"] = config.expert_cfg.power_ramping_time_us;
+    YAML::Node expert_node                      = node["expert_cfg"];
+    expert_node["low_phy_dl_throttling"]        = config.expert_cfg.lphy_dl_throttling;
+    expert_node["tx_mode"]                      = config.expert_cfg.transmission_mode;
+    expert_node["power_ramping_time_us"]        = config.expert_cfg.power_ramping_time_us;
+    expert_node["low_phy_tx_acceleration_mode"] = config.expert_cfg.low_phy_tx_acceleration_mode;
+    expert_node["low_phy_rx_acceleration_mode"] = config.expert_cfg.low_phy_rx_acceleration_mode;
+    expert_node["low_phy_prach_demodulation_acceleration_mode"] =
+        config.expert_cfg.low_phy_prach_demodulation_acceleration_mode;
   }
 }
 

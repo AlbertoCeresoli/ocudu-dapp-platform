@@ -15,6 +15,7 @@ class network_order_binary_serializer;
 class ofh_uplane_message_builder_dynamic_compression_impl : public uplane_message_builder_impl
 {
 public:
+  /// Creates a dynamic-compression U-Plane message builder.
   ofh_uplane_message_builder_dynamic_compression_impl(ocudulog::basic_logger& logger_, iq_compressor& compressor_) :
     uplane_message_builder_impl(logger_, compressor_)
   {

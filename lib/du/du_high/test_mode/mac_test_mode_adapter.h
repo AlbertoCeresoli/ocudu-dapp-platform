@@ -11,6 +11,7 @@
 #include "ocudu/mac/mac_cell_manager.h"
 #include "ocudu/mac/mac_cell_result.h"
 #include "ocudu/ocudulog/ocudulog.h"
+#include "ocudu/ran/tdd/tdd_ul_dl_config.h"
 
 namespace ocudu::odu {
 
@@ -99,6 +100,10 @@ private:
   void forward_uci_ind_to_mac(const mac_uci_indication_message& uci_msg);
   void forward_crc_ind_to_mac(const mac_crc_indication_message& crc_msg);
 
+  /// Determines whether a history entry is expected for the given slot. The MAC only notifies UL scheduler results
+  /// for slots with active UL symbols, so DL-only slots legitimately have no entry.
+  bool ul_history_expected(slot_point sl_rx) const;
+
   const du_cell_index_t                           cell_index;
   const du_test_mode_config::test_mode_ue_config& test_ue_cfg;
   mac_cell_control_information_handler&           adapted;
@@ -108,6 +113,8 @@ private:
   std::function<void(rnti_t)>                     dl_bs_notifier;
   mac_test_mode_event_notifier&                   ev_notifier;
   ocudulog::basic_logger&                         logger;
+  /// Cell TDD pattern, used to tell DL-only slots (no UL history expected) from genuine history misses.
+  const std::optional<tdd_ul_dl_config_common> tdd_cfg;
 
   /// Ring buffer of slot decision history.
   mac_test_mode_cell_decision_history history;

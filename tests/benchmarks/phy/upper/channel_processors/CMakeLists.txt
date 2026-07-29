@@ -42,11 +42,12 @@ add_test(pdsch_processor_benchmark_flexible pdsch_processor_benchmark -m silent 
 add_test(pdsch_processor_benchmark_lite pdsch_processor_benchmark -m silent -R 1 -B 1 -T 2 -P pdsch_scs15_5MHz_qpsk_min -t lite)
 
 add_executable(prach_detector_benchmark prach_detector_benchmark.cpp)
+target_include_directories(prach_detector_benchmark PRIVATE ${PROJECT_SOURCE_DIR}/lib)
 target_link_libraries(prach_detector_benchmark
         ocudu_phy_support
         ocudu_prach_detector
+        ocudu_upper_phy
         ocudu_dft
         ocudulog
         ocuduvec)
 add_test(prach_detector_benchmark prach_detector_benchmark -R 1)
-

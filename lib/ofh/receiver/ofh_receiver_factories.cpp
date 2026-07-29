@@ -22,7 +22,8 @@ static std::unique_ptr<uplane_message_decoder> create_uplane_decoder(const recei
   // Compressors.
   std::array<std::unique_ptr<iq_decompressor>, NOF_COMPRESSION_TYPES_SUPPORTED> decompr;
   for (unsigned i = 0; i != NOF_COMPRESSION_TYPES_SUPPORTED; ++i) {
-    decompr[i] = create_iq_decompressor(static_cast<compression_type>(i), logger);
+    decompr[i] =
+        create_iq_decompressor(static_cast<compression_type>(i), logger, receiver_cfg.compression_acceleration_mode);
   }
 
   frequency_range freq_range =

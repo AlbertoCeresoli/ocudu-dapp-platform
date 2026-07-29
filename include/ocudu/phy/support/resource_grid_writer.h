@@ -88,6 +88,30 @@ public:
   /// \param[in] l    OFDM symbol index.
   /// \return Resource grid view.
   virtual span<cbf16_t> get_view(unsigned port, unsigned l) = 0;
+
+  /// Returns true if the writer owns a device-resident BF16 grid destination.
+  virtual bool supports_device_grid_mapping() const { return false; }
+
+  /// Returns true if device-grid mapping writes into the same host-visible backing store used by host put/get_view.
+  virtual bool device_grid_mapping_aliases_host_grid() const { return false; }
+
+  /// Gets an opaque device pointer to a full-grid BF16 IQ destination.
+  ///
+  /// The expected layout is `port * nof_symbols * nof_subc + symbol * nof_subc + subcarrier`,
+  /// with each RE represented by two BF16 uint16 words `(real, imag)`.
+  virtual void* get_device_grid_bf16() { return nullptr; }
+
+  /// Prepares the device grid for mapping on an opaque execution stream.
+  virtual bool prepare_device_grid_mapping(void*) { return true; }
+
+  /// Records that device-grid mapping has been enqueued on an opaque execution stream.
+  virtual bool on_device_grid_mapping_enqueued(void*) { return true; }
+
+  /// Cancels a device-grid mapping attempt before it records completion.
+  virtual bool cancel_device_grid_mapping() { return true; }
+
+  /// Prepares any device-grid writes for host-side consumption.
+  virtual bool synchronize_device_grid_mapping() { return true; }
 };
 
 } // namespace ocudu

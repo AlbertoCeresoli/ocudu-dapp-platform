@@ -145,16 +145,18 @@ downlink_processor_baseband_impl::process(baseband_gateway_timestamp timestamp)
   if (pdxch_baseband_result.buffer) {
     // Apply carrier frequency offset for the entire transmit slot buffer.
     cfo_processor.next_cfo_command();
-    for (unsigned i_port = 0, i_port_end = pdxch_baseband_result.buffer->get_nof_channels(); i_port != i_port_end;
-         ++i_port) {
-      // The CFO compensation is not currently supported for 16-bit complex integer samples. So, it must convert it to
-      // single-precision complex floating-point samples.
-      span<ci16_t> channel_buffer = pdxch_baseband_result.buffer->get_writer().get_channel_buffer(i_port);
-      span<cf_t>   cf_buf         = cf_buffer.get_view({i_port}).first(channel_buffer.size());
+    if (cfo_processor.is_active()) {
+      for (unsigned i_port = 0, i_port_end = pdxch_baseband_result.buffer->get_nof_channels(); i_port != i_port_end;
+           ++i_port) {
+        // The CFO compensation is not currently supported for 16-bit complex integer samples. So, it must convert it to
+        // single-precision complex floating-point samples.
+        span<ci16_t> channel_buffer = pdxch_baseband_result.buffer->get_writer().get_channel_buffer(i_port);
+        span<cf_t>   cf_buf         = cf_buffer.get_view({i_port}).first(channel_buffer.size());
 
-      ocuduvec::convert(cf_buf, channel_buffer, scaling_factor_ci16_to_cf);
-      cfo_processor.process(cf_buf);
-      ocuduvec::convert(channel_buffer, cf_buf, scaling_factor_cf_to_ci16);
+        ocuduvec::convert(cf_buf, channel_buffer, scaling_factor_ci16_to_cf);
+        cfo_processor.process(cf_buf);
+        ocuduvec::convert(channel_buffer, cf_buf, scaling_factor_cf_to_ci16);
+      }
     }
 
     // Notify metrics.

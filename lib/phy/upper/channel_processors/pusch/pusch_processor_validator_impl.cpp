@@ -4,6 +4,7 @@
 
 #include "pusch_processor_validator_impl.h"
 #include "pusch_processor_impl.h"
+#include "ocudu/ran/dmrs/dmrs.h"
 #include "ocudu/ran/transform_precoding/transform_precoding_helpers.h"
 #include "ocudu/ran/uci/uci_constants.h"
 #include "ocudu/ran/uci/uci_formatters.h"
@@ -64,6 +65,17 @@ error_type<std::string> pusch_processor_validator_impl::is_valid(const pusch_pro
                     pdu.bwp_start_rb + pdu.bwp_size_rb,
                     pdu.freq_alloc));
   }
+
+  if ((pdu.uci.nof_harq_ack > uci_constants::MAX_NOF_HARQ_BITS) ||
+      (pdu.uci.nof_csi_part1 > uci_constants::MAX_NOF_CSI_PART1_OR_PART2_BITS)) {
+    return make_unexpected(
+        fmt::format("UCI field sizes in bits ({}, {}), exceed the maximum bit sizes, i.e., {} and {}.",
+                    pdu.uci.nof_harq_ack,
+                    pdu.uci.nof_csi_part1,
+                    uci_constants::MAX_NOF_HARQ_BITS,
+                    uci_constants::MAX_NOF_CSI_PART1_OR_PART2_BITS));
+  }
+
 
   // CSI Part 2 size parameters must be compatible with the CSI Part 1 number of bits.
   if (!pdu.uci.csi_part2_size.is_valid(pdu.uci.nof_csi_part1)) {

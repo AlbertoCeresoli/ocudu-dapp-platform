@@ -70,7 +70,7 @@ struct ru_sdr_executor_mapper_sequential_configuration {
 struct ru_sdr_executor_mapper_single_configuration {
   /// Common radio executor.
   task_executor* radio_exec;
-  /// High priority executor for downlink modulation, and uplink demodulation.
+  /// High priority executor for downlink modulation.
   task_executor* high_prio_executor;
   /// Dedicated baseband executor per cell basis.
   std::vector<task_executor*> baseband_exec;
@@ -81,14 +81,16 @@ struct ru_sdr_executor_mapper_dual_configuration {
   /// Collects transmit and receive baseband executors.
   struct cell_executors {
     /// Baseband transmitter executor.
-    task_executor* tx_exec;
+    task_executor* tx_exec = nullptr;
     /// Baseband receiver executor.
-    task_executor* rx_exec;
+    task_executor* rx_exec = nullptr;
+    /// PRACH demodulation and handoff executor.
+    task_executor* prach_exec = nullptr;
   };
 
   /// Common radio executor.
   task_executor* radio_exec;
-  /// High priority executor for downlink modulation, and uplink demodulation.
+  /// High priority executor for downlink modulation.
   task_executor* high_prio_executor;
   /// Dedicated baseband executor per cell basis.
   std::vector<cell_executors> baseband_exec;
@@ -99,16 +101,18 @@ struct ru_sdr_executor_mapper_triple_configuration {
   /// Collects transmit and receive baseband executors.
   struct cell_executors {
     /// Baseband transmitter executor.
-    task_executor* tx_exec;
+    task_executor* tx_exec = nullptr;
     /// Baseband receiver executor.
-    task_executor* rx_exec;
+    task_executor* rx_exec = nullptr;
     /// Baseband uplink executor.
-    task_executor* ul_exec;
+    task_executor* ul_exec = nullptr;
+    /// PRACH demodulation and handoff executor.
+    task_executor* prach_exec = nullptr;
   };
 
   /// Common radio executor.
   task_executor* radio_exec;
-  /// High priority executor for downlink modulation, and uplink demodulation.
+  /// High priority executor for downlink modulation.
   task_executor* high_prio_executor;
   /// Dedicated baseband executor per cell basis.
   std::vector<cell_executors> baseband_exec;

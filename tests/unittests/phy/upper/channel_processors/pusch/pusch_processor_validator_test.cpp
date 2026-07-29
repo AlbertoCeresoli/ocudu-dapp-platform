@@ -193,6 +193,18 @@ const std::vector<test_case_t> pusch_processor_validator_test_data = {
        return pdu;
      },
      R"(Transform precoding is only possible with a valid number of PRB\.)"},
+    {[] {
+       pusch_processor::pdu_t pdu = base_pdu;
+       pdu.uci.nof_harq_ack       = uci_constants::MAX_NOF_HARQ_BITS + 1;
+       return pdu;
+     },
+     R"(UCI field sizes in bits \(1707, 1\), exceed the maximum bit sizes, i\.e\., 1706 and 1706\.)"},
+    {[] {
+       pusch_processor::pdu_t pdu = base_pdu;
+       pdu.uci.nof_csi_part1      = uci_constants::MAX_NOF_CSI_PART1_OR_PART2_BITS + 1;
+       return pdu;
+     },
+     R"(UCI field sizes in bits \(0, 1707\), exceed the maximum bit sizes, i\.e\., 1706 and 1706\.)"},
 };
 
 class PuschProcessorFixture : public ::testing::TestWithParam<test_case_t>

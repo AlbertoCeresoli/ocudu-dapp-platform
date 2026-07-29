@@ -40,6 +40,32 @@ struct ru_sdr_unit_expert_config {
   /// \note Powering up the transmitter ahead of time requires starting the transmission earlier, and reduces the time
   /// window for the radio to transmit the provided samples.
   float power_ramping_time_us = 0.0F;
+  /// \brief Acceleration mode for lower-PHY transmit baseband processing.
+  ///
+  /// Use one of these options:
+  /// - \c auto: enable acceleration if available (default),
+  /// - \c enabled: require acceleration (fail if unavailable),
+  /// - \c disabled: use CPU only.
+  std::string low_phy_tx_acceleration_mode = "auto";
+  /// \brief Acceleration mode for lower-PHY receive OFDM demodulation.
+  ///
+  /// Applies to the regular PUxCH path that feeds PUSCH, PUCCH and SRS. PRACH demodulation is controlled separately
+  /// because it uses different waveform timing.
+  ///
+  /// Use one of these options:
+  /// - \c auto: enable acceleration if available (default),
+  /// - \c enabled: require acceleration (fail if unavailable),
+  /// - \c disabled: use CPU only.
+  std::string low_phy_rx_acceleration_mode = "auto";
+  /// \brief Acceleration mode for lower-PHY PRACH OFDM demodulation.
+  ///
+  /// This is independent from the upper-PHY PRACH detector acceleration mode.
+  ///
+  /// Use one of these options:
+  /// - \c auto: enable acceleration if available (default),
+  /// - \c enabled: require acceleration (fail if unavailable),
+  /// - \c disabled: use CPU only.
+  std::string low_phy_prach_demodulation_acceleration_mode = "auto";
 };
 
 /// Amplitude control application configuration.

@@ -43,6 +43,9 @@ add_backward(gnb)
 target_include_directories(gnb PRIVATE ${CMAKE_SOURCE_DIR})
 install(TARGETS gnb RUNTIME)
 target_link_libraries(gnb PRIVATE gnb_base ocudu_flexible_o_du_split_dynamic)
+if (ENABLE_CUDA)
+    target_compile_definitions(gnb PRIVATE ENABLE_CUDA)
+endif (ENABLE_CUDA)
 notify_binary_target(gnb)
 
 # Add the targets for the rest of the splits.
@@ -54,6 +57,9 @@ foreach (NAME LIB IN ZIP_LISTS EXTENSIONS LIBRARIES)
     add_backward(${NAME})
     target_include_directories(${NAME} PRIVATE ${CMAKE_SOURCE_DIR})
     target_link_libraries(${NAME} PRIVATE gnb_base ${LIB})
+    if (ENABLE_CUDA)
+        target_compile_definitions(${NAME} PRIVATE ENABLE_CUDA)
+    endif (ENABLE_CUDA)
     set_target_properties(${NAME} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/../${NAME}"   # Path to the binary.
             RUNTIME_OUTPUT_NAME "gnb"                                           # Binary name.

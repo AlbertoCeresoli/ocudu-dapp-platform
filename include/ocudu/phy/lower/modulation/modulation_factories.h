@@ -9,6 +9,7 @@
 #include "ocudu/phy/lower/modulation/ofdm_modulator.h"
 #include "ocudu/phy/lower/modulation/ofdm_prach_demodulator.h"
 #include "ocudu/phy/lower/sampling_rate.h"
+#include <string>
 
 namespace ocudu {
 
@@ -81,6 +82,13 @@ std::shared_ptr<ofdm_modulator_factory> create_ofdm_modulator_pool_factory(std::
 std::shared_ptr<ofdm_demodulator_factory>
 create_ofdm_demodulator_factory_generic(ofdm_factory_generic_configuration& config);
 
+/// \brief Creates an OFDM demodulator factory with implementation-specific acceleration when requested and available.
+/// \param[in] config            Generic OFDM demodulator dependencies for the software fallback.
+/// \param[in] acceleration_mode Acceleration mode: "auto", "enabled" or "disabled".
+std::shared_ptr<ofdm_demodulator_factory>
+create_ofdm_demodulator_factory_accelerated(ofdm_factory_generic_configuration& config,
+                                            std::string                         acceleration_mode = "auto");
+
 /// Creates a generic OFDM demodulator concurrent pool factory.
 std::shared_ptr<ofdm_demodulator_factory>
 create_ofdm_demodulator_pool_factory(std::shared_ptr<ofdm_demodulator_factory> base, unsigned max_nof_threads);
@@ -93,5 +101,16 @@ std::shared_ptr<ofdm_prach_demodulator_factory>
 create_ofdm_prach_demodulator_factory_sw(std::shared_ptr<dft_processor_factory> dft_factory,
                                          sampling_rate                          srate,
                                          frequency_range                        fr);
+
+/// \brief Creates a PRACH demodulator factory with implementation-specific acceleration when requested and available.
+/// \param[in] dft_factory       DFT factory for the software fallback.
+/// \param[in] srate             Sampling rate.
+/// \param[in] fr                Frequency range.
+/// \param[in] acceleration_mode Acceleration mode: "auto", "enabled" or "disabled".
+std::shared_ptr<ofdm_prach_demodulator_factory>
+create_ofdm_prach_demodulator_factory_accelerated(std::shared_ptr<dft_processor_factory> dft_factory,
+                                                  sampling_rate                          srate,
+                                                  frequency_range                        fr,
+                                                  std::string                            acceleration_mode = "auto");
 
 } // namespace ocudu

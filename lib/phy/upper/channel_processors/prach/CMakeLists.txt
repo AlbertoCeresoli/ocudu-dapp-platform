@@ -10,3 +10,9 @@ add_library(ocudu_prach_detector STATIC
         prach_detector_phy_validator_impl.cpp
         factories.cpp)
 target_link_libraries(ocudu_prach_detector ocudu_ran ocuduvec)
+if(CUDA_ACCEL_FOUND)
+    target_sources(ocudu_prach_detector PRIVATE prach_detector_cuda_impl.cpp)
+    target_compile_definitions(ocudu_prach_detector PUBLIC ENABLE_CUDA)
+    target_include_directories(ocudu_prach_detector PRIVATE ${CUDA_ACCEL_INCLUDE_DIRS})
+    target_link_libraries(ocudu_prach_detector ${CUDA_ACCEL_LIBRARIES} CUDA::cudart CUDA::cuda_driver)
+endif()

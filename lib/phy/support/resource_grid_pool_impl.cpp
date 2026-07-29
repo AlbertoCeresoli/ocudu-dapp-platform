@@ -48,7 +48,7 @@ void resource_grid_pool_wrapper::release()
 void resource_grid_pool_wrapper::notify_release_scope()
 {
   // Skip zeroing if the grid is empty.
-  if (grid->get_reader().is_empty()) {
+  if (grid->is_empty()) {
     release();
     return;
   }
@@ -104,11 +104,27 @@ shared_resource_grid resource_grid_pool_impl::allocate_resource_grid(slot_point 
 
   // Try reserving the resource grid.
   shared_resource_grid grid = grids[identifier].try_reserve(std::move(token));
-
-  // Log a warning message if the grid is not available.
-  if (!grid) {
-    logger.warning(slot.sfn(), slot.slot_index(), "Resource grid with identifier {} is not available.", identifier);
+  if (grid) {
+    return grid;
   }
 
-  return grid;
+  // The request counter is only a load-spreading hint. If the selected grid is still busy, try the remaining grids
+  // before declaring a miss. This avoids slot drops caused by round-robin collisions during short latency spikes.
+  for (unsigned i = 1, nof_grids = grids.size(); i != nof_grids; ++i) {
+    token = stop_control.get_token();
+    if (OCUDU_UNLIKELY(token.is_stop_requested())) {
+      return {};
+    }
+
+    unsigned fallback_identifier = (identifier + i) % nof_grids;
+    grid                         = grids[fallback_identifier].try_reserve(std::move(token));
+    if (grid) {
+      return grid;
+    }
+  }
+
+  // Log a warning message if no grid is available.
+  logger.warning(slot.sfn(), slot.slot_index(), "Resource grid with identifier {} is not available.", identifier);
+
+  return {};
 }

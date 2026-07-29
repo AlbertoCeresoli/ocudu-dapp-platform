@@ -85,6 +85,26 @@ if (BUILD_TESTING)
     endif(${CMAKE_BUILD_TYPE} STREQUAL "Debug")
 endif(BUILD_TESTING)
 
+# NVIDIA CUDA acceleration with in-tree CUDA kernels.
+option(ENABLE_CUDA "Enable NVIDIA CUDA acceleration with in-tree CUDA kernels" OFF)
+
+if(ENABLE_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        find_package(CUDAToolkit)
+        set(CUDA_FOUND TRUE)
+        message(STATUS "NVIDIA CUDA support enabled")
+    else()
+        set(CUDA_FOUND FALSE)
+        message(STATUS "NVIDIA CUDA compiler not found, CUDA support disabled")
+    endif()
+else()
+    set(CUDA_FOUND FALSE)
+    message(STATUS "NVIDIA CUDA support disabled by user")
+endif()
+
 # Set linker options and default value.
 set(LINKER "default" CACHE STRING "Which linker to use")
 set_property(CACHE LINKER PROPERTY STRINGS default bfd lld mold)

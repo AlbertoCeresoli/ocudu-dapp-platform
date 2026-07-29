@@ -55,6 +55,10 @@ public:
   /// \param[in] center_frequency_Hz Given center frequency in Hertz.
   virtual void set_center_frequency(double center_frequency_Hz) = 0;
 
+  /// \brief Gets the maximum number of consecutive packed signed-16 IQ symbols the demodulator can process together.
+  /// \return Maximum supported symbol batch size, or one if symbol batching is not supported.
+  virtual unsigned get_max_ci16_symbol_batch_size() const { return 1; }
+
   /// \brief Demodulates an OFDM signal with symbol granularity.
   /// \param[out] grid Provides the output as frequency-domain signal corresponding to one slot.
   /// \param[in] input Provides the time domain modulated signal.
@@ -64,6 +68,66 @@ public:
   /// \note The output size must be consistent with the configured bandwidth.
   virtual void
   demodulate(resource_grid_writer& grid, span<const cf_t> input, unsigned port_index, unsigned symbol_index) = 0;
+
+  /// \brief Attempts to demodulate a packed signed-16 IQ OFDM signal with symbol granularity.
+  /// \param[out] grid Provides the output as frequency-domain signal corresponding to one slot.
+  /// \param[in] input Provides the time domain modulated signal.
+  /// \param[in] input_scale Scale that maps packed integer samples to complex float samples.
+  /// \param[in] port_index Indicates the port index to demodulate.
+  /// \param[in] symbol_index Symbol index within the subframe to demodulate.
+  /// \return True if the implementation consumed the packed input directly, otherwise false.
+  ///
+  /// Implementations may override this method to bypass host-side `ci16` to `cf_t` conversion and write directly to a
+  /// device-visible resource grid. The default implementation keeps existing CPU demodulators unchanged.
+  virtual bool demodulate_ci16(resource_grid_writer& grid,
+                               span<const ci16_t>    input,
+                               float                 input_scale,
+                               unsigned              port_index,
+                               unsigned              symbol_index)
+  {
+    return false;
+  }
+
+  /// \brief Attempts to demodulate packed signed-16 IQ OFDM signals for multiple ports.
+  /// \param[out] grid Provides the output as frequency-domain signal corresponding to one slot.
+  /// \param[in] inputs Provides one time-domain modulated signal pointer per port.
+  /// \param[in] nof_samples Number of input samples per port.
+  /// \param[in] input_scale Scale that maps packed integer samples to complex float samples.
+  /// \param[in] port_indices Resource-grid port index for each input.
+  /// \param[in] symbol_index Symbol index within the subframe to demodulate.
+  /// \return True if the implementation consumed the packed inputs directly, otherwise false.
+  virtual bool demodulate_ci16_ports(resource_grid_writer&     grid,
+                                     span<const ci16_t* const> inputs,
+                                     unsigned                  nof_samples,
+                                     float                     input_scale,
+                                     span<const unsigned>      port_indices,
+                                     unsigned                  symbol_index)
+  {
+    return false;
+  }
+
+  /// \brief Attempts to demodulate a batch of consecutive packed signed-16 IQ OFDM symbols for multiple ports.
+  /// \param[out] grid Provides the output as frequency-domain signal corresponding to one slot.
+  /// \param[in] inputs Provides one time-domain modulated signal pointer per symbol and port.
+  /// \param[in] symbol_sample_counts Number of input samples per symbol.
+  /// \param[in] input_scale Scale that maps packed integer samples to complex float samples.
+  /// \param[in] port_indices Resource-grid port index for each input port.
+  /// \param[in] first_symbol_index First symbol index within the subframe to demodulate.
+  /// \param[in] nof_symbols Number of consecutive symbols to demodulate.
+  /// \return True if the implementation consumed the packed inputs directly, otherwise false.
+  ///
+  /// The input pointer array is symbol-major and port-minor:
+  /// `inputs[symbol * port_indices.size() + port]`.
+  virtual bool demodulate_ci16_symbol_batch_ports(resource_grid_writer&     grid,
+                                                  span<const ci16_t* const> inputs,
+                                                  span<const unsigned>      symbol_sample_counts,
+                                                  float                     input_scale,
+                                                  span<const unsigned>      port_indices,
+                                                  unsigned                  first_symbol_index,
+                                                  unsigned                  nof_symbols)
+  {
+    return false;
+  }
 };
 
 /// \brief Describes an OFDM demodulator with slot granularity.

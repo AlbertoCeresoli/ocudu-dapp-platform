@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
 
 #include "ofh_uplane_prach_symbol_data_flow_writer.h"
+#include "ocudu/ofh/serdes/ofh_uplane_message_decoder.h"
 #include "ocudu/ofh/serdes/ofh_uplane_message_decoder_properties.h"
 
 using namespace ocudu;
@@ -102,4 +103,105 @@ bool uplane_prach_symbol_data_flow_writer::write_to_prach_buffer(unsigned       
   }
 
   return true;
+}
+
+bool uplane_prach_symbol_data_flow_writer::write_compressed_to_prach_buffer(
+    unsigned                              eaxc,
+    const uplane_message_decoder_results& results,
+    uplane_message_decoder&               decoder)
+{
+  slot_point slot = results.params.slot;
+
+  prach_context prach_context = prach_context_repo->get(slot);
+  if (OCUDU_UNLIKELY(prach_context.empty())) {
+    logger.info("Sector#{}: dropped received Open Fronthaul message as no uplink PRACH context was found for slot '{}' "
+                "and eAxC '{}'",
+                sector_id,
+                slot,
+                eaxc);
+    return false;
+  }
+
+  unsigned port = std::distance(prach_eaxc.begin(), std::find(prach_eaxc.begin(), prach_eaxc.end(), eaxc));
+  if (OCUDU_UNLIKELY(port >= prach_context.get_max_nof_ports())) {
+    return true;
+  }
+
+  unsigned prach_nof_res           = prach_context.get_prach_nof_re();
+  unsigned nof_re_to_prach_data    = prach_context.get_prach_offset_to_first_re();
+  unsigned prach_nof_prbs          = std::ceil(float(prach_nof_res + nof_re_to_prach_data) / NOF_SUBCARRIERS_PER_RB);
+  unsigned nof_re_after_prach_data = prach_nof_prbs * NOF_SUBCARRIERS_PER_RB - (prach_nof_res + nof_re_to_prach_data);
+  unsigned prach_data_start_prb    = nof_re_to_prach_data / NOF_SUBCARRIERS_PER_RB;
+  bool     wrote_any               = false;
+
+  for (const auto& section : results.sections) {
+    if (section.start_prb >= prach_nof_prbs) {
+      continue;
+    }
+    if (section.start_prb + section.nof_prbs <= prach_data_start_prb) {
+      continue;
+    }
+    if (section.compressed_iq_data.empty()) {
+      return false;
+    }
+
+    unsigned nof_prbs_to_write = prach_nof_prbs - section.start_prb;
+    if (section.start_prb + section.nof_prbs < prach_nof_prbs) {
+      nof_prbs_to_write = section.nof_prbs;
+    }
+
+    unsigned start_re = std::max<int>(0, (section.start_prb * NOF_SUBCARRIERS_PER_RB - nof_re_to_prach_data));
+
+    unsigned section_start_re = section.start_prb * NOF_SUBCARRIERS_PER_RB;
+    unsigned section_nof_re   = nof_prbs_to_write * NOF_SUBCARRIERS_PER_RB;
+
+    if (section.start_prb + section.nof_prbs >= prach_nof_prbs) {
+      section_nof_re -= nof_re_after_prach_data;
+    }
+
+    unsigned iq_start_re = 0U;
+    if (section_start_re < nof_re_to_prach_data) {
+      iq_start_re = nof_re_to_prach_data - section_start_re;
+      section_nof_re -= iq_start_re;
+    }
+
+    unsigned iq_size_re = std::min(section_nof_re, prach_nof_res);
+
+    bool written = prach_context_repo->write_iq_device(
+        slot,
+        port,
+        results.params.symbol_id,
+        start_re,
+        iq_size_re,
+        [&decoder, start_re, iq_start_re, iq_size_re, nof_prbs_to_write, &section](prach_buffer& buffer,
+                                                                                   unsigned      prach_port,
+                                                                                   unsigned      td_occasion,
+                                                                                   unsigned      fd_occasion,
+                                                                                   unsigned      prach_symbol) {
+          return decoder.decompress_to_prach_buffer(buffer,
+                                                    prach_port,
+                                                    td_occasion,
+                                                    fd_occasion,
+                                                    prach_symbol,
+                                                    start_re,
+                                                    iq_start_re,
+                                                    iq_size_re,
+                                                    nof_prbs_to_write,
+                                                    section);
+        });
+    if (!written) {
+      return false;
+    }
+    wrote_any = true;
+
+    if (OCUDU_UNLIKELY(logger.debug.enabled())) {
+      logger.debug("Sector#{}: handling compressed PRACH in slot '{}', symbol '{}' and port '{}'",
+                   sector_id,
+                   slot,
+                   results.params.symbol_id,
+                   port);
+    }
+  }
+
+  return wrote_any;
 }

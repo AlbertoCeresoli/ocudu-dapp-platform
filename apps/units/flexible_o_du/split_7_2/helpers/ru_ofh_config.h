@@ -108,6 +108,8 @@ struct ru_ofh_unit_base_cell_config {
   std::string compression_method_prach = "bfp";
   /// PRACH compression bitwidth.
   unsigned compression_bitwidth_prach = 9;
+  /// Open Fronthaul IQ compression/decompression acceleration mode: auto, enabled or disabled.
+  std::string compression_acceleration_mode = "auto";
   /// Downlink static compression header flag.
   bool is_downlink_static_comp_hdr_enabled = true;
   /// Uplink static compression header flag.

@@ -7,6 +7,7 @@
 #include "../../../../gateways/baseband/baseband_gateway_buffer_test_doubles.h"
 #include "prach/prach_processor_test_doubles.h"
 #include "puxch/puxch_processor_test_doubles.h"
+#include "ocudu/phy/lower/lower_phy_baseband_metrics.h"
 #include "ocudu/phy/lower/lower_phy_timing_context.h"
 #include "ocudu/phy/lower/processors/lower_phy_cfo_controller.h"
 #include "ocudu/phy/lower/processors/uplink/uplink_processor.h"
@@ -23,21 +24,25 @@ public:
 
   void on_full_slot(const lower_phy_timing_context& context) override { full_slots.emplace_back(context); }
 
-  void on_new_metrics(const lower_phy_baseband_metrics& metrics) override {}
+  void on_new_metrics(const lower_phy_baseband_metrics& metrics) override { metrics_entries.emplace_back(metrics); }
 
   const std::vector<lower_phy_timing_context>& get_half_slots() const { return half_slots; }
 
   const std::vector<lower_phy_timing_context>& get_full_slots() const { return full_slots; }
 
+  const std::vector<lower_phy_baseband_metrics>& get_metrics() const { return metrics_entries; }
+
   void clear_notifications()
   {
     half_slots.clear();
     full_slots.clear();
+    metrics_entries.clear();
   }
 
 private:
-  std::vector<lower_phy_timing_context> half_slots;
-  std::vector<lower_phy_timing_context> full_slots;
+  std::vector<lower_phy_timing_context>   half_slots;
+  std::vector<lower_phy_timing_context>   full_slots;
+  std::vector<lower_phy_baseband_metrics> metrics_entries;
 };
 
 class uplink_processor_baseband_spy : public uplink_processor_baseband

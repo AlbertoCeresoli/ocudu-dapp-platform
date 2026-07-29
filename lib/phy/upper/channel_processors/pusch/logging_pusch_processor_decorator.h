@@ -131,6 +131,8 @@ private:
 
     // Calculate the final time.
     std::chrono::nanoseconds time_ns = time_end - time_start;
+    const double             wall_us = std::chrono::duration<double, std::micro>(time_ns).count();
+    const double             uci_us  = std::chrono::duration<double, std::micro>(time_uci_ns).count();
 
     if (logger.debug.enabled()) {
       // Detailed log information, including a list of all PDU fields.
@@ -160,6 +162,38 @@ private:
                   time_ns,
                   time_uci_ns,
                   time_return_ns);
+    }
+
+    // PDSCH-style host phase breakdown (always collected on the resident path).
+    // chest/setup/demod/decode/join are steady_clock host stages; ldpc/wait/d2h only
+    // non-zero when OCUDU_PUSCH_ACCELERATION_TIMING enables CUDA event sub-phases.
+    if (results.sch.has_value() && results.sch->data.acceleration_pipeline_timing.valid) {
+      const auto& p = results.sch->data.acceleration_pipeline_timing;
+      logger.info(pdu.slot.sfn(),
+                  pdu.slot.slot_index(),
+                  "PUSCH phase rnti=0x{:x} tbs={} chest={:.1f}us setup={:.1f}us demod={:.1f}us "
+                  "grid={:.1f}us demsync={:.1f}us decode={:.1f}us wait={:.1f}us ldpc={:.1f}us "
+                  "rm={:.1f}us cfg={:.1f}us d2h={:.1f}us join={:.1f}us sinr={:.1f}us e2e={:.1f}us "
+                  "cbs={} wall={:.1f}us uci={:.1f}us",
+                  static_cast<unsigned>(pdu.rnti),
+                  data.size(),
+                  p.ch_estimate_us,
+                  p.process_data_setup_us,
+                  p.demod_call_us,
+                  p.grid_staging_us,
+                  p.demod_sync_us,
+                  p.decode_call_us,
+                  p.completion_wait_us,
+                  p.ldpc_decode_us,
+                  p.rate_dematch_us,
+                  p.decoder_config_us,
+                  p.d2h_transfer_us,
+                  p.join_notify_us,
+                  p.sinr_readback_us,
+                  p.total_e2e_us,
+                  p.nof_cbs,
+                  wall_us,
+                  uci_us);
     }
 
     // Exchanges the notifier before notifying the reception of SCH.

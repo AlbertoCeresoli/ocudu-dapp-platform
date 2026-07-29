@@ -10,6 +10,7 @@
 #include "ocudu/phy/upper/signal_processors/srs/srs_estimator.h"
 #include "ocudu/phy/upper/signal_processors/srs/srs_estimator_configuration_validator.h"
 #include <memory>
+#include <string>
 
 namespace ocudu {
 
@@ -34,7 +35,15 @@ public:
 std::shared_ptr<srs_estimator_factory>
 create_srs_estimator_generic_factory(std::shared_ptr<low_papr_sequence_generator_factory> sequence_generator_factory,
                                      std::shared_ptr<time_alignment_estimator_factory>    ta_estimator_factory,
-                                     unsigned                                             max_nof_prb);
+                                     unsigned                                             max_nof_prb,
+                                     std::string                                          acceleration_mode = "auto",
+                                     int                                                  nvcuda_device_id  = 0);
+
+/// Returns true if the accelerated SRS estimator can be instantiated.
+bool is_srs_estimator_acceleration_available();
+
+/// Resolves the configured SRS acceleration mode, including supported environment overrides.
+std::string resolve_srs_estimator_acceleration_mode(const std::string& configured_mode);
 
 /// Creates a Sounding Reference Signal propagation channel estimator pool.
 std::shared_ptr<srs_estimator_factory> create_srs_estimator_pool(std::shared_ptr<srs_estimator_factory> base_factory,

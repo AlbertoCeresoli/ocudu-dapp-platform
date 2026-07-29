@@ -130,10 +130,23 @@ private:
     {
       if (stats.sinr_dB.has_value()) {
         csi.set_sinr_dB(channel_state_information::sinr_type::post_equalization, *stats.sinr_dB);
+        csi.set_sinr_dB(channel_state_information::sinr_type::channel_estimator, *stats.sinr_dB);
       }
       if (stats.evm.has_value()) {
         csi.set_symbol_evm(i_symbol, *stats.evm);
         csi.set_sinr_dB(channel_state_information::sinr_type::evm, -20.0F * log10f(*stats.evm) - 3.7F);
+      }
+      if (stats.epre_dB.has_value()) {
+        csi.set_epre(*stats.epre_dB);
+      }
+      if (stats.rsrp_dB.has_value()) {
+        csi.set_rsrp_dB(*stats.rsrp_dB);
+      }
+      if (stats.time_alignment_s.has_value()) {
+        csi.set_time_alignment(phy_time_unit::from_seconds(static_cast<double>(*stats.time_alignment_s)));
+      }
+      if (stats.cfo_Hz.has_value()) {
+        csi.set_cfo(*stats.cfo_Hz);
       }
     }
 
@@ -142,10 +155,23 @@ private:
     {
       if (stats.sinr_dB.has_value()) {
         csi.set_sinr_dB(channel_state_information::sinr_type::post_equalization, *stats.sinr_dB);
+        csi.set_sinr_dB(channel_state_information::sinr_type::channel_estimator, *stats.sinr_dB);
       }
       if (stats.evm.has_value()) {
         csi.set_total_evm(*stats.evm);
         csi.set_sinr_dB(channel_state_information::sinr_type::evm, -20.0F * log10f(*stats.evm) - 3.7F);
+      }
+      if (stats.epre_dB.has_value()) {
+        csi.set_epre(*stats.epre_dB);
+      }
+      if (stats.rsrp_dB.has_value()) {
+        csi.set_rsrp_dB(*stats.rsrp_dB);
+      }
+      if (stats.time_alignment_s.has_value()) {
+        csi.set_time_alignment(phy_time_unit::from_seconds(static_cast<double>(*stats.time_alignment_s)));
+      }
+      if (stats.cfo_Hz.has_value()) {
+        csi.set_cfo(*stats.cfo_Hz);
       }
     }
 

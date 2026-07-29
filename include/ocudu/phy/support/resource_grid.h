@@ -22,6 +22,9 @@ public:
   /// Sets all resource elements in the grid to zero.
   virtual void set_all_zero() = 0;
 
+  /// Determines whether the resource grid is empty.
+  virtual bool is_empty() const = 0;
+
   /// Gets the resource grid writer.
   virtual resource_grid_writer& get_writer() = 0;
 

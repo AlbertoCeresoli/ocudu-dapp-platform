@@ -4,12 +4,82 @@
 #include "../../../../lib/ofh/receiver/ofh_uplane_rx_symbol_data_flow_writer.h"
 #include "helpers.h"
 #include "ocudu/ocudulog/ocudulog.h"
+#include "ocudu/ofh/serdes/ofh_message_decoder_properties.h"
+#include "ocudu/ofh/serdes/ofh_uplane_message_decoder.h"
 #include "ocudu/ofh/serdes/ofh_uplane_message_decoder_properties.h"
 #include <gtest/gtest.h>
 
 using namespace ocudu;
 using namespace ofh;
 using namespace ofh::testing;
+
+namespace {
+
+class resource_grid_device_writer_spy : public resource_grid_writer_bool_spy
+{
+public:
+  explicit resource_grid_device_writer_spy(unsigned nof_prbs) : resource_grid_writer_bool_spy(nof_prbs) {}
+
+  bool supports_device_grid_mapping() const override { return true; }
+
+  void* get_device_grid_bf16() override { return this; }
+
+  bool prepare_device_grid_mapping(void*) override
+  {
+    ++prepare_count;
+    return true;
+  }
+
+  bool on_device_grid_mapping_enqueued(void*) override
+  {
+    ++enqueue_count;
+    return true;
+  }
+
+  unsigned prepare_count = 0;
+  unsigned enqueue_count = 0;
+};
+
+class uplane_message_decoder_device_spy : public uplane_message_decoder
+{
+public:
+  bool decode(uplane_message_decoder_results& results, span<const uint8_t> message) override
+  {
+    (void)results;
+    (void)message;
+    return false;
+  }
+
+  bool decompress_to_resource_grid(resource_grid_writer&        grid,
+                                   unsigned                     port_,
+                                   unsigned                     symbol_,
+                                   unsigned                     start_prb_,
+                                   unsigned                     nof_prbs_,
+                                   const uplane_section_params& section_) override
+  {
+    (void)grid;
+    called    = true;
+    port      = port_;
+    symbol    = symbol_;
+    start_prb = start_prb_;
+    nof_prbs  = nof_prbs_;
+    section   = &section_;
+    if (success) {
+      success = grid.prepare_device_grid_mapping(nullptr) && grid.on_device_grid_mapping_enqueued(nullptr);
+    }
+    return success;
+  }
+
+  bool                         success   = true;
+  bool                         called    = false;
+  unsigned                     port      = 0;
+  unsigned                     symbol    = 0;
+  unsigned                     start_prb = 0;
+  unsigned                     nof_prbs  = 0;
+  const uplane_section_params* section   = nullptr;
+};
+
+} // namespace
 
 class ofh_uplane_rx_symbol_data_flow_writer_fixture : public ::testing::Test
 {
@@ -98,9 +168,13 @@ TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, decoded_prbs_match_grid_pr
   ASSERT_TRUE(rg_writer.has_grid_been_written());
   ASSERT_EQ(section.nof_prbs, rg_writer.get_nof_prbs_written());
 
-  const uplink_context& context  = repo->get(slot, symbol_id);
-  const auto&           sym_data = context.get_re_written_mask();
-  ASSERT_TRUE(std::all_of(sym_data.begin(), sym_data.end(), [](const auto& port) { return port.all(); }));
+  {
+    const uplink_context& context  = repo->get(slot, symbol_id);
+    const auto&           sym_data = context.get_re_written_mask();
+    ASSERT_TRUE(std::all_of(sym_data.begin(), sym_data.end(), [](const auto& port) { return port.all(); }));
+  }
+
+  repo->clear();
 }
 
 TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, decoded_prbs_bigger_than_grid_prbs_write)
@@ -201,4 +275,61 @@ TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, segmented_prbs_fill_the_gr
   const uplink_context& context  = repo->get(slot, symbol_id);
   const auto&           sym_data = context.get_re_written_mask();
   ASSERT_TRUE(std::all_of(sym_data.begin(), sym_data.end(), [](const auto& port) { return port.all(); }));
+}
+
+TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_write_through_device_grid_path)
+{
+  resource_grid_device_writer_spy   device_writer(nof_prb);
+  resource_grid_spy                 device_grid(rg_reader, device_writer);
+  shared_resource_grid_spy          device_shared_grid(device_grid);
+  std::array<uint8_t, 128>          compressed_payload = {};
+  uplane_message_decoder_device_spy decoder;
+
+  auto& section              = results.sections.back();
+  section.nof_prbs           = nof_prb;
+  section.start_prb          = 0;
+  section.compressed_iq_data = compressed_payload;
+
+  repo->add(
+      {results.params.slot, sector}, device_shared_grid.get_grid(), symbol_range, ocudulog::fetch_basic_logger("TEST"));
+  repo->process_pending_contexts();
+
+  bool direct_written  = writer.write_compressed_to_resource_grid(eaxc[0], results, decoder);
+  bool all_res_written = false;
+  {
+    const uplink_context& context  = repo->get(slot, symbol_id);
+    const auto&           sym_data = context.get_re_written_mask();
+    all_res_written = std::all_of(sym_data.begin(), sym_data.end(), [](const auto& port) { return port.all(); });
+  }
+  repo->clear();
+
+  ASSERT_TRUE(direct_written);
+  ASSERT_TRUE(decoder.called);
+  ASSERT_EQ(0, decoder.port);
+  ASSERT_EQ(symbol_id, decoder.symbol);
+  ASSERT_EQ(section.start_prb, decoder.start_prb);
+  ASSERT_EQ(section.nof_prbs, decoder.nof_prbs);
+  ASSERT_EQ(&section, decoder.section);
+  ASSERT_EQ(1, device_writer.prepare_count);
+  ASSERT_EQ(1, device_writer.enqueue_count);
+  ASSERT_FALSE(device_writer.has_grid_been_written());
+  ASSERT_TRUE(all_res_written);
+}
+
+TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_return_false_when_device_grid_unavailable)
+{
+  std::array<uint8_t, 128>          compressed_payload = {};
+  uplane_message_decoder_device_spy decoder;
+
+  auto& section              = results.sections.back();
+  section.nof_prbs           = nof_prb;
+  section.start_prb          = 0;
+  section.compressed_iq_data = compressed_payload;
+
+  repo->add({results.params.slot, sector}, shared_grid.get_grid(), symbol_range, ocudulog::fetch_basic_logger("TEST"));
+  repo->process_pending_contexts();
+
+  ASSERT_FALSE(writer.write_compressed_to_resource_grid(eaxc[0], results, decoder));
+  ASSERT_FALSE(decoder.called);
+  ASSERT_FALSE(rg_writer.has_grid_been_written());
 }

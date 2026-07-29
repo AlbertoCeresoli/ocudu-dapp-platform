@@ -261,6 +261,69 @@ static void configure_cli11_expert_phy_args(CLI::App& app, du_low_unit_expert_up
              expert_phy_params.phy_tap_arguments,
              "PHY tap plugin argument string passed during construction.")
       ->capture_default_str();
+
+  auto acceleration_mode_check = [](const std::string& value) -> std::string {
+    if ((value == "auto") || (value == "enabled") || (value == "disabled")) {
+      return {};
+    }
+    return "Invalid acceleration mode. Accepted values [auto,enabled,disabled]";
+  };
+  add_option(app,
+             "--pusch_acceleration_mode",
+             expert_phy_params.pusch_acceleration_mode,
+             "Acceleration mode for PUSCH: auto (enable if available), enabled (require), disabled (CPU only).")
+      ->capture_default_str()
+      ->check(acceleration_mode_check);
+  add_option(app,
+             "--srs_acceleration_mode",
+             expert_phy_params.srs_acceleration_mode,
+             "Acceleration mode for SRS channel estimation: auto (enable if available), enabled (require), disabled "
+             "(CPU only).")
+      ->capture_default_str()
+      ->check(acceleration_mode_check);
+  add_option(
+      app,
+      "--pdsch_acceleration_mode",
+      expert_phy_params.pdsch_acceleration_mode,
+      "Acceleration mode for PDSCH: auto (enable if available and PDSCH processor type is auto or flexible), enabled "
+      "(require acceleration and PDSCH processor type auto or flexible), disabled (CPU only or configured hardware "
+      "encoder path).")
+      ->capture_default_str()
+      ->check(acceleration_mode_check);
+  add_option(
+      app,
+      "--prach_acceleration_mode",
+      expert_phy_params.prach_acceleration_mode,
+      "Acceleration mode for PRACH detection: auto (enable if available), enabled (require), disabled (CPU only).")
+      ->capture_default_str()
+      ->check(acceleration_mode_check);
+  add_option(app,
+             "--pdsch_acceleration_nof_lanes",
+             expert_phy_params.pdsch_acceleration_nof_lanes,
+             "Number of concurrent PDSCH acceleration lanes. Set to zero for the default policy.")
+      ->capture_default_str()
+      ->check(CLI::Number);
+
+  auto ldpc_algorithm_check = [](const std::string& value) -> std::string {
+    if ((value == "auto") || (value == "boxplus") || (value == "min_sum")) {
+      return {};
+    }
+    return "Invalid LDPC decoder algorithm. Accepted values [auto,boxplus,min_sum]";
+  };
+  add_option(app,
+             "--ldpc_decoder_algorithm",
+             expert_phy_params.ldpc_decoder_algorithm,
+             "Accelerated LDPC decoder algorithm: auto (adaptive), boxplus, min_sum.")
+      ->capture_default_str()
+      ->check(ldpc_algorithm_check);
+
+  // Optional support of NVIDIA CUDA
+  add_option(app,
+             "--nvcuda_device_id",
+             expert_phy_params.nvcuda_device_id,
+             "NVIDIA CUDA device ID used by all accelerated upper-PHY components.")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
 }
 
 #ifdef DPDK_FOUND

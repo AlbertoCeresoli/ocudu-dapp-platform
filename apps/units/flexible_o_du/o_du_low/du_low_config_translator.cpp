@@ -12,8 +12,30 @@
 #include "ocudu/ran/pusch/pusch_constants.h"
 #include "ocudu/support/cpu_architecture_info.h"
 #include <cmath>
+#include <cstdlib>
+#include <limits>
 
 using namespace ocudu;
+
+namespace {
+
+static unsigned get_env_unsigned(const char* env_name, unsigned default_value)
+{
+  const char* value = std::getenv(env_name);
+  if ((value == nullptr) || (value[0] == '\0')) {
+    return default_value;
+  }
+
+  char*         end    = nullptr;
+  unsigned long parsed = std::strtoul(value, &end, 10);
+  if ((end == value) || (*end != '\0') || (parsed > std::numeric_limits<unsigned>::max())) {
+    return default_value;
+  }
+
+  return static_cast<unsigned>(parsed);
+}
+
+} // namespace
 
 static odu::du_low_config generate_du_low_config(const du_low_unit_config&                       du_low,
                                                  span<const o_du_low_unit_config::du_low_config> cells)
@@ -56,11 +78,22 @@ static odu::du_low_config generate_du_low_config(const du_low_unit_config&      
   upper_phy_factory_config.ldpc_decoder_iterations           = du_low.expert_phy_cfg.pusch_decoder_max_iterations;
   upper_phy_factory_config.ldpc_decoder_early_stop           = du_low.expert_phy_cfg.pusch_decoder_early_stop;
   upper_phy_factory_config.ldpc_decoder_force_decoding       = du_low.expert_phy_cfg.pusch_decoder_force_decoding;
+  upper_phy_factory_config.pusch_acceleration_mode           = du_low.expert_phy_cfg.pusch_acceleration_mode;
+  upper_phy_factory_config.srs_acceleration_mode             = du_low.expert_phy_cfg.srs_acceleration_mode;
+  upper_phy_factory_config.pdsch_acceleration_mode           = du_low.expert_phy_cfg.pdsch_acceleration_mode;
+  upper_phy_factory_config.prach_acceleration_mode           = du_low.expert_phy_cfg.prach_acceleration_mode;
+  upper_phy_factory_config.pdsch_acceleration_nof_lanes      = du_low.expert_phy_cfg.pdsch_acceleration_nof_lanes;
+  upper_phy_factory_config.ldpc_decoder_algorithm            = du_low.expert_phy_cfg.ldpc_decoder_algorithm;
   upper_phy_factory_config.nof_rx_ports                      = max_nof_rx_antennas;
   upper_phy_factory_config.ul_bw_rb                          = max_ul_bw_rb;
   upper_phy_factory_config.pusch_max_nof_layers              = pusch_max_nof_layers;
   upper_phy_factory_config.enable_metrics                    = du_low.metrics_cfg.enable_du_low;
   upper_phy_factory_config.ldpc_decoder_type                 = "auto";
+
+#ifdef ENABLE_CUDA
+  upper_phy_factory_config.nvcuda_device_id = du_low.expert_phy_cfg.nvcuda_device_id;
+#endif
+
   if (du_low.expert_phy_cfg.enable_phy_tap) {
     upper_phy_factory_config.phy_tap_arguments = du_low.expert_phy_cfg.phy_tap_arguments;
     if (cells[0].tdd_pattern) {
@@ -172,7 +205,7 @@ static odu::du_low_config generate_du_low_config(const du_low_unit_config&      
 
     upper_phy_cell.nof_tx_ports               = cell.nof_tx_antennas;
     upper_phy_cell.nof_rx_ports               = cell.nof_rx_antennas;
-    upper_phy_cell.nof_dl_rg                  = dl_pipeline_depth + 2;
+    upper_phy_cell.nof_dl_rg                  = dl_pipeline_depth + 2 + get_env_unsigned("OCUDU_DU_LOW_EXTRA_DL_RG", 0);
     upper_phy_cell.nof_ul_rg                  = ul_pipeline_depth;
     upper_phy_cell.nof_prach_buffer           = du_low.expert_phy_cfg.max_processing_delay_slots + 2;
     upper_phy_cell.max_nof_td_prach_occasions = prach_cfg.nof_occasions_within_slot;

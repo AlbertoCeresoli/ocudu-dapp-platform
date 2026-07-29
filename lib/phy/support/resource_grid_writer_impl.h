@@ -54,6 +54,17 @@ public:
   // See interface for documentation.
   span<cbf16_t> get_view(unsigned port, unsigned l) override;
 
+  /// \brief Marks every OFDM symbol of a port as fully allocated.
+  ///
+  /// Used when the resource grid contents for a port are written outside this writer, for instance by a device-side
+  /// grid mapping, so that the allocation information reflects that the port is no longer empty.
+  void mark_port_allocated(unsigned i_port)
+  {
+    for (unsigned i_symbol = 0, nof_symbols = get_nof_symbols(); i_symbol != nof_symbols; ++i_symbol) {
+      alloc_mask.update_crb_range(i_port, i_symbol);
+    }
+  }
+
 private:
   storage_type&                  data;
   resource_grid_allocation_info& alloc_mask;
