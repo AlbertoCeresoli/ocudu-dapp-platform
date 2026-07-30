@@ -528,6 +528,54 @@ smoke rtsan:
     TEST_MODE: rtsan
     MARCH: x86-64-v3
 
+# CUDA jobs run on a project-provided shell runner so the test binary sees the host GPU and driver. Define
+# OCUDU_CUDA_RUNNER_TAG and OCUDU_CUDA_ARCHITECTURES (for example, 121 on GB10) to enable this gate.
+cuda pdsch issue 1 regression:
+  stage: extended
+  tags:
+    - ${OCUDU_CUDA_RUNNER_TAG}
+  rules:
+    - if: '$OCUDU_CUDA_RUNNER_TAG && $OCUDU_CUDA_ARCHITECTURES && $ON_MR'
+      changes:
+        paths:
+          - .gitlab/ci/build.yml
+          - CMakeLists.txt
+          - cmake/**/*
+          - lib/phy/cuda/**/*
+          - lib/phy/upper/channel_coding/ldpc/cuda/**/*
+          - lib/phy/upper/channel_processors/pdsch/**/*
+          - lib/phy/upper/resource_grid_cuda_visible*
+          - tests/integrationtests/phy/upper/channel_processors/**/*
+    - if: '$OCUDU_CUDA_RUNNER_TAG && $OCUDU_CUDA_ARCHITECTURES && $CI_PIPELINE_SCHEDULE_DESCRIPTION =~ /CUDA/'
+    - if: '$OCUDU_CUDA_RUNNER_TAG && $OCUDU_CUDA_ARCHITECTURES && $ON_WEB'
+      when: manual
+  variables:
+    CUDA_PDSCH_BUILD_DIR: build-cuda-pdsch-ci
+  script:
+    - nvidia-smi
+    - nvcc --version
+    - |
+      cmake -S . -B "${CUDA_PDSCH_BUILD_DIR}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DENABLE_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${OCUDU_CUDA_ARCHITECTURES}" \
+        -DBUILD_TESTING=ON
+    - cmake --build "${CUDA_PDSCH_BUILD_DIR}" --target pdsch_gpu_e2e_test -j"$(nproc)"
+    - |
+      ctest --test-dir "${CUDA_PDSCH_BUILD_DIR}" \
+        --output-on-failure \
+        --output-junit cuda-pdsch-issue-1.xml \
+        -j1 \
+        -R '^pdsch_gpu_issue_1_regression$'
+  artifacts:
+    when: always
+    reports:
+      junit: ${CUDA_PDSCH_BUILD_DIR}/cuda-pdsch-issue-1.xml
+    paths:
+      - ${CUDA_PDSCH_BUILD_DIR}/cuda-pdsch-issue-1.xml
+      - ${CUDA_PDSCH_BUILD_DIR}/Testing/Temporary/LastTest.log
+    expire_in: 5 days
+
 # Packaging
 
 package:

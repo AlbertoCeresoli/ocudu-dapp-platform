@@ -273,6 +273,17 @@ public:
       return;
     }
 
+    // Track when the asynchronous H2D transfer has stopped reading the reusable pinned TB staging buffers.
+    err = cudaEventCreateWithFlags(&tb_input_copied_event_, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+      cudaEventDestroy(completion_event_);
+      completion_event_ = nullptr;
+      cudaStreamDestroy(stream_);
+      cuDevicePrimaryCtxRelease(device_);
+      gpu_available_ = false;
+      return;
+    }
+
     const char* timing_env = std::getenv("OCUDU_PDSCH_TIMING");
     timing_enabled_        = timing_env && (std::strcmp(timing_env, "0") != 0);
     if (timing_enabled_) {
@@ -641,6 +652,9 @@ public:
     if (tb_bytes_count > MAX_TB_BYTES) {
       return 0;
     }
+    if (!wait_for_tb_input_staging()) {
+      return 0;
+    }
     if (timing_enabled_) {
       cudaEventRecord(timing_start_event_, stream_);
     }
@@ -715,12 +729,18 @@ public:
       return 0;
     }
 
+    if (!wait_for_tb_input_staging()) {
+      return 0;
+    }
     if (timing_enabled_) {
       cudaEventRecord(timing_start_event_, stream_);
     }
     std::memcpy(h_tb_input_pinned_, tb_bytes.data(), tb_bytes_count);
     if (cudaMemcpyAsync(d_tb_input_, h_tb_input_pinned_, tb_bytes_count, cudaMemcpyHostToDevice, stream_) !=
         cudaSuccess) {
+      return 0;
+    }
+    if (!record_tb_input_copied()) {
       return 0;
     }
     if (timing_enabled_) {
@@ -835,6 +855,39 @@ public:
   void set_defer_symbol_download(bool defer) override { defer_symbol_download_ = defer; }
 
 private:
+  bool wait_for_tb_input_staging()
+  {
+    if (!tb_input_copy_pending_) {
+      return true;
+    }
+    if (cudaEventSynchronizeYielding(tb_input_copied_event_) != cudaSuccess) {
+      return false;
+    }
+    tb_input_copy_pending_ = false;
+    return true;
+  }
+
+  bool record_tb_input_copied()
+  {
+    if (cudaEventRecord(tb_input_copied_event_, stream_) != cudaSuccess) {
+      return false;
+    }
+    tb_input_copy_pending_ = true;
+    return true;
+  }
+
+  void record_tb_input_copied_after_graph()
+  {
+    // Event nodes are not reliable in the opt-in full-encode graph on all CUDA versions. Recording after the graph
+    // preserves staging-buffer correctness for that experimental path, at the cost of waiting for the whole graph
+    // before the next submission can overwrite the pinned input. The default non-graph path records immediately after
+    // H2D and retains encode overlap.
+    if (!record_tb_input_copied()) {
+      (void)cudaStreamSynchronizeYielding(stream_);
+      tb_input_copy_pending_ = false;
+    }
+  }
+
   static bool are_encode_graph_keys_equal(const encode_graph_key& left, const encode_graph_key& right)
   {
     return (left.cfg == right.cfg) && (left.tb_encoder == right.tb_encoder) &&
@@ -915,6 +968,7 @@ private:
     }
     if (cudaGraphLaunch(entry->exec, key.stream) == cudaSuccess) {
       entry->use_counter = ++encode_graph_use_counter_;
+      record_tb_input_copied_after_graph();
       return true;
     }
 
@@ -949,7 +1003,8 @@ private:
   nr_ldpc_status_t enqueue_encode_to_symbols_int8(tb_encoder_handle_t tb_encoder,
                                                   unsigned            tb_bytes_count,
                                                   bool                use_host_tb_crc,
-                                                  bool                record_h2d_event)
+                                                  bool                record_h2d_event,
+                                                  bool                track_tb_input_copy = true)
   {
     if (cudaMemcpyAsync(d_tb_input_, h_tb_input_pinned_, tb_bytes_count, cudaMemcpyHostToDevice, stream_) !=
         cudaSuccess) {
@@ -958,6 +1013,9 @@ private:
     if (use_host_tb_crc &&
         (cudaMemcpyAsync(d_tb_crc_, h_tb_crc_pinned_, sizeof(uint32_t), cudaMemcpyHostToDevice, stream_) !=
          cudaSuccess)) {
+      return NR_LDPC_ERROR_CUDA_FAILED;
+    }
+    if (track_tb_input_copy && !record_tb_input_copied()) {
       return NR_LDPC_ERROR_CUDA_FAILED;
     }
     if (record_h2d_event) {
@@ -978,7 +1036,7 @@ private:
     }
 
     nr_ldpc_status_t capture_status =
-        enqueue_encode_to_symbols_int8(key.tb_encoder, key.tb_bytes_count, key.host_tb_crc, false);
+        enqueue_encode_to_symbols_int8(key.tb_encoder, key.tb_bytes_count, key.host_tb_crc, false, false);
 
     cudaGraph_t captured_graph = nullptr;
     cudaError_t end_status     = cudaStreamEndCapture(key.stream, &captured_graph);
@@ -1009,6 +1067,7 @@ private:
       pending_encode_graph_key_valid_   = false;
 
       if (cudaGraphLaunch(entry->exec, key.stream) == cudaSuccess) {
+        record_tb_input_copied_after_graph();
         return NR_LDPC_SUCCESS;
       }
 
@@ -1220,6 +1279,10 @@ private:
       cudaEventDestroy(completion_event_);
       completion_event_ = nullptr;
     }
+    if (tb_input_copied_event_) {
+      cudaEventDestroy(tb_input_copied_event_);
+      tb_input_copied_event_ = nullptr;
+    }
     if (timing_start_event_) {
       cudaEventDestroy(timing_start_event_);
       timing_start_event_ = nullptr;
@@ -1254,6 +1317,7 @@ private:
   CUcontext    context_             = nullptr;
   cudaStream_t stream_              = nullptr;
   cudaEvent_t  completion_event_    = nullptr; // Event for async completion tracking
+  cudaEvent_t  tb_input_copied_event_ = nullptr;
   cudaEvent_t  timing_start_event_  = nullptr;
   cudaEvent_t  timing_h2d_event_    = nullptr;
   cudaEvent_t  timing_encode_event_ = nullptr;
@@ -1292,6 +1356,7 @@ private:
   bool         defer_symbol_download_  = false;
   bool         timing_enabled_         = false;
   bool         timing_report_pending_  = false;
+  bool         tb_input_copy_pending_  = false;
   unsigned     pending_timing_nof_cbs_ = 0;
   timing_stats last_timing_stats_;
 

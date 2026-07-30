@@ -5,6 +5,9 @@
 /// \file
 /// \brief GPU vs CPU PDSCH end-to-end resource-grid comparison test.
 
+#include "ocudu/ocudulog/ocudulog.h"
+#include "ocudu/ofh/compression/compression_factory.h"
+#include "ocudu/ofh/compression/compression_properties.h"
 #include "ocudu/phy/antenna_ports.h"
 #include "ocudu/phy/support/resource_grid.h"
 #include "ocudu/phy/support/resource_grid_reader.h"
@@ -37,6 +40,7 @@
 #ifdef ENABLE_CUDA
 #include "cuda/pdsch_device_grid_writer_cuda.h"
 #include "cuda/pdsch_resource_grid_mapper_cuda.h"
+#include "resource_grid_cuda_visible_impl.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -56,20 +60,23 @@ static constexpr float              grid_tolerance        = 1e-3F;
 enum class dmrs_profile : uint8_t { single_symbol, double_symbol, triple_symbol };
 
 struct pdsch_gpu_e2e_params {
-  pdsch_mcs_table  mcs_table;
-  sch_mcs_index    mcs_index;
-  unsigned         nof_prb;
-  unsigned         nof_layers;
-  unsigned         rv;
-  dmrs_profile     dmrs_symbols;
-  unsigned         nof_cdm_groups_without_data;
-  unsigned         nof_ports     = 0;
-  dmrs_config_type dmrs_cfg_type = dmrs_config_type::type1;
-  uint16_t         rnti          = default_rnti;
-  unsigned         n_id          = default_n_id;
-  unsigned         scrambling_id = default_scrambling_id;
-  bool             n_scid        = default_n_scid;
-  unsigned         slot_index    = default_slot_index;
+  pdsch_mcs_table    mcs_table;
+  sch_mcs_index      mcs_index;
+  unsigned           nof_prb;
+  unsigned           nof_layers;
+  unsigned           rv;
+  dmrs_profile       dmrs_symbols;
+  unsigned           nof_cdm_groups_without_data;
+  unsigned           nof_ports     = 0;
+  dmrs_config_type   dmrs_cfg_type = dmrs_config_type::type1;
+  uint16_t           rnti          = default_rnti;
+  unsigned           n_id          = default_n_id;
+  unsigned           scrambling_id = default_scrambling_id;
+  bool               n_scid        = default_n_scid;
+  unsigned           slot_index    = default_slot_index;
+  unsigned           start_symbol  = 0;
+  unsigned           nof_symbols   = nof_ofdm_symbols;
+  subcarrier_spacing pdu_scs       = scs;
 };
 
 namespace ocudu {
@@ -135,7 +142,8 @@ std::string format_params(const pdsch_gpu_e2e_params& params)
      << ",ports" << nof_ports << ",rv" << params.rv << "," << dmrs_profile_name(params.dmrs_symbols) << ","
      << dmrs_type_name(params.dmrs_cfg_type) << ",cdm" << params.nof_cdm_groups_without_data << ",rnti0x" << std::hex
      << params.rnti << std::dec << ",nid" << params.n_id << ",scrambling" << params.scrambling_id << ",nscid"
-     << params.n_scid << ",slot" << params.slot_index;
+     << params.n_scid << ",slot" << params.slot_index << ",symbols" << params.start_symbol << ":"
+     << params.start_symbol + params.nof_symbols << ",mu" << to_numerology_value(params.pdu_scs);
   return ss.str();
 }
 
@@ -217,13 +225,14 @@ unsigned calculate_tbs(const sch_mcs_description& mcs_descr,
                        unsigned                   nof_layers,
                        dmrs_config_type           dmrs_cfg_type,
                        const symbol_slot_mask&    dmrs_symbol_mask,
-                       unsigned                   nof_cdm_groups_without_data)
+                       unsigned                   nof_cdm_groups_without_data,
+                       unsigned                   nof_symbols = nof_ofdm_symbols)
 {
   tbs_calculator_configuration tbs_config = {};
   tbs_config.mcs_descr                    = mcs_descr;
   tbs_config.n_prb                        = nof_prb;
   tbs_config.nof_layers                   = nof_layers;
-  tbs_config.nof_symb_sh                  = nof_ofdm_symbols;
+  tbs_config.nof_symb_sh                  = nof_symbols;
   tbs_config.nof_dmrs_prb = get_nof_re_per_prb(dmrs_cfg_type) * dmrs_symbol_mask.count() * nof_cdm_groups_without_data;
   return tbs_calculator_calculate(tbs_config).to_bits().value();
 }
@@ -241,11 +250,14 @@ pdsch_processor::pdu_t build_pdsch_pdu(const sch_mcs_description& mcs_descr,
                                        unsigned                   n_id          = default_n_id,
                                        unsigned                   scrambling_id = default_scrambling_id,
                                        bool                       n_scid        = default_n_scid,
-                                       unsigned                   slot_index    = default_slot_index)
+                                       unsigned                   slot_index    = default_slot_index,
+                                       unsigned                   start_symbol  = 0,
+                                       unsigned                   nof_symbols   = nof_ofdm_symbols,
+                                       subcarrier_spacing         pdu_scs       = scs)
 {
   pdsch_processor::pdu_t pdu;
   pdu.context                     = std::nullopt;
-  pdu.slot                        = slot_point(to_numerology_value(scs), slot_index);
+  pdu.slot                        = slot_point(to_numerology_value(pdu_scs), slot_index);
   pdu.rnti                        = to_rnti(rnti);
   pdu.bwp_size_rb                 = nof_prb;
   pdu.bwp_start_rb                = bwp_start_rb;
@@ -258,8 +270,8 @@ pdsch_processor::pdu_t build_pdsch_pdu(const sch_mcs_description& mcs_descr,
   pdu.n_scid                      = n_scid;
   pdu.nof_cdm_groups_without_data = nof_cdm_groups_without_data;
   pdu.freq_alloc                  = rb_allocation::make_type1(bwp_start_rb, nof_prb, std::nullopt);
-  pdu.start_symbol_index          = 0;
-  pdu.nof_symbols                 = nof_ofdm_symbols;
+  pdu.start_symbol_index          = start_symbol;
+  pdu.nof_symbols                 = nof_symbols;
   pdu.tbs_lbrm                    = tbs_lbrm_default;
   pdu.reserved                    = {};
   pdu.ptrs                        = std::nullopt;
@@ -568,7 +580,8 @@ TEST_P(PdschGpuE2eFixture, CpuAndGpuResourceGridsMatch)
                                params.nof_layers,
                                params.dmrs_cfg_type,
                                dmrs_symbol_mask,
-                               params.nof_cdm_groups_without_data);
+                               params.nof_cdm_groups_without_data,
+                               params.nof_symbols);
   ASSERT_EQ(tbs % 8, 0U);
 
   pdsch_processor::pdu_t pdu = build_pdsch_pdu(mcs_descr,
@@ -584,7 +597,10 @@ TEST_P(PdschGpuE2eFixture, CpuAndGpuResourceGridsMatch)
                                                params.n_id,
                                                params.scrambling_id,
                                                params.n_scid,
-                                               params.slot_index);
+                                               params.slot_index,
+                                               params.start_symbol,
+                                               params.nof_symbols,
+                                               params.pdu_scs);
 
   std::vector<uint8_t> tx_data(tbs / 8);
   unsigned             seed = 0x5eed1234U + params.nof_prb * 17U + params.mcs_index.value() * 101U;
@@ -621,6 +637,219 @@ TEST_P(PdschGpuE2eFixture, CpuAndGpuResourceGridsMatch)
 }
 
 #ifdef ENABLE_CUDA
+TEST(PdschGpuIssueProfile, ManagedGridMatchesHostAcrossHarqRvsAndRepeatedSlots)
+{
+  if (!is_pdsch_block_processor_acceleration_available()) {
+    GTEST_SKIP() << "CUDA PDSCH GPU block processor is not available in this build/runtime.";
+  }
+
+  env_var_guard grid_mode("OCUDU_DL_CUDA_VISIBLE_GRID");
+  ASSERT_EQ(setenv("OCUDU_DL_CUDA_VISIBLE_GRID", "managed", 1), 0);
+
+  inline_task_executor executor;
+  auto                 cpu_proc_factory = create_test_pdsch_processor_factory(
+      create_cpu_pdsch_block_processor_factory(), executor, std::numeric_limits<unsigned>::max());
+  auto gpu_proc_factory = create_test_pdsch_processor_factory(
+      create_pdsch_block_processor_factory_accelerated(), executor, std::numeric_limits<unsigned>::max());
+  ASSERT_NE(cpu_proc_factory, nullptr);
+  ASSERT_NE(gpu_proc_factory, nullptr);
+
+  std::unique_ptr<pdsch_processor> cpu_proc = cpu_proc_factory->create();
+  std::unique_ptr<pdsch_processor> gpu_proc = gpu_proc_factory->create();
+  ASSERT_NE(cpu_proc, nullptr);
+  ASSERT_NE(gpu_proc, nullptr);
+
+  constexpr unsigned nof_prb         = 106;
+  constexpr unsigned nof_layers      = 4;
+  constexpr unsigned nof_ports       = 4;
+  constexpr unsigned nof_subc        = nof_prb * NOF_SUBCARRIERS_PER_RB;
+  constexpr unsigned start_symbol    = 2;
+  constexpr unsigned nof_symbols     = 12;
+  constexpr unsigned nof_repetitions = 8;
+
+  symbol_slot_mask    dmrs_symbol_mask = make_dmrs_symbol_mask(dmrs_profile::triple_symbol);
+  sch_mcs_description mcs_descr        = pdsch_mcs_get_config(pdsch_mcs_table::qam256, sch_mcs_index(26));
+  unsigned            tbs =
+      calculate_tbs(mcs_descr, nof_prb, nof_layers, dmrs_config_type::type1, dmrs_symbol_mask, 2, nof_symbols);
+  ASSERT_EQ(tbs % 8, 0U);
+
+  std::shared_ptr<resource_grid_factory> host_grid_factory = create_resource_grid_factory();
+  resource_grid_cuda_visible_factory     managed_grid_factory(resource_grid_cuda_visible_factory::direction::downlink);
+  std::unique_ptr<resource_grid>         cpu_grid = host_grid_factory->create(nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
+  std::unique_ptr<resource_grid> gpu_grid = managed_grid_factory.create(nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
+  ASSERT_NE(cpu_grid, nullptr);
+  ASSERT_NE(gpu_grid, nullptr);
+  ASSERT_TRUE(gpu_grid->get_writer().supports_device_grid_mapping());
+  ASSERT_TRUE(gpu_grid->get_writer().device_grid_mapping_aliases_host_grid());
+  ASSERT_TRUE(gpu_grid->get_reader().supports_device_grid_reading());
+
+  constexpr float            issue_iq_scaling = 0.25118864F;
+  ofh::ru_compression_params compression_params{ofh::compression_type::BFP, 9};
+  unsigned                compressed_symbol_bytes = nof_prb * ofh::get_compressed_prb_size(compression_params).value();
+  ocudulog::basic_logger& logger                  = ocudulog::fetch_basic_logger("TEST", false);
+  std::unique_ptr<ofh::iq_compressor> cpu_compressor =
+      ofh::create_iq_compressor(ofh::compression_type::BFP, logger, issue_iq_scaling, "generic");
+  std::unique_ptr<ofh::iq_compressor> gpu_compressor =
+      ofh::create_iq_compressor(ofh::compression_type::BFP, logger, issue_iq_scaling, "cuda");
+  ASSERT_NE(cpu_compressor, nullptr);
+  ASSERT_NE(gpu_compressor, nullptr);
+
+  for (unsigned i_tx = 0; i_tx != nof_repetitions; ++i_tx) {
+    SCOPED_TRACE("transmission=" + std::to_string(i_tx));
+
+    cpu_grid->set_all_zero();
+    gpu_grid->set_all_zero();
+
+    unsigned               rv  = std::array<unsigned, 4>{0, 2, 3, 1}[i_tx % 4];
+    pdsch_processor::pdu_t pdu = build_pdsch_pdu(mcs_descr,
+                                                 nof_prb,
+                                                 nof_layers,
+                                                 nof_ports,
+                                                 rv,
+                                                 dmrs_config_type::type1,
+                                                 dmrs_symbol_mask,
+                                                 2,
+                                                 tbs,
+                                                 0x4601,
+                                                 10,
+                                                 10,
+                                                 false,
+                                                 i_tx,
+                                                 start_symbol,
+                                                 nof_symbols,
+                                                 subcarrier_spacing::kHz15);
+
+    std::vector<uint8_t> tx_data(tbs / 8);
+    std::mt19937         rgen(0x1f1f0000U + i_tx);
+    std::generate(tx_data.begin(), tx_data.end(), [&rgen]() { return static_cast<uint8_t>(rgen() & 0xff); });
+
+    pdsch_processor_notifier_adaptor cpu_notifier;
+    pdsch_processor_notifier_adaptor gpu_notifier;
+    cpu_proc->process(cpu_grid->get_writer(), cpu_notifier, {shared_transport_block(tx_data)}, pdu);
+    gpu_proc->process(gpu_grid->get_writer(), gpu_notifier, {shared_transport_block(tx_data)}, pdu);
+    cpu_notifier.wait_for_completion();
+    gpu_notifier.wait_for_completion();
+
+    grid_diff_stats diff = compare_resource_grids(cpu_grid->get_reader(), gpu_grid->get_reader());
+    ASSERT_EQ(diff.nof_mismatches, 0U) << "max_abs_error=" << diff.max_abs_error << " at port=" << diff.port
+                                       << " symbol=" << diff.symbol << " subcarrier=" << diff.subcarrier
+                                       << " cpu=" << diff.cpu_value << " gpu=" << diff.gpu_value;
+
+    // Mirror the split-7.2 handoff from the completed CUDA-visible DL grid into 9-bit BFP OFH payloads.
+    for (unsigned symbol = 0; symbol != MAX_NSYMB_PER_SLOT; ++symbol) {
+      for (unsigned port = 0; port != nof_ports; ++port) {
+        SCOPED_TRACE("symbol=" + std::to_string(symbol) + " port=" + std::to_string(port));
+        std::vector<uint8_t> cpu_compressed(compressed_symbol_bytes);
+        std::vector<uint8_t> gpu_compressed(compressed_symbol_bytes);
+        cpu_compressor->compress(cpu_compressed, cpu_grid->get_reader().get_view(port, symbol), compression_params);
+        ASSERT_TRUE(gpu_compressor->compress_device_symbol(
+            gpu_compressed, gpu_grid->get_reader(), port, symbol, 0, nof_prb, compression_params));
+        ASSERT_EQ(cpu_compressed, gpu_compressed);
+      }
+    }
+  }
+}
+
+TEST(PdschGpuIssueProfile, BackToBackManagedGridSubmissionsPreserveEveryTransportBlock)
+{
+  if (!is_pdsch_block_processor_acceleration_available()) {
+    GTEST_SKIP() << "CUDA PDSCH GPU block processor is not available in this build/runtime.";
+  }
+
+  env_var_guard grid_mode("OCUDU_DL_CUDA_VISIBLE_GRID");
+  ASSERT_EQ(setenv("OCUDU_DL_CUDA_VISIBLE_GRID", "managed", 1), 0);
+
+  inline_task_executor executor;
+  auto                 cpu_proc_factory = create_test_pdsch_processor_factory(
+      create_cpu_pdsch_block_processor_factory(), executor, std::numeric_limits<unsigned>::max());
+  auto gpu_proc_factory = create_test_pdsch_processor_factory(
+      create_pdsch_block_processor_factory_accelerated(), executor, std::numeric_limits<unsigned>::max());
+  ASSERT_NE(cpu_proc_factory, nullptr);
+  ASSERT_NE(gpu_proc_factory, nullptr);
+
+  std::unique_ptr<pdsch_processor> cpu_proc = cpu_proc_factory->create();
+  std::unique_ptr<pdsch_processor> gpu_proc = gpu_proc_factory->create();
+  ASSERT_NE(cpu_proc, nullptr);
+  ASSERT_NE(gpu_proc, nullptr);
+
+  constexpr unsigned nof_prb           = 106;
+  constexpr unsigned nof_layers        = 4;
+  constexpr unsigned nof_ports         = 4;
+  constexpr unsigned nof_subc          = nof_prb * NOF_SUBCARRIERS_PER_RB;
+  constexpr unsigned start_symbol      = 2;
+  constexpr unsigned nof_symbols       = 12;
+  constexpr unsigned nof_transmissions = 12;
+
+  symbol_slot_mask    dmrs_symbol_mask = make_dmrs_symbol_mask(dmrs_profile::triple_symbol);
+  sch_mcs_description mcs_descr        = pdsch_mcs_get_config(pdsch_mcs_table::qam256, sch_mcs_index(26));
+  unsigned            tbs =
+      calculate_tbs(mcs_descr, nof_prb, nof_layers, dmrs_config_type::type1, dmrs_symbol_mask, 2, nof_symbols);
+  ASSERT_EQ(tbs % 8, 0U);
+
+  std::shared_ptr<resource_grid_factory> host_grid_factory = create_resource_grid_factory();
+  resource_grid_cuda_visible_factory     managed_grid_factory(resource_grid_cuda_visible_factory::direction::downlink);
+  std::vector<std::unique_ptr<resource_grid>> cpu_grids;
+  std::vector<std::unique_ptr<resource_grid>> gpu_grids;
+  std::vector<std::vector<uint8_t>>           tx_data;
+  std::vector<pdsch_processor::pdu_t>         pdus;
+  cpu_grids.reserve(nof_transmissions);
+  gpu_grids.reserve(nof_transmissions);
+  tx_data.reserve(nof_transmissions);
+  pdus.reserve(nof_transmissions);
+
+  // Build all reference grids first. This lets the CUDA submissions below run back-to-back without CPU encoding
+  // between them, matching a reused acceleration lane with multiple slots already queued on its stream.
+  for (unsigned i_tx = 0; i_tx != nof_transmissions; ++i_tx) {
+    cpu_grids.push_back(host_grid_factory->create(nof_ports, MAX_NSYMB_PER_SLOT, nof_subc));
+    gpu_grids.push_back(managed_grid_factory.create(nof_ports, MAX_NSYMB_PER_SLOT, nof_subc));
+    ASSERT_NE(cpu_grids.back(), nullptr);
+    ASSERT_NE(gpu_grids.back(), nullptr);
+
+    pdus.push_back(build_pdsch_pdu(mcs_descr,
+                                   nof_prb,
+                                   nof_layers,
+                                   nof_ports,
+                                   0,
+                                   dmrs_config_type::type1,
+                                   dmrs_symbol_mask,
+                                   2,
+                                   tbs,
+                                   0x4601,
+                                   10,
+                                   10,
+                                   false,
+                                   i_tx,
+                                   start_symbol,
+                                   nof_symbols,
+                                   subcarrier_spacing::kHz15));
+
+    tx_data.emplace_back(tbs / 8);
+    std::mt19937 rgen(0x1f1f8000U + i_tx);
+    std::generate(
+        tx_data.back().begin(), tx_data.back().end(), [&rgen]() { return static_cast<uint8_t>(rgen() & 0xff); });
+
+    pdsch_processor_notifier_adaptor cpu_notifier;
+    cpu_proc->process(
+        cpu_grids.back()->get_writer(), cpu_notifier, {shared_transport_block(tx_data.back())}, pdus.back());
+    cpu_notifier.wait_for_completion();
+  }
+
+  for (unsigned i_tx = 0; i_tx != nof_transmissions; ++i_tx) {
+    pdsch_processor_notifier_adaptor gpu_notifier;
+    gpu_proc->process(gpu_grids[i_tx]->get_writer(), gpu_notifier, {shared_transport_block(tx_data[i_tx])}, pdus[i_tx]);
+    gpu_notifier.wait_for_completion();
+  }
+
+  // Reading each managed grid waits for its recorded CUDA event. No synchronization is allowed between submissions.
+  for (unsigned i_tx = 0; i_tx != nof_transmissions; ++i_tx) {
+    SCOPED_TRACE("transmission=" + std::to_string(i_tx));
+    grid_diff_stats diff = compare_resource_grids(cpu_grids[i_tx]->get_reader(), gpu_grids[i_tx]->get_reader());
+    ASSERT_EQ(diff.nof_mismatches, 0U) << "max_abs_error=" << diff.max_abs_error << " at port=" << diff.port
+                                       << " symbol=" << diff.symbol << " subcarrier=" << diff.subcarrier
+                                       << " cpu=" << diff.cpu_value << " gpu=" << diff.gpu_value;
+  }
+}
+
 class PdschGpuDeviceGridWriter : public ::testing::TestWithParam<unsigned>
 {};
 
@@ -1226,6 +1455,75 @@ INSTANTIATE_TEST_SUITE_P(
                              false,
                              9},
         pdsch_gpu_e2e_params{pdsch_mcs_table::qam256, sch_mcs_index(20), 106, 4, 2, dmrs_profile::single_symbol, 1},
+        // Issue #1 OTA profile: 20 MHz FDD, rank 4, qam256 MCS 26 and the scheduler's 12-symbol allocation.
+        pdsch_gpu_e2e_params{pdsch_mcs_table::qam256,
+                             sch_mcs_index(26),
+                             106,
+                             4,
+                             0,
+                             dmrs_profile::triple_symbol,
+                             2,
+                             4,
+                             dmrs_config_type::type1,
+                             0x4601,
+                             10,
+                             10,
+                             false,
+                             0,
+                             2,
+                             12,
+                             subcarrier_spacing::kHz15},
+        pdsch_gpu_e2e_params{pdsch_mcs_table::qam256,
+                             sch_mcs_index(26),
+                             106,
+                             4,
+                             1,
+                             dmrs_profile::triple_symbol,
+                             2,
+                             4,
+                             dmrs_config_type::type1,
+                             0x4601,
+                             10,
+                             10,
+                             false,
+                             1,
+                             2,
+                             12,
+                             subcarrier_spacing::kHz15},
+        pdsch_gpu_e2e_params{pdsch_mcs_table::qam256,
+                             sch_mcs_index(26),
+                             106,
+                             4,
+                             2,
+                             dmrs_profile::triple_symbol,
+                             2,
+                             4,
+                             dmrs_config_type::type1,
+                             0x4601,
+                             10,
+                             10,
+                             false,
+                             2,
+                             2,
+                             12,
+                             subcarrier_spacing::kHz15},
+        pdsch_gpu_e2e_params{pdsch_mcs_table::qam256,
+                             sch_mcs_index(26),
+                             106,
+                             4,
+                             3,
+                             dmrs_profile::triple_symbol,
+                             2,
+                             4,
+                             dmrs_config_type::type1,
+                             0x4601,
+                             10,
+                             10,
+                             false,
+                             3,
+                             2,
+                             12,
+                             subcarrier_spacing::kHz15},
         pdsch_gpu_e2e_params{pdsch_mcs_table::qam64, sch_mcs_index(10), 106, 1, 0, dmrs_profile::triple_symbol, 2},
         pdsch_gpu_e2e_params{pdsch_mcs_table::qam64, sch_mcs_index(10), 106, 2, 0, dmrs_profile::triple_symbol, 2},
         pdsch_gpu_e2e_params{pdsch_mcs_table::qam64, sch_mcs_index(10), 106, 3, 0, dmrs_profile::triple_symbol, 2},

@@ -59,9 +59,13 @@ target_link_libraries(pdsch_gpu_e2e_test
 add_test(pdsch_gpu_e2e_test pdsch_gpu_e2e_test)
 if(CUDA_ACCEL_FOUND)
   target_include_directories(pdsch_gpu_e2e_test PRIVATE
+          ${CMAKE_SOURCE_DIR}/lib/phy/upper
           ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc)
-  target_link_libraries(pdsch_gpu_e2e_test ocudu_ldpc_cuda CUDA::cudart)
+  target_link_libraries(pdsch_gpu_e2e_test ocudu_ldpc_cuda ocudu_ofh_compression CUDA::cudart)
   target_compile_definitions(pdsch_gpu_e2e_test PRIVATE ENABLE_CUDA)
+  add_test(NAME pdsch_gpu_issue_1_regression
+           COMMAND pdsch_gpu_e2e_test --gtest_filter=PdschGpuIssueProfile.*)
+  set_tests_properties(pdsch_gpu_issue_1_regression PROPERTIES LABELS "cuda;pdsch;regression" TIMEOUT 120)
 endif()
 
 add_executable(pdsch_gpu_latency_benchmark pdsch_gpu_latency_benchmark.cpp)
@@ -187,6 +191,7 @@ if (CUDA_ACCEL_FOUND)
     set_tests_properties(
             pusch_gpu_cpu_comparison_test
             pdsch_gpu_e2e_test
+            pdsch_gpu_issue_1_regression
             pusch_gpu_cpu_result_parity_test
             pusch_64qam_stress_test
             pusch_e2e_pipeline_test
