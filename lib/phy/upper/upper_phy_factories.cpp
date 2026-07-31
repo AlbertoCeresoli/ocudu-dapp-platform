@@ -127,7 +127,7 @@ public:
 
     std::unique_ptr<resource_grid> grid =
         grid_factory->create(config.nof_rx_ports, MAX_NSYMB_PER_SLOT, config.nof_rb * NOF_SUBCARRIERS_PER_RB);
-    report_fatal_error_if_not(grid, "Invalid SRS estimator.");
+    report_fatal_error_if_not(grid, "Invalid uplink resource grid.");
 
     // If a TAP factory is provided, create the PHY TAP and pass it to the uplink processor.
     std::unique_ptr<phy_tap> ul_tap;
@@ -166,7 +166,7 @@ public:
 
     std::unique_ptr<resource_grid> grid =
         grid_factory->create(config.nof_rx_ports, MAX_NSYMB_PER_SLOT, config.nof_rb * NOF_SUBCARRIERS_PER_RB);
-    report_fatal_error_if_not(grid, "Invalid SRS estimator.");
+    report_fatal_error_if_not(grid, "Invalid uplink resource grid.");
 
     // If a TAP factory is provided, create the PHY TAP and pass it to the uplink processor.
     std::unique_ptr<phy_tap> ul_tap;
