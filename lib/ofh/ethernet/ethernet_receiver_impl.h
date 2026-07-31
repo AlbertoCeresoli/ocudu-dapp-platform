@@ -56,6 +56,7 @@ private:
   rt_stop_event_source            stop_manager;
   ethernet_rx_buffer_pool         buffer_pool;
   receiver_metrics_collector_impl metrics_collector;
+  uint64_t                        nof_consecutive_buffer_exhaustions = 0;
 };
 
 } // namespace ether

@@ -4,6 +4,7 @@
 #include "realtime_timing_worker.h"
 #include "../support/logger_utils.h"
 #include "../support/metrics_helpers.h"
+#include "realtime_timing_worker_utils.h"
 #include "ocudu/instrumentation/traces/ofh_traces.h"
 #include "ocudu/ofh/timing/ofh_ota_symbol_boundary_notifier.h"
 #include "ocudu/ran/slot_point_extended.h"
@@ -194,9 +195,22 @@ void realtime_timing_worker::poll()
   slot_symbol_point symbol_point(
       slot.without_hyper_sfn(), current_symbol_index % nof_symbols_per_slot, nof_symbols_per_slot);
 
-  for (unsigned i = 0; i != delta; ++i) {
-    unsigned skipped_symbol_id = delta - 1 - i;
-    // Notify pending symbols from oldest to newest.
+  // Replaying every elapsed symbol after a long stall cannot restore expired real-time deadlines. It instead creates an
+  // unbounded burst of stale transmitter and closed-RX-window tasks. Keep at most the newest slot so repositories can
+  // close recent contexts, while the metrics above still account for the full stall.
+  unsigned nof_symbols_to_notify = get_bounded_symbol_replay_count(delta, nof_symbols_per_slot);
+  if (OCUDU_UNLIKELY(nof_symbols_to_notify != delta)) {
+    log_conditional_warning(logger,
+                            enable_log_warnings_for_lates,
+                            "Real-time timing worker is discarding '{}' stale symbol notifications and replaying only "
+                            "the newest '{}' symbols",
+                            delta - nof_symbols_to_notify,
+                            nof_symbols_to_notify);
+  }
+
+  for (unsigned i = 0; i != nof_symbols_to_notify; ++i) {
+    unsigned skipped_symbol_id = nof_symbols_to_notify - 1 - i;
+    // Notify the retained symbols from oldest to newest.
     notify_slot_symbol_point(slot_symbol_point_context{.symbol_point = symbol_point - skipped_symbol_id,
                                                        .hfn          = slot.hyper_sfn(),
                                                        .time_point   = std::chrono::system_clock::now()});

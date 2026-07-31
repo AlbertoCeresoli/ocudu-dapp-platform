@@ -18,8 +18,12 @@ namespace ether {
 /// Pool of buffers accessed by a socket-based Ethernet receiver.
 class ethernet_rx_buffer_pool
 {
-  /// Allocate 4MB of storage, evenly divided between Ethernet receive buffers.
-  static constexpr units::bytes ETH_BUFFER_POOL_SIZE{4096000};
+  /// Allocate 32MB of storage, evenly divided between Ethernet receive buffers.
+  ///
+  /// Four-antenna 20 MHz cells can deliver more than 56,000 U-Plane frames per second. The previous 4MB pool held
+  /// only 427 jumbo frames, so a short executor stall depleted it and made the socket receive loop spin. Keep enough
+  /// buffers to absorb a bounded scheduling stall without dropping fronthaul packets.
+  static constexpr units::bytes ETH_BUFFER_POOL_SIZE{32768000};
 
   using rx_buffer_id_list =
       concurrent_queue<unsigned, concurrent_queue_policy::lockfree_mpmc, concurrent_queue_wait_policy::non_blocking>;

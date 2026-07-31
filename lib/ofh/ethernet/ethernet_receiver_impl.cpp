@@ -140,8 +140,23 @@ void receiver_impl::receive()
 
   auto exp_buffer = buffer_pool.reserve();
   if (!exp_buffer) {
-    logger.warning("No buffer is available for receiving an Ethernet packet on the port bound to fd = '{}'", socket_fd);
+    ++nof_consecutive_buffer_exhaustions;
+    // Log the first failure and then at exponentially increasing intervals. Logging every failed attempt makes the
+    // receiver spin on a readable socket and can turn a short executor stall into a persistent logger overload.
+    if ((nof_consecutive_buffer_exhaustions & (nof_consecutive_buffer_exhaustions - 1U)) == 0U) {
+      logger.warning("No buffer is available for receiving an Ethernet packet on the port bound to fd = '{}'. "
+                     "Consecutive failed receive attempts: '{}'",
+                     socket_fd,
+                     nof_consecutive_buffer_exhaustions);
+    }
     return;
+  }
+  if (nof_consecutive_buffer_exhaustions != 0) {
+    logger.warning("Ethernet packet reception on the port bound to fd = '{}' recovered after '{}' failed buffer "
+                   "reservation attempts",
+                   socket_fd,
+                   nof_consecutive_buffer_exhaustions);
+    nof_consecutive_buffer_exhaustions = 0;
   }
   ethernet_rx_buffer_impl buffer    = std::move(*exp_buffer);
   span<uint8_t>           data_span = buffer.storage();
