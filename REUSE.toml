@@ -10,6 +10,6 @@ SPDX-License-Identifier = "BSD-3-Clause-Open-MPI"
 
 # Vendored third-party library (VkFFT), kept under its original MIT license.
 [[annotations]]
-path = ["lib/phy/cuda/third_party/vkfft/**"]
+path = ["lib/phy/cuda/external/vkfft/**"]
 SPDX-FileCopyrightText = "Copyright (c) 2020 - present Dmitrii Tolmachev <dtolm96@gmail.com>"
 SPDX-License-Identifier = "MIT"

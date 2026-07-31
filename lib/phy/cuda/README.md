@@ -66,7 +66,7 @@ standalone test inventory. Enable them with
 ## Runtime Notes
 
 - VkFFT support is required for the FFT-backed low-PHY kernels and is provided
-  from `third_party/vkfft` by default. Override with
+  from `external/vkfft` by default. Override with
   `-DOCUDU_PHY_CUDA_VKFFT_ROOT=/path/to/vkfft` when needed.
 - `OCUDU_PHY_CUDA_PUSCH_TRANSFORM_DEPRECODER=0|1` overrides the PUSCH
   transform-deprecoder path for debugging.

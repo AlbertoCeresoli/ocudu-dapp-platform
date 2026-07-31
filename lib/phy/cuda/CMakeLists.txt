@@ -157,7 +157,7 @@ target_link_libraries(ocudu_phy_cuda PUBLIC
     CUDA::curand
 )
 
-set(OCUDU_PHY_CUDA_VKFFT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vkfft" CACHE PATH
+set(OCUDU_PHY_CUDA_VKFFT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/vkfft" CACHE PATH
     "Path to a VkFFT checkout or bundled copy")
 
 if(NOT EXISTS "${OCUDU_PHY_CUDA_VKFFT_ROOT}/vkFFT/vkFFT.h")
