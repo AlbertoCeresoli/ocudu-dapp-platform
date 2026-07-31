@@ -25,6 +25,8 @@ struct ocudu_ofh_compression_handle {
     size_t       h_out_cap                                 = 0;
     size_t       h_in_cap[HOST_INPUT_STAGING_SLOTS] = {};
     unsigned     h_in_slot                         = 0;
+    cudaError_t  last_error                        = cudaSuccess;
+    const char*  last_error_operation              = "none";
 };
 
 namespace {
@@ -45,6 +47,26 @@ constexpr unsigned DECOMPRESS_9B_RE_PARALLEL_PRB_THRESHOLD = 4096U;
 constexpr unsigned DECOMPRESS_12B_RE_PARALLEL_PRB_THRESHOLD = 1024U;
 // The generic RE-parallel decompressor (widths 8, 10, 14, 16) follows the BFP12 threshold.
 constexpr unsigned DECOMPRESS_RE_PARALLEL_PRB_THRESHOLD = 1024U;
+
+static void clear_last_error(ocudu_ofh_compression_handle_t* handle)
+{
+    if (handle != nullptr) {
+        handle->last_error           = cudaSuccess;
+        handle->last_error_operation = "none";
+    }
+}
+
+static bool record_cuda_status(ocudu_ofh_compression_handle_t* handle, cudaError_t status, const char* operation)
+{
+    if (status == cudaSuccess) {
+        return true;
+    }
+    if (handle != nullptr) {
+        handle->last_error           = status;
+        handle->last_error_operation = operation;
+    }
+    return false;
+}
 
 static bool use_9b_none_group_compressor(unsigned total_prbs)
 {
@@ -107,40 +129,52 @@ static bool valid_grid_symbol_batch_request(int      compression_type,
     return nof_symbols <= (nof_grid_symbols - first_symbol);
 }
 
-static bool ensure_capacity(uint8_t** ptr, size_t* capacity, size_t required)
+static bool ensure_capacity(ocudu_ofh_compression_handle_t* handle,
+                            uint8_t**                        ptr,
+                            size_t*                          capacity,
+                            size_t                           required,
+                            const char*                      operation)
 {
     if (*capacity >= required) {
         return true;
     }
     if (*ptr != nullptr) {
-        cudaFree(*ptr);
+        if (!record_cuda_status(handle, cudaFree(*ptr), operation)) {
+            return false;
+        }
         *ptr = nullptr;
         *capacity = 0;
     }
     if (required == 0) {
         return true;
     }
-    if (cudaMalloc(reinterpret_cast<void**>(ptr), required) != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaMalloc(reinterpret_cast<void**>(ptr), required), operation)) {
         return false;
     }
     *capacity = required;
     return true;
 }
 
-static bool ensure_host_capacity(uint8_t** ptr, size_t* capacity, size_t required)
+static bool ensure_host_capacity(ocudu_ofh_compression_handle_t* handle,
+                                 uint8_t**                        ptr,
+                                 size_t*                          capacity,
+                                 size_t                           required,
+                                 const char*                      operation)
 {
     if (*capacity >= required) {
         return true;
     }
     if (*ptr != nullptr) {
-        cudaFreeHost(*ptr);
+        if (!record_cuda_status(handle, cudaFreeHost(*ptr), operation)) {
+            return false;
+        }
         *ptr = nullptr;
         *capacity = 0;
     }
     if (required == 0) {
         return true;
     }
-    if (cudaMallocHost(reinterpret_cast<void**>(ptr), required) != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaMallocHost(reinterpret_cast<void**>(ptr), required), operation)) {
         return false;
     }
     *capacity = required;
@@ -179,20 +213,26 @@ static bool copy_device_to_host(ocudu_ofh_compression_handle_t* handle,
                                 bool                             use_pinned_staging)
 {
     if (use_pinned_staging) {
-        if (!ensure_host_capacity(&handle->h_out, &handle->h_out_cap, bytes)) {
+        if (!ensure_host_capacity(
+                handle, &handle->h_out, &handle->h_out_cap, bytes, "allocate pinned compression output")) {
             return false;
         }
-        if (cudaMemcpyAsync(handle->h_out, src, bytes, cudaMemcpyDeviceToHost, handle->stream) != cudaSuccess) {
+        if (!record_cuda_status(handle,
+                                cudaMemcpyAsync(handle->h_out, src, bytes, cudaMemcpyDeviceToHost, handle->stream),
+                                "copy compressed output to host")) {
             return false;
         }
-        if (cudaStreamSynchronize(handle->stream) != cudaSuccess) {
+        if (!record_cuda_status(
+                handle, cudaStreamSynchronize(handle->stream), "synchronize compressed output copy")) {
             return false;
         }
         std::memcpy(dst, handle->h_out, bytes);
         return true;
     }
 
-    if (cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, handle->stream) != cudaSuccess) {
+    if (!record_cuda_status(handle,
+                            cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, handle->stream),
+                            "copy compression output to host")) {
         return false;
     }
     return ocudu_ofh_compression_synchronize(handle);
@@ -209,13 +249,17 @@ static bool copy_device_to_host_buffers(ocudu_ofh_compression_handle_t* handle,
     }
 
     size_t total_bytes = static_cast<size_t>(nof_dst_buffers) * dst_buffer_bytes;
-    if (!ensure_host_capacity(&handle->h_out, &handle->h_out_cap, total_bytes)) {
+    if (!ensure_host_capacity(
+            handle, &handle->h_out, &handle->h_out_cap, total_bytes, "allocate batched pinned compression output")) {
         return false;
     }
-    if (cudaMemcpyAsync(handle->h_out, src, total_bytes, cudaMemcpyDeviceToHost, handle->stream) != cudaSuccess) {
+    if (!record_cuda_status(handle,
+                            cudaMemcpyAsync(handle->h_out, src, total_bytes, cudaMemcpyDeviceToHost, handle->stream),
+                            "copy batched compressed output to host")) {
         return false;
     }
-    if (cudaStreamSynchronize(handle->stream) != cudaSuccess) {
+    if (!record_cuda_status(
+            handle, cudaStreamSynchronize(handle->stream), "synchronize batched compressed output copy")) {
         return false;
     }
 
@@ -232,29 +276,43 @@ static bool copy_host_to_device(ocudu_ofh_compression_handle_t* handle,
                                 bool                            use_pinned_staging)
 {
     if (!use_pinned_staging) {
-        return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, handle->stream) == cudaSuccess;
+        return record_cuda_status(handle,
+                                  cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, handle->stream),
+                                  "copy compression input to device");
     }
 
     const unsigned slot = handle->h_in_slot++ % ocudu_ofh_compression_handle::HOST_INPUT_STAGING_SLOTS;
     if (handle->h_in_event_valid[slot] &&
-        (wait_event_yielding(handle->h_in_ready_events[slot]) != cudaSuccess)) {
+        !record_cuda_status(handle,
+                            wait_event_yielding(handle->h_in_ready_events[slot]),
+                            "wait for pinned compression input staging")) {
         return false;
     }
 
-    if (!ensure_host_capacity(&handle->h_in[slot], &handle->h_in_cap[slot], bytes)) {
+    if (!ensure_host_capacity(handle,
+                              &handle->h_in[slot],
+                              &handle->h_in_cap[slot],
+                              bytes,
+                              "allocate pinned compression input")) {
         return false;
     }
     if (handle->h_in_ready_events[slot] == nullptr) {
-        if (cudaEventCreateWithFlags(&handle->h_in_ready_events[slot], cudaEventDisableTiming) != cudaSuccess) {
+        if (!record_cuda_status(handle,
+                                cudaEventCreateWithFlags(&handle->h_in_ready_events[slot], cudaEventDisableTiming),
+                                "create pinned compression input event")) {
             return false;
         }
     }
 
     std::memcpy(handle->h_in[slot], src, bytes);
-    if (cudaMemcpyAsync(dst, handle->h_in[slot], bytes, cudaMemcpyHostToDevice, handle->stream) != cudaSuccess) {
+    if (!record_cuda_status(handle,
+                            cudaMemcpyAsync(dst, handle->h_in[slot], bytes, cudaMemcpyHostToDevice, handle->stream),
+                            "copy pinned compression input to device")) {
         return false;
     }
-    if (cudaEventRecord(handle->h_in_ready_events[slot], handle->stream) != cudaSuccess) {
+    if (!record_cuda_status(handle,
+                            cudaEventRecord(handle->h_in_ready_events[slot], handle->stream),
+                            "record pinned compression input event")) {
         return false;
     }
     handle->h_in_event_valid[slot] = true;
@@ -3303,18 +3361,32 @@ extern "C" void* ocudu_ofh_compression_get_stream(ocudu_ofh_compression_handle_t
     return (handle == nullptr) ? nullptr : static_cast<void*>(handle->stream);
 }
 
+extern "C" int ocudu_ofh_compression_get_last_error(const ocudu_ofh_compression_handle_t* handle,
+                                                     ocudu_ofh_compression_error_info_t*    error_info)
+{
+    if ((handle == nullptr) || (error_info == nullptr)) {
+        return 0;
+    }
+    error_info->cuda_error_code   = static_cast<int>(handle->last_error);
+    error_info->operation         = handle->last_error_operation;
+    error_info->error_name        = cudaGetErrorName(handle->last_error);
+    error_info->error_description = cudaGetErrorString(handle->last_error);
+    return 1;
+}
+
 extern "C" int ocudu_ofh_compression_synchronize(ocudu_ofh_compression_handle_t* handle)
 {
     if (handle == nullptr) {
         return 0;
     }
     if (handle->done_event == nullptr) {
-        return cudaStreamSynchronize(handle->stream) == cudaSuccess;
+        return record_cuda_status(handle, cudaStreamSynchronize(handle->stream), "synchronize compression stream");
     }
-    if (cudaEventRecord(handle->done_event, handle->stream) != cudaSuccess) {
+    if (!record_cuda_status(
+            handle, cudaEventRecord(handle->done_event, handle->stream), "record compression completion event")) {
         return 0;
     }
-    return wait_event_yielding(handle->done_event) == cudaSuccess;
+    return record_cuda_status(handle, wait_event_yielding(handle->done_event), "wait for compression completion event");
 }
 
 extern "C" int ocudu_ofh_compress(ocudu_ofh_compression_handle_t* handle,
@@ -3325,18 +3397,27 @@ extern "C" int ocudu_ofh_compress(ocudu_ofh_compression_handle_t* handle,
                                   unsigned                        data_width,
                                   float                           iq_scaling)
 {
-    if ((handle == nullptr) || (output_bytes == nullptr) || (input_cbf16 == nullptr)) {
+    if (handle == nullptr) {
+        return 0;
+    }
+    clear_last_error(handle);
+    if ((output_bytes == nullptr) || (input_cbf16 == nullptr)) {
+        record_cuda_status(handle, cudaErrorInvalidValue, "validate compression arguments");
         return 0;
     }
     if (!valid_request(compression_type, nof_prbs, data_width)) {
-        return nof_prbs == 0U;
+        if (nof_prbs == 0U) {
+            return 1;
+        }
+        record_cuda_status(handle, cudaErrorInvalidValue, "validate compression request");
+        return 0;
     }
 
     unsigned prb_size = compressed_prb_size(compression_type, data_width);
     size_t in_bytes   = static_cast<size_t>(nof_prbs) * NOF_SUBCARRIERS_PER_RB * sizeof(uint32_t);
     size_t out_bytes  = static_cast<size_t>(nof_prbs) * prb_size;
-    if (!ensure_capacity(&handle->d_in, &handle->in_cap, in_bytes) ||
-        !ensure_capacity(&handle->d_out, &handle->out_cap, out_bytes)) {
+    if (!ensure_capacity(handle, &handle->d_in, &handle->in_cap, in_bytes, "allocate compression input") ||
+        !ensure_capacity(handle, &handle->d_out, &handle->out_cap, out_bytes, "allocate compression output")) {
         return 0;
     }
 
@@ -3352,7 +3433,7 @@ extern "C" int ocudu_ofh_compress(ocudu_ofh_compression_handle_t* handle,
                     prb_size,
                     iq_scaling,
                     handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch compression kernel")) {
         return 0;
     }
     return copy_device_to_host(
@@ -3366,18 +3447,27 @@ extern "C" int ocudu_ofh_decompress(ocudu_ofh_compression_handle_t* handle,
                                     unsigned                        nof_prbs,
                                     unsigned                        data_width)
 {
-    if ((handle == nullptr) || (output_cbf16 == nullptr) || (input_bytes == nullptr)) {
+    if (handle == nullptr) {
+        return 0;
+    }
+    clear_last_error(handle);
+    if ((output_cbf16 == nullptr) || (input_bytes == nullptr)) {
+        record_cuda_status(handle, cudaErrorInvalidValue, "validate decompression arguments");
         return 0;
     }
     if (!valid_request(compression_type, nof_prbs, data_width)) {
-        return nof_prbs == 0U;
+        if (nof_prbs == 0U) {
+            return 1;
+        }
+        record_cuda_status(handle, cudaErrorInvalidValue, "validate decompression request");
+        return 0;
     }
 
     unsigned prb_size = compressed_prb_size(compression_type, data_width);
     size_t in_bytes   = static_cast<size_t>(nof_prbs) * prb_size;
     size_t out_bytes  = static_cast<size_t>(nof_prbs) * NOF_SUBCARRIERS_PER_RB * sizeof(uint32_t);
-    if (!ensure_capacity(&handle->d_in, &handle->in_cap, in_bytes) ||
-        !ensure_capacity(&handle->d_out, &handle->out_cap, out_bytes)) {
+    if (!ensure_capacity(handle, &handle->d_in, &handle->in_cap, in_bytes, "allocate decompression input") ||
+        !ensure_capacity(handle, &handle->d_out, &handle->out_cap, out_bytes, "allocate decompression output")) {
         return 0;
     }
 
@@ -3392,7 +3482,7 @@ extern "C" int ocudu_ofh_decompress(ocudu_ofh_compression_handle_t* handle,
                       data_width,
                       prb_size,
                       handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch decompression kernel")) {
         return 0;
     }
     return copy_device_to_host(handle, output_cbf16, handle->d_out, out_bytes, false);
@@ -3420,7 +3510,7 @@ extern "C" int ocudu_ofh_compress_device_grid(ocudu_ofh_compression_handle_t* ha
 
     unsigned prb_size = compressed_prb_size(compression_type, data_width);
     size_t out_bytes  = static_cast<size_t>(nof_prbs) * prb_size;
-    if (!ensure_capacity(&handle->d_out, &handle->out_cap, out_bytes)) {
+    if (!ensure_capacity(handle, &handle->d_out, &handle->out_cap, out_bytes, "allocate grid compression output")) {
         return 0;
     }
 
@@ -3436,7 +3526,7 @@ extern "C" int ocudu_ofh_compress_device_grid(ocudu_ofh_compression_handle_t* ha
                     prb_size,
                     iq_scaling,
                     handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
     return copy_device_to_host(
@@ -3492,7 +3582,7 @@ extern "C" int ocudu_ofh_decompress_to_device_grid_async(ocudu_ofh_compression_h
 
     unsigned prb_size = compressed_prb_size(compression_type, data_width);
     size_t in_bytes   = static_cast<size_t>(nof_prbs) * prb_size;
-    if (!ensure_capacity(&handle->d_in, &handle->in_cap, in_bytes)) {
+    if (!ensure_capacity(handle, &handle->d_in, &handle->in_cap, in_bytes, "allocate grid decompression input")) {
         return 0;
     }
 
@@ -3512,7 +3602,7 @@ extern "C" int ocudu_ofh_decompress_to_device_grid_async(ocudu_ofh_compression_h
                       data_width,
                       prb_size,
                       handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
     return 1;
@@ -3544,8 +3634,8 @@ extern "C" int ocudu_ofh_decompress_to_device_prach_buffer_async(ocudu_ofh_compr
     unsigned prb_size = compressed_prb_size(compression_type, data_width);
     size_t in_bytes   = static_cast<size_t>(nof_prbs) * prb_size;
     size_t out_bytes  = static_cast<size_t>(nof_prbs) * NOF_SUBCARRIERS_PER_RB * sizeof(uint32_t);
-    if (!ensure_capacity(&handle->d_in, &handle->in_cap, in_bytes) ||
-        !ensure_capacity(&handle->d_out, &handle->out_cap, out_bytes)) {
+    if (!ensure_capacity(handle, &handle->d_in, &handle->in_cap, in_bytes, "allocate PRACH decompression input") ||
+        !ensure_capacity(handle, &handle->d_out, &handle->out_cap, out_bytes, "allocate PRACH decompression output")) {
         return 0;
     }
 
@@ -3565,7 +3655,7 @@ extern "C" int ocudu_ofh_decompress_to_device_prach_buffer_async(ocudu_ofh_compr
                                 input_start_re,
                                 nof_re,
                                 handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
     return 1;
@@ -3599,7 +3689,7 @@ extern "C" int ocudu_ofh_compress_device_grid_ports(ocudu_ofh_compression_handle
         return 0;
     }
     size_t out_bytes = static_cast<size_t>(nof_ports - 1U) * output_port_stride_bytes + port_bytes;
-    if (!ensure_capacity(&handle->d_out, &handle->out_cap, out_bytes)) {
+    if (!ensure_capacity(handle, &handle->d_out, &handle->out_cap, out_bytes, "allocate port compression output")) {
         return 0;
     }
 
@@ -3618,7 +3708,7 @@ extern "C" int ocudu_ofh_compress_device_grid_ports(ocudu_ofh_compression_handle
                           prb_size,
                           iq_scaling,
                           handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
     return copy_device_to_host(
@@ -3661,7 +3751,8 @@ extern "C" int ocudu_ofh_compress_device_grid_ports_to_host_buffers(ocudu_ofh_co
     }
 
     size_t out_bytes = static_cast<size_t>(nof_ports) * port_bytes;
-    if (!ensure_capacity(&handle->d_out, &handle->out_cap, out_bytes)) {
+    if (!ensure_capacity(
+            handle, &handle->d_out, &handle->out_cap, out_bytes, "allocate host-buffer compression output")) {
         return 0;
     }
 
@@ -3680,7 +3771,7 @@ extern "C" int ocudu_ofh_compress_device_grid_ports_to_host_buffers(ocudu_ofh_co
                           prb_size,
                           iq_scaling,
                           handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
 
@@ -3731,7 +3822,7 @@ extern "C" int ocudu_ofh_compress_device_grid_ports_to_device_async(ocudu_ofh_co
                           prb_size,
                           iq_scaling,
                           handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
     return 1;
@@ -3804,7 +3895,7 @@ extern "C" int ocudu_ofh_compress_device_grid_symbol_batch(ocudu_ofh_compression
     }
     size_t out_bytes = static_cast<size_t>(nof_symbols - 1U) * output_symbol_stride_bytes +
                        static_cast<size_t>(nof_ports - 1U) * output_port_stride_bytes + port_bytes;
-    if (!ensure_capacity(&handle->d_out, &handle->out_cap, out_bytes)) {
+    if (!ensure_capacity(handle, &handle->d_out, &handle->out_cap, out_bytes, "allocate symbol-batch output")) {
         return 0;
     }
 
@@ -3825,7 +3916,7 @@ extern "C" int ocudu_ofh_compress_device_grid_symbol_batch(ocudu_ofh_compression
                                  prb_size,
                                  iq_scaling,
                                  handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
     return copy_device_to_host(
@@ -3878,7 +3969,8 @@ extern "C" int ocudu_ofh_compress_device_grid_symbol_batch_to_host_buffers(
     }
 
     size_t out_bytes = static_cast<size_t>(nof_symbols) * symbol_stride;
-    if (!ensure_capacity(&handle->d_out, &handle->out_cap, out_bytes)) {
+    if (!ensure_capacity(
+            handle, &handle->d_out, &handle->out_cap, out_bytes, "allocate host-buffer symbol-batch output")) {
         return 0;
     }
 
@@ -3899,7 +3991,7 @@ extern "C" int ocudu_ofh_compress_device_grid_symbol_batch_to_host_buffers(
                                  prb_size,
                                  iq_scaling,
                                  handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
 
@@ -3956,7 +4048,7 @@ extern "C" int ocudu_ofh_compress_device_grid_symbol_batch_to_device_async(ocudu
                                  prb_size,
                                  iq_scaling,
                                  handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
     return 1;
@@ -4027,7 +4119,7 @@ extern "C" int ocudu_ofh_decompress_to_device_grid_ports(ocudu_ofh_compression_h
         return 0;
     }
     size_t in_bytes = static_cast<size_t>(nof_ports - 1U) * input_port_stride_bytes + port_bytes;
-    if (!ensure_capacity(&handle->d_in, &handle->in_cap, in_bytes)) {
+    if (!ensure_capacity(handle, &handle->d_in, &handle->in_cap, in_bytes, "allocate port decompression input")) {
         return 0;
     }
 
@@ -4049,7 +4141,7 @@ extern "C" int ocudu_ofh_decompress_to_device_grid_ports(ocudu_ofh_compression_h
                             data_width,
                             prb_size,
                             handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
     return ocudu_ofh_compression_synchronize(handle);
@@ -4097,7 +4189,7 @@ extern "C" int ocudu_ofh_decompress_device_bytes_to_device_grid_ports(ocudu_ofh_
                             data_width,
                             prb_size,
                             handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
     return ocudu_ofh_compression_synchronize(handle);
@@ -4135,7 +4227,8 @@ extern "C" int ocudu_ofh_decompress_to_device_grid_symbol_batch(ocudu_ofh_compre
     }
     size_t in_bytes = static_cast<size_t>(nof_symbols - 1U) * input_symbol_stride_bytes +
                       static_cast<size_t>(nof_ports - 1U) * input_port_stride_bytes + port_bytes;
-    if (!ensure_capacity(&handle->d_in, &handle->in_cap, in_bytes)) {
+    if (!ensure_capacity(
+            handle, &handle->d_in, &handle->in_cap, in_bytes, "allocate symbol-batch decompression input")) {
         return 0;
     }
 
@@ -4159,7 +4252,7 @@ extern "C" int ocudu_ofh_decompress_to_device_grid_symbol_batch(ocudu_ofh_compre
                                    data_width,
                                    prb_size,
                                    handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
     return ocudu_ofh_compression_synchronize(handle);
@@ -4214,7 +4307,7 @@ extern "C" int ocudu_ofh_decompress_device_bytes_to_device_grid_symbol_batch(
                                    data_width,
                                    prb_size,
                                    handle->stream);
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
     return ocudu_ofh_compression_synchronize(handle);

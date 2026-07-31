@@ -13,6 +13,17 @@ extern "C" {
 
 typedef struct ocudu_ofh_compression_handle ocudu_ofh_compression_handle_t;
 
+/// Details of the most recent CUDA runtime failure observed by a compression handle.
+///
+/// The string pointers are owned by the CUDA runtime or the compression backend and remain valid for the lifetime of
+/// the process. A successful operation clears the error code and reports operation "none".
+typedef struct {
+    int         cuda_error_code;
+    const char* operation;
+    const char* error_name;
+    const char* error_description;
+} ocudu_ofh_compression_error_info_t;
+
 enum { OCUDU_OFH_COMPRESSION_TYPE_NONE = 0, OCUDU_OFH_COMPRESSION_TYPE_BFP = 1 };
 
 int   ocudu_ofh_compression_available(void);
@@ -20,6 +31,8 @@ int   ocudu_ofh_compression_create(ocudu_ofh_compression_handle_t** handle);
 void  ocudu_ofh_compression_destroy(ocudu_ofh_compression_handle_t* handle);
 void* ocudu_ofh_compression_get_stream(ocudu_ofh_compression_handle_t* handle);
 int   ocudu_ofh_compression_synchronize(ocudu_ofh_compression_handle_t* handle);
+int   ocudu_ofh_compression_get_last_error(const ocudu_ofh_compression_handle_t* handle,
+                                           ocudu_ofh_compression_error_info_t*    error_info);
 
 int ocudu_ofh_compress(ocudu_ofh_compression_handle_t* handle,
                        int                             compression_type,

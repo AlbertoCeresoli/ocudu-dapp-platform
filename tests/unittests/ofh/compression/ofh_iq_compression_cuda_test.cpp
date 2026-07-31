@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
 
 #include "ofh_compression.h"
+#include "iq_compression_cuda.h"
 #include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/ofh/compression/compression_factory.h"
 #include "ocudu/ofh/compression/compression_properties.h"
@@ -308,6 +309,8 @@ TEST(ofh_iq_compression_cuda_c_api_test, rejects_invalid_arguments_and_requests)
   EXPECT_EQ(ocudu_ofh_compression_create(nullptr), 0);
   EXPECT_EQ(ocudu_ofh_compression_get_stream(nullptr), nullptr);
   EXPECT_EQ(ocudu_ofh_compression_synchronize(nullptr), 0);
+  ocudu_ofh_compression_error_info_t error_info = {};
+  EXPECT_EQ(ocudu_ofh_compression_get_last_error(nullptr, &error_info), 0);
   ocudu_ofh_compression_destroy(nullptr);
 
   ocudu_ofh_compression_handle_t* handle = nullptr;
@@ -326,6 +329,11 @@ TEST(ofh_iq_compression_cuda_c_api_test, rejects_invalid_arguments_and_requests)
   EXPECT_EQ(ocudu_ofh_compress(handle, OCUDU_OFH_COMPRESSION_TYPE_BFP, bytes.data(), input_cbf16.data(), 1, 17, 0.27F),
             0);
   EXPECT_EQ(ocudu_ofh_decompress(handle, OCUDU_OFH_COMPRESSION_TYPE_BFP, output_cbf16.data(), bytes.data(), 1, 17), 0);
+  ASSERT_NE(ocudu_ofh_compression_get_last_error(handle, &error_info), 0);
+  EXPECT_EQ(error_info.cuda_error_code, static_cast<int>(cudaErrorInvalidValue));
+  EXPECT_STREQ(error_info.operation, "validate decompression request");
+  EXPECT_STREQ(error_info.error_name, cudaGetErrorName(cudaErrorInvalidValue));
+  EXPECT_STREQ(error_info.error_description, cudaGetErrorString(cudaErrorInvalidValue));
 
   EXPECT_EQ(ocudu_ofh_compress_device_grid(handle,
                                            OCUDU_OFH_COMPRESSION_TYPE_BFP,
@@ -1087,4 +1095,98 @@ TEST_P(ofh_iq_compression_cuda_test, cuda_device_grid_symbol_batch_path_matches_
   ocudu_ofh_compression_destroy(handle);
   cudaFree(output_grid);
   cudaFree(device_grid);
+}
+
+/// Verifies that a failure of the accelerated backend degrades to the CPU implementation instead of terminating the
+/// process. The failure is injected with the OCUDU_OFH_COMPRESSION_FORCE_FALLBACK test hook, which is read when the
+/// compressor is created.
+TEST_P(ofh_iq_compression_cuda_test, cuda_failure_falls_back_to_cpu)
+{
+  static constexpr unsigned nof_prbs = 273;
+  static constexpr float    iq_scale = 0.27F;
+
+  ofh::compression_type type = GetParam();
+  auto                  data = generate_iq(nof_prbs);
+
+  std::unique_ptr<ofh::iq_compressor>   cpu_compressor   = ofh::create_iq_compressor(type, logger, iq_scale, "generic");
+  std::unique_ptr<ofh::iq_decompressor> cpu_decompressor = ofh::create_iq_decompressor(type, logger, "generic");
+
+  ASSERT_EQ(::setenv("OCUDU_OFH_COMPRESSION_FORCE_FALLBACK", "1", 1), 0);
+  std::unique_ptr<ofh::iq_compressor>   cuda_compressor = ofh::create_iq_compressor(type, logger, iq_scale, "cuda");
+  std::unique_ptr<ofh::iq_decompressor> cuda_decompressor = ofh::create_iq_decompressor(type, logger, "cuda");
+  ASSERT_EQ(::unsetenv("OCUDU_OFH_COMPRESSION_FORCE_FALLBACK"), 0);
+
+  ASSERT_NE(cuda_compressor, nullptr);
+  ASSERT_NE(cuda_decompressor, nullptr);
+
+  for (unsigned data_width : {9U, 12U}) {
+    ofh::ru_compression_params params;
+    params.type       = type;
+    params.data_width = data_width;
+
+    unsigned             prb_size = ofh::get_compressed_prb_size(params).value();
+    std::vector<uint8_t> cpu_compressed(nof_prbs * prb_size);
+    std::vector<uint8_t> fallback_compressed(nof_prbs * prb_size);
+    std::vector<cbf16_t> cpu_decompressed(data.size());
+    std::vector<cbf16_t> fallback_decompressed(data.size());
+
+    cpu_compressor->compress(cpu_compressed, data, params);
+    cuda_compressor->compress(fallback_compressed, data, params);
+    ASSERT_EQ(cpu_compressed, fallback_compressed)
+        << "fallback compression type=" << ofh::to_string(type) << " width=" << data_width;
+
+    cpu_decompressor->decompress(cpu_decompressed, cpu_compressed, params);
+    cuda_decompressor->decompress(fallback_decompressed, cpu_compressed, params);
+    ASSERT_EQ(cpu_decompressed, fallback_decompressed)
+        << "fallback decompression type=" << ofh::to_string(type) << " width=" << data_width;
+  }
+
+  // The accelerated path reported a failure for every call above, and none of them was fatal.
+  auto& cuda_compressor_impl = static_cast<ofh::iq_compression_cuda&>(*cuda_compressor);
+  EXPECT_EQ(cuda_compressor_impl.get_nof_acceleration_failures(), 2U);
+  auto& cuda_decompressor_impl = static_cast<ofh::iq_compression_cuda&>(*cuda_decompressor);
+  EXPECT_EQ(cuda_decompressor_impl.get_nof_acceleration_failures(), 2U);
+}
+
+/// Verifies that a transient CUDA failure stays on the accelerated path by quarantining the failed handle and retrying
+/// the operation once on a freshly created CUDA stream.
+TEST_P(ofh_iq_compression_cuda_test, cuda_transient_failure_retries_on_fresh_handle)
+{
+  static constexpr unsigned nof_prbs = 106;
+  static constexpr float    iq_scale = 0.27F;
+
+  ofh::compression_type                 type = GetParam();
+  std::vector<cbf16_t>                  data = generate_iq(nof_prbs);
+  ofh::ru_compression_params            params{type, 9U};
+  std::unique_ptr<ofh::iq_compressor>   cpu_compressor   = ofh::create_iq_compressor(type, logger, iq_scale, "generic");
+  std::unique_ptr<ofh::iq_decompressor> cpu_decompressor = ofh::create_iq_decompressor(type, logger, "generic");
+
+  ASSERT_EQ(::setenv("OCUDU_OFH_COMPRESSION_FORCE_FIRST_GPU_FAILURE", "1", 1), 0);
+  std::unique_ptr<ofh::iq_compressor>   cuda_compressor   = ofh::create_iq_compressor(type, logger, iq_scale, "cuda");
+  std::unique_ptr<ofh::iq_decompressor> cuda_decompressor = ofh::create_iq_decompressor(type, logger, "cuda");
+  ASSERT_EQ(::unsetenv("OCUDU_OFH_COMPRESSION_FORCE_FIRST_GPU_FAILURE"), 0);
+
+  ASSERT_NE(cuda_compressor, nullptr);
+  ASSERT_NE(cuda_decompressor, nullptr);
+
+  unsigned             prb_size = ofh::get_compressed_prb_size(params).value();
+  std::vector<uint8_t> cpu_compressed(nof_prbs * prb_size);
+  std::vector<uint8_t> cuda_compressed(nof_prbs * prb_size);
+  std::vector<cbf16_t> cpu_decompressed(data.size());
+  std::vector<cbf16_t> cuda_decompressed(data.size());
+
+  cpu_compressor->compress(cpu_compressed, data, params);
+  cuda_compressor->compress(cuda_compressed, data, params);
+  ASSERT_EQ(cpu_compressed, cuda_compressed);
+
+  cpu_decompressor->decompress(cpu_decompressed, cpu_compressed, params);
+  cuda_decompressor->decompress(cuda_decompressed, cpu_compressed, params);
+  ASSERT_EQ(cpu_decompressed, cuda_decompressed);
+
+  auto& cuda_compressor_impl = static_cast<ofh::iq_compression_cuda&>(*cuda_compressor);
+  EXPECT_EQ(cuda_compressor_impl.get_nof_acceleration_retries(), 1U);
+  EXPECT_EQ(cuda_compressor_impl.get_nof_acceleration_failures(), 0U);
+  auto& cuda_decompressor_impl = static_cast<ofh::iq_compression_cuda&>(*cuda_decompressor);
+  EXPECT_EQ(cuda_decompressor_impl.get_nof_acceleration_retries(), 1U);
+  EXPECT_EQ(cuda_decompressor_impl.get_nof_acceleration_failures(), 0U);
 }

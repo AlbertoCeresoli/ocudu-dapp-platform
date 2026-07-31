@@ -86,7 +86,7 @@ std::unique_ptr<iq_compressor> ocudu::ofh::create_iq_compressor(compression_type
       if (is_cuda_compression_requested(resolved_impl_type)) {
         report_fatal_error_if_not(is_iq_compression_cuda_available(),
                                   "CUDA OFH compression requested but unavailable.");
-        return std::make_unique<iq_compression_cuda>(type, iq_scaling);
+        return std::make_unique<iq_compression_cuda>(type, logger, iq_scaling);
       }
 #endif
 #ifdef __x86_64__
@@ -116,7 +116,7 @@ std::unique_ptr<iq_compressor> ocudu::ofh::create_iq_compressor(compression_type
       if (is_cuda_compression_requested(resolved_impl_type)) {
         report_fatal_error_if_not(is_iq_compression_cuda_available(),
                                   "CUDA OFH compression requested but unavailable.");
-        return std::make_unique<iq_compression_cuda>(type, iq_scaling);
+        return std::make_unique<iq_compression_cuda>(type, logger, iq_scaling);
       }
 #endif
 #ifdef __x86_64__
@@ -172,7 +172,7 @@ ocudu::ofh::create_iq_decompressor(compression_type type, ocudulog::basic_logger
       if (is_cuda_compression_requested(resolved_impl_type)) {
         report_fatal_error_if_not(is_iq_compression_cuda_available(),
                                   "CUDA OFH decompression requested but unavailable.");
-        return std::make_unique<iq_compression_cuda>(type);
+        return std::make_unique<iq_compression_cuda>(type, logger);
       }
 #endif
 #ifdef __x86_64__
@@ -202,7 +202,7 @@ ocudu::ofh::create_iq_decompressor(compression_type type, ocudulog::basic_logger
       if (is_cuda_compression_requested(resolved_impl_type)) {
         report_fatal_error_if_not(is_iq_compression_cuda_available(),
                                   "CUDA OFH decompression requested but unavailable.");
-        return std::make_unique<iq_compression_cuda>(type);
+        return std::make_unique<iq_compression_cuda>(type, logger);
       }
 #endif
 #ifdef __x86_64__

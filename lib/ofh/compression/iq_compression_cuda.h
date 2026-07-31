@@ -4,9 +4,11 @@
 
 #pragma once
 
+#include "ocudu/ocudulog/logger.h"
 #include "ocudu/ofh/compression/compression_params.h"
 #include "ocudu/ofh/compression/iq_compressor.h"
 #include "ocudu/ofh/compression/iq_decompressor.h"
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -18,10 +20,17 @@ namespace ofh {
 
 bool is_iq_compression_cuda_available();
 
+/// \brief CUDA accelerated IQ data compressor and decompressor.
+///
+/// A failed CUDA handle is quarantined and synchronous host-buffer operations are retried once on a fresh handle.
+/// Only when recovery fails does the equivalent CPU implementation produce the affected symbol, so a CUDA error does
+/// not drop the fronthaul link or allow a failed stream to poison subsequent symbols.
 class iq_compression_cuda : public iq_compressor, public iq_decompressor
 {
 public:
-  explicit iq_compression_cuda(compression_type type_, float iq_scaling_ = 1.0F);
+  explicit iq_compression_cuda(compression_type        type_,
+                               ocudulog::basic_logger& logger_,
+                               float                   iq_scaling_ = 1.0F);
   ~iq_compression_cuda() override;
 
   iq_compression_cuda(const iq_compression_cuda&)            = delete;
@@ -105,12 +114,44 @@ public:
                                   span<const uint8_t>          compressed_data,
                                   const ru_compression_params& params) override;
 
+  /// Returns the number of times the accelerated path failed and the CPU implementation was used instead.
+  uint64_t get_nof_acceleration_failures() const
+  {
+    return nof_acceleration_failures.load(std::memory_order_relaxed);
+  }
+
+  /// Returns the number of fresh-handle GPU retries attempted after an accelerated backend failure.
+  uint64_t get_nof_acceleration_retries() const { return nof_acceleration_retries.load(std::memory_order_relaxed); }
+
 private:
   ocudu_ofh_compression_handle* acquire_handle();
   void                          release_handle(ocudu_ofh_compression_handle* acquired_handle);
+  void                          discard_handle(ocudu_ofh_compression_handle* failed_handle);
+
+  /// Consumes the one-shot failure injection hook used to exercise fresh-handle recovery.
+  bool should_inject_gpu_failure();
+
+  /// Counts a fresh-handle retry and logs the failed CUDA operation at a bounded rate.
+  void note_acceleration_retry(const char* operation, const ocudu_ofh_compression_handle* failed_handle, bool injected);
+
+  /// Counts a failure of the accelerated path and logs it at a bounded rate.
+  void note_acceleration_failure(const char*                         operation,
+                                 const ocudu_ofh_compression_handle* failed_handle = nullptr,
+                                 bool                                injected      = false);
+
+  /// Number of failures between two consecutive log entries. Failures happen once per symbol and eAxC in the worst
+  /// case, so logging every one of them would flood the log backend.
+  static constexpr uint64_t failure_log_period = 1000;
 
   compression_type                           type;
+  ocudulog::basic_logger&                    logger;
   float                                      iq_scaling;
+  bool                                       force_fallback;
+  std::atomic<bool>                          inject_next_gpu_failure;
+  std::unique_ptr<iq_compressor>             fallback_compressor;
+  std::unique_ptr<iq_decompressor>           fallback_decompressor;
+  std::atomic<uint64_t>                      nof_acceleration_retries  = {0};
+  std::atomic<uint64_t>                      nof_acceleration_failures = {0};
   std::vector<ocudu_ofh_compression_handle*> handles;
   std::mutex                                 mutex;
 };

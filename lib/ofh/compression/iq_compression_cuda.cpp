@@ -3,12 +3,15 @@
 // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
 
 #include "iq_compression_cuda.h"
+#include "ocudu/ofh/compression/compression_factory.h"
 #include "ocudu/ofh/compression/compression_properties.h"
 #include "ocudu/phy/support/prach_buffer.h"
 #include "ocudu/phy/support/resource_grid_reader.h"
 #include "ocudu/phy/support/resource_grid_writer.h"
 #include "ocudu/support/error_handling.h"
 #include "ocudu/support/ocudu_assert.h"
+#include <cstdlib>
+#include <cstring>
 
 #ifdef ENABLE_CUDA
 #include "ofh_compression.h"
@@ -38,12 +41,36 @@ bool ocudu::ofh::is_iq_compression_cuda_available()
 #endif
 }
 
-iq_compression_cuda::iq_compression_cuda(compression_type type_, float iq_scaling_) :
-  type(type_), iq_scaling(iq_scaling_)
+/// Reads the test hook that forces every data path call to take the CPU fallback.
+static bool read_force_fallback()
+{
+  const char* env_value = std::getenv("OCUDU_OFH_COMPRESSION_FORCE_FALLBACK");
+  return (env_value != nullptr) && (env_value[0] != '\0') && (std::strcmp(env_value, "0") != 0);
+}
+
+/// Reads the test hook that fails only the first GPU call made by an object. The retry is still executed by CUDA.
+static bool read_force_first_gpu_failure()
+{
+  const char* env_value = std::getenv("OCUDU_OFH_COMPRESSION_FORCE_FIRST_GPU_FAILURE");
+  return (env_value != nullptr) && (env_value[0] != '\0') && (std::strcmp(env_value, "0") != 0);
+}
+
+iq_compression_cuda::iq_compression_cuda(compression_type type_, ocudulog::basic_logger& logger_, float iq_scaling_) :
+  type(type_),
+  logger(logger_),
+  iq_scaling(iq_scaling_),
+  force_fallback(read_force_fallback()),
+  inject_next_gpu_failure(read_force_first_gpu_failure())
 {
 #ifdef ENABLE_CUDA
   report_fatal_error_if_not((type == compression_type::none) || (type == compression_type::BFP),
                             "CUDA OFH compression supports none and BFP only.");
+
+  // CPU implementations used when the accelerated path fails at run-time. They are built up-front so that the fallback
+  // does not allocate on the data path. Requesting "cpu_auto" cannot resolve back to CUDA, so this does not recurse.
+  fallback_compressor   = create_iq_compressor(type, logger, iq_scaling, "cpu_auto");
+  fallback_decompressor = create_iq_decompressor(type, logger, "cpu_auto");
+
   ocudu_ofh_compression_handle* initial_handle = nullptr;
   report_fatal_error_if_not(ocudu_ofh_compression_create(&initial_handle) != 0,
                             "Failed to create CUDA OFH compression backend.");
@@ -51,6 +78,62 @@ iq_compression_cuda::iq_compression_cuda(compression_type type_, float iq_scalin
 #else
   report_fatal_error("CUDA OFH compression backend is not available in this build.");
 #endif
+}
+
+static void log_backend_failure(ocudulog::basic_logger&             logger,
+                                const char*                         operation,
+                                const char*                         recovery_action,
+                                const ocudu_ofh_compression_handle* failed_handle,
+                                bool                                injected,
+                                uint64_t                            count)
+{
+#ifdef ENABLE_CUDA
+  ocudu_ofh_compression_error_info_t error_info = {};
+  if (injected) {
+    logger.warning("CUDA OFH {} test failure injected; {}. Total events: {}", operation, recovery_action, count);
+  } else if ((failed_handle != nullptr) && ocudu_ofh_compression_get_last_error(failed_handle, &error_info) &&
+             (error_info.cuda_error_code != 0)) {
+    logger.warning("CUDA OFH {} failed during '{}': {} ({}): {}; {}. Total events: {}",
+                   operation,
+                   error_info.operation,
+                   error_info.error_name,
+                   error_info.cuda_error_code,
+                   error_info.error_description,
+                   recovery_action,
+                   count);
+  } else {
+    logger.warning(
+        "CUDA OFH {} failed without a CUDA runtime error; {}. Total events: {}", operation, recovery_action, count);
+  }
+#else
+  (void)logger;
+  (void)operation;
+  (void)recovery_action;
+  (void)failed_handle;
+  (void)injected;
+  (void)count;
+#endif
+}
+
+void iq_compression_cuda::note_acceleration_retry(const char*                         operation,
+                                                  const ocudu_ofh_compression_handle* failed_handle,
+                                                  bool                                injected)
+{
+  uint64_t nof_retries = nof_acceleration_retries.fetch_add(1, std::memory_order_relaxed) + 1;
+  if ((nof_retries == 1) || ((nof_retries % failure_log_period) == 0)) {
+    log_backend_failure(logger, operation, "retrying on a fresh CUDA handle", failed_handle, injected, nof_retries);
+  }
+}
+
+void iq_compression_cuda::note_acceleration_failure(const char*                         operation,
+                                                    const ocudu_ofh_compression_handle* failed_handle,
+                                                    bool                                injected)
+{
+  uint64_t nof_failures = nof_acceleration_failures.fetch_add(1, std::memory_order_relaxed) + 1;
+  if ((nof_failures == 1) || ((nof_failures % failure_log_period) == 0)) {
+    log_backend_failure(
+        logger, operation, "using the CPU implementation for this symbol", failed_handle, injected, nof_failures);
+  }
 }
 
 iq_compression_cuda::~iq_compression_cuda()
@@ -97,6 +180,22 @@ void iq_compression_cuda::release_handle(ocudu_ofh_compression_handle* acquired_
 #endif
 }
 
+void iq_compression_cuda::discard_handle(ocudu_ofh_compression_handle* failed_handle)
+{
+#ifdef ENABLE_CUDA
+  if (failed_handle != nullptr) {
+    ocudu_ofh_compression_destroy(failed_handle);
+  }
+#else
+  (void)failed_handle;
+#endif
+}
+
+bool iq_compression_cuda::should_inject_gpu_failure()
+{
+  return inject_next_gpu_failure.exchange(false, std::memory_order_relaxed);
+}
+
 void iq_compression_cuda::compress(span<uint8_t>                buffer,
                                    span<const cbf16_t>          iq_data,
                                    const ru_compression_params& params)
@@ -109,17 +208,58 @@ void iq_compression_cuda::compress(span<uint8_t>                buffer,
   if (nof_prbs == 0) {
     return;
   }
-  ocudu_ofh_compression_handle* handle = acquire_handle();
-  report_fatal_error_if_not(handle != nullptr, "Failed to create CUDA OFH compression backend.");
-  bool success = ocudu_ofh_compress(handle,
-                                    to_cuda_compression_type(type),
-                                    buffer.data(),
-                                    iq_data.data(),
-                                    nof_prbs,
-                                    params.data_width,
-                                    iq_scaling) != 0;
-  release_handle(handle);
-  report_fatal_error_if_not(success, "CUDA OFH compression failed.");
+  bool success       = false;
+  bool first_failure = false;
+  if (!force_fallback) {
+    if (ocudu_ofh_compression_handle* handle = acquire_handle(); handle != nullptr) {
+      bool injected = should_inject_gpu_failure();
+      success       = !injected && (ocudu_ofh_compress(handle,
+                                                 to_cuda_compression_type(type),
+                                                 buffer.data(),
+                                                 iq_data.data(),
+                                                 nof_prbs,
+                                                 params.data_width,
+                                                 iq_scaling) != 0);
+      if (success) {
+        release_handle(handle);
+      } else {
+        first_failure = true;
+        note_acceleration_retry("compression", handle, injected);
+        discard_handle(handle);
+      }
+    } else {
+      first_failure = true;
+      note_acceleration_retry("compression handle creation", nullptr, false);
+    }
+
+    if (first_failure) {
+      if (ocudu_ofh_compression_handle* retry_handle = acquire_handle(); retry_handle != nullptr) {
+        success = ocudu_ofh_compress(retry_handle,
+                                     to_cuda_compression_type(type),
+                                     buffer.data(),
+                                     iq_data.data(),
+                                     nof_prbs,
+                                     params.data_width,
+                                     iq_scaling) != 0;
+        if (success) {
+          release_handle(retry_handle);
+        } else {
+          note_acceleration_failure("compression retry", retry_handle);
+          discard_handle(retry_handle);
+        }
+      } else {
+        note_acceleration_failure("compression retry handle creation");
+      }
+    }
+  }
+
+  // A failure of the accelerated backend must not bring the fronthaul down: compress the symbol on the CPU instead.
+  if (!success) {
+    if (force_fallback) {
+      note_acceleration_failure("compression", nullptr, true);
+    }
+    fallback_compressor->compress(buffer, iq_data, params);
+  }
 #else
   (void)buffer;
   (void)iq_data;
@@ -155,20 +295,28 @@ bool iq_compression_cuda::compress_device_symbol(span<uint8_t>                bu
   }
 
   void* stream = ocudu_ofh_compression_get_stream(handle);
-  bool  success =
-      grid.prepare_device_grid_reading(stream) && (ocudu_ofh_compress_device_grid(handle,
-                                                                                  to_cuda_compression_type(type),
-                                                                                  buffer.data(),
-                                                                                  grid.get_device_grid_cbf16(),
-                                                                                  grid.get_nof_symbols(),
-                                                                                  grid.get_nof_subc(),
-                                                                                  port,
-                                                                                  symbol,
-                                                                                  start_prb,
-                                                                                  nof_prbs,
-                                                                                  params.data_width,
-                                                                                  iq_scaling) != 0);
-  release_handle(handle);
+  if (!grid.prepare_device_grid_reading(stream)) {
+    release_handle(handle);
+    return false;
+  }
+  bool success = ocudu_ofh_compress_device_grid(handle,
+                                                to_cuda_compression_type(type),
+                                                buffer.data(),
+                                                grid.get_device_grid_cbf16(),
+                                                grid.get_nof_symbols(),
+                                                grid.get_nof_subc(),
+                                                port,
+                                                symbol,
+                                                start_prb,
+                                                nof_prbs,
+                                                params.data_width,
+                                                iq_scaling) != 0;
+  if (success) {
+    release_handle(handle);
+  } else {
+    note_acceleration_failure("device-grid compression", handle);
+    discard_handle(handle);
+  }
   return success;
 #else
   (void)buffer;
@@ -213,22 +361,30 @@ bool iq_compression_cuda::compress_device_symbols(span<uint8_t>                b
   }
 
   void* stream = ocudu_ofh_compression_get_stream(handle);
-  bool  success =
-      grid.prepare_device_grid_reading(stream) && (ocudu_ofh_compress_device_grid_ports(handle,
-                                                                                        to_cuda_compression_type(type),
-                                                                                        buffer.data(),
-                                                                                        port_stride_bytes,
-                                                                                        grid.get_device_grid_cbf16(),
-                                                                                        grid.get_nof_symbols(),
-                                                                                        grid.get_nof_subc(),
-                                                                                        first_port,
-                                                                                        nof_ports,
-                                                                                        symbol,
-                                                                                        start_prb,
-                                                                                        nof_prbs,
-                                                                                        params.data_width,
-                                                                                        iq_scaling) != 0);
-  release_handle(handle);
+  if (!grid.prepare_device_grid_reading(stream)) {
+    release_handle(handle);
+    return false;
+  }
+  bool success = ocudu_ofh_compress_device_grid_ports(handle,
+                                                      to_cuda_compression_type(type),
+                                                      buffer.data(),
+                                                      port_stride_bytes,
+                                                      grid.get_device_grid_cbf16(),
+                                                      grid.get_nof_symbols(),
+                                                      grid.get_nof_subc(),
+                                                      first_port,
+                                                      nof_ports,
+                                                      symbol,
+                                                      start_prb,
+                                                      nof_prbs,
+                                                      params.data_width,
+                                                      iq_scaling) != 0;
+  if (success) {
+    release_handle(handle);
+  } else {
+    note_acceleration_failure("device-grid port compression", handle);
+    discard_handle(handle);
+  }
   return success;
 #else
   (void)buffer;
@@ -277,24 +433,32 @@ bool iq_compression_cuda::compress_device_symbols_to_buffers(span<span<uint8_t>>
     return false;
   }
 
-  void* stream  = ocudu_ofh_compression_get_stream(handle);
-  bool  success = grid.prepare_device_grid_reading(stream) &&
-                 (ocudu_ofh_compress_device_grid_ports_to_host_buffers(handle,
-                                                                       to_cuda_compression_type(type),
-                                                                       output_buffers.data(),
-                                                                       nof_ports,
-                                                                       port_bytes,
-                                                                       grid.get_device_grid_cbf16(),
-                                                                       grid.get_nof_symbols(),
-                                                                       grid.get_nof_subc(),
-                                                                       first_port,
-                                                                       nof_ports,
-                                                                       symbol,
-                                                                       start_prb,
-                                                                       nof_prbs,
-                                                                       params.data_width,
-                                                                       iq_scaling) != 0);
-  release_handle(handle);
+  void* stream = ocudu_ofh_compression_get_stream(handle);
+  if (!grid.prepare_device_grid_reading(stream)) {
+    release_handle(handle);
+    return false;
+  }
+  bool success = ocudu_ofh_compress_device_grid_ports_to_host_buffers(handle,
+                                                                      to_cuda_compression_type(type),
+                                                                      output_buffers.data(),
+                                                                      nof_ports,
+                                                                      port_bytes,
+                                                                      grid.get_device_grid_cbf16(),
+                                                                      grid.get_nof_symbols(),
+                                                                      grid.get_nof_subc(),
+                                                                      first_port,
+                                                                      nof_ports,
+                                                                      symbol,
+                                                                      start_prb,
+                                                                      nof_prbs,
+                                                                      params.data_width,
+                                                                      iq_scaling) != 0;
+  if (success) {
+    release_handle(handle);
+  } else {
+    note_acceleration_failure("device-grid host-buffer compression", handle);
+    discard_handle(handle);
+  }
   return success;
 #else
   (void)buffers;
@@ -344,25 +508,33 @@ bool iq_compression_cuda::compress_device_symbol_batch(span<uint8_t>            
     return false;
   }
 
-  void* stream  = ocudu_ofh_compression_get_stream(handle);
-  bool  success = grid.prepare_device_grid_reading(stream) &&
-                 (ocudu_ofh_compress_device_grid_symbol_batch(handle,
-                                                              to_cuda_compression_type(type),
-                                                              buffer.data(),
-                                                              symbol_stride_bytes,
-                                                              port_stride_bytes,
-                                                              grid.get_device_grid_cbf16(),
-                                                              grid.get_nof_symbols(),
-                                                              grid.get_nof_subc(),
-                                                              first_port,
-                                                              nof_ports,
-                                                              first_symbol,
-                                                              nof_symbols,
-                                                              start_prb,
-                                                              nof_prbs,
-                                                              params.data_width,
-                                                              iq_scaling) != 0);
-  release_handle(handle);
+  void* stream = ocudu_ofh_compression_get_stream(handle);
+  if (!grid.prepare_device_grid_reading(stream)) {
+    release_handle(handle);
+    return false;
+  }
+  bool success = ocudu_ofh_compress_device_grid_symbol_batch(handle,
+                                                             to_cuda_compression_type(type),
+                                                             buffer.data(),
+                                                             symbol_stride_bytes,
+                                                             port_stride_bytes,
+                                                             grid.get_device_grid_cbf16(),
+                                                             grid.get_nof_symbols(),
+                                                             grid.get_nof_subc(),
+                                                             first_port,
+                                                             nof_ports,
+                                                             first_symbol,
+                                                             nof_symbols,
+                                                             start_prb,
+                                                             nof_prbs,
+                                                             params.data_width,
+                                                             iq_scaling) != 0;
+  if (success) {
+    release_handle(handle);
+  } else {
+    note_acceleration_failure("device-grid symbol-batch compression", handle);
+    discard_handle(handle);
+  }
   return success;
 #else
   (void)buffer;
@@ -419,25 +591,33 @@ bool iq_compression_cuda::compress_device_symbol_batch_to_buffers(span<span<uint
     return false;
   }
 
-  void* stream  = ocudu_ofh_compression_get_stream(handle);
-  bool  success = grid.prepare_device_grid_reading(stream) &&
-                 (ocudu_ofh_compress_device_grid_symbol_batch_to_host_buffers(handle,
-                                                                              to_cuda_compression_type(type),
-                                                                              output_buffers.data(),
-                                                                              nof_buffers,
-                                                                              port_bytes,
-                                                                              grid.get_device_grid_cbf16(),
-                                                                              grid.get_nof_symbols(),
-                                                                              grid.get_nof_subc(),
-                                                                              first_port,
-                                                                              nof_ports,
-                                                                              first_symbol,
-                                                                              nof_symbols,
-                                                                              start_prb,
-                                                                              nof_prbs,
-                                                                              params.data_width,
-                                                                              iq_scaling) != 0);
-  release_handle(handle);
+  void* stream = ocudu_ofh_compression_get_stream(handle);
+  if (!grid.prepare_device_grid_reading(stream)) {
+    release_handle(handle);
+    return false;
+  }
+  bool success = ocudu_ofh_compress_device_grid_symbol_batch_to_host_buffers(handle,
+                                                                             to_cuda_compression_type(type),
+                                                                             output_buffers.data(),
+                                                                             nof_buffers,
+                                                                             port_bytes,
+                                                                             grid.get_device_grid_cbf16(),
+                                                                             grid.get_nof_symbols(),
+                                                                             grid.get_nof_subc(),
+                                                                             first_port,
+                                                                             nof_ports,
+                                                                             first_symbol,
+                                                                             nof_symbols,
+                                                                             start_prb,
+                                                                             nof_prbs,
+                                                                             params.data_width,
+                                                                             iq_scaling) != 0;
+  if (success) {
+    release_handle(handle);
+  } else {
+    note_acceleration_failure("device-grid host-buffer symbol-batch compression", handle);
+    discard_handle(handle);
+  }
   return success;
 #else
   (void)buffers;
@@ -467,16 +647,56 @@ void iq_compression_cuda::decompress(span<cbf16_t>                iq_data,
   if (nof_prbs == 0) {
     return;
   }
-  ocudu_ofh_compression_handle* handle = acquire_handle();
-  report_fatal_error_if_not(handle != nullptr, "Failed to create CUDA OFH compression backend.");
-  bool success = ocudu_ofh_decompress(handle,
-                                      to_cuda_compression_type(type),
-                                      iq_data.data(),
-                                      compressed_data.data(),
-                                      nof_prbs,
-                                      params.data_width) != 0;
-  release_handle(handle);
-  report_fatal_error_if_not(success, "CUDA OFH decompression failed.");
+  bool success       = false;
+  bool first_failure = false;
+  if (!force_fallback) {
+    if (ocudu_ofh_compression_handle* handle = acquire_handle(); handle != nullptr) {
+      bool injected = should_inject_gpu_failure();
+      success       = !injected && (ocudu_ofh_decompress(handle,
+                                                   to_cuda_compression_type(type),
+                                                   iq_data.data(),
+                                                   compressed_data.data(),
+                                                   nof_prbs,
+                                                   params.data_width) != 0);
+      if (success) {
+        release_handle(handle);
+      } else {
+        first_failure = true;
+        note_acceleration_retry("decompression", handle, injected);
+        discard_handle(handle);
+      }
+    } else {
+      first_failure = true;
+      note_acceleration_retry("decompression handle creation", nullptr, false);
+    }
+
+    if (first_failure) {
+      if (ocudu_ofh_compression_handle* retry_handle = acquire_handle(); retry_handle != nullptr) {
+        success = ocudu_ofh_decompress(retry_handle,
+                                       to_cuda_compression_type(type),
+                                       iq_data.data(),
+                                       compressed_data.data(),
+                                       nof_prbs,
+                                       params.data_width) != 0;
+        if (success) {
+          release_handle(retry_handle);
+        } else {
+          note_acceleration_failure("decompression retry", retry_handle);
+          discard_handle(retry_handle);
+        }
+      } else {
+        note_acceleration_failure("decompression retry handle creation");
+      }
+    }
+  }
+
+  // See the comment in compress(): fall back to the CPU implementation instead of terminating the process.
+  if (!success) {
+    if (force_fallback) {
+      note_acceleration_failure("decompression", nullptr, true);
+    }
+    fallback_decompressor->decompress(iq_data, compressed_data, params);
+  }
 #else
   (void)iq_data;
   (void)compressed_data;
@@ -517,24 +737,34 @@ bool iq_compression_cuda::decompress_to_resource_grid(resource_grid_writer&     
     return false;
   }
 
-  bool success = ocudu_ofh_decompress_to_device_grid_async(handle,
-                                                           to_cuda_compression_type(type),
-                                                           grid.get_device_grid_bf16(),
-                                                           compressed_data.data(),
-                                                           grid.get_nof_symbols(),
-                                                           grid.get_nof_subc(),
-                                                           port,
-                                                           symbol,
-                                                           start_prb,
-                                                           nof_prbs,
-                                                           params.data_width) != 0;
-  if (success) {
-    success = grid.on_device_grid_mapping_enqueued(stream);
-  }
-
-  if (!success) {
+  bool backend_success = ocudu_ofh_decompress_to_device_grid_async(handle,
+                                                                   to_cuda_compression_type(type),
+                                                                   grid.get_device_grid_bf16(),
+                                                                   compressed_data.data(),
+                                                                   grid.get_nof_symbols(),
+                                                                   grid.get_nof_subc(),
+                                                                   port,
+                                                                   symbol,
+                                                                   start_prb,
+                                                                   nof_prbs,
+                                                                   params.data_width) != 0;
+  if (!backend_success) {
     (void)ocudu_ofh_compression_synchronize(handle);
     (void)grid.cancel_device_grid_mapping();
+    note_acceleration_failure("device-grid decompression", handle);
+    discard_handle(handle);
+    return false;
+  }
+
+  bool success = grid.on_device_grid_mapping_enqueued(stream);
+  if (!success) {
+    bool synchronized = ocudu_ofh_compression_synchronize(handle) != 0;
+    (void)grid.cancel_device_grid_mapping();
+    if (!synchronized) {
+      note_acceleration_failure("device-grid decompression synchronization", handle);
+      discard_handle(handle);
+      return false;
+    }
   }
 
   release_handle(handle);
@@ -588,22 +818,32 @@ bool iq_compression_cuda::decompress_to_prach_buffer(prach_buffer&              
   }
 
   unsigned output_offset_re = buffer.get_device_prach_symbol_offset(port, td_occasion, fd_occasion, symbol) + start_re;
-  bool     success          = ocudu_ofh_decompress_to_device_prach_buffer_async(handle,
-                                                                   to_cuda_compression_type(type),
-                                                                   buffer.get_device_prach_buffer_cbf16(),
-                                                                   output_offset_re,
-                                                                   compressed_data.data(),
-                                                                   input_start_re,
-                                                                   nof_re,
-                                                                   nof_prbs,
-                                                                   params.data_width) != 0;
-  if (success) {
-    success = buffer.on_device_prach_buffer_mapping_enqueued(stream);
-  }
-
-  if (!success) {
+  bool     backend_success  = ocudu_ofh_decompress_to_device_prach_buffer_async(handle,
+                                                                           to_cuda_compression_type(type),
+                                                                           buffer.get_device_prach_buffer_cbf16(),
+                                                                           output_offset_re,
+                                                                           compressed_data.data(),
+                                                                           input_start_re,
+                                                                           nof_re,
+                                                                           nof_prbs,
+                                                                           params.data_width) != 0;
+  if (!backend_success) {
     (void)ocudu_ofh_compression_synchronize(handle);
     (void)buffer.cancel_device_prach_buffer_mapping();
+    note_acceleration_failure("device PRACH decompression", handle);
+    discard_handle(handle);
+    return false;
+  }
+
+  bool success = buffer.on_device_prach_buffer_mapping_enqueued(stream);
+  if (!success) {
+    bool synchronized = ocudu_ofh_compression_synchronize(handle) != 0;
+    (void)buffer.cancel_device_prach_buffer_mapping();
+    if (!synchronized) {
+      note_acceleration_failure("device PRACH decompression synchronization", handle);
+      discard_handle(handle);
+      return false;
+    }
   }
 
   release_handle(handle);
