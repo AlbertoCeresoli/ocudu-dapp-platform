@@ -28,9 +28,7 @@ bool is_iq_compression_cuda_available();
 class iq_compression_cuda : public iq_compressor, public iq_decompressor
 {
 public:
-  explicit iq_compression_cuda(compression_type        type_,
-                               ocudulog::basic_logger& logger_,
-                               float                   iq_scaling_ = 1.0F);
+  explicit iq_compression_cuda(compression_type type_, ocudulog::basic_logger& logger_, float iq_scaling_ = 1.0F);
   ~iq_compression_cuda() override;
 
   iq_compression_cuda(const iq_compression_cuda&)            = delete;
@@ -115,10 +113,7 @@ public:
                                   const ru_compression_params& params) override;
 
   /// Returns the number of times the accelerated path failed and the CPU implementation was used instead.
-  uint64_t get_nof_acceleration_failures() const
-  {
-    return nof_acceleration_failures.load(std::memory_order_relaxed);
-  }
+  uint64_t get_nof_acceleration_failures() const { return nof_acceleration_failures.load(std::memory_order_relaxed); }
 
   /// Returns the number of fresh-handle GPU retries attempted after an accelerated backend failure.
   uint64_t get_nof_acceleration_retries() const { return nof_acceleration_retries.load(std::memory_order_relaxed); }

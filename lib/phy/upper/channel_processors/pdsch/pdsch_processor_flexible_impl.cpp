@@ -475,11 +475,11 @@ void pdsch_processor_flexible_impl::fork_codeword_processing(unsigned i_cw)
       resource_grid_mapper::symbol_buffer& grid_buffer = [&]() -> resource_grid_mapper::symbol_buffer& {
         auto configure_scope = make_scoped_trace(l1_dl_tracer, "L1.DL.PDSCH.cb_configure_tb");
         return block_processor->configure_new_transmission(codeword_ctx.data.get_buffer(),
-                                                          i_cw,
-                                                          codeword_ctx.block_config,
-                                                          *segmenter_buffer,
-                                                          first_cb_index,
-                                                          next_cb_batch_length);
+                                                           i_cw,
+                                                           codeword_ctx.block_config,
+                                                           *segmenter_buffer,
+                                                           first_cb_index,
+                                                           next_cb_batch_length);
       }();
 
       // Map PDSCH.

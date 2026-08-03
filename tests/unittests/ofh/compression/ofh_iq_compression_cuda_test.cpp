@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
 // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
 
-#include "ofh_compression.h"
 #include "iq_compression_cuda.h"
+#include "ofh_compression.h"
 #include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/ofh/compression/compression_factory.h"
 #include "ocudu/ofh/compression/compression_properties.h"
@@ -1112,7 +1112,7 @@ TEST_P(ofh_iq_compression_cuda_test, cuda_failure_falls_back_to_cpu)
   std::unique_ptr<ofh::iq_decompressor> cpu_decompressor = ofh::create_iq_decompressor(type, logger, "generic");
 
   ASSERT_EQ(::setenv("OCUDU_OFH_COMPRESSION_FORCE_FALLBACK", "1", 1), 0);
-  std::unique_ptr<ofh::iq_compressor>   cuda_compressor = ofh::create_iq_compressor(type, logger, iq_scale, "cuda");
+  std::unique_ptr<ofh::iq_compressor>   cuda_compressor   = ofh::create_iq_compressor(type, logger, iq_scale, "cuda");
   std::unique_ptr<ofh::iq_decompressor> cuda_decompressor = ofh::create_iq_decompressor(type, logger, "cuda");
   ASSERT_EQ(::unsetenv("OCUDU_OFH_COMPRESSION_FORCE_FALLBACK"), 0);
 

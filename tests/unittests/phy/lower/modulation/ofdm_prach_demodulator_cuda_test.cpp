@@ -95,10 +95,10 @@ void assert_symbols_near(const prach_buffer&                          cpu_buffer
     for (unsigned i_re = 0; i_re != cpu_symbol.size(); ++i_re) {
       cf_t cpu = to_cf(cpu_symbol[i_re]);
       cf_t gpu = to_cf(gpu_symbol[i_re]);
-      EXPECT_NEAR(cpu.real(), gpu.real(), near_bf16(cpu.real(), gpu.real(), tolerance)) << "symbol=" << i_symbol
-                                                                                       << " re=" << i_re;
-      EXPECT_NEAR(cpu.imag(), gpu.imag(), near_bf16(cpu.imag(), gpu.imag(), tolerance)) << "symbol=" << i_symbol
-                                                                                       << " re=" << i_re;
+      EXPECT_NEAR(cpu.real(), gpu.real(), near_bf16(cpu.real(), gpu.real(), tolerance))
+          << "symbol=" << i_symbol << " re=" << i_re;
+      EXPECT_NEAR(cpu.imag(), gpu.imag(), near_bf16(cpu.imag(), gpu.imag(), tolerance))
+          << "symbol=" << i_symbol << " re=" << i_re;
     }
   }
 }

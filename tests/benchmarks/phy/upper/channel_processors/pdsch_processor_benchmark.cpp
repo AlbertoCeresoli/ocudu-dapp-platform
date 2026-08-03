@@ -124,8 +124,8 @@ static std::string                        pdsch_processor_type          = "flexi
 static bool                               use_gpu_pdsch_block_processor = false;
 static benchmark_modes                    benchmark_mode                = benchmark_modes::throughput_total;
 static std::string                        tracing_filename;
-static dmrs_config_type                   dmrs                          = dmrs_config_type::type1;
-static unsigned                           nof_cdm_groups_without_data   = 2;
+static dmrs_config_type                   dmrs                        = dmrs_config_type::type1;
+static unsigned                           nof_cdm_groups_without_data = 2;
 static bounded_bitset<MAX_NSYMB_PER_SLOT> dmrs_single_mask =
     {false, false, true, false, false, false, false, true, false, false, false, true, false, false};
 static bounded_bitset<MAX_NSYMB_PER_SLOT> dmrs_double_mask =
@@ -1101,8 +1101,8 @@ int main(int argc, char** argv)
             // Record slot end time and store latency.
             auto slot_end = slot_latency_collector::clock_type::now();
             if (latency_collector) {
-              latency_collector->record(
-                  i_thread, std::chrono::duration_cast<std::chrono::nanoseconds>(slot_end - slot_start));
+              latency_collector->record(i_thread,
+                                        std::chrono::duration_cast<std::chrono::nanoseconds>(slot_end - slot_start));
             }
           }
           // Count the completion of the thread.

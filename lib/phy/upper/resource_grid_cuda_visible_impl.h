@@ -252,9 +252,7 @@ private:
   class writer_impl : public resource_grid_writer_impl
   {
   public:
-    writer_impl(cuda_visible_resource_grid&    parent_,
-                storage_type&                  data_,
-                resource_grid_allocation_info& alloc_mask_) :
+    writer_impl(cuda_visible_resource_grid& parent_, storage_type& data_, resource_grid_allocation_info& alloc_mask_) :
       resource_grid_writer_impl(data_, alloc_mask_), parent(parent_)
     {
     }
