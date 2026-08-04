@@ -217,8 +217,9 @@ explanatory error before the radio is brought up.
 All operator-facing acceleration mode selectors accept the same values and
 default to `auto`, so any selector left out of the config behaves as `auto`:
 
-- `auto`: use the accelerated path when the build and runtime support it. This
-  is the default for every selector below.
+- `auto`: apply the component's runtime policy when acceleration is available.
+  This is the default for every selector below, but a policy can still prefer
+  the host path (notably PDSCH on a discrete CUDA device).
 - `enabled`: require the accelerated path and fail configuration if it cannot be
   used.
 - `disabled`: force the CPU path, or an explicitly configured non-CUDA hardware
@@ -230,7 +231,7 @@ Upper-PHY options under `expert_phy`:
 | --- | --- | --- |
 | `pusch_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA resident PUSCH demodulator/decoder path when available. |
 | `srs_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA SRS estimator when available. |
-| `pdsch_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA PDSCH block processor when the PDSCH processor type is `auto` or `flexible`. |
+| `pdsch_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA PDSCH block processor when the PDSCH processor type is `auto` or `flexible`. On a discrete CUDA device, `auto` prefers host unless the downlink grid is CUDA-visible or `OCUDU_PDSCH_AUTO_ENABLE_DISCRETE=1`; use `enabled` to require CUDA. |
 | `prach_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA upper-PHY PRACH detector when available. |
 | `pdsch_acceleration_nof_lanes` | `0` or positive integer | `0` uses the default lane policy; non-zero values bound concurrent accelerated PDSCH lanes. |
 | `ldpc_decoder_algorithm` | `auto`, `boxplus`, `min_sum` | Selects the CUDA LDPC decoder algorithm. `auto` chooses the lower-latency algorithm for the current codeblock batch. |
@@ -249,9 +250,9 @@ Split-7.2 Open Fronthaul option under `ru_ofh`:
 | --- | --- | --- |
 | `compression_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects CUDA OFH IQ compression/decompression for supported compression types. |
 
-The example below sets explicit values only to illustrate the syntax; omitting
-any of these keys leaves it at `auto`, which already enables acceleration where
-supported.
+The example below sets explicit values only to illustrate the syntax. Omitting
+any key leaves it at `auto`, which follows the component policy described
+above. Use `enabled` when deployment validation must fail rather than fall back.
 
 ```yaml
 ru_sdr:

@@ -1431,6 +1431,9 @@ INSTANTIATE_TEST_SUITE_P(
         pdsch_gpu_e2e_params{pdsch_mcs_table::qam64, sch_mcs_index(10), 52, 4, 0, dmrs_profile::double_symbol, 2},
         pdsch_gpu_e2e_params{pdsch_mcs_table::qam64, sch_mcs_index(10), 106, 4, 0, dmrs_profile::double_symbol, 2},
         pdsch_gpu_e2e_params{pdsch_mcs_table::qam64, sch_mcs_index(10), 273, 4, 0, dmrs_profile::double_symbol, 2},
+        // Maximum-bandwidth, rank-4 profile. This requires more than 52 LDPC codeblocks and guards the resident
+        // transport-block encoder's preallocated buffers.
+        pdsch_gpu_e2e_params{pdsch_mcs_table::qam256, sch_mcs_index(27), 273, 4, 0, dmrs_profile::double_symbol, 2},
         pdsch_gpu_e2e_params{pdsch_mcs_table::qam64,
                              sch_mcs_index(10),
                              273,

@@ -1298,12 +1298,12 @@ __global__ void compare_crc_kernel(
 extern "C" {
 
 // Maximum sizes for pre-allocation (avoids any runtime cudaMalloc/cudaFree)
-// Based on 100MHz 256QAM 4-layer max configuration:
-// - Max TBS: ~1.3Mbits = 200KB with CRC
-// - Max CBs: 52 (BG1 with max TBS)
+// Based on the maximum NR TBS and coded-bit allocation supported by this backend:
+// - Max TBS: NR_MAX_TBS_BITS (~1.28Mbits); reserve 200KB with CRC and headroom
+// - Max CBs: ceil((A + TB CRC) / (K_cb - CB CRC)) for BG1
 // - Max LDPC input: Kb=22 * Z=384 = 8448 bits/CB = 264 words/CB
 // - Max LDPC output: 66 * Z = 25344 bits/CB = 792 words/CB
-    // - Max rate matched: G up to 2Mbits = 62500 words
+// - Max rate matched: G up to 2Mbits plus per-CB word-rounding slack
     static constexpr size_t MAX_TB_WITH_CRC_BYTES = 200000;
     // 16 KiB slices keep each 256-thread block at ~64 bytes/thread while the serial GF-combine
     // stays cheap (<=13 chunks for the largest TB).
@@ -1311,10 +1311,14 @@ extern "C" {
     static constexpr int MAX_CRC24A_CHUNKS =
         (MAX_TB_WITH_CRC_BYTES + PDSCH_CRC24A_MULTI_CTA_CHUNK_BYTES - 1) /
         PDSCH_CRC24A_MULTI_CTA_CHUNK_BYTES;
-    static constexpr size_t MAX_CB_BITS_SIZE = 52 * 264 * sizeof(uint32_t);        // ~55KB
-static constexpr size_t MAX_ENCODED_BITS_SIZE = 52 * 792 * sizeof(uint32_t);   // ~165KB
-static constexpr size_t MAX_RATE_MATCHED_SIZE = 52 * 2000 * sizeof(uint32_t);  // ~416KB (E up to 64000 bits/CB)
-static constexpr size_t MAX_OUTPUT_WORDS = 65536;                              // ~256KB (2M bits / 32)
+    static constexpr size_t MAX_PDSCH_CODEBLOCKS =
+        (NR_MAX_TBS_BITS + NR_TB_CRC24A_BITS + (NR_LDPC_MAX_CB_INFO_BITS - NR_CB_CRC24B_BITS) - 1) /
+        (NR_LDPC_MAX_CB_INFO_BITS - NR_CB_CRC24B_BITS);
+    static constexpr size_t MAX_OUTPUT_WORDS      = 65536; // ~256KB (2M bits / 32)
+    static constexpr size_t MAX_CB_BITS_SIZE      = MAX_PDSCH_CODEBLOCKS * 264 * sizeof(uint32_t);
+    static constexpr size_t MAX_ENCODED_BITS_SIZE = MAX_PDSCH_CODEBLOCKS * 792 * sizeof(uint32_t);
+    static constexpr size_t MAX_RATE_MATCHED_SIZE =
+        (MAX_OUTPUT_WORDS + MAX_PDSCH_CODEBLOCKS) * sizeof(uint32_t);
 
 nr_ldpc_status_t tb_encoder_create(tb_encoder_handle_t* handle) {
     if (!handle) return NR_LDPC_ERROR_INVALID_CONFIG;
