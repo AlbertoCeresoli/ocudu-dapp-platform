@@ -501,3 +501,54 @@ TEST(cuda_visible_phy_support_test, prach_buffer_repeated_device_mapping_and_rea
     ASSERT_TRUE(buffer->cancel_device_prach_buffer_mapping());
   }
 }
+
+TEST(cuda_visible_phy_support_test, prach_buffer_sustained_device_only_cycles_remain_ordered)
+{
+  testing::AssertionResult cuda_available = cuda_managed_memory_available();
+  if (!cuda_available) {
+    GTEST_SKIP() << cuda_available.message();
+  }
+
+  scoped_env_var buffer_mode("OCUDU_UL_CUDA_VISIBLE_PRACH_BUFFER");
+  ASSERT_TRUE(buffer_mode.set("managed"));
+
+  std::unique_ptr<prach_buffer> buffer = create_phy_acceleration_prach_buffer_short(1, 1, 1, true);
+  ASSERT_NE(buffer, nullptr);
+  ASSERT_TRUE(buffer->supports_device_prach_buffer_mapping());
+  ASSERT_TRUE(buffer->supports_device_prach_buffer_reading());
+
+  cuda_stream_guard producer_stream;
+  cuda_stream_guard consumer_stream;
+  ASSERT_TRUE(producer_stream.create());
+  ASSERT_TRUE(consumer_stream.create());
+
+  cbf16_t* device_buffer = static_cast<cbf16_t*>(buffer->get_device_prach_buffer_cbf16());
+  ASSERT_NE(device_buffer, nullptr);
+  const unsigned offset = buffer->get_device_prach_symbol_offset(0, 0, 0, 0);
+
+  for (unsigned iteration = 0; iteration != 512; ++iteration) {
+    SCOPED_TRACE("iteration=" + std::to_string(iteration));
+    std::vector<cbf16_t> expected =
+        generate_symbol_payload(buffer->get_sequence_length(), 0.001F * static_cast<float>(iteration + 1));
+
+    ASSERT_TRUE(buffer->prepare_device_prach_buffer_mapping(producer_stream.get()));
+    ASSERT_EQ(cudaMemcpyAsync(device_buffer + offset,
+                              expected.data(),
+                              expected.size() * sizeof(cbf16_t),
+                              cudaMemcpyHostToDevice,
+                              producer_stream.get()),
+              cudaSuccess);
+    ASSERT_TRUE(buffer->on_device_prach_buffer_mapping_enqueued(producer_stream.get()));
+
+    ASSERT_TRUE(buffer->prepare_device_prach_buffer_reading(consumer_stream.get()));
+    std::vector<cbf16_t> copied(expected.size());
+    ASSERT_EQ(cudaMemcpyAsync(copied.data(),
+                              device_buffer + offset,
+                              copied.size() * sizeof(cbf16_t),
+                              cudaMemcpyDeviceToHost,
+                              consumer_stream.get()),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(consumer_stream.get()), cudaSuccess);
+    EXPECT_EQ(copied, expected);
+  }
+}

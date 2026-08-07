@@ -170,6 +170,22 @@ create_txrx(const sector_configuration&                        sector_cfg,
 std::unique_ptr<sector> ocudu::ofh::create_ofh_sector(const sector_configuration& sector_cfg,
                                                       sector_dependencies&&       sector_deps)
 {
+  const char* compression_backend = sector_cfg.compression_acceleration_mode == "enabled"
+                                        ? "CUDA"
+                                        : (sector_cfg.compression_acceleration_mode == "disabled" ? "host" : "auto");
+  sector_deps.logger->info("OCUDU O-FH compression manifest: backend={} requested={} DL={}/{} UL={}/{} PRACH={}/{} "
+                           "DL-header={} UL-header={}",
+                           compression_backend,
+                           sector_cfg.compression_acceleration_mode,
+                           to_string(sector_cfg.dl_compression_params.type),
+                           sector_cfg.dl_compression_params.data_width,
+                           to_string(sector_cfg.ul_compression_params.type),
+                           sector_cfg.ul_compression_params.data_width,
+                           to_string(sector_cfg.prach_compression_params.type),
+                           sector_cfg.prach_compression_params.data_width,
+                           sector_cfg.is_downlink_static_compr_hdr_enabled ? "static" : "dynamic",
+                           sector_cfg.is_uplink_static_compr_hdr_enabled ? "static" : "dynamic");
+
   unsigned repository_size = calculate_repository_size(sector_cfg.scs, sector_cfg.max_processing_delay_slots * 4);
 
   auto cp_repo                      = std::make_shared<uplink_cplane_context_repository>(repository_size);

@@ -266,7 +266,17 @@ private:
     if (!wait_for_device_mapping_locked(stream)) {
       return false;
     }
-    return prefetch_managed_memory(device_location(), stream);
+    if (!prefetch_managed_memory(device_location(), stream)) {
+      return false;
+    }
+
+    // The waits above transfer ownership of all recorded producer fences to the consumer stream. A PRACH buffer is
+    // not returned to its pool until that consumer has completed, so the bounded event pool can be reused by the next
+    // fill cycle. Keeping these events pending forever makes every detection wait on its entire history and allocates
+    // one new CUDA event per received section in device-only pipelines.
+    pending_buffer_ready_events.clear();
+    buffer_ready_recorded = false;
+    return true;
   }
 
   bool prepare_host_access() const

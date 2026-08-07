@@ -319,6 +319,18 @@ static bool copy_host_to_device(ocudu_ofh_compression_handle_t* handle,
     return true;
 }
 
+// Direct-to-device decompression returns before the stream consumes its input. The caller's packet span is transient
+// and may be recycled as soon as the API returns, so it must always be snapshotted into handle-owned pinned storage.
+// In particular, a pageable cudaMemcpyAsync is genuinely asynchronous on coherent CPU/GPU systems such as GH200 and
+// can otherwise read a later packet after the receive buffer has been reused.
+static bool copy_transient_host_to_device(ocudu_ofh_compression_handle_t* handle,
+                                          uint8_t*                        dst,
+                                          const void*                     src,
+                                          size_t                          bytes)
+{
+    return copy_host_to_device(handle, dst, src, bytes, true);
+}
+
 __device__ __forceinline__ float bf16_to_float(uint16_t value)
 {
     return __uint_as_float(static_cast<uint32_t>(value) << 16U);
@@ -3586,8 +3598,7 @@ extern "C" int ocudu_ofh_decompress_to_device_grid_async(ocudu_ofh_compression_h
         return 0;
     }
 
-    if (!copy_host_to_device(
-            handle, handle->d_in, input_bytes, in_bytes, use_pinned_host_input_transfer(compression_type, data_width))) {
+    if (!copy_transient_host_to_device(handle, handle->d_in, input_bytes, in_bytes)) {
         return 0;
     }
 
@@ -3639,8 +3650,7 @@ extern "C" int ocudu_ofh_decompress_to_device_prach_buffer_async(ocudu_ofh_compr
         return 0;
     }
 
-    if (!copy_host_to_device(
-            handle, handle->d_in, input_bytes, in_bytes, use_pinned_host_input_transfer(compression_type, data_width))) {
+    if (!copy_transient_host_to_device(handle, handle->d_in, input_bytes, in_bytes)) {
         return 0;
     }
     launch_decompress(reinterpret_cast<uint32_t*>(handle->d_out),

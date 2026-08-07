@@ -9,11 +9,13 @@
 #include "ocudu/ofh/compression/compression_properties.h"
 #include "gtest/gtest.h"
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <random>
+#include <thread>
 
 using namespace ocudu;
 
@@ -460,6 +462,103 @@ TEST(ofh_iq_compression_cuda_c_api_test, accepts_zero_length_noop_requests)
                 handle, OCUDU_OFH_COMPRESSION_TYPE_BFP, output_cbf16.data(), 0, bytes.data(), 0, 0, 1, 9),
             0);
 
+  ocudu_ofh_compression_destroy(handle);
+}
+
+TEST(ofh_iq_compression_cuda_c_api_test, async_prach_decompression_snapshots_transient_none16_input)
+{
+  static constexpr unsigned nof_prbs    = 1;
+  static constexpr unsigned data_width = 16;
+
+  ocudulog::basic_logger& logger = ocudulog::fetch_basic_logger("TEST", false);
+  logger.set_level(ocudulog::basic_levels::none);
+  ofh::ru_compression_params params{ofh::compression_type::none, data_width};
+  std::vector<cbf16_t>      source = generate_golden_iq_prb();
+  std::vector<uint8_t>      compressed(ofh::get_compressed_prb_size(params).value() * nof_prbs);
+  std::vector<cbf16_t>      expected(source.size());
+  ofh::create_iq_compressor(ofh::compression_type::none, logger, 1.0F, "generic")
+      ->compress(compressed, source, params);
+  ofh::create_iq_decompressor(ofh::compression_type::none, logger, "generic")
+      ->decompress(expected, compressed, params);
+
+  ocudu_ofh_compression_handle_t* handle = nullptr;
+  if (ocudu_ofh_compression_create(&handle) == 0) {
+    GTEST_SKIP() << "CUDA OFH compression backend is not available.";
+  }
+
+  cbf16_t* output = nullptr;
+  ASSERT_EQ(cudaMallocManaged(&output, expected.size() * sizeof(cbf16_t)), cudaSuccess);
+  std::fill(output, output + expected.size(), cbf16_t{0.0F, 0.0F});
+
+  // Prime the device buffers and every pinned staging slot before blocking
+  // the stream. CUDA allocation APIs may synchronize outstanding work; this
+  // test is intended to isolate caller-buffer lifetime after enqueue, not
+  // allocation behavior behind a deliberately blocked host callback.
+  for (unsigned slot = 0; slot != 4; ++slot) {
+    ASSERT_NE(ocudu_ofh_decompress_to_device_prach_buffer_async(handle,
+                                                                OCUDU_OFH_COMPRESSION_TYPE_NONE,
+                                                                output,
+                                                                0,
+                                                                compressed.data(),
+                                                                0,
+                                                                expected.size(),
+                                                                nof_prbs,
+                                                                data_width),
+              0);
+    ASSERT_NE(ocudu_ofh_compression_synchronize(handle), 0);
+  }
+  std::fill(output, output + expected.size(), cbf16_t{0.0F, 0.0F});
+
+  struct callback_gate {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+  } gate;
+  cudaStream_t stream = static_cast<cudaStream_t>(ocudu_ofh_compression_get_stream(handle));
+  ASSERT_NE(stream, nullptr);
+  ASSERT_EQ(cudaLaunchHostFunc(
+                stream,
+                [](void* data) {
+                  auto& callback = *static_cast<callback_gate*>(data);
+                  callback.entered.store(true, std::memory_order_release);
+                  while (!callback.release.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                  }
+                },
+                &gate),
+            cudaSuccess);
+  while (!gate.entered.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+
+  std::atomic<int>  enqueue_status{0};
+  std::atomic<bool> enqueue_finished{false};
+  std::thread enqueue_thread([&]() {
+    enqueue_status.store(ocudu_ofh_decompress_to_device_prach_buffer_async(handle,
+                                                                           OCUDU_OFH_COMPRESSION_TYPE_NONE,
+                                                                           output,
+                                                                           0,
+                                                                           compressed.data(),
+                                                                           0,
+                                                                           expected.size(),
+                                                                           nof_prbs,
+                                                                           data_width),
+                         std::memory_order_release);
+    enqueue_finished.store(true, std::memory_order_release);
+  });
+
+  // Model the O-RAN receiver returning and immediately recycling its packet storage while CUDA work is queued.
+  while (!enqueue_finished.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  std::fill(compressed.begin(), compressed.end(), 0U);
+  gate.release.store(true, std::memory_order_release);
+  enqueue_thread.join();
+
+  ASSERT_NE(enqueue_status.load(std::memory_order_acquire), 0);
+  ASSERT_NE(ocudu_ofh_compression_synchronize(handle), 0);
+  EXPECT_TRUE(std::equal(expected.begin(), expected.end(), output));
+
+  cudaFree(output);
   ocudu_ofh_compression_destroy(handle);
 }
 
