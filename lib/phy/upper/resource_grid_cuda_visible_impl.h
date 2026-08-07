@@ -66,7 +66,11 @@ private:
 class cuda_visible_resource_grid : public resource_grid
 {
 public:
-  cuda_visible_resource_grid(unsigned nof_ports_, unsigned nof_symbols_, unsigned nof_subc_, int nvcuda_device_id = 0) :
+  cuda_visible_resource_grid(unsigned nof_ports_,
+                             unsigned nof_symbols_,
+                             unsigned nof_subc_,
+                             int      nvcuda_device_id                  = 0,
+                             bool     enable_concurrent_downlink_writes = false) :
     alloc_mask(nof_ports_, nof_symbols_, divide_ceil(nof_subc_, NOF_SUBCARRIERS_PER_RB)),
     device_id(nvcuda_device_id),
     nof_ports(nof_ports_),
@@ -75,6 +79,21 @@ public:
   {
     // Bind to the configured device so backing allocations and events land on the right GPU.
     (void)cudaSetDevice(device_id);
+
+    if (enable_concurrent_downlink_writes && !prefetch_enabled) {
+      int concurrent_managed_access       = 0;
+      int host_page_table_access          = 0;
+      int direct_managed_access_from_host = 0;
+      concurrent_downlink_writes =
+          (cudaDeviceGetAttribute(&concurrent_managed_access, cudaDevAttrConcurrentManagedAccess, device_id) ==
+           cudaSuccess) &&
+          (cudaDeviceGetAttribute(
+               &host_page_table_access, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device_id) == cudaSuccess) &&
+          (cudaDeviceGetAttribute(&direct_managed_access_from_host,
+                                  cudaDevAttrDirectManagedMemAccessFromHost,
+                                  device_id) == cudaSuccess) &&
+          (concurrent_managed_access != 0) && (host_page_table_access != 0) && (direct_managed_access_from_host != 0);
+    }
 
     static constexpr unsigned initial_ready_events = 32;
     grid_ready_events.reserve(initial_ready_events);
@@ -269,7 +288,7 @@ private:
                          const bounded_bitset<MAX_NOF_SUBCARRIERS>& mask,
                          span<const cf_t>                           symbols) override
     {
-      report_fatal_error_if_not(parent.prepare_host_access(), "Failed to synchronize CUDA-visible resource grid.");
+      report_fatal_error_if_not(parent.prepare_host_write(), "Failed to prepare CUDA-visible resource grid write.");
       return resource_grid_writer_impl::put(port, l, k_init, mask, symbols);
     }
 
@@ -279,25 +298,25 @@ private:
                             const bounded_bitset<MAX_NOF_SUBCARRIERS>& mask,
                             span<const cbf16_t>                        symbols) override
     {
-      report_fatal_error_if_not(parent.prepare_host_access(), "Failed to synchronize CUDA-visible resource grid.");
+      report_fatal_error_if_not(parent.prepare_host_write(), "Failed to prepare CUDA-visible resource grid write.");
       return resource_grid_writer_impl::put(port, l, k_init, mask, symbols);
     }
 
     void put(unsigned port, unsigned l, unsigned k_init, span<const cf_t> symbols) override
     {
-      report_fatal_error_if_not(parent.prepare_host_access(), "Failed to synchronize CUDA-visible resource grid.");
+      report_fatal_error_if_not(parent.prepare_host_write(), "Failed to prepare CUDA-visible resource grid write.");
       resource_grid_writer_impl::put(port, l, k_init, symbols);
     }
 
     void put(unsigned port, unsigned l, unsigned k_init, unsigned stride, span<const cbf16_t> symbols) override
     {
-      report_fatal_error_if_not(parent.prepare_host_access(), "Failed to synchronize CUDA-visible resource grid.");
+      report_fatal_error_if_not(parent.prepare_host_write(), "Failed to prepare CUDA-visible resource grid write.");
       resource_grid_writer_impl::put(port, l, k_init, stride, symbols);
     }
 
     span<cbf16_t> get_view(unsigned port, unsigned l) override
     {
-      report_fatal_error_if_not(parent.prepare_host_access(), "Failed to synchronize CUDA-visible resource grid.");
+      report_fatal_error_if_not(parent.prepare_host_write(), "Failed to prepare CUDA-visible resource grid write.");
       return resource_grid_writer_impl::get_view(port, l);
     }
 
@@ -438,6 +457,18 @@ private:
 
   bool synchronize_device_mapping() const { return prepare_host_access(); }
 
+  bool prepare_host_write() const
+  {
+    // A downlink scheduler maps reference signals and PDSCH data to disjoint resource elements. On coherent
+    // unified-memory systems, avoid making the next PDU's host-generated reference signal wait for the previous
+    // PDSCH kernel. Grid clears complete before set_all_zero() returns and readers still wait for every producer.
+    if (concurrent_downlink_writes) {
+      std::lock_guard<std::mutex> lock(grid_ready_mutex);
+      return managed_data != nullptr;
+    }
+    return prepare_host_access();
+  }
+
   bool prepare_host_access() const
   {
     std::unique_lock<std::mutex> lock(grid_ready_mutex);
@@ -497,10 +528,16 @@ private:
     if (cudaEventRecord(static_cast<cudaEvent_t>(event), stream) != cudaSuccess) {
       return false;
     }
+    if (concurrent_downlink_writes &&
+        (cuda_event_synchronize_yielding(static_cast<cudaEvent_t>(event)) != cudaSuccess)) {
+      return false;
+    }
     pending_grid_ready_events.clear();
-    pending_grid_ready_events.push_back(event);
+    if (!concurrent_downlink_writes) {
+      pending_grid_ready_events.push_back(event);
+    }
     grid_ready_event                = event;
-    grid_ready_recorded             = true;
+    grid_ready_recorded             = !pending_grid_ready_events.empty();
     device_mapping_active           = false;
     device_mapping_replaces_pending = false;
     return true;
@@ -597,11 +634,12 @@ private:
   mutable bool               device_mapping_replaces_pending = false;
   /// Per-port, per-symbol allocation tracking, shared with the reader and writer.
   resource_grid_allocation_info alloc_mask;
-  bool     prefetch_enabled = phy_acceleration_env_flag_enabled("OCUDU_CUDA_VISIBLE_GRID_PREFETCH", false);
-  int      device_id        = 0;
-  unsigned nof_ports        = 0;
-  unsigned nof_symbols      = 0;
-  unsigned nof_subc         = 0;
+  bool     prefetch_enabled           = phy_acceleration_env_flag_enabled("OCUDU_CUDA_VISIBLE_GRID_PREFETCH", false);
+  bool     concurrent_downlink_writes = false;
+  int      device_id                  = 0;
+  unsigned nof_ports                  = 0;
+  unsigned nof_symbols                = 0;
+  unsigned nof_subc                   = 0;
   std::unique_ptr<managed_tensor>            rg_buffer;
   std::unique_ptr<resource_grid_writer_impl> writer;
   std::unique_ptr<reader_impl>               reader;
@@ -623,7 +661,8 @@ public:
   std::unique_ptr<resource_grid> create(unsigned nof_ports, unsigned nof_symbols, unsigned nof_subc) override
   {
     if (use_managed_grid) {
-      auto grid = std::make_unique<cuda_visible_resource_grid>(nof_ports, nof_symbols, nof_subc, device_id);
+      auto grid = std::make_unique<cuda_visible_resource_grid>(
+          nof_ports, nof_symbols, nof_subc, device_id, grid_direction == direction::downlink);
       if (grid->is_valid()) {
         return grid;
       }

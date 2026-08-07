@@ -12,11 +12,14 @@
 #include "ocudu/phy/support/resource_grid_writer.h"
 #include "ocudu/phy/support/support_factories.h"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace ocudu;
@@ -94,6 +97,59 @@ testing::AssertionResult cuda_managed_memory_available()
   }
 
   return testing::AssertionSuccess();
+}
+
+testing::AssertionResult cuda_concurrent_managed_access_available()
+{
+  testing::AssertionResult managed_available = cuda_managed_memory_available();
+  if (!managed_available) {
+    return managed_available;
+  }
+
+  int device_id = 0;
+  if (cudaGetDevice(&device_id) != cudaSuccess) {
+    return testing::AssertionFailure() << "Failed to query the active CUDA device.";
+  }
+
+  int concurrent_managed_access       = 0;
+  int host_page_table_access          = 0;
+  int direct_managed_access_from_host = 0;
+  if ((cudaDeviceGetAttribute(&concurrent_managed_access, cudaDevAttrConcurrentManagedAccess, device_id) !=
+       cudaSuccess) ||
+      (cudaDeviceGetAttribute(&host_page_table_access, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device_id) !=
+       cudaSuccess) ||
+      (cudaDeviceGetAttribute(&direct_managed_access_from_host, cudaDevAttrDirectManagedMemAccessFromHost, device_id) !=
+       cudaSuccess)) {
+    return testing::AssertionFailure() << "Failed to query concurrent managed-memory support.";
+  }
+  if ((concurrent_managed_access == 0) || (host_page_table_access == 0) || (direct_managed_access_from_host == 0)) {
+    return testing::AssertionFailure() << "Concurrent managed host/device access is not supported.";
+  }
+
+  return testing::AssertionSuccess();
+}
+
+bool wait_for_flag(const std::atomic<bool>& flag, std::chrono::milliseconds timeout)
+{
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!flag.load(std::memory_order_acquire) && (std::chrono::steady_clock::now() < deadline)) {
+    std::this_thread::yield();
+  }
+  return flag.load(std::memory_order_acquire);
+}
+
+struct cuda_callback_gate {
+  std::atomic<bool> entered  = false;
+  std::atomic<bool> released = false;
+};
+
+void wait_for_cuda_callback_gate(void* opaque)
+{
+  auto& gate = *static_cast<cuda_callback_gate*>(opaque);
+  gate.entered.store(true, std::memory_order_release);
+  while (!gate.released.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
 }
 
 std::vector<cbf16_t> generate_grid_payload(unsigned nof_ports, unsigned nof_symbols, unsigned nof_subc)
@@ -277,6 +333,68 @@ TEST(cuda_visible_phy_support_test, resource_grid_host_writer_is_visible_to_devi
   ASSERT_TRUE(reader.synchronize_device_grid_reading());
 
   EXPECT_EQ(copied, expected);
+}
+
+TEST(cuda_visible_phy_support_test, downlink_host_writer_does_not_wait_for_disjoint_device_mapping)
+{
+  testing::AssertionResult concurrent_access = cuda_concurrent_managed_access_available();
+  if (!concurrent_access) {
+    GTEST_SKIP() << concurrent_access.message();
+  }
+
+  scoped_env_var grid_mode("OCUDU_DL_CUDA_VISIBLE_GRID");
+  scoped_env_var prefetch_mode("OCUDU_CUDA_VISIBLE_GRID_PREFETCH");
+  ASSERT_TRUE(grid_mode.set("managed"));
+  ASSERT_TRUE(prefetch_mode.unset());
+
+  static constexpr unsigned nof_ports   = 1;
+  static constexpr unsigned nof_symbols = 2;
+  static constexpr unsigned nof_subc    = 24;
+
+  auto factory = create_phy_acceleration_resource_grid_factory(
+      create_resource_grid_factory(), phy_acceleration_resource_grid_direction::downlink, true);
+  std::unique_ptr<resource_grid> grid = factory->create(nof_ports, nof_symbols, nof_subc);
+  ASSERT_NE(grid, nullptr);
+
+  resource_grid_writer&       writer = grid->get_writer();
+  const resource_grid_reader& reader = grid->get_reader();
+  ASSERT_TRUE(writer.supports_device_grid_mapping());
+
+  cuda_stream_guard stream;
+  ASSERT_TRUE(stream.create());
+
+  std::vector<cbf16_t> device_values(nof_subc);
+  auto*                device_value_bytes = reinterpret_cast<unsigned char*>(device_values.data());
+  std::fill(device_value_bytes, device_value_bytes + device_values.size() * sizeof(cbf16_t), 0x2a);
+  std::vector<cbf16_t> host_values = generate_symbol_payload(nof_subc, 0.007F);
+  cuda_callback_gate   gate;
+
+  ASSERT_TRUE(writer.prepare_device_grid_mapping(stream.get()));
+  ASSERT_EQ(cudaLaunchHostFunc(stream.get(), wait_for_cuda_callback_gate, &gate), cudaSuccess);
+  ASSERT_EQ(cudaMemsetAsync(writer.get_device_grid_bf16(), 0x2a, device_values.size() * sizeof(cbf16_t), stream.get()),
+            cudaSuccess);
+  ASSERT_TRUE(writer.on_device_grid_mapping_enqueued(stream.get()));
+
+  bool callback_entered = wait_for_flag(gate.entered, std::chrono::seconds(1));
+  if (!callback_entered) {
+    gate.released.store(true, std::memory_order_release);
+    (void)cudaStreamSynchronize(stream.get());
+    FAIL() << "CUDA callback did not enter before the timeout.";
+  }
+
+  std::atomic<bool> host_write_done = false;
+  std::thread       host_writer([&]() {
+    writer.put(0, 1, 0, 1, span<const cbf16_t>(host_values));
+    host_write_done.store(true, std::memory_order_release);
+  });
+
+  bool host_write_overlapped = wait_for_flag(host_write_done, std::chrono::seconds(1));
+  gate.released.store(true, std::memory_order_release);
+  host_writer.join();
+
+  ASSERT_TRUE(host_write_overlapped) << "The disjoint host write waited for the pending CUDA producer.";
+  expect_equal(reader.get_view(0, 0), device_values);
+  expect_equal(reader.get_view(0, 1), host_values);
 }
 
 TEST(cuda_visible_phy_support_test, resource_grid_repeated_device_mapping_and_reading_cycles_are_ordered)

@@ -166,7 +166,8 @@ private:
 std::shared_ptr<pdsch_processor_factory>
 create_test_pdsch_processor_factory(std::shared_ptr<pdsch_block_processor_factory> block_processor_factory,
                                     task_executor&                                 executor,
-                                    unsigned                                       cb_batch_length = 1)
+                                    unsigned                                       cb_batch_length        = 1,
+                                    unsigned                                       nof_concurrent_threads = 1)
 {
   std::shared_ptr<crc_calculator_factory> crc_factory = create_crc_calculator_factory_sw("auto");
   TESTASSERT(crc_factory);
@@ -198,7 +199,7 @@ create_test_pdsch_processor_factory(std::shared_ptr<pdsch_block_processor_factor
                                                     dmrs_factory,
                                                     ptrs_factory,
                                                     executor,
-                                                    1,
+                                                    nof_concurrent_threads,
                                                     cb_batch_length);
 }
 
@@ -748,6 +749,120 @@ TEST(PdschGpuIssueProfile, ManagedGridMatchesHostAcrossHarqRvsAndRepeatedSlots)
       }
     }
   }
+}
+
+TEST(PdschGpuIssueProfile, DisjointPdschsShareManagedGridWithoutIntermediateSynchronization)
+{
+  if (!is_pdsch_block_processor_acceleration_available()) {
+    GTEST_SKIP() << "CUDA PDSCH GPU block processor is not available in this build/runtime.";
+  }
+
+  env_var_guard grid_mode("OCUDU_DL_CUDA_VISIBLE_GRID");
+  env_var_guard prefetch_mode("OCUDU_CUDA_VISIBLE_GRID_PREFETCH");
+  ASSERT_EQ(setenv("OCUDU_DL_CUDA_VISIBLE_GRID", "managed", 1), 0);
+  ASSERT_EQ(unsetenv("OCUDU_CUDA_VISIBLE_GRID_PREFETCH"), 0);
+
+  inline_task_executor executor;
+  auto                 cpu_proc_factory = create_test_pdsch_processor_factory(
+      create_cpu_pdsch_block_processor_factory(), executor, std::numeric_limits<unsigned>::max());
+  auto gpu_proc_factory = create_test_pdsch_processor_factory(
+      create_pdsch_block_processor_factory_accelerated(), executor, std::numeric_limits<unsigned>::max(), 3);
+  ASSERT_NE(cpu_proc_factory, nullptr);
+  ASSERT_NE(gpu_proc_factory, nullptr);
+
+  std::unique_ptr<pdsch_processor>                cpu_proc = cpu_proc_factory->create();
+  std::array<std::unique_ptr<pdsch_processor>, 3> gpu_procs;
+  for (std::unique_ptr<pdsch_processor>& gpu_proc : gpu_procs) {
+    gpu_proc = gpu_proc_factory->create();
+  }
+  ASSERT_NE(cpu_proc, nullptr);
+  for (const std::unique_ptr<pdsch_processor>& gpu_proc : gpu_procs) {
+    ASSERT_NE(gpu_proc, nullptr);
+  }
+
+  constexpr unsigned  nof_pdus     = 3;
+  constexpr unsigned  cell_nof_prb = 51;
+  constexpr unsigned  pdu_nof_prb  = cell_nof_prb / nof_pdus;
+  constexpr unsigned  nof_ports    = 1;
+  constexpr unsigned  nof_layers   = 1;
+  constexpr unsigned  nof_subc     = cell_nof_prb * NOF_SUBCARRIERS_PER_RB;
+  constexpr unsigned  start_symbol = 2;
+  constexpr unsigned  nof_symbols  = 12;
+  symbol_slot_mask    dmrs_symbols = make_dmrs_symbol_mask(dmrs_profile::single_symbol);
+  sch_mcs_description mcs_descr    = pdsch_mcs_get_config(pdsch_mcs_table::qam64, sch_mcs_index(25));
+  unsigned            tbs =
+      calculate_tbs(mcs_descr, pdu_nof_prb, nof_layers, dmrs_config_type::type1, dmrs_symbols, 1, nof_symbols);
+  ASSERT_EQ(tbs % 8, 0U);
+
+  std::shared_ptr<resource_grid_factory> host_grid_factory = create_resource_grid_factory();
+  resource_grid_cuda_visible_factory     managed_grid_factory(resource_grid_cuda_visible_factory::direction::downlink);
+  std::unique_ptr<resource_grid>         cpu_grid = host_grid_factory->create(nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
+  std::unique_ptr<resource_grid> gpu_grid = managed_grid_factory.create(nof_ports, MAX_NSYMB_PER_SLOT, nof_subc);
+  ASSERT_NE(cpu_grid, nullptr);
+  ASSERT_NE(gpu_grid, nullptr);
+  ASSERT_TRUE(gpu_grid->get_writer().device_grid_mapping_aliases_host_grid());
+
+  std::array<pdsch_processor::pdu_t, nof_pdus> pdus;
+  std::array<std::vector<uint8_t>, nof_pdus>   tx_data;
+  for (unsigned i_pdu = 0; i_pdu != nof_pdus; ++i_pdu) {
+    pdus[i_pdu]             = build_pdsch_pdu(mcs_descr,
+                                  pdu_nof_prb,
+                                  nof_layers,
+                                  nof_ports,
+                                  0,
+                                  dmrs_config_type::type1,
+                                  dmrs_symbols,
+                                  1,
+                                  tbs,
+                                  0x4601,
+                                  10,
+                                  10,
+                                  false,
+                                  0,
+                                  start_symbol,
+                                  nof_symbols,
+                                  subcarrier_spacing::kHz30);
+    pdus[i_pdu].bwp_size_rb = cell_nof_prb;
+    pdus[i_pdu].freq_alloc  = rb_allocation::make_type1(i_pdu * pdu_nof_prb, pdu_nof_prb, std::nullopt);
+
+    tx_data[i_pdu].resize(tbs / 8);
+    std::mt19937 rgen(0x1f1fc000U + i_pdu);
+    std::generate(
+        tx_data[i_pdu].begin(), tx_data[i_pdu].end(), [&rgen]() { return static_cast<uint8_t>(rgen() & 0xff); });
+
+    pdsch_processor_notifier_adaptor cpu_notifier;
+    cpu_proc->process(cpu_grid->get_writer(), cpu_notifier, {shared_transport_block(tx_data[i_pdu])}, pdus[i_pdu]);
+    cpu_notifier.wait_for_completion();
+  }
+
+  // Submit from distinct persistent worker threads so the processor pool assigns one CUDA lane per PDSCH, matching
+  // the live multi-UE executor. Submission remains ordered, but an earlier kernel may still be in flight when the next
+  // PDU maps its disjoint host DMRS. The final reader joins the recorded producer chain.
+  std::atomic<unsigned>             submit_turn = 0;
+  std::array<std::thread, nof_pdus> submit_threads;
+  for (unsigned i_pdu = 0; i_pdu != nof_pdus; ++i_pdu) {
+    submit_threads[i_pdu] = std::thread([&, i_pdu]() {
+      while (submit_turn.load(std::memory_order_acquire) != i_pdu) {
+        std::this_thread::yield();
+      }
+      pdsch_processor_notifier_adaptor gpu_notifier;
+      gpu_procs[i_pdu]->process(
+          gpu_grid->get_writer(), gpu_notifier, {shared_transport_block(tx_data[i_pdu])}, pdus[i_pdu]);
+      gpu_notifier.wait_for_completion();
+      submit_turn.store(i_pdu + 1, std::memory_order_release);
+      while (submit_turn.load(std::memory_order_acquire) != nof_pdus) {
+        std::this_thread::yield();
+      }
+    });
+  }
+  for (std::thread& submit_thread : submit_threads) {
+    submit_thread.join();
+  }
+
+  grid_diff_stats diff = compare_resource_grids(cpu_grid->get_reader(), gpu_grid->get_reader());
+  ASSERT_EQ(diff.nof_mismatches, 0U) << "max_abs_error=" << diff.max_abs_error << " at port=" << diff.port
+                                     << " symbol=" << diff.symbol << " subcarrier=" << diff.subcarrier
+                                     << " cpu=" << diff.cpu_value << " gpu=" << diff.gpu_value;
 }
 
 TEST(PdschGpuIssueProfile, BackToBackManagedGridSubmissionsPreserveEveryTransportBlock)
