@@ -551,6 +551,11 @@ struct FlexibleLdpcEncoder {
     int cached_base_graph;      // -1 = not cached
     int cached_lifting_set_idx; // -1 = not cached
     int cached_Z;               // -1 = not cached (need to also cache Z since shifts depend on it)
+
+    // Stream that last consumed the mutable device graph tables. Reconfiguration
+    // queues replacements behind that consumer so a resident encoder can change
+    // lifting shape without overwriting tables still used by an in-flight kernel.
+    cudaStream_t last_encode_stream;
 };
 
 // ============================================================================
@@ -2582,8 +2587,21 @@ nr_ldpc_status_t ldpc_encoder_configure(ldpc_encoder_handle_t handle, const nr_l
         return NR_LDPC_ERROR_INVALID_CONFIG;
     }
 
-    CHECK_NVFAILURE_LDPC(cudaMemcpy(enc->d_row_ptr, row_ptr, num_rows * sizeof(int), cudaMemcpyHostToDevice));
-    CHECK_NVFAILURE_LDPC(cudaMemcpy(enc->d_col_idx, col_idx, enc->nnz * sizeof(int8_t), cudaMemcpyHostToDevice));
+    if (enc->last_encode_stream != nullptr) {
+        CHECK_NVFAILURE_LDPC(cudaMemcpyAsync(enc->d_row_ptr,
+                                             row_ptr,
+                                             num_rows * sizeof(int),
+                                             cudaMemcpyHostToDevice,
+                                             enc->last_encode_stream));
+        CHECK_NVFAILURE_LDPC(cudaMemcpyAsync(enc->d_col_idx,
+                                             col_idx,
+                                             enc->nnz * sizeof(int8_t),
+                                             cudaMemcpyHostToDevice,
+                                             enc->last_encode_stream));
+    } else {
+        CHECK_NVFAILURE_LDPC(cudaMemcpy(enc->d_row_ptr, row_ptr, num_rows * sizeof(int), cudaMemcpyHostToDevice));
+        CHECK_NVFAILURE_LDPC(cudaMemcpy(enc->d_col_idx, col_idx, enc->nnz * sizeof(int8_t), cudaMemcpyHostToDevice));
+    }
 
     int16_t scaled_shifts[BG1_NNZ];
     int     Z_ref = get_Z_ref(lifting_set_idx);
@@ -2591,8 +2609,16 @@ nr_ldpc_status_t ldpc_encoder_configure(ldpc_encoder_handle_t handle, const nr_l
         scaled_shifts[i] = compute_shift(shifts_ref[i], enc->Z, Z_ref);
     }
 
-    CHECK_NVFAILURE_LDPC(
-        cudaMemcpy(enc->d_shifts, scaled_shifts, enc->nnz * sizeof(int16_t), cudaMemcpyHostToDevice));
+    if (enc->last_encode_stream != nullptr) {
+        CHECK_NVFAILURE_LDPC(cudaMemcpyAsync(enc->d_shifts,
+                                             scaled_shifts,
+                                             enc->nnz * sizeof(int16_t),
+                                             cudaMemcpyHostToDevice,
+                                             enc->last_encode_stream));
+    } else {
+        CHECK_NVFAILURE_LDPC(
+            cudaMemcpy(enc->d_shifts, scaled_shifts, enc->nnz * sizeof(int16_t), cudaMemcpyHostToDevice));
+    }
 
     enc->cached_base_graph      = enc->base_graph;
     enc->cached_lifting_set_idx = lifting_set_idx;
@@ -3518,6 +3544,8 @@ nr_ldpc_status_t ldpc_encoder_encode_batch(
     if (!enc || !d_input || !d_output || num_codewords <= 0) {
         return NR_LDPC_ERROR_INVALID_CONFIG;
     }
+
+    enc->last_encode_stream = stream;
 
     int words_per_Z = (enc->Z + 31) / 32;
 
