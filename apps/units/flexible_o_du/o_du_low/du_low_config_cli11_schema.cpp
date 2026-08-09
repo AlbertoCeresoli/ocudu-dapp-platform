@@ -275,6 +275,20 @@ static void configure_cli11_expert_phy_args(CLI::App& app, du_low_unit_expert_up
       ->capture_default_str()
       ->check(acceleration_mode_check);
   add_option(app,
+             "--ul_cuda_visible_grid_mode",
+             expert_phy_params.ul_cuda_visible_grid_mode,
+             "CUDA-visible uplink resource-grid mode: auto (managed on integrated GPUs), managed (require managed "
+             "memory), or pinned (host memory).")
+      ->capture_default_str()
+      ->check(CLI::IsMember({"auto", "managed", "pinned"}));
+  add_option(app,
+             "--dl_cuda_visible_grid_mode",
+             expert_phy_params.dl_cuda_visible_grid_mode,
+             "CUDA-visible downlink resource-grid mode: auto (managed on integrated GPUs), managed (require managed "
+             "memory), or pinned (host memory).")
+      ->capture_default_str()
+      ->check(CLI::IsMember({"auto", "managed", "pinned"}));
+  add_option(app,
              "--srs_acceleration_mode",
              expert_phy_params.srs_acceleration_mode,
              "Acceleration mode for SRS channel estimation: auto (enable if available), enabled (require), disabled "

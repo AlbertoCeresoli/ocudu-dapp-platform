@@ -79,6 +79,8 @@ static odu::du_low_config generate_du_low_config(const du_low_unit_config&      
   upper_phy_factory_config.ldpc_decoder_early_stop           = du_low.expert_phy_cfg.pusch_decoder_early_stop;
   upper_phy_factory_config.ldpc_decoder_force_decoding       = du_low.expert_phy_cfg.pusch_decoder_force_decoding;
   upper_phy_factory_config.pusch_acceleration_mode           = du_low.expert_phy_cfg.pusch_acceleration_mode;
+  upper_phy_factory_config.ul_cuda_visible_grid_mode         = du_low.expert_phy_cfg.ul_cuda_visible_grid_mode;
+  upper_phy_factory_config.dl_cuda_visible_grid_mode         = du_low.expert_phy_cfg.dl_cuda_visible_grid_mode;
   upper_phy_factory_config.srs_acceleration_mode             = du_low.expert_phy_cfg.srs_acceleration_mode;
   upper_phy_factory_config.pdsch_acceleration_mode           = du_low.expert_phy_cfg.pdsch_acceleration_mode;
   upper_phy_factory_config.prach_acceleration_mode           = du_low.expert_phy_cfg.prach_acceleration_mode;

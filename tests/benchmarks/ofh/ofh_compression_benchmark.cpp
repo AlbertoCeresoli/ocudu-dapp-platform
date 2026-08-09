@@ -506,9 +506,9 @@ int main(int argc, char** argv)
           });
       perf_meas.new_measure(meas_descr_decompression, nof_iq_samples, [&]() {
         if (grid_mode == "device-fragments") {
-          // Approximate the IQ payload available in a 1500-byte Open Fronthaul frame. BFP9 therefore uses 51-PRB
-          // fragments, matching the six-packet 273-PRB profile used by the O-RU simulator.
-          constexpr unsigned fragment_payload_bytes = 1440U;
+          // Match the BFP9 IQ payload observed on the 1500-byte O-RU simulator wire profile: five 52-PRB fragments
+          // followed by one 13-PRB fragment for a 273-PRB symbol.
+          constexpr unsigned fragment_payload_bytes = 1456U;
           unsigned fragment_nof_prbs = std::max(1U, fragment_payload_bytes / comp_prb_size);
           for (unsigned symbol = 0; symbol != nof_batch_symbols; ++symbol) {
             for (unsigned i = 0; i != nof_ports; ++i) {

@@ -422,6 +422,53 @@ TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_fragments_are_a
   repo->clear();
 }
 
+TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, wideband_wire_fragments_are_assembled_into_one_device_grid_write)
+{
+  static constexpr unsigned     wideband_nof_prb = 273;
+  static constexpr unsigned     fragment_nof_prb = 52;
+  resource_grid_reader_spy      wideband_reader(nof_ports, symbol_range.stop(), wideband_nof_prb);
+  resource_grid_device_writer_spy wideband_writer(wideband_nof_prb);
+  resource_grid_spy               wideband_grid(wideband_reader, wideband_writer);
+  shared_resource_grid_spy        wideband_shared_grid(wideband_grid);
+  const ru_compression_params     compression = {compression_type::BFP, 9};
+  const unsigned                  prb_size = get_compressed_prb_size(compression).value();
+  std::vector<uint8_t>            compressed_payload(wideband_nof_prb * prb_size);
+  uplane_message_decoder_device_spy decoder;
+  decoder.assemble_fragments = true;
+  std::iota(compressed_payload.begin(), compressed_payload.end(), uint8_t{0});
+
+  repo->add({results.params.slot, sector},
+            wideband_shared_grid.get_grid(),
+            symbol_range,
+            ocudulog::fetch_basic_logger("TEST"));
+  repo->process_pending_contexts();
+
+  auto& section       = results.sections.back();
+  section.ud_comp_hdr = compression;
+  for (unsigned start_prb = 0; start_prb != wideband_nof_prb;) {
+    section.start_prb          = start_prb;
+    section.nof_prbs           = std::min(fragment_nof_prb, wideband_nof_prb - start_prb);
+    section.compressed_iq_data = span<const uint8_t>(compressed_payload)
+                                     .subspan(static_cast<size_t>(start_prb) * prb_size,
+                                              static_cast<size_t>(section.nof_prbs) * prb_size);
+
+    auto expected = (start_prb + section.nof_prbs == wideband_nof_prb)
+                        ? uplane_rx_symbol_data_flow_writer::direct_write_result::success
+                        : uplane_rx_symbol_data_flow_writer::direct_write_result::fragment_buffered;
+    ASSERT_EQ(expected, writer.write_compressed_to_resource_grid(eaxc[0], results, decoder));
+    start_prb += section.nof_prbs;
+  }
+
+  ASSERT_TRUE(decoder.called);
+  EXPECT_EQ(0, decoder.start_prb);
+  EXPECT_EQ(wideband_nof_prb, decoder.nof_prbs);
+  EXPECT_EQ(compressed_payload, decoder.payload);
+  EXPECT_EQ(1, wideband_writer.prepare_count);
+  EXPECT_EQ(1, wideband_writer.enqueue_count);
+  EXPECT_TRUE(repo->get(slot, symbol_id).get_re_written_mask().front().all());
+  repo->clear();
+}
+
 TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_return_failure_when_context_is_expired)
 {
   std::array<uint8_t, 128>          compressed_payload = {};

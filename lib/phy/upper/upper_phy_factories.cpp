@@ -51,7 +51,7 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
                             std::shared_ptr<resource_grid_factory> rg_factory,
                             upper_phy_metrics_notifiers*           metric_notifier);
 
-static bool use_pdsch_acceleration_in_auto_mode(int nvcuda_device_id)
+static bool use_pdsch_acceleration_in_auto_mode(int nvcuda_device_id, const std::string& dl_grid_mode)
 {
   if (!is_pdsch_block_processor_acceleration_available()) {
     return false;
@@ -61,7 +61,11 @@ static bool use_pdsch_acceleration_in_auto_mode(int nvcuda_device_id)
     return phy_acceleration_pdsch_auto_enable_discrete_requested();
   }
 
-  if (phy_acceleration_cuda_visible_grid_managed_requested("OCUDU_DL_CUDA_VISIBLE_GRID")) {
+  bool managed_grid_requested = dl_grid_mode == "managed";
+  if (dl_grid_mode == "auto") {
+    managed_grid_requested = phy_acceleration_cuda_visible_grid_managed_requested("OCUDU_DL_CUDA_VISIBLE_GRID");
+  }
+  if (managed_grid_requested) {
     return true;
   }
 
@@ -73,6 +77,19 @@ static bool use_pdsch_acceleration_in_auto_mode(int nvcuda_device_id)
   }
 
   return true;
+}
+
+static phy_acceleration_resource_grid_memory_mode parse_cuda_visible_grid_mode(const std::string& mode,
+                                                                               const char*        direction)
+{
+  if (mode == "managed") {
+    return phy_acceleration_resource_grid_memory_mode::managed;
+  }
+  if (mode == "pinned") {
+    return phy_acceleration_resource_grid_memory_mode::pinned;
+  }
+  report_fatal_error_if_not(mode == "auto", "Invalid CUDA-visible {} resource-grid mode '{}'", direction, mode);
+  return phy_acceleration_resource_grid_memory_mode::auto_select;
 }
 
 static std::unique_ptr<uplink_processor_pool>
@@ -435,6 +452,7 @@ public:
         .crc_calculator_type          = factory_config.crc_calculator_type,
         .pdsch_processor              = factory_config.pdsch_processor,
         .pdsch_acceleration_mode      = factory_config.pdsch_acceleration_mode,
+        .dl_cuda_visible_grid_mode    = factory_config.dl_cuda_visible_grid_mode,
         .pdsch_acceleration_nof_lanes = factory_config.pdsch_acceleration_nof_lanes,
 #ifdef ENABLE_CUDA
         .nvcuda_device_id = factory_config.nvcuda_device_id,
@@ -494,14 +512,20 @@ public:
     phy_config.rx_symbol_request_notifier  = deps.rx_symbol_request_notifier;
     phy_config.nof_slots_ul_pdu_repository = config.nof_ul_rg;
 
+    const phy_acceleration_resource_grid_memory_mode dl_grid_memory_mode =
+        parse_cuda_visible_grid_mode(factory_config.dl_cuda_visible_grid_mode, "downlink");
     const bool use_accelerated_dl_grid =
+        (dl_grid_memory_mode == phy_acceleration_resource_grid_memory_mode::managed) ||
         (factory_config.pdsch_acceleration_mode == "enabled") ||
         ((factory_config.pdsch_acceleration_mode == "auto") && is_pdsch_block_processor_acceleration_available());
     std::shared_ptr<resource_grid_factory> dl_rg_factory =
         create_phy_acceleration_resource_grid_factory(rg_factory,
                                                       phy_acceleration_resource_grid_direction::downlink,
                                                       use_accelerated_dl_grid,
-                                                      factory_config.nvcuda_device_id);
+                                                      factory_config.nvcuda_device_id,
+                                                      dl_grid_memory_mode);
+    ocudulog::fetch_basic_logger("APP").info("Downlink CUDA-visible resource-grid manifest: requested={}",
+                                             factory_config.dl_cuda_visible_grid_mode);
 
     phy_config.dl_rg_pool = create_dl_resource_grid_pool(factory_deps, config, dl_rg_factory);
     report_fatal_error_if_not(phy_config.dl_rg_pool, "Invalid downlink resource grid pool.");
@@ -1062,11 +1086,18 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
 
   // Use the acceleration-specific resource grid when uplink acceleration is active. The helper keeps backend-specific
   // memory policy out of the generic upper-PHY factory.
+  phy_acceleration_resource_grid_memory_mode ul_grid_memory_mode =
+      parse_cuda_visible_grid_mode(config.ul_cuda_visible_grid_mode, "uplink");
+  bool enable_cuda_visible_ul_grid = (ul_grid_memory_mode == phy_acceleration_resource_grid_memory_mode::managed) ||
+                                     use_pusch_acceleration || use_srs_acceleration;
   std::shared_ptr<resource_grid_factory> ul_rg_factory =
       create_phy_acceleration_resource_grid_factory(rg_factory,
                                                     phy_acceleration_resource_grid_direction::uplink,
-                                                    use_pusch_acceleration || use_srs_acceleration,
-                                                    config.nvcuda_device_id);
+                                                    enable_cuda_visible_ul_grid,
+                                                    config.nvcuda_device_id,
+                                                    ul_grid_memory_mode);
+  ocudulog::fetch_basic_logger("APP").info("Uplink CUDA-visible resource-grid manifest: requested={}",
+                                           config.ul_cuda_visible_grid_mode);
 
   // Create base factory.
   std::shared_ptr<uplink_processor_factory> factory =
@@ -1356,7 +1387,8 @@ ocudu::create_downlink_processor_factory_sw(const downlink_processor_factory_sw_
       }
       use_pdsch_acceleration = true;
     } else if (config.pdsch_acceleration_mode == "auto") {
-      use_pdsch_acceleration = use_pdsch_acceleration_in_auto_mode(config.nvcuda_device_id);
+      use_pdsch_acceleration =
+          use_pdsch_acceleration_in_auto_mode(config.nvcuda_device_id, config.dl_cuda_visible_grid_mode);
     }
     // "disabled" means use_pdsch_acceleration stays false.
 

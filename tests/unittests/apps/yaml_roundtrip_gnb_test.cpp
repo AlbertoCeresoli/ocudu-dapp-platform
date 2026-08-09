@@ -100,4 +100,16 @@ TEST(gnb_default_config_test, roundtrip)
   assert_roundtrip(YAML::Dump(a), &load_and_emit, "gnb defaults");
 }
 
+TEST(gnb_expert_phy_config_test, preserves_managed_downlink_cuda_visible_grid_mode)
+{
+  YAML::Node input                                 = YAML::Load(read_file(CONFIGS + "/gnb_rf_b200_tdd_n78_20mhz.yml"));
+  input["expert_phy"]["dl_cuda_visible_grid_mode"] = "managed";
+
+  YAML::Node output = load_and_emit(YAML::Dump(input));
+
+  ASSERT_TRUE(output["expert_phy"]);
+  ASSERT_TRUE(output["expert_phy"]["dl_cuda_visible_grid_mode"]);
+  EXPECT_EQ(output["expert_phy"]["dl_cuda_visible_grid_mode"].as<std::string>(), "managed");
+}
+
 } // namespace

@@ -230,6 +230,7 @@ Upper-PHY options under `expert_phy`:
 | Option | Values | Effect |
 | --- | --- | --- |
 | `pusch_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA resident PUSCH demodulator/decoder path when available. |
+| `ul_cuda_visible_grid_mode` | `auto`, `managed`, `pinned` | Selects UL resource-grid memory. `auto` uses managed memory on integrated GPUs and pinned host memory otherwise; `managed` requires a CUDA managed grid suitable for direct OFH-to-PUSCH GPU processing. |
 | `srs_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA SRS estimator when available. |
 | `pdsch_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA PDSCH block processor when the PDSCH processor type is `auto` or `flexible`. On a discrete CUDA device, `auto` prefers host unless the downlink grid is CUDA-visible or `OCUDU_PDSCH_AUTO_ENABLE_DISCRETE=1`; use `enabled` to require CUDA. |
 | `prach_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA upper-PHY PRACH detector when available. |
@@ -263,6 +264,7 @@ ru_sdr:
 
 expert_phy:
   pusch_acceleration_mode: enabled
+  ul_cuda_visible_grid_mode: managed
   srs_acceleration_mode: enabled
   pdsch_acceleration_mode: enabled
   prach_acceleration_mode: disabled
@@ -281,9 +283,9 @@ Useful environment hooks:
 
 | Variable | Values | Effect |
 | --- | --- | --- |
-| `OCUDU_CUDA_VISIBLE_GRID` | `managed` or unset | Global CUDA-visible resource-grid override. |
-| `OCUDU_DL_CUDA_VISIBLE_GRID` | `managed` or unset | Direction-specific DL resource-grid override. |
-| `OCUDU_UL_CUDA_VISIBLE_GRID` | `managed` or unset | Direction-specific UL resource-grid override. |
+| `OCUDU_CUDA_VISIBLE_GRID` | `managed`, `pinned`, `auto`, or unset | Global CUDA-visible resource-grid override. Prefer the YAML option for UL application configuration. |
+| `OCUDU_DL_CUDA_VISIBLE_GRID` | `managed`, `pinned`, `auto`, or unset | Direction-specific DL resource-grid override. |
+| `OCUDU_UL_CUDA_VISIBLE_GRID` | `managed`, `pinned`, `auto`, or unset | Direction-specific UL resource-grid override used when the YAML mode is `auto`. |
 | `OCUDU_PDSCH_DIRECT_DEVICE_GRID` | `1`, `0`, `true`, `false`, `on`, `off` | Enables or disables the direct CUDA-visible PDSCH grid writer. The GB10 OTA path defaults to enabled where available. |
 | `OCUDU_PDSCH_DIRECT_GRID_ENCODE` | `1`, `0`, `true`, `false`, `on`, `off` | Enables fused PDSCH encode-direct-to-grid. Keep enabled for isolated PDSCH latency benchmarks; disable for sustained multi-sector full-gNB runs when DL and UL GPU work contend. |
 | `OCUDU_DU_LOW_PDSCH_EXECUTOR_MAX_BATCH` | positive integer or unset | Caps the DU-low PDSCH executor fork-limiter batch size. Use `1` for sustained multisector GPU runs to avoid long PDSCH bursts monopolizing worker threads. Defaults to the upstream batch size. |

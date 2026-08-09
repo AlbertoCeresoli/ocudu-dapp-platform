@@ -207,6 +207,80 @@ TEST(cuda_visible_phy_support_test, resource_grid_factory_can_force_managed_cuda
   EXPECT_EQ(reader.get_device_grid_cbf16(), writer.get_device_grid_bf16());
 }
 
+TEST(cuda_visible_phy_support_test, coherent_managed_resource_grid_uses_direct_host_mapping_by_default)
+{
+  testing::AssertionResult concurrent_access = cuda_concurrent_managed_access_available();
+  if (!concurrent_access) {
+    GTEST_SKIP() << concurrent_access.message();
+  }
+
+  scoped_env_var grid_mode("OCUDU_UL_CUDA_VISIBLE_GRID");
+  scoped_env_var prefer_device("OCUDU_CUDA_VISIBLE_GRID_PREFER_DEVICE");
+  ASSERT_TRUE(grid_mode.set("managed"));
+  ASSERT_TRUE(prefer_device.unset());
+
+  static constexpr unsigned nof_ports   = 2;
+  static constexpr unsigned nof_symbols = 4;
+  static constexpr unsigned nof_subc    = 24;
+  static constexpr size_t   grid_bytes  = nof_ports * nof_symbols * nof_subc * sizeof(cbf16_t);
+
+  auto factory = create_phy_acceleration_resource_grid_factory(
+      create_resource_grid_factory(), phy_acceleration_resource_grid_direction::uplink, true);
+  std::unique_ptr<resource_grid> grid = factory->create(nof_ports, nof_symbols, nof_subc);
+  ASSERT_NE(grid, nullptr);
+
+  void* managed_grid = grid->get_writer().get_device_grid_bf16();
+  ASSERT_NE(managed_grid, nullptr);
+
+  int preferred_location = cudaInvalidDeviceId;
+  ASSERT_EQ(cudaMemRangeGetAttribute(&preferred_location,
+                                     sizeof(preferred_location),
+                                     cudaMemRangeAttributePreferredLocation,
+                                     managed_grid,
+                                     grid_bytes),
+            cudaSuccess);
+
+  int device_id = cudaInvalidDeviceId;
+  ASSERT_EQ(cudaGetDevice(&device_id), cudaSuccess);
+  EXPECT_EQ(preferred_location, device_id);
+
+  int device_count = 0;
+  ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+  std::vector<int> accessed_by(static_cast<size_t>(device_count) + 1, cudaInvalidDeviceId);
+  ASSERT_EQ(cudaMemRangeGetAttribute(accessed_by.data(),
+                                     accessed_by.size() * sizeof(accessed_by.front()),
+                                     cudaMemRangeAttributeAccessedBy,
+                                     managed_grid,
+                                     grid_bytes),
+            cudaSuccess);
+  EXPECT_NE(std::find(accessed_by.begin(), accessed_by.end(), device_id), accessed_by.end());
+  EXPECT_NE(std::find(accessed_by.begin(), accessed_by.end(), cudaCpuDeviceId), accessed_by.end());
+}
+
+TEST(cuda_visible_phy_support_test, explicit_managed_mode_overrides_pinned_environment_policy)
+{
+  testing::AssertionResult cuda_available = cuda_managed_memory_available();
+  if (!cuda_available) {
+    GTEST_SKIP() << cuda_available.message();
+  }
+
+  scoped_env_var grid_mode("OCUDU_UL_CUDA_VISIBLE_GRID");
+  ASSERT_TRUE(grid_mode.set("pinned"));
+
+  std::shared_ptr<resource_grid_factory> factory = create_phy_acceleration_resource_grid_factory(
+      create_resource_grid_factory(),
+      phy_acceleration_resource_grid_direction::uplink,
+      true,
+      0,
+      phy_acceleration_resource_grid_memory_mode::managed);
+  ASSERT_NE(factory, nullptr);
+
+  std::unique_ptr<resource_grid> grid = factory->create(1, 1, 24);
+  ASSERT_NE(grid, nullptr);
+  EXPECT_TRUE(grid->get_writer().supports_device_grid_mapping());
+  EXPECT_TRUE(grid->get_reader().supports_device_grid_reading());
+}
+
 TEST(cuda_visible_phy_support_test, resource_grid_factory_uses_fallback_when_accelerated_grid_is_disabled)
 {
   scoped_env_var grid_mode("OCUDU_UL_CUDA_VISIBLE_GRID");

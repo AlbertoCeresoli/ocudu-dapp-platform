@@ -33,21 +33,38 @@ std::shared_ptr<resource_grid_factory>
 ocudu::create_phy_acceleration_resource_grid_factory(std::shared_ptr<resource_grid_factory>   fallback_factory,
                                                      phy_acceleration_resource_grid_direction direction,
                                                      bool                                     enable_accelerated_grid,
-                                                     int                                      nvcuda_device_id)
+                                                     int                                      nvcuda_device_id,
+                                                     phy_acceleration_resource_grid_memory_mode memory_mode)
 {
   if (!enable_accelerated_grid) {
     return fallback_factory;
   }
 
 #ifdef ENABLE_CUDA
+  std::optional<bool> use_managed_grid;
+  switch (memory_mode) {
+    case phy_acceleration_resource_grid_memory_mode::managed:
+      use_managed_grid = true;
+      break;
+    case phy_acceleration_resource_grid_memory_mode::pinned:
+      use_managed_grid = false;
+      break;
+    case phy_acceleration_resource_grid_memory_mode::auto_select:
+      break;
+  }
+
   switch (direction) {
     case phy_acceleration_resource_grid_direction::downlink:
       return std::make_shared<resource_grid_cuda_visible_factory>(
-          resource_grid_cuda_visible_factory::direction::downlink, nvcuda_device_id);
+          resource_grid_cuda_visible_factory::direction::downlink, nvcuda_device_id, use_managed_grid);
     case phy_acceleration_resource_grid_direction::uplink:
       return std::make_shared<resource_grid_cuda_visible_factory>(resource_grid_cuda_visible_factory::direction::uplink,
-                                                                  nvcuda_device_id);
+                                                                  nvcuda_device_id,
+                                                                  use_managed_grid);
   }
+#else
+  report_fatal_error_if_not(memory_mode != phy_acceleration_resource_grid_memory_mode::managed,
+                            "A CUDA managed resource grid was required, but CUDA support is not available");
 #endif
 
   (void)nvcuda_device_id;

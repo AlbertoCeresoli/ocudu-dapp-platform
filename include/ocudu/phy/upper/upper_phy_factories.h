@@ -163,6 +163,8 @@ struct downlink_processor_factory_sw_config {
   ///
   /// The accelerated PDSCH block processor requires a block-processor capable PDSCH processor configuration.
   std::string pdsch_acceleration_mode = "auto";
+  /// CUDA-visible downlink resource-grid mode: "auto", "managed", or "pinned".
+  std::string dl_cuda_visible_grid_mode = "auto";
   /// Number of concurrent PDSCH acceleration lanes. Zero selects the default policy.
   unsigned pdsch_acceleration_nof_lanes = 0;
   /// NVIDIA CUDA device ID the accelerated PDSCH block processor binds to.
@@ -372,6 +374,10 @@ struct upper_phy_factory_configuration {
   bool ldpc_decoder_force_decoding;
   /// Acceleration mode for PUSCH processing: "auto", "enabled", or "disabled".
   std::string pusch_acceleration_mode = "auto";
+  /// CUDA-visible uplink resource-grid mode: "auto", "managed", or "pinned".
+  std::string ul_cuda_visible_grid_mode = "auto";
+  /// CUDA-visible downlink resource-grid mode: "auto", "managed", or "pinned".
+  std::string dl_cuda_visible_grid_mode = "auto";
   /// Acceleration mode for SRS channel estimation: "auto", "enabled", or "disabled".
   std::string srs_acceleration_mode = "auto";
   /// Acceleration mode for PDSCH processing: "auto", "enabled", or "disabled".

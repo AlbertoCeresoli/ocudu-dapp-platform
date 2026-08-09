@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <sched.h>
 #include <vector>
 
@@ -80,20 +81,12 @@ public:
     // Bind to the configured device so backing allocations and events land on the right GPU.
     (void)cudaSetDevice(device_id);
 
-    if (enable_concurrent_downlink_writes && !prefetch_enabled) {
-      int concurrent_managed_access       = 0;
-      int host_page_table_access          = 0;
-      int direct_managed_access_from_host = 0;
-      concurrent_downlink_writes =
-          (cudaDeviceGetAttribute(&concurrent_managed_access, cudaDevAttrConcurrentManagedAccess, device_id) ==
-           cudaSuccess) &&
-          (cudaDeviceGetAttribute(
-               &host_page_table_access, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device_id) == cudaSuccess) &&
-          (cudaDeviceGetAttribute(&direct_managed_access_from_host,
-                                  cudaDevAttrDirectManagedMemAccessFromHost,
-                                  device_id) == cudaSuccess) &&
-          (concurrent_managed_access != 0) && (host_page_table_access != 0) && (direct_managed_access_from_host != 0);
-    }
+    const bool supports_concurrent_access = supports_concurrent_managed_access(device_id);
+    concurrent_downlink_writes = enable_concurrent_downlink_writes && !prefetch_enabled && supports_concurrent_access;
+    // Keep pages on the GPU when the CPU can access device-resident managed memory directly. This prevents host work
+    // on one symbol from migrating a shared managed-memory page while a GPU producer writes another symbol.
+    prefer_device_memory =
+        phy_acceleration_env_flag_enabled("OCUDU_CUDA_VISIBLE_GRID_PREFER_DEVICE", supports_concurrent_access);
 
     static constexpr unsigned initial_ready_events = 32;
     grid_ready_events.reserve(initial_ready_events);
@@ -568,6 +561,19 @@ private:
     return cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking);
   }
 
+  static bool supports_concurrent_managed_access(int device)
+  {
+    int concurrent_access  = 0;
+    int host_page_tables   = 0;
+    int direct_host_access = 0;
+    return (cudaDeviceGetAttribute(&concurrent_access, cudaDevAttrConcurrentManagedAccess, device) == cudaSuccess) &&
+           (cudaDeviceGetAttribute(&host_page_tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device) ==
+            cudaSuccess) &&
+           (cudaDeviceGetAttribute(&direct_host_access, cudaDevAttrDirectManagedMemAccessFromHost, device) ==
+            cudaSuccess) &&
+           (concurrent_access != 0) && (host_page_tables != 0) && (direct_host_access != 0);
+  }
+
   void advise_managed_memory() const
   {
     if (managed_data == nullptr) {
@@ -575,8 +581,11 @@ private:
     }
     // Best-effort hints only. The public resource-grid contract must not depend on managed-memory advice support.
     (void)cudaMemAdvise(managed_data, managed_bytes, cudaMemAdviseSetAccessedBy, device_location());
-    if (phy_acceleration_env_flag_enabled("OCUDU_CUDA_VISIBLE_GRID_PREFER_DEVICE", false)) {
+    if (prefer_device_memory) {
       (void)cudaMemAdvise(managed_data, managed_bytes, cudaMemAdviseSetPreferredLocation, device_location());
+      // On coherent systems, CUDA requires this hint for the CPU to access GPU-resident managed pages directly
+      // instead of faulting and migrating them back to host memory.
+      (void)cudaMemAdvise(managed_data, managed_bytes, cudaMemAdviseSetAccessedBy, host_location());
     }
   }
 
@@ -636,6 +645,7 @@ private:
   resource_grid_allocation_info alloc_mask;
   bool     prefetch_enabled           = phy_acceleration_env_flag_enabled("OCUDU_CUDA_VISIBLE_GRID_PREFETCH", false);
   bool     concurrent_downlink_writes = false;
+  bool     prefer_device_memory       = false;
   int      device_id                  = 0;
   unsigned nof_ports                  = 0;
   unsigned nof_symbols                = 0;
@@ -651,10 +661,13 @@ class resource_grid_cuda_visible_factory : public resource_grid_factory
 public:
   enum class direction { generic, downlink, uplink };
 
-  explicit resource_grid_cuda_visible_factory(direction grid_direction_ = direction::generic, int cuda_device_id_ = 0) :
+  explicit resource_grid_cuda_visible_factory(direction           grid_direction_ = direction::generic,
+                                              int                 cuda_device_id_ = 0,
+                                              std::optional<bool> use_managed_grid_override = std::nullopt) :
     grid_direction(grid_direction_),
     device_id(cuda_device_id_),
-    use_managed_grid(should_use_managed_grid(grid_direction_, cuda_device_id_))
+    use_managed_grid(use_managed_grid_override.value_or(should_use_managed_grid(grid_direction_, cuda_device_id_))),
+    managed_grid_required(use_managed_grid_override.value_or(false))
   {
   }
 
@@ -666,6 +679,9 @@ public:
       if (grid->is_valid()) {
         return grid;
       }
+      report_fatal_error_if_not(!managed_grid_required,
+                                "Failed to allocate a required CUDA managed resource grid on device {}",
+                                device_id);
     }
     return fallback_factory->create(nof_ports, nof_symbols, nof_subc);
   }
@@ -722,6 +738,7 @@ private:
   direction                              grid_direction;
   int                                    device_id;
   bool                                   use_managed_grid;
+  bool                                   managed_grid_required;
   std::shared_ptr<resource_grid_factory> fallback_factory = std::make_shared<resource_grid_pinned_factory>();
 };
 

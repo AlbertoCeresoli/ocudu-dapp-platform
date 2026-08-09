@@ -83,6 +83,20 @@ struct du_low_unit_expert_upper_phy_config {
   /// - \c enabled: require acceleration (fail if unavailable),
   /// - \c disabled: use CPU only.
   std::string pusch_acceleration_mode = "auto";
+  /// \brief CUDA-visible uplink resource-grid allocation mode.
+  ///
+  /// Use one of these options:
+  /// - \c auto: use managed memory on integrated GPUs and pinned host memory otherwise (default),
+  /// - \c managed: require a CUDA managed resource grid, or
+  /// - \c pinned: use pinned host memory.
+  std::string ul_cuda_visible_grid_mode = "auto";
+  /// \brief CUDA-visible downlink resource-grid allocation mode.
+  ///
+  /// Use one of these options:
+  /// - \c auto: use managed memory on integrated GPUs and pinned host memory otherwise (default),
+  /// - \c managed: require a CUDA managed resource grid, or
+  /// - \c pinned: use pinned host memory.
+  std::string dl_cuda_visible_grid_mode = "auto";
   /// \brief Acceleration mode for SRS channel estimation.
   ///
   /// Use one of these options:
