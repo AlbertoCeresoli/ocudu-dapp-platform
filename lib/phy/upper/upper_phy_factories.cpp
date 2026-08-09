@@ -680,7 +680,7 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
   const bool use_prach_acceleration =
       (resolved_prach_acceleration_mode == "enabled") ||
       ((resolved_prach_acceleration_mode == "auto") && is_prach_detector_acceleration_available());
-  ocudulog::fetch_basic_logger("PHY").info("PRACH acceleration manifest: requested={} backend={}",
+  ocudulog::fetch_basic_logger("APP").info("PRACH acceleration manifest: requested={} backend={}",
                                            config.prach_acceleration_mode,
                                            use_prach_acceleration ? "CUDA" : "host");
 
@@ -709,7 +709,7 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
   if (use_srs_acceleration) {
     ocudulog::fetch_basic_logger("PHY").info("Using accelerated SRS estimator");
   }
-  ocudulog::fetch_basic_logger("PHY").info("SRS acceleration manifest: requested={} resolved={} backend={}",
+  ocudulog::fetch_basic_logger("APP").info("SRS acceleration manifest: requested={} resolved={} backend={}",
                                            config.srs_acceleration_mode,
                                            resolved_srs_acceleration_mode,
                                            use_srs_acceleration ? "CUDA" : "host");
@@ -950,7 +950,7 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
                                                               config.ul_bw_rb,
                                                               enable_eq_sinr);
   }
-  ocudulog::fetch_basic_logger("PHY").info(
+  ocudulog::fetch_basic_logger("APP").info(
       "PUSCH acceleration manifest: requested={} backend={} resident_decode={} decoder_pool={} device_uci={}",
       config.pusch_acceleration_mode,
       use_pusch_acceleration ? "CUDA" : "host",
@@ -1481,7 +1481,7 @@ ocudu::create_downlink_processor_factory_sw(const downlink_processor_factory_sw_
         std::move(pdsch_proc_factory), dependencies.metric_notifier->get_pdsch_processor_notifier());
     report_fatal_error_if_not(pdsch_proc_factory, "Invalid PDSCH processor metric decorator factory.");
   }
-  ocudulog::fetch_basic_logger("PHY").info(
+  ocudulog::fetch_basic_logger("APP").info(
       "PDSCH acceleration manifest: requested={} backend={} lanes={} pool_size={} device_grid_writer={}",
       config.pdsch_acceleration_mode,
       use_pdsch_acceleration ? "CUDA" : "host",
