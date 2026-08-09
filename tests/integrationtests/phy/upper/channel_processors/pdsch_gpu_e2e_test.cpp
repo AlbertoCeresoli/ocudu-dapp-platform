@@ -784,16 +784,16 @@ TEST(PdschGpuIssueProfile, DisjointPdschsShareManagedGridWithoutIntermediateSync
     ASSERT_NE(gpu_proc, nullptr);
   }
 
-  constexpr unsigned nof_pdus       = 3;
-  constexpr unsigned cell_nof_prb   = 51;
-  constexpr unsigned pdu_nof_prb    = cell_nof_prb / nof_pdus;
-  constexpr unsigned nof_ports      = 1;
-  constexpr unsigned nof_layers     = 1;
-  constexpr unsigned nof_subc       = cell_nof_prb * NOF_SUBCARRIERS_PER_RB;
-  constexpr unsigned start_symbol   = 2;
-  constexpr unsigned nof_symbols    = 12;
+  constexpr unsigned nof_pdus        = 3;
+  constexpr unsigned cell_nof_prb    = 51;
+  constexpr unsigned pdu_nof_prb     = cell_nof_prb / nof_pdus;
+  constexpr unsigned nof_ports       = 1;
+  constexpr unsigned nof_layers      = 1;
+  constexpr unsigned nof_subc        = cell_nof_prb * NOF_SUBCARRIERS_PER_RB;
+  constexpr unsigned start_symbol    = 2;
+  constexpr unsigned nof_symbols     = 12;
   constexpr unsigned nof_repetitions = 128;
-  symbol_slot_mask   dmrs_symbols = make_dmrs_symbol_mask(dmrs_profile::single_symbol);
+  symbol_slot_mask   dmrs_symbols    = make_dmrs_symbol_mask(dmrs_profile::single_symbol);
 
   std::shared_ptr<resource_grid_factory> host_grid_factory = create_resource_grid_factory();
   resource_grid_cuda_visible_factory     managed_grid_factory(resource_grid_cuda_visible_factory::direction::downlink);
@@ -813,11 +813,11 @@ TEST(PdschGpuIssueProfile, DisjointPdschsShareManagedGridWithoutIntermediateSync
     for (unsigned i_pdu = 0; i_pdu != nof_pdus; ++i_pdu) {
       sch_mcs_description mcs_descr =
           pdsch_mcs_get_config(pdsch_mcs_table::qam64, sch_mcs_index(19 + ((i_tx + 2 * i_pdu) % 8)));
-      unsigned tbs = calculate_tbs(
-          mcs_descr, pdu_nof_prb, nof_layers, dmrs_config_type::type1, dmrs_symbols, 1, nof_symbols);
+      unsigned tbs =
+          calculate_tbs(mcs_descr, pdu_nof_prb, nof_layers, dmrs_config_type::type1, dmrs_symbols, 1, nof_symbols);
       ASSERT_EQ(tbs % 8, 0U);
 
-      pdus[i_pdu] = build_pdsch_pdu(mcs_descr,
+      pdus[i_pdu]             = build_pdsch_pdu(mcs_descr,
                                     pdu_nof_prb,
                                     nof_layers,
                                     nof_ports,
@@ -835,7 +835,7 @@ TEST(PdschGpuIssueProfile, DisjointPdschsShareManagedGridWithoutIntermediateSync
                                     nof_symbols,
                                     subcarrier_spacing::kHz30);
       pdus[i_pdu].bwp_size_rb = cell_nof_prb;
-      pdus[i_pdu].freq_alloc = rb_allocation::make_type1(i_pdu * pdu_nof_prb, pdu_nof_prb, std::nullopt);
+      pdus[i_pdu].freq_alloc  = rb_allocation::make_type1(i_pdu * pdu_nof_prb, pdu_nof_prb, std::nullopt);
 
       tx_data[i_pdu].resize(tbs / 8);
       std::mt19937 rgen(0x1f1fc000U + i_tx * nof_pdus + i_pdu);

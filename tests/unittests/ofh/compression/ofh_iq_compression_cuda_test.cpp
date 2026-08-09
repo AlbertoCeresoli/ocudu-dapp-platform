@@ -9,8 +9,8 @@
 #include "ocudu/ofh/compression/compression_properties.h"
 #include "gtest/gtest.h"
 #include <algorithm>
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -467,19 +467,17 @@ TEST(ofh_iq_compression_cuda_c_api_test, accepts_zero_length_noop_requests)
 
 TEST(ofh_iq_compression_cuda_c_api_test, async_prach_decompression_snapshots_transient_none16_input)
 {
-  static constexpr unsigned nof_prbs    = 1;
+  static constexpr unsigned nof_prbs   = 1;
   static constexpr unsigned data_width = 16;
 
   ocudulog::basic_logger& logger = ocudulog::fetch_basic_logger("TEST", false);
   logger.set_level(ocudulog::basic_levels::none);
   ofh::ru_compression_params params{ofh::compression_type::none, data_width};
-  std::vector<cbf16_t>      source = generate_golden_iq_prb();
-  std::vector<uint8_t>      compressed(ofh::get_compressed_prb_size(params).value() * nof_prbs);
-  std::vector<cbf16_t>      expected(source.size());
-  ofh::create_iq_compressor(ofh::compression_type::none, logger, 1.0F, "generic")
-      ->compress(compressed, source, params);
-  ofh::create_iq_decompressor(ofh::compression_type::none, logger, "generic")
-      ->decompress(expected, compressed, params);
+  std::vector<cbf16_t>       source = generate_golden_iq_prb();
+  std::vector<uint8_t>       compressed(ofh::get_compressed_prb_size(params).value() * nof_prbs);
+  std::vector<cbf16_t>       expected(source.size());
+  ofh::create_iq_compressor(ofh::compression_type::none, logger, 1.0F, "generic")->compress(compressed, source, params);
+  ofh::create_iq_decompressor(ofh::compression_type::none, logger, "generic")->decompress(expected, compressed, params);
 
   ocudu_ofh_compression_handle_t* handle = nullptr;
   if (ocudu_ofh_compression_create(&handle) == 0) {
@@ -532,7 +530,7 @@ TEST(ofh_iq_compression_cuda_c_api_test, async_prach_decompression_snapshots_tra
 
   std::atomic<int>  enqueue_status{0};
   std::atomic<bool> enqueue_finished{false};
-  std::thread enqueue_thread([&]() {
+  std::thread       enqueue_thread([&]() {
     enqueue_status.store(ocudu_ofh_decompress_to_device_prach_buffer_async(handle,
                                                                            OCUDU_OFH_COMPRESSION_TYPE_NONE,
                                                                            output,
