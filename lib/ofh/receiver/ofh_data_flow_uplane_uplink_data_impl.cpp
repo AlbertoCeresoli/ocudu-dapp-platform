@@ -43,6 +43,9 @@ void data_flow_uplane_uplink_data_impl::decode_type1_message(unsigned eaxc, span
       uplane_rx_symbol_data_flow_writer::direct_write_result write_result =
           rx_symbol_writer.write_compressed_to_resource_grid(eaxc, compressed_results, *uplane_decoder);
       metrics_collector.increase_direct_write_result(write_result);
+      if (is_direct_write_fragment_buffered(write_result)) {
+        return;
+      }
       if (is_direct_write_success(write_result)) {
         notification_sender.notify_received_symbol(compressed_results.params.slot,
                                                    compressed_results.params.symbol_id);

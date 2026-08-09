@@ -9,6 +9,7 @@ namespace ofh {
 /// Open Fronthaul direct IQ decompression result counters.
 struct rx_direct_decompression_metrics {
   unsigned nof_acceleration_retries;
+  unsigned nof_buffered_fragments;
   unsigned nof_unsupported_destinations;
   unsigned nof_unsupported_compressions;
   unsigned nof_missing_contexts;

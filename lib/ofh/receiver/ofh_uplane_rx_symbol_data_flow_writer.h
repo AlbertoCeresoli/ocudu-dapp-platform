@@ -5,6 +5,7 @@
 
 #include "../support/uplink_context_repository.h"
 #include "ofh_direct_write_result.h"
+#include "ofh_uplane_iq_data_fragment_assembler.h"
 #include "ocudu/ocudulog/logger.h"
 
 namespace ocudu {
@@ -32,6 +33,8 @@ public:
   {
     ocudu_assert(!ul_eaxc.empty(), "Invalid number of uplink eAxCs");
     ocudu_assert(ul_context_repo, "Invalid uplink context repository");
+    fragment_assemblers.resize(static_cast<size_t>(ul_context_repo->get_nof_slot_entries()) * MAX_NSYMB_PER_SLOT *
+                               ul_eaxc.size());
   }
 
   /// Writes the given decoder results in the corresponding resource grid using the given eAxC. Returns true on success,
@@ -40,16 +43,20 @@ public:
 
   /// Writes compressed decoder results directly into the corresponding resource grid when the grid and decompressor
   /// support a device-resident path. A fallback result means that no device write was attempted and host decoding is
-  /// safe. A failure result is terminal for the packet and must not trigger host decoding.
+  /// safe. A buffered result means that the fragment was retained until the complete symbol arrives. A failure result
+  /// is terminal for the packet and must not trigger host decoding.
   direct_write_result write_compressed_to_resource_grid(unsigned                              eaxc,
                                                         const uplane_message_decoder_results& results,
                                                         uplane_message_decoder&               decoder);
 
 private:
+  uplane_iq_data_fragment_assembler& get_fragment_assembler(slot_point slot, unsigned symbol, unsigned port);
+
   const static_vector<unsigned, MAX_NOF_SUPPORTED_EAXC> ul_eaxc;
   const unsigned                                        sector_id;
   ocudulog::basic_logger&                               logger;
   std::shared_ptr<uplink_context_repository>            ul_context_repo;
+  std::vector<uplane_iq_data_fragment_assembler>        fragment_assemblers;
 };
 
 } // namespace ofh

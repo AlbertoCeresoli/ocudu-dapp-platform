@@ -48,6 +48,13 @@ public:
     return supports_resource_grid_decompression();
   }
 
+  /// Returns true when direct resource-grid decompression benefits from receiving a complete OFDM symbol per call.
+  virtual bool prefers_full_symbol_decompression(const ru_compression_params& params) const
+  {
+    (void)params;
+    return false;
+  }
+
   /// Returns true if the decompressor can write directly into a device-capable PRACH buffer.
   virtual bool supports_prach_buffer_decompression() const { return false; }
 

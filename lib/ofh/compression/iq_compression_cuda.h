@@ -90,6 +90,11 @@ public:
 
   bool supports_resource_grid_decompression() const override { return true; }
 
+  bool prefers_full_symbol_decompression(const ru_compression_params& params) const override
+  {
+    return params.type == type;
+  }
+
   bool supports_prach_buffer_decompression() const override { return true; }
 
   iq_decompression_result decompress_to_resource_grid(resource_grid_writer&        grid,

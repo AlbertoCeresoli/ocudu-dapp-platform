@@ -30,6 +30,7 @@ static std::string          impl_type         = "auto";
 static std::string          grid_mode         = "host";
 static unsigned             nof_ports         = 1;
 static unsigned             nof_batch_symbols = 1;
+static unsigned             bit_width_filter  = 0;
 static bs_channel_bandwidth bw                = ocudu::bs_channel_bandwidth::MHz20;
 static subcarrier_spacing   scs               = subcarrier_spacing::kHz30;
 
@@ -39,7 +40,7 @@ static void usage(const char* prog)
   fmt::print("\t-R Repetitions [Default {}]\n", nof_repetitions);
   fmt::print("\t-T Type of compression [{{'none', 'bfp'}}, default is {}]\n", method);
   fmt::print("\t-F Select compression factory [Default {}]\n", impl_type);
-  fmt::print("\t-G Grid mode [{{'host', 'device', 'device-batch', 'device-host-buffer-batch', "
+  fmt::print("\t-G Grid mode [{{'host', 'device', 'device-fragments', 'device-batch', 'device-host-buffer-batch', "
              "'device-device-batch', 'device-symbol-batch', 'device-host-buffer-symbol-batch', "
              "'device-device-symbol-batch', 'device-device-symbol-batch-async'}}, default is {}]\n",
              grid_mode);
@@ -47,6 +48,7 @@ static void usage(const char* prog)
   fmt::print("\t-C Subcarrier spacing. [Default {}]\n", to_string(scs));
   fmt::print("\t-N Number of ports [from 1 to 4, default {}]\n", nof_ports);
   fmt::print("\t-Y Number of OFDM symbols to batch [Default {}]\n", nof_batch_symbols);
+  fmt::print("\t-W IQ bit width to measure [1..16, default all common widths]\n");
   fmt::print("\t-h Show this message\n");
 }
 
@@ -102,7 +104,7 @@ static void parse_args(int argc, char** argv)
 {
   int  opt         = 0;
   bool invalid_arg = false;
-  while ((opt = getopt(argc, argv, "R:T:F:G:B:C:N:Y:sh")) != -1) {
+  while ((opt = getopt(argc, argv, "R:T:F:G:B:C:N:Y:W:sh")) != -1) {
     switch (opt) {
       case 'R':
         nof_repetitions = std::strtol(optarg, nullptr, 10);
@@ -115,8 +117,9 @@ static void parse_args(int argc, char** argv)
         break;
       case 'G':
         grid_mode = std::string(optarg);
-        if ((grid_mode != "host") && (grid_mode != "device") && (grid_mode != "device-batch") &&
-            (grid_mode != "device-host-buffer-batch") && (grid_mode != "device-device-batch") &&
+        if ((grid_mode != "host") && (grid_mode != "device") && (grid_mode != "device-fragments") &&
+            (grid_mode != "device-batch") && (grid_mode != "device-host-buffer-batch") &&
+            (grid_mode != "device-device-batch") &&
             (grid_mode != "device-symbol-batch") && (grid_mode != "device-host-buffer-symbol-batch") &&
             (grid_mode != "device-device-symbol-batch") && (grid_mode != "device-device-symbol-batch-async")) {
           fmt::print("Invalid grid mode\n");
@@ -151,6 +154,13 @@ static void parse_args(int argc, char** argv)
         nof_batch_symbols = std::strtol(optarg, nullptr, 10);
         if ((nof_batch_symbols < 1) || (nof_batch_symbols > 14)) {
           fmt::print("Invalid number of symbols\n");
+          invalid_arg = true;
+        }
+        break;
+      case 'W':
+        bit_width_filter = std::strtol(optarg, nullptr, 10);
+        if ((bit_width_filter < 1) || (bit_width_filter > 16)) {
+          fmt::print("Invalid IQ bit width\n");
           invalid_arg = true;
         }
         break;
@@ -190,6 +200,27 @@ static void check_cuda(bool success, const char* operation)
     std::exit(1);
   }
 }
+
+static void check_cuda_backend(bool success, const ocudu_ofh_compression_handle_t* handle, const char* operation)
+{
+  if (success) {
+    return;
+  }
+
+  ocudu_ofh_compression_error_info_t error_info = {};
+  if (ocudu_ofh_compression_get_last_error(handle, &error_info) && (error_info.cuda_error_code != 0)) {
+    fmt::print(stderr,
+               "{} failed during '{}': {} ({}): {}\n",
+               operation,
+               error_info.operation,
+               error_info.error_name,
+               error_info.cuda_error_code,
+               error_info.error_description);
+  } else {
+    fmt::print(stderr, "{} failed without a CUDA runtime error\n", operation);
+  }
+  std::exit(1);
+}
 #endif
 
 int main(int argc, char** argv)
@@ -227,6 +258,9 @@ int main(int argc, char** argv)
 
   // Test for the most common bit width.
   for (unsigned bit_width : {8, 9, 10, 12, 14, 16}) {
+    if ((bit_width_filter != 0) && (bit_width != bit_width_filter)) {
+      continue;
+    }
     ofh::ru_compression_params params;
     params.type       = ofh::to_compression_type(method);
     params.data_width = bit_width;
@@ -253,8 +287,9 @@ int main(int argc, char** argv)
     }
 
 #ifdef ENABLE_CUDA
-    if ((grid_mode == "device") || (grid_mode == "device-batch") || (grid_mode == "device-host-buffer-batch") ||
-        (grid_mode == "device-device-batch") || (grid_mode == "device-symbol-batch") ||
+    if ((grid_mode == "device") || (grid_mode == "device-fragments") || (grid_mode == "device-batch") ||
+        (grid_mode == "device-host-buffer-batch") || (grid_mode == "device-device-batch") ||
+        (grid_mode == "device-symbol-batch") ||
         (grid_mode == "device-host-buffer-symbol-batch") || (grid_mode == "device-device-symbol-batch") ||
         (grid_mode == "device-device-symbol-batch-async")) {
       if (impl_type != "cuda") {
@@ -470,7 +505,36 @@ int main(int argc, char** argv)
             }
           });
       perf_meas.new_measure(meas_descr_decompression, nof_iq_samples, [&]() {
-        if (grid_mode == "device-device-batch") {
+        if (grid_mode == "device-fragments") {
+          // Approximate the IQ payload available in a 1500-byte Open Fronthaul frame. BFP9 therefore uses 51-PRB
+          // fragments, matching the six-packet 273-PRB profile used by the O-RU simulator.
+          constexpr unsigned fragment_payload_bytes = 1440U;
+          unsigned fragment_nof_prbs = std::max(1U, fragment_payload_bytes / comp_prb_size);
+          for (unsigned symbol = 0; symbol != nof_batch_symbols; ++symbol) {
+            for (unsigned i = 0; i != nof_ports; ++i) {
+              for (unsigned start_prb = 0; start_prb < nof_prbs; start_prb += fragment_nof_prbs) {
+                unsigned current_nof_prbs = std::min<unsigned>(fragment_nof_prbs, nof_prbs - start_prb);
+                check_cuda_backend(
+                    ocudu_ofh_decompress_to_device_grid_async(
+                        cuda_handle,
+                        to_cuda_compression_type(params.type),
+                        device_output_grid,
+                        compressed_data[i].data() + static_cast<size_t>(symbol) * port_stride_bytes +
+                            static_cast<size_t>(start_prb) * comp_prb_size,
+                        nof_batch_symbols,
+                        nof_prbs * NOF_SUBCARRIERS_PER_RB,
+                        i,
+                        symbol,
+                        start_prb,
+                        current_nof_prbs,
+                        params.data_width) != 0,
+                    cuda_handle,
+                    "ocudu_ofh_decompress_to_device_grid_async fragments");
+              }
+            }
+          }
+          check_cuda(ocudu_ofh_compression_synchronize(cuda_handle) != 0, "synchronize fragment decompression");
+        } else if (grid_mode == "device-device-batch") {
           for (unsigned symbol = 0; symbol != nof_batch_symbols; ++symbol) {
             check_cuda(ocudu_ofh_decompress_device_bytes_to_device_grid_ports(
                            cuda_handle,

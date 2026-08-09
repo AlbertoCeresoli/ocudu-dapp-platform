@@ -12,6 +12,7 @@ set(SOURCES
         ofh_receiver_impl.cpp
         ofh_rx_symbol_reorderer.cpp
         ofh_rx_window_checker.cpp
+        ofh_uplane_iq_data_fragment_assembler.cpp
         ofh_uplane_rx_symbol_data_flow_notifier.cpp
         ofh_uplane_rx_symbol_data_flow_writer.cpp
         ofh_uplane_prach_data_flow_notifier.cpp

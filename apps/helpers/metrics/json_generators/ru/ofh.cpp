@@ -70,6 +70,7 @@ static nlohmann::json generate_message_decoder_item(const ofh::rx_data_flow_perf
   const auto& direct_metrics = metrics.direct_decompression;
   auto&       direct_json    = json["direct_decompression"];
   direct_json["nof_acceleration_retries"]             = direct_metrics.nof_acceleration_retries;
+  direct_json["nof_buffered_fragments"]                = direct_metrics.nof_buffered_fragments;
   direct_json["nof_unsupported_destinations"]         = direct_metrics.nof_unsupported_destinations;
   direct_json["nof_unsupported_compressions"]         = direct_metrics.nof_unsupported_compressions;
   direct_json["nof_missing_contexts"]                 = direct_metrics.nof_missing_contexts;

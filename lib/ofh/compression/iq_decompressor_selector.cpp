@@ -39,6 +39,11 @@ bool iq_decompressor_selector::supports_resource_grid_decompression(const ru_com
   return decompressors[static_cast<unsigned>(params.type)]->supports_resource_grid_decompression(params);
 }
 
+bool iq_decompressor_selector::prefers_full_symbol_decompression(const ru_compression_params& params) const
+{
+  return decompressors[static_cast<unsigned>(params.type)]->prefers_full_symbol_decompression(params);
+}
+
 bool iq_decompressor_selector::supports_prach_buffer_decompression() const
 {
   return std::any_of(decompressors.begin(), decompressors.end(), [](const auto& decompressor) {

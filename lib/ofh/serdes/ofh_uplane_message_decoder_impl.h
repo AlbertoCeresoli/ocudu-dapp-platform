@@ -69,6 +69,9 @@ public:
   bool supports_resource_grid_decompression(const ru_compression_params& params) const override;
 
   // See interface for documentation.
+  bool prefers_full_symbol_decompression(const ru_compression_params& params) const override;
+
+  // See interface for documentation.
   bool supports_prach_buffer_decompression() const override;
 
   // See interface for documentation.

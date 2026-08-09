@@ -35,6 +35,11 @@ bool uplane_message_decoder_impl::supports_resource_grid_decompression(const ru_
   return decompressor->supports_resource_grid_decompression(params);
 }
 
+bool uplane_message_decoder_impl::prefers_full_symbol_decompression(const ru_compression_params& params) const
+{
+  return decompressor->prefers_full_symbol_decompression(params);
+}
+
 bool uplane_message_decoder_impl::supports_prach_buffer_decompression() const
 {
   return decompressor->supports_prach_buffer_decompression();

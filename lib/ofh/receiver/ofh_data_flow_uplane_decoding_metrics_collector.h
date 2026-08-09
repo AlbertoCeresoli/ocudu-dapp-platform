@@ -55,6 +55,8 @@ public:
     metrics.nof_dropped_messages = nof_dropped_messages.exchange(0, std::memory_order_relaxed);
     metrics.direct_decompression.nof_acceleration_retries =
         exchange_direct_write_result(direct_write_result::success_after_retry);
+    metrics.direct_decompression.nof_buffered_fragments =
+        exchange_direct_write_result(direct_write_result::fragment_buffered);
     metrics.direct_decompression.nof_unsupported_destinations =
         exchange_direct_write_result(direct_write_result::fallback_unsupported_destination);
     metrics.direct_decompression.nof_unsupported_compressions =

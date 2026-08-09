@@ -98,10 +98,12 @@ static void log_ru_ofh_performance_metrics_verbose(fmt::basic_memory_buffer<char
 
   auto log_direct_decompression = [&buffer](const char* label, const ofh::rx_direct_decompression_metrics& metrics) {
     fmt::format_to(std::back_inserter(buffer),
-                   "{} retries={} unsupported_dst={} unsupported_compr={} missing_context={} invalid_input={} "
+                   "{} retries={} buffered_fragments={} unsupported_dst={} unsupported_compr={} missing_context={} "
+                   "invalid_input={} "
                    "no_data={} resource_unavailable={} acceleration_failure={} destination_failure={}; ",
                    label,
                    metrics.nof_acceleration_retries,
+                   metrics.nof_buffered_fragments,
                    metrics.nof_unsupported_destinations,
                    metrics.nof_unsupported_compressions,
                    metrics.nof_missing_contexts,

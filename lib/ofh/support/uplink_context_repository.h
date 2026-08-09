@@ -176,6 +176,9 @@ class uplink_context_repository
 public:
   explicit uplink_context_repository(unsigned size_) : pending_context_to_add(size_), buffer(size_) {}
 
+  /// Returns the number of slot entries in the bounded repository.
+  unsigned get_nof_slot_entries() const { return buffer.size(); }
+
   /// Adds the given entry to the repository at slot.
   void add(const resource_grid_context& context,
            const shared_resource_grid&  grid,

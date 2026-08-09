@@ -12,6 +12,7 @@ namespace ofh {
 enum class direct_write_result {
   success,
   success_after_retry,
+  fragment_buffered,
   fallback_unsupported_destination,
   fallback_unsupported_compression,
   failure_missing_context,
@@ -26,6 +27,12 @@ enum class direct_write_result {
 constexpr bool is_direct_write_success(direct_write_result result)
 {
   return (result == direct_write_result::success) || (result == direct_write_result::success_after_retry);
+}
+
+/// Returns true when a compressed fragment was accepted but the complete symbol has not arrived yet.
+constexpr bool is_direct_write_fragment_buffered(direct_write_result result)
+{
+  return result == direct_write_result::fragment_buffered;
 }
 
 /// Returns true when no destination write was attempted and host decompression remains safe.
