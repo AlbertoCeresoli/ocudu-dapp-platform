@@ -313,6 +313,8 @@ static unsigned get_nof_prealloc_producers(const worker_manager_config& worker_c
     nof_producers += 1;
     // Include a TxRx thread for each RU cell.
     nof_producers += worker_cfg.ru_ofh_cfg->nof_cells;
+    // Include the dedicated Open Fronthaul uplink workers.
+    nof_producers += worker_cfg.ru_ofh_cfg->nof_cells;
   }
   if (worker_cfg.ru_dummy_cfg.has_value()) {
     // Include RU dummy thread.
@@ -469,9 +471,35 @@ void worker_manager::create_ofh_executors(const worker_manager_config::ru_ofh_co
     exec_mapper_config.timing_executor = exec_mng.executors().at(exec_name);
   }
 
-  // Downlink and uplink executors.
+  // Downlink executor.
   exec_mapper_config.downlink_executor = rt_hi_prio_exec;
-  exec_mapper_config.uplink_executor   = rt_hi_prio_exec;
+
+  // Keep Open Fronthaul receive parsing and uplink decompression independent
+  // of upper-PHY and MAC bursts in the main real-time pool. The per-sector
+  // strands created by the executor mapper still serialize packet processing.
+  // A dedicated worker per cell prevents a temporarily saturated main pool
+  // from filling the receive strand and dropping already-received Ethernet
+  // frames, which is particularly important for wideband, fragmented traffic.
+  {
+    const std::string name      = "ru_uplink";
+    const std::string exec_name = "ru_uplink_exec";
+
+    std::vector<os_sched_affinity_bitmask> uplink_affinity_masks;
+    uplink_affinity_masks.reserve(config.nof_cells);
+    for (unsigned i = 0; i != config.nof_cells; ++i) {
+      uplink_affinity_masks.push_back(
+          main_pool_affinity_mng.calcute_affinity_mask(sched_affinity_mask_types::main));
+    }
+
+    create_worker_pool(name,
+                       config.nof_cells,
+                       exec_name,
+                       task_worker_queue_size,
+                       os_thread_realtime_priority::max() - 1,
+                       uplink_affinity_masks,
+                       concurrent_queue_policy::lockfree_mpmc);
+    exec_mapper_config.uplink_executor = exec_mng.executors().at(exec_name);
+  }
 
   // Executor for Open Fronthaul messages transmission and reception.
   {
