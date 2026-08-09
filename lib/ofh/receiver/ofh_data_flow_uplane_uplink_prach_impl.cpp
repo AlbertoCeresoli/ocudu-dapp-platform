@@ -19,6 +19,7 @@ data_flow_uplane_uplink_prach_impl::data_flow_uplane_uplink_prach_impl(
   notification_sender(*dependencies.logger, dependencies.prach_context_repo, dependencies.notifier),
   sector_id(config.sector),
   ignore_prach_start_symbol(config.ignore_prach_start_symbol),
+  host_decompression(config.host_decompression),
   metrics_collector(config.are_metrics_enabled)
 {
   ocudu_assert(prach_cplane_context_repo, "Invalid PRACH Control-Plane context repository");
@@ -91,18 +92,35 @@ bool data_flow_uplane_uplink_prach_impl::should_uplane_packet_be_filtered(
 void data_flow_uplane_uplink_prach_impl::decode_type1_message(unsigned eaxc, span<const uint8_t> message)
 {
   uplane_message_decoder_results compressed_results;
-  if (uplane_decoder->supports_prach_buffer_decompression() &&
-      uplane_decoder->decode_with_compressed_iq(compressed_results, message)) {
-    if (should_uplane_packet_be_filtered(eaxc, compressed_results)) {
-      metrics_collector.increase_dropped_messages();
+  if (uplane_decoder->supports_prach_buffer_decompression()) {
+    if (uplane_decoder->decode_with_compressed_iq(compressed_results, message)) {
+      if (should_uplane_packet_be_filtered(eaxc, compressed_results)) {
+        metrics_collector.increase_dropped_messages();
 
-      return;
-    }
+        return;
+      }
 
-    if (prach_iq_writter.write_compressed_to_prach_buffer(eaxc, compressed_results, *uplane_decoder)) {
-      notification_sender.notify_prach(compressed_results.params.slot);
-      return;
+      uplane_prach_symbol_data_flow_writer::direct_write_result write_result =
+          prach_iq_writter.write_compressed_to_prach_buffer(eaxc, compressed_results, *uplane_decoder);
+      metrics_collector.increase_direct_write_result(write_result);
+      if (is_direct_write_success(write_result)) {
+        notification_sender.notify_prach(compressed_results.params.slot);
+        return;
+      }
+      if (!allows_host_decompression_fallback(write_result)) {
+        metrics_collector.increase_dropped_messages();
+        return;
+      }
+    } else {
+      metrics_collector.increase_direct_write_result(direct_write_result::failure_invalid_input);
     }
+  } else {
+    metrics_collector.increase_direct_write_result(direct_write_result::fallback_unsupported_compression);
+  }
+
+  if (host_decompression == host_decompression_policy::forbid) {
+    metrics_collector.increase_dropped_messages();
+    return;
   }
 
   uplane_message_decoder_results results;

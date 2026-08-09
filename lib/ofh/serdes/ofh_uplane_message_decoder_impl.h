@@ -66,30 +66,36 @@ public:
   bool supports_resource_grid_decompression() const override;
 
   // See interface for documentation.
+  bool supports_resource_grid_decompression(const ru_compression_params& params) const override;
+
+  // See interface for documentation.
   bool supports_prach_buffer_decompression() const override;
+
+  // See interface for documentation.
+  bool supports_prach_buffer_decompression(const ru_compression_params& params) const override;
 
   // See interface for documentation.
   bool decode_with_compressed_iq(uplane_message_decoder_results& results, span<const uint8_t> message) override;
 
   // See interface for documentation.
-  bool decompress_to_resource_grid(resource_grid_writer&        grid,
-                                   unsigned                     port,
-                                   unsigned                     symbol,
-                                   unsigned                     start_prb,
-                                   unsigned                     nof_prbs,
-                                   const uplane_section_params& section) override;
+  iq_decompression_result decompress_to_resource_grid(resource_grid_writer&        grid,
+                                                       unsigned                     port,
+                                                       unsigned                     symbol,
+                                                       unsigned                     start_prb,
+                                                       unsigned                     nof_prbs,
+                                                       const uplane_section_params& section) override;
 
   // See interface for documentation.
-  bool decompress_to_prach_buffer(prach_buffer&                buffer,
-                                  unsigned                     port,
-                                  unsigned                     td_occasion,
-                                  unsigned                     fd_occasion,
-                                  unsigned                     symbol,
-                                  unsigned                     start_re,
-                                  unsigned                     input_start_re,
-                                  unsigned                     nof_re,
-                                  unsigned                     nof_prbs,
-                                  const uplane_section_params& section) override;
+  iq_decompression_result decompress_to_prach_buffer(prach_buffer&                buffer,
+                                                      unsigned                     port,
+                                                      unsigned                     td_occasion,
+                                                      unsigned                     fd_occasion,
+                                                      unsigned                     symbol,
+                                                      unsigned                     start_re,
+                                                      unsigned                     input_start_re,
+                                                      unsigned                     nof_re,
+                                                      unsigned                     nof_prbs,
+                                                      const uplane_section_params& section) override;
 
 private:
   /// Decodes the given message. Optionally keeps section IQ payloads compressed.

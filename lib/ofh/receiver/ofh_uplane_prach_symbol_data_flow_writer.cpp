@@ -105,7 +105,8 @@ bool uplane_prach_symbol_data_flow_writer::write_to_prach_buffer(unsigned       
   return true;
 }
 
-bool uplane_prach_symbol_data_flow_writer::write_compressed_to_prach_buffer(
+uplane_prach_symbol_data_flow_writer::direct_write_result
+uplane_prach_symbol_data_flow_writer::write_compressed_to_prach_buffer(
     unsigned                              eaxc,
     const uplane_message_decoder_results& results,
     uplane_message_decoder&               decoder)
@@ -119,12 +120,12 @@ bool uplane_prach_symbol_data_flow_writer::write_compressed_to_prach_buffer(
                 sector_id,
                 slot,
                 eaxc);
-    return false;
+    return direct_write_result::failure_missing_context;
   }
 
   unsigned port = std::distance(prach_eaxc.begin(), std::find(prach_eaxc.begin(), prach_eaxc.end(), eaxc));
   if (OCUDU_UNLIKELY(port >= prach_context.get_max_nof_ports())) {
-    return true;
+    return direct_write_result::success;
   }
 
   unsigned prach_nof_res           = prach_context.get_prach_nof_re();
@@ -132,7 +133,11 @@ bool uplane_prach_symbol_data_flow_writer::write_compressed_to_prach_buffer(
   unsigned prach_nof_prbs          = std::ceil(float(prach_nof_res + nof_re_to_prach_data) / NOF_SUBCARRIERS_PER_RB);
   unsigned nof_re_after_prach_data = prach_nof_prbs * NOF_SUBCARRIERS_PER_RB - (prach_nof_res + nof_re_to_prach_data);
   unsigned prach_data_start_prb    = nof_re_to_prach_data / NOF_SUBCARRIERS_PER_RB;
-  bool     wrote_any               = false;
+  bool     has_relevant_section    = false;
+
+  if (!prach_context.supports_device_prach_buffer_mapping()) {
+    return direct_write_result::fallback_unsupported_destination;
+  }
 
   for (const auto& section : results.sections) {
     if (section.start_prb >= prach_nof_prbs) {
@@ -141,8 +146,25 @@ bool uplane_prach_symbol_data_flow_writer::write_compressed_to_prach_buffer(
     if (section.start_prb + section.nof_prbs <= prach_data_start_prb) {
       continue;
     }
+    has_relevant_section = true;
     if (section.compressed_iq_data.empty()) {
-      return false;
+      return direct_write_result::failure_invalid_input;
+    }
+    if (!decoder.supports_prach_buffer_decompression(section.ud_comp_hdr)) {
+      return direct_write_result::fallback_unsupported_compression;
+    }
+  }
+  if (!has_relevant_section) {
+    return direct_write_result::failure_no_relevant_data;
+  }
+
+  bool recovered_after_retry = false;
+  for (const auto& section : results.sections) {
+    if (section.start_prb >= prach_nof_prbs) {
+      continue;
+    }
+    if (section.start_prb + section.nof_prbs <= prach_data_start_prb) {
+      continue;
     }
 
     unsigned nof_prbs_to_write = prach_nof_prbs - section.start_prb;
@@ -167,32 +189,35 @@ bool uplane_prach_symbol_data_flow_writer::write_compressed_to_prach_buffer(
 
     unsigned iq_size_re = std::min(section_nof_re, prach_nof_res);
 
+    iq_decompression_result decompression_result = iq_decompression_result::destination_failure;
     bool written = prach_context_repo->write_iq_device(
         slot,
         port,
         results.params.symbol_id,
         start_re,
         iq_size_re,
-        [&decoder, start_re, iq_start_re, iq_size_re, nof_prbs_to_write, &section](prach_buffer& buffer,
-                                                                                   unsigned      prach_port,
-                                                                                   unsigned      td_occasion,
-                                                                                   unsigned      fd_occasion,
-                                                                                   unsigned      prach_symbol) {
-          return decoder.decompress_to_prach_buffer(buffer,
-                                                    prach_port,
-                                                    td_occasion,
-                                                    fd_occasion,
-                                                    prach_symbol,
-                                                    start_re,
-                                                    iq_start_re,
-                                                    iq_size_re,
-                                                    nof_prbs_to_write,
-                                                    section);
+        [&decoder, &decompression_result, start_re, iq_start_re, iq_size_re, nof_prbs_to_write, &section](
+            prach_buffer& buffer,
+            unsigned      prach_port,
+            unsigned      td_occasion,
+            unsigned      fd_occasion,
+            unsigned      prach_symbol) {
+          decompression_result = decoder.decompress_to_prach_buffer(buffer,
+                                                                    prach_port,
+                                                                    td_occasion,
+                                                                    fd_occasion,
+                                                                    prach_symbol,
+                                                                    start_re,
+                                                                    iq_start_re,
+                                                                    iq_size_re,
+                                                                    nof_prbs_to_write,
+                                                                    section);
+          return is_iq_decompression_success(decompression_result);
         });
     if (!written) {
-      return false;
+      return to_direct_write_result(decompression_result);
     }
-    wrote_any = true;
+    recovered_after_retry |= (decompression_result == iq_decompression_result::success_after_retry);
 
     if (OCUDU_UNLIKELY(logger.debug.enabled())) {
       logger.debug("Sector#{}: handling compressed PRACH in slot '{}', symbol '{}' and port '{}'",
@@ -203,5 +228,5 @@ bool uplane_prach_symbol_data_flow_writer::write_compressed_to_prach_buffer(
     }
   }
 
-  return wrote_any;
+  return recovered_after_retry ? direct_write_result::success_after_retry : direct_write_result::success;
 }

@@ -67,6 +67,18 @@ static nlohmann::json generate_message_decoder_item(const ofh::rx_data_flow_perf
   json["max_latency_us"]       = validate_fp_value(metrics.message_unpacking_max_latency_us);
   json["cpu_usage_percent"]    = validate_fp_value(metrics.cpu_usage_us / (metrics_period_ms * 1e3) * 100.0f);
 
+  const auto& direct_metrics = metrics.direct_decompression;
+  auto&       direct_json    = json["direct_decompression"];
+  direct_json["nof_acceleration_retries"]             = direct_metrics.nof_acceleration_retries;
+  direct_json["nof_unsupported_destinations"]         = direct_metrics.nof_unsupported_destinations;
+  direct_json["nof_unsupported_compressions"]         = direct_metrics.nof_unsupported_compressions;
+  direct_json["nof_missing_contexts"]                 = direct_metrics.nof_missing_contexts;
+  direct_json["nof_invalid_inputs"]                   = direct_metrics.nof_invalid_inputs;
+  direct_json["nof_messages_without_relevant_data"]   = direct_metrics.nof_messages_without_relevant_data;
+  direct_json["nof_resource_unavailable_failures"]    = direct_metrics.nof_resource_unavailable_failures;
+  direct_json["nof_acceleration_failures"]            = direct_metrics.nof_acceleration_failures;
+  direct_json["nof_destination_failures"]             = direct_metrics.nof_destination_failures;
+
   return json;
 }
 

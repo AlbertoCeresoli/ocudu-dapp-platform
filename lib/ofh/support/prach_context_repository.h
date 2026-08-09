@@ -123,6 +123,12 @@ public:
   /// Gets the maximum number of ports supported in PRACH buffer.
   unsigned get_max_nof_ports() const { return empty() ? 0U : context_info.buffer->get_max_nof_ports(); }
 
+  /// Returns true if the context buffer accepts device-resident writes.
+  bool supports_device_prach_buffer_mapping() const
+  {
+    return context_info.buffer && context_info.buffer->supports_device_prach_buffer_mapping();
+  }
+
   /// Returns a span of bitmaps that indicate the REs that have been written for the given symbol. Each element of the
   /// span corresponds to a port.
   span<const bounded_bitset<prach_constants::LONG_SEQUENCE_LENGTH>> get_symbol_re_written(unsigned symbol) const

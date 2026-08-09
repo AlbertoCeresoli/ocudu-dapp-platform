@@ -6,6 +6,7 @@
 #include "../support/uplink_context_repository.h"
 #include "../support/uplink_cplane_context_repository.h"
 #include "ofh_data_flow_uplane_decoding_metrics_collector.h"
+#include "ofh_host_decompression_policy.h"
 #include "ofh_data_flow_uplane_uplink_data.h"
 #include "ofh_uplane_rx_symbol_data_flow_notifier.h"
 #include "ofh_uplane_rx_symbol_data_flow_writer.h"
@@ -22,6 +23,8 @@ struct data_flow_uplane_uplink_data_impl_config {
   unsigned sector;
   /// Enabled metrics flag.
   bool are_metrics_enabled;
+  /// Policy controlling fallback to host IQ decompression.
+  host_decompression_policy host_decompression = host_decompression_policy::allow;
   /// Uplink eAxCs.
   static_vector<unsigned, MAX_NOF_SUPPORTED_EAXC> ul_eaxc;
 };
@@ -65,6 +68,7 @@ private:
   uplane_rx_symbol_data_flow_writer                 rx_symbol_writer;
   uplane_rx_symbol_data_flow_notifier               notification_sender;
   const unsigned                                    sector_id;
+  const host_decompression_policy                   host_decompression;
   data_flow_message_decoding_metrics_collector      metrics_collector;
 };
 

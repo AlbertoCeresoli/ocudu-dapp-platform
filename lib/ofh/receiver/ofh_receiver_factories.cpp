@@ -62,6 +62,9 @@ create_uplink_prach_data_flow(const receiver_config&                            
   config.prach_eaxcs               = receiver_cfg.prach_eaxc;
   config.sector                    = receiver_cfg.sector;
   config.are_metrics_enabled       = receiver_cfg.are_metrics_enabled;
+  config.host_decompression = receiver_cfg.compression_acceleration_mode == "enabled"
+                                  ? host_decompression_policy::forbid
+                                  : host_decompression_policy::allow;
 
   data_flow_uplane_uplink_prach_impl_dependencies dependencies;
   dependencies.logger                    = &logger;
@@ -84,6 +87,9 @@ create_uplink_data_flow(const receiver_config&                            receiv
   config.ul_eaxc             = receiver_cfg.ul_eaxc;
   config.sector              = receiver_cfg.sector;
   config.are_metrics_enabled = receiver_cfg.are_metrics_enabled;
+  config.host_decompression = receiver_cfg.compression_acceleration_mode == "enabled"
+                                  ? host_decompression_policy::forbid
+                                  : host_decompression_policy::allow;
 
   data_flow_uplane_uplink_data_impl_dependencies dependencies;
   dependencies.logger                 = &logger;

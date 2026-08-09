@@ -18,6 +18,7 @@ data_flow_uplane_uplink_data_impl::data_flow_uplane_uplink_data_impl(
   rx_symbol_writer(config.ul_eaxc, config.sector, *dependencies.logger, dependencies.ul_context_repo),
   notification_sender(*dependencies.logger, dependencies.ul_context_repo, dependencies.notifier),
   sector_id(config.sector),
+  host_decompression(config.host_decompression),
   metrics_collector(config.are_metrics_enabled)
 {
   ocudu_assert(ul_cplane_context_repo, "Invalid control plane repository");
@@ -29,20 +30,38 @@ void data_flow_uplane_uplink_data_impl::decode_type1_message(unsigned eaxc, span
   trace_point decode_tp = ofh_tracer.now();
 
   uplane_message_decoder_results compressed_results;
-  if (uplane_decoder->supports_resource_grid_decompression() &&
-      uplane_decoder->decode_with_compressed_iq(compressed_results, message)) {
-    ofh_tracer << trace_event("ofh_receiver_uplane_decode", decode_tp);
+  if (uplane_decoder->supports_resource_grid_decompression()) {
+    if (uplane_decoder->decode_with_compressed_iq(compressed_results, message)) {
+      ofh_tracer << trace_event("ofh_receiver_uplane_decode", decode_tp);
 
-    if (should_uplane_packet_be_filtered(eaxc, compressed_results)) {
-      metrics_collector.increase_dropped_messages();
+      if (should_uplane_packet_be_filtered(eaxc, compressed_results)) {
+        metrics_collector.increase_dropped_messages();
 
-      return;
+        return;
+      }
+
+      uplane_rx_symbol_data_flow_writer::direct_write_result write_result =
+          rx_symbol_writer.write_compressed_to_resource_grid(eaxc, compressed_results, *uplane_decoder);
+      metrics_collector.increase_direct_write_result(write_result);
+      if (is_direct_write_success(write_result)) {
+        notification_sender.notify_received_symbol(compressed_results.params.slot,
+                                                   compressed_results.params.symbol_id);
+        return;
+      }
+      if (!allows_host_decompression_fallback(write_result)) {
+        metrics_collector.increase_dropped_messages();
+        return;
+      }
+    } else {
+      metrics_collector.increase_direct_write_result(direct_write_result::failure_invalid_input);
     }
+  } else {
+    metrics_collector.increase_direct_write_result(direct_write_result::fallback_unsupported_compression);
+  }
 
-    if (rx_symbol_writer.write_compressed_to_resource_grid(eaxc, compressed_results, *uplane_decoder)) {
-      notification_sender.notify_received_symbol(compressed_results.params.slot, compressed_results.params.symbol_id);
-      return;
-    }
+  if (host_decompression == host_decompression_policy::forbid) {
+    metrics_collector.increase_dropped_messages();
+    return;
   }
 
   decode_tp = ofh_tracer.now();

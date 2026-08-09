@@ -96,6 +96,24 @@ static void log_ru_ofh_performance_metrics_verbose(fmt::basic_memory_buffer<char
                  validate_fp_value(ul_data_df_metrics.message_unpacking_max_latency_us),
                  validate_fp_value(ul_data_df_metrics.message_unpacking_avg_latency_us));
 
+  auto log_direct_decompression = [&buffer](const char* label, const ofh::rx_direct_decompression_metrics& metrics) {
+    fmt::format_to(std::back_inserter(buffer),
+                   "{} retries={} unsupported_dst={} unsupported_compr={} missing_context={} invalid_input={} "
+                   "no_data={} resource_unavailable={} acceleration_failure={} destination_failure={}; ",
+                   label,
+                   metrics.nof_acceleration_retries,
+                   metrics.nof_unsupported_destinations,
+                   metrics.nof_unsupported_compressions,
+                   metrics.nof_missing_contexts,
+                   metrics.nof_invalid_inputs,
+                   metrics.nof_messages_without_relevant_data,
+                   metrics.nof_resource_unavailable_failures,
+                   metrics.nof_acceleration_failures,
+                   metrics.nof_destination_failures);
+  };
+  log_direct_decompression("prach_direct_decompr:", ul_prach_df_metrics.direct_decompression);
+  log_direct_decompression("ul_direct_decompr:", ul_data_df_metrics.direct_decompression);
+
   const auto& dl_cp_df_metrics = cell_metrics.tx_metrics.dl_metrics.dl_cp_metrics;
   const auto& dl_up_df_metrics = cell_metrics.tx_metrics.dl_metrics.dl_up_metrics;
   const auto& ul_cp_df_metrics = cell_metrics.tx_metrics.ul_metrics.ul_cp_metrics;

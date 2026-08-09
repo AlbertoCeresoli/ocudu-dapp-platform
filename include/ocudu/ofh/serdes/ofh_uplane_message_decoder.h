@@ -4,6 +4,7 @@
 #pragma once
 
 #include "ocudu/adt/span.h"
+#include "ocudu/ofh/compression/iq_decompression_result.h"
 #include "ocudu/ofh/serdes/ofh_uplane_message_decoder_properties.h"
 #include "ocudu/ofh/timing/slot_symbol_point.h"
 #include <optional>
@@ -49,8 +50,22 @@ public:
   /// Returns true if this decoder can place decoded IQ directly into a device-capable resource grid.
   virtual bool supports_resource_grid_decompression() const { return false; }
 
+  /// Returns true if this decoder can place the given compression format directly into a device-capable resource grid.
+  virtual bool supports_resource_grid_decompression(const ru_compression_params& params) const
+  {
+    (void)params;
+    return supports_resource_grid_decompression();
+  }
+
   /// Returns true if this decoder can place decoded IQ directly into a device-capable PRACH buffer.
   virtual bool supports_prach_buffer_decompression() const { return false; }
+
+  /// Returns true if this decoder can place the given compression format directly into a device-capable PRACH buffer.
+  virtual bool supports_prach_buffer_decompression(const ru_compression_params& params) const
+  {
+    (void)params;
+    return supports_prach_buffer_decompression();
+  }
 
   /// Decodes the given message and preserves compressed IQ payloads without decompressing them to host memory.
   ///
@@ -70,13 +85,13 @@ public:
   /// \param[in]  start_prb First destination PRB.
   /// \param[in]  nof_prbs  Number of PRBs to decompress.
   /// \param[in]  section   Previously decoded U-Plane section.
-  /// \return True on success, false when direct grid decompression is unsupported.
-  virtual bool decompress_to_resource_grid(resource_grid_writer&        grid,
-                                           unsigned                     port,
-                                           unsigned                     symbol,
-                                           unsigned                     start_prb,
-                                           unsigned                     nof_prbs,
-                                           const uplane_section_params& section)
+  /// \return Structured result describing whether the operation completed and, on failure, why it did not.
+  virtual iq_decompression_result decompress_to_resource_grid(resource_grid_writer&        grid,
+                                                               unsigned                     port,
+                                                               unsigned                     symbol,
+                                                               unsigned                     start_prb,
+                                                               unsigned                     nof_prbs,
+                                                               const uplane_section_params& section)
   {
     (void)grid;
     (void)port;
@@ -84,7 +99,7 @@ public:
     (void)start_prb;
     (void)nof_prbs;
     (void)section;
-    return false;
+    return iq_decompression_result::unsupported;
   }
 
   /// Decompresses a previously decoded section directly into a PRACH buffer.
@@ -99,17 +114,17 @@ public:
   /// \param[in]  nof_re         Number of RE to decompress.
   /// \param[in]  nof_prbs       Number of PRBs represented by the compressed payload.
   /// \param[in]  section        Previously decoded U-Plane section.
-  /// \return True on success, false when direct PRACH-buffer decompression is unsupported.
-  virtual bool decompress_to_prach_buffer(prach_buffer&                buffer,
-                                          unsigned                     port,
-                                          unsigned                     td_occasion,
-                                          unsigned                     fd_occasion,
-                                          unsigned                     symbol,
-                                          unsigned                     start_re,
-                                          unsigned                     input_start_re,
-                                          unsigned                     nof_re,
-                                          unsigned                     nof_prbs,
-                                          const uplane_section_params& section)
+  /// \return Structured result describing whether the operation completed and, on failure, why it did not.
+  virtual iq_decompression_result decompress_to_prach_buffer(prach_buffer&                buffer,
+                                                              unsigned                     port,
+                                                              unsigned                     td_occasion,
+                                                              unsigned                     fd_occasion,
+                                                              unsigned                     symbol,
+                                                              unsigned                     start_re,
+                                                              unsigned                     input_start_re,
+                                                              unsigned                     nof_re,
+                                                              unsigned                     nof_prbs,
+                                                              const uplane_section_params& section)
   {
     (void)buffer;
     (void)port;
@@ -121,7 +136,7 @@ public:
     (void)nof_re;
     (void)nof_prbs;
     (void)section;
-    return false;
+    return iq_decompression_result::unsupported;
   }
 };
 

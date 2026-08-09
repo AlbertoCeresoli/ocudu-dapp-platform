@@ -50,12 +50,14 @@ public:
     return false;
   }
 
-  bool decompress_to_resource_grid(resource_grid_writer&        grid,
-                                   unsigned                     port_,
-                                   unsigned                     symbol_,
-                                   unsigned                     start_prb_,
-                                   unsigned                     nof_prbs_,
-                                   const uplane_section_params& section_) override
+  bool supports_resource_grid_decompression() const override { return true; }
+
+  iq_decompression_result decompress_to_resource_grid(resource_grid_writer&        grid,
+                                                       unsigned                     port_,
+                                                       unsigned                     symbol_,
+                                                       unsigned                     start_prb_,
+                                                       unsigned                     nof_prbs_,
+                                                       const uplane_section_params& section_) override
   {
     (void)grid;
     called    = true;
@@ -64,13 +66,14 @@ public:
     start_prb = start_prb_;
     nof_prbs  = nof_prbs_;
     section   = &section_;
-    if (success) {
-      success = grid.prepare_device_grid_mapping(nullptr) && grid.on_device_grid_mapping_enqueued(nullptr);
+    if (is_iq_decompression_success(result) &&
+        !(grid.prepare_device_grid_mapping(nullptr) && grid.on_device_grid_mapping_enqueued(nullptr))) {
+      return iq_decompression_result::destination_failure;
     }
-    return success;
+    return result;
   }
 
-  bool                         success   = true;
+  iq_decompression_result      result    = iq_decompression_result::success;
   bool                         called    = false;
   unsigned                     port      = 0;
   unsigned                     symbol    = 0;
@@ -294,7 +297,7 @@ TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_write_thro
       {results.params.slot, sector}, device_shared_grid.get_grid(), symbol_range, ocudulog::fetch_basic_logger("TEST"));
   repo->process_pending_contexts();
 
-  bool direct_written  = writer.write_compressed_to_resource_grid(eaxc[0], results, decoder);
+  auto direct_result   = writer.write_compressed_to_resource_grid(eaxc[0], results, decoder);
   bool all_res_written = false;
   {
     const uplink_context& context  = repo->get(slot, symbol_id);
@@ -303,7 +306,7 @@ TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_write_thro
   }
   repo->clear();
 
-  ASSERT_TRUE(direct_written);
+  ASSERT_EQ(uplane_rx_symbol_data_flow_writer::direct_write_result::success, direct_result);
   ASSERT_TRUE(decoder.called);
   ASSERT_EQ(0, decoder.port);
   ASSERT_EQ(symbol_id, decoder.symbol);
@@ -316,7 +319,7 @@ TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_write_thro
   ASSERT_TRUE(all_res_written);
 }
 
-TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_return_false_when_device_grid_unavailable)
+TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_request_fallback_when_device_grid_unavailable)
 {
   std::array<uint8_t, 128>          compressed_payload = {};
   uplane_message_decoder_device_spy decoder;
@@ -329,7 +332,76 @@ TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_return_fal
   repo->add({results.params.slot, sector}, shared_grid.get_grid(), symbol_range, ocudulog::fetch_basic_logger("TEST"));
   repo->process_pending_contexts();
 
-  ASSERT_FALSE(writer.write_compressed_to_resource_grid(eaxc[0], results, decoder));
+  ASSERT_EQ(uplane_rx_symbol_data_flow_writer::direct_write_result::fallback_unsupported_destination,
+            writer.write_compressed_to_resource_grid(eaxc[0], results, decoder));
   ASSERT_FALSE(decoder.called);
   ASSERT_FALSE(rg_writer.has_grid_been_written());
+}
+
+TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_report_success_after_acceleration_retry)
+{
+  resource_grid_device_writer_spy   device_writer(nof_prb);
+  resource_grid_spy                 device_grid(rg_reader, device_writer);
+  shared_resource_grid_spy          device_shared_grid(device_grid);
+  std::array<uint8_t, 128>          compressed_payload = {};
+  uplane_message_decoder_device_spy decoder;
+  decoder.result = iq_decompression_result::success_after_retry;
+
+  auto& section              = results.sections.back();
+  section.nof_prbs           = nof_prb;
+  section.start_prb          = 0;
+  section.compressed_iq_data = compressed_payload;
+
+  repo->add(
+      {results.params.slot, sector}, device_shared_grid.get_grid(), symbol_range, ocudulog::fetch_basic_logger("TEST"));
+  repo->process_pending_contexts();
+
+  auto direct_result = writer.write_compressed_to_resource_grid(eaxc[0], results, decoder);
+  repo->clear();
+
+  ASSERT_EQ(uplane_rx_symbol_data_flow_writer::direct_write_result::success_after_retry, direct_result);
+  ASSERT_TRUE(decoder.called);
+  ASSERT_EQ(1, device_writer.prepare_count);
+  ASSERT_EQ(1, device_writer.enqueue_count);
+}
+
+TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_return_failure_when_context_is_expired)
+{
+  std::array<uint8_t, 128>          compressed_payload = {};
+  uplane_message_decoder_device_spy decoder;
+
+  auto& section              = results.sections.back();
+  section.nof_prbs           = nof_prb;
+  section.start_prb          = 0;
+  section.compressed_iq_data = compressed_payload;
+
+  ASSERT_EQ(uplane_rx_symbol_data_flow_writer::direct_write_result::failure_missing_context,
+            writer.write_compressed_to_resource_grid(eaxc[0], results, decoder));
+  ASSERT_FALSE(decoder.called);
+}
+
+TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_return_failure_after_device_write_error)
+{
+  resource_grid_device_writer_spy   device_writer(nof_prb);
+  resource_grid_spy                 device_grid(rg_reader, device_writer);
+  shared_resource_grid_spy          device_shared_grid(device_grid);
+  std::array<uint8_t, 128>          compressed_payload = {};
+  uplane_message_decoder_device_spy decoder;
+  decoder.result = iq_decompression_result::acceleration_failure;
+
+  auto& section              = results.sections.back();
+  section.nof_prbs           = nof_prb;
+  section.start_prb          = 0;
+  section.compressed_iq_data = compressed_payload;
+
+  repo->add(
+      {results.params.slot, sector}, device_shared_grid.get_grid(), symbol_range, ocudulog::fetch_basic_logger("TEST"));
+  repo->process_pending_contexts();
+
+  auto direct_result = writer.write_compressed_to_resource_grid(eaxc[0], results, decoder);
+  repo->clear();
+
+  ASSERT_EQ(uplane_rx_symbol_data_flow_writer::direct_write_result::failure_acceleration, direct_result);
+  ASSERT_TRUE(decoder.called);
+  ASSERT_FALSE(device_writer.has_grid_been_written());
 }

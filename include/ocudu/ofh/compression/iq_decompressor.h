@@ -6,6 +6,7 @@
 #include "ocudu/adt/complex.h"
 #include "ocudu/adt/span.h"
 #include "ocudu/ofh/compression/compression_params.h"
+#include "ocudu/ofh/compression/iq_decompression_result.h"
 
 namespace ocudu {
 
@@ -38,13 +39,29 @@ public:
   /// Returns true if the decompressor can write directly into a device-capable resource grid.
   virtual bool supports_resource_grid_decompression() const { return false; }
 
+  /// Returns true if the decompressor can write the given compression format directly into a device-capable resource
+  /// grid. Selectors override this method so that support is checked for the compression format carried by each
+  /// section rather than inferred from an unrelated registered decompressor.
+  virtual bool supports_resource_grid_decompression(const ru_compression_params& params) const
+  {
+    (void)params;
+    return supports_resource_grid_decompression();
+  }
+
   /// Returns true if the decompressor can write directly into a device-capable PRACH buffer.
   virtual bool supports_prach_buffer_decompression() const { return false; }
 
+  /// Returns true if the decompressor can write the given compression format directly into a device-capable PRACH
+  /// buffer.
+  virtual bool supports_prach_buffer_decompression(const ru_compression_params& params) const
+  {
+    (void)params;
+    return supports_prach_buffer_decompression();
+  }
+
   /// \brief Decompress received compressed PRBs directly into a resource grid.
   ///
-  /// Implementations return false when direct grid decompression is unavailable for the destination or compression
-  /// parameters. The default implementation leaves the existing host decompression path unchanged.
+  /// The default implementation reports that direct decompression is unsupported and leaves the host path unchanged.
   ///
   /// \param[out] grid            Destination resource grid.
   /// \param[in]  port            Resource-grid port index.
@@ -53,14 +70,14 @@ public:
   /// \param[in]  nof_prbs        Number of PRBs to decompress.
   /// \param[in]  compressed_data Received compressed IQ payload and compression parameters.
   /// \param[in]  params          Compression parameters.
-  /// \return True on success, false when this path is unsupported or cannot be used.
-  virtual bool decompress_to_resource_grid(resource_grid_writer&        grid,
-                                           unsigned                     port,
-                                           unsigned                     symbol,
-                                           unsigned                     start_prb,
-                                           unsigned                     nof_prbs,
-                                           span<const uint8_t>          compressed_data,
-                                           const ru_compression_params& params)
+  /// \return Structured result describing whether the operation completed and, on failure, why it did not.
+  virtual iq_decompression_result decompress_to_resource_grid(resource_grid_writer&        grid,
+                                                               unsigned                     port,
+                                                               unsigned                     symbol,
+                                                               unsigned                     start_prb,
+                                                               unsigned                     nof_prbs,
+                                                               span<const uint8_t>          compressed_data,
+                                                               const ru_compression_params& params)
   {
     (void)grid;
     (void)port;
@@ -69,7 +86,7 @@ public:
     (void)nof_prbs;
     (void)compressed_data;
     (void)params;
-    return false;
+    return iq_decompression_result::unsupported;
   }
 
   /// \brief Decompress received compressed PRBs directly into a PRACH buffer.
@@ -85,18 +102,18 @@ public:
   /// \param[in]  nof_prbs        Number of PRBs represented by the compressed payload.
   /// \param[in]  compressed_data Received compressed IQ payload and compression parameters.
   /// \param[in]  params          Compression parameters.
-  /// \return True on success, false when this path is unsupported or cannot be used.
-  virtual bool decompress_to_prach_buffer(prach_buffer&                buffer,
-                                          unsigned                     port,
-                                          unsigned                     td_occasion,
-                                          unsigned                     fd_occasion,
-                                          unsigned                     symbol,
-                                          unsigned                     start_re,
-                                          unsigned                     input_start_re,
-                                          unsigned                     nof_re,
-                                          unsigned                     nof_prbs,
-                                          span<const uint8_t>          compressed_data,
-                                          const ru_compression_params& params)
+  /// \return Structured result describing whether the operation completed and, on failure, why it did not.
+  virtual iq_decompression_result decompress_to_prach_buffer(prach_buffer&                buffer,
+                                                              unsigned                     port,
+                                                              unsigned                     td_occasion,
+                                                              unsigned                     fd_occasion,
+                                                              unsigned                     symbol,
+                                                              unsigned                     start_re,
+                                                              unsigned                     input_start_re,
+                                                              unsigned                     nof_re,
+                                                              unsigned                     nof_prbs,
+                                                              span<const uint8_t>          compressed_data,
+                                                              const ru_compression_params& params)
   {
     (void)buffer;
     (void)port;
@@ -109,7 +126,7 @@ public:
     (void)nof_prbs;
     (void)compressed_data;
     (void)params;
-    return false;
+    return iq_decompression_result::unsupported;
   }
 };
 

@@ -4,9 +4,11 @@
 
 #include "iq_compression_cuda.h"
 #include "ofh_compression.h"
+#include "phy_acceleration_resource_grid_factory.h"
 #include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/ofh/compression/compression_factory.h"
 #include "ocudu/ofh/compression/compression_properties.h"
+#include "ocudu/phy/support/resource_grid_reader.h"
 #include "gtest/gtest.h"
 #include <algorithm>
 #include <array>
@@ -1283,6 +1285,66 @@ TEST_P(ofh_iq_compression_cuda_test, cuda_transient_failure_retries_on_fresh_han
   auto& cuda_compressor_impl = static_cast<ofh::iq_compression_cuda&>(*cuda_compressor);
   EXPECT_EQ(cuda_compressor_impl.get_nof_acceleration_retries(), 1U);
   EXPECT_EQ(cuda_compressor_impl.get_nof_acceleration_failures(), 0U);
+  auto& cuda_decompressor_impl = static_cast<ofh::iq_compression_cuda&>(*cuda_decompressor);
+  EXPECT_EQ(cuda_decompressor_impl.get_nof_acceleration_retries(), 1U);
+  EXPECT_EQ(cuda_decompressor_impl.get_nof_acceleration_failures(), 0U);
+}
+
+/// Verifies that direct device-grid decompression safely retries on a fresh handle without entering host
+/// decompression.
+TEST_P(ofh_iq_compression_cuda_test, cuda_direct_grid_transient_failure_retries_on_fresh_handle)
+{
+  static constexpr unsigned nof_prbs = 24;
+
+  ofh::compression_type      type   = GetParam();
+  std::vector<cbf16_t>       data   = generate_iq(nof_prbs);
+  ofh::ru_compression_params params = {type, 9U};
+
+  std::unique_ptr<ofh::iq_compressor> cpu_compressor =
+      ofh::create_iq_compressor(type, logger, 1.0F, "generic");
+  unsigned             prb_size = ofh::get_compressed_prb_size(params).value();
+  std::vector<uint8_t> compressed(nof_prbs * prb_size);
+  cpu_compressor->compress(compressed, data, params);
+
+  ASSERT_EQ(::setenv("OCUDU_OFH_COMPRESSION_FORCE_FIRST_GPU_FAILURE", "1", 1), 0);
+  std::unique_ptr<ofh::iq_decompressor> cuda_decompressor =
+      ofh::create_iq_decompressor(type, logger, "cuda");
+  ASSERT_EQ(::unsetenv("OCUDU_OFH_COMPRESSION_FORCE_FIRST_GPU_FAILURE"), 0);
+
+  ASSERT_EQ(::setenv("OCUDU_UL_CUDA_VISIBLE_GRID", "managed", 1), 0);
+  std::shared_ptr<resource_grid_factory> grid_factory = create_phy_acceleration_resource_grid_factory(
+      create_resource_grid_factory(), phy_acceleration_resource_grid_direction::uplink, true);
+  ASSERT_EQ(::unsetenv("OCUDU_UL_CUDA_VISIBLE_GRID"), 0);
+  std::unique_ptr<resource_grid> grid = grid_factory->create(1, 1, nof_prbs * NOF_SUBCARRIERS_PER_RB);
+  ASSERT_NE(grid, nullptr);
+  ASSERT_TRUE(grid->get_writer().supports_device_grid_mapping());
+
+  ofh::ru_compression_params invalid_params = params;
+  invalid_params.data_width                 = 0;
+  EXPECT_EQ(cuda_decompressor->decompress_to_resource_grid(
+                grid->get_writer(), 0, 0, 0, nof_prbs, compressed, invalid_params),
+            ofh::iq_decompression_result::invalid_input);
+  EXPECT_EQ(cuda_decompressor->decompress_to_resource_grid(
+                grid->get_writer(),
+                0,
+                0,
+                0,
+                nof_prbs,
+                span<const uint8_t>(compressed).first(compressed.size() - 1),
+                params),
+            ofh::iq_decompression_result::invalid_input);
+
+  ASSERT_EQ(cuda_decompressor->decompress_to_resource_grid(
+                grid->get_writer(), 0, 0, 0, nof_prbs, compressed, params),
+            ofh::iq_decompression_result::success_after_retry);
+
+  std::vector<cbf16_t> expected(data.size());
+  std::unique_ptr<ofh::iq_decompressor> cpu_decompressor = ofh::create_iq_decompressor(type, logger, "generic");
+  cpu_decompressor->decompress(expected, compressed, params);
+  span<const cbf16_t> actual = grid->get_reader().get_view(0, 0);
+  ASSERT_EQ(expected.size(), actual.size());
+  ASSERT_TRUE(std::equal(expected.begin(), expected.end(), actual.begin()));
+
   auto& cuda_decompressor_impl = static_cast<ofh::iq_compression_cuda&>(*cuda_decompressor);
   EXPECT_EQ(cuda_decompressor_impl.get_nof_acceleration_retries(), 1U);
   EXPECT_EQ(cuda_decompressor_impl.get_nof_acceleration_failures(), 0U);

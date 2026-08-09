@@ -80,9 +80,10 @@ bool uplane_rx_symbol_data_flow_writer::write_to_resource_grid(unsigned         
   return true;
 }
 
-bool uplane_rx_symbol_data_flow_writer::write_compressed_to_resource_grid(unsigned                              eaxc,
-                                                                          const uplane_message_decoder_results& results,
-                                                                          uplane_message_decoder&               decoder)
+uplane_rx_symbol_data_flow_writer::direct_write_result
+uplane_rx_symbol_data_flow_writer::write_compressed_to_resource_grid(unsigned                              eaxc,
+                                                                     const uplane_message_decoder_results& results,
+                                                                     uplane_message_decoder&               decoder)
 {
   trace_point access_repo_tp = ofh_tracer.now();
 
@@ -98,7 +99,7 @@ bool uplane_rx_symbol_data_flow_writer::write_compressed_to_resource_grid(unsign
         results.params.symbol_id,
         eaxc);
 
-    return false;
+    return direct_write_result::failure_missing_context;
   }
   ofh_tracer << trace_event("ofh_receiver_access_repo", access_repo_tp);
 
@@ -106,13 +107,34 @@ bool uplane_rx_symbol_data_flow_writer::write_compressed_to_resource_grid(unsign
   ocudu_assert(rg_port < ul_eaxc.size(), "Invalid resource grid port value '{}'", rg_port);
 
   unsigned du_nof_prbs = ul_context.get_grid_nof_prbs();
-  bool     wrote_any   = false;
+
+  // Preflight every relevant section before writing any data. A host fallback is safe only if this resource grid or
+  // compression format has no direct path. Malformed payloads and device-write failures are terminal packet drops.
+  if (!ul_context.supports_device_grid_mapping()) {
+    return direct_write_result::fallback_unsupported_destination;
+  }
+
+  bool has_relevant_section = false;
   for (const auto& section : results.sections) {
     if (section.start_prb >= du_nof_prbs) {
       continue;
     }
+    has_relevant_section = true;
     if (section.compressed_iq_data.empty()) {
-      return false;
+      return direct_write_result::failure_invalid_input;
+    }
+    if (!decoder.supports_resource_grid_decompression(section.ud_comp_hdr)) {
+      return direct_write_result::fallback_unsupported_compression;
+    }
+  }
+  if (!has_relevant_section) {
+    return direct_write_result::failure_no_relevant_data;
+  }
+
+  bool recovered_after_retry = false;
+  for (const auto& section : results.sections) {
+    if (section.start_prb >= du_nof_prbs) {
+      continue;
     }
 
     unsigned nof_prbs_to_write = du_nof_prbs - section.start_prb;
@@ -122,20 +144,22 @@ bool uplane_rx_symbol_data_flow_writer::write_compressed_to_resource_grid(unsign
 
     trace_point write_rg_tp = ofh_tracer.now();
 
+    iq_decompression_result decompression_result = iq_decompression_result::destination_failure;
     bool written = ul_context_repo->write_grid_device(
         slot,
         rg_port,
         symbol,
         section.start_prb * NOF_SUBCARRIERS_PER_RB,
         nof_prbs_to_write * NOF_SUBCARRIERS_PER_RB,
-        [&decoder, rg_port, symbol, &section, nof_prbs_to_write](resource_grid_writer& writer) {
-          return decoder.decompress_to_resource_grid(
+        [&decoder, &decompression_result, rg_port, symbol, &section, nof_prbs_to_write](resource_grid_writer& writer) {
+          decompression_result = decoder.decompress_to_resource_grid(
               writer, rg_port, symbol, section.start_prb, nof_prbs_to_write, section);
+          return is_iq_decompression_success(decompression_result);
         });
     if (!written) {
-      return false;
+      return to_direct_write_result(decompression_result);
     }
-    wrote_any = true;
+    recovered_after_retry |= (decompression_result == iq_decompression_result::success_after_retry);
 
     ofh_tracer << trace_event("ofh_receiver_write_rg_device", write_rg_tp);
 
@@ -151,5 +175,5 @@ bool uplane_rx_symbol_data_flow_writer::write_compressed_to_resource_grid(unsign
     }
   }
 
-  return wrote_any;
+  return recovered_after_retry ? direct_write_result::success_after_retry : direct_write_result::success;
 }

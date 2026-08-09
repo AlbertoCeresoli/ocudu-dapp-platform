@@ -4,7 +4,9 @@
 #pragma once
 
 #include "../support/metrics_helpers.h"
+#include "ofh_direct_write_result.h"
 #include "ocudu/ofh/receiver/ofh_receiver_data_flow_metrics.h"
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <limits>
@@ -38,10 +40,37 @@ public:
   /// Increases by one the number of dropped messages.
   void increase_dropped_messages() { nof_dropped_messages.fetch_add(1, std::memory_order_relaxed); }
 
+  /// Records a direct IQ write result relevant to receive-path observability.
+  void increase_direct_write_result(direct_write_result result)
+  {
+    if (result == direct_write_result::success) {
+      return;
+    }
+    direct_write_results[static_cast<unsigned>(result)].fetch_add(1, std::memory_order_relaxed);
+  }
+
   /// Collect the performance metrics of a data flow.
   void collect_metrics(rx_data_flow_perf_metrics& metrics)
   {
     metrics.nof_dropped_messages = nof_dropped_messages.exchange(0, std::memory_order_relaxed);
+    metrics.direct_decompression.nof_acceleration_retries =
+        exchange_direct_write_result(direct_write_result::success_after_retry);
+    metrics.direct_decompression.nof_unsupported_destinations =
+        exchange_direct_write_result(direct_write_result::fallback_unsupported_destination);
+    metrics.direct_decompression.nof_unsupported_compressions =
+        exchange_direct_write_result(direct_write_result::fallback_unsupported_compression);
+    metrics.direct_decompression.nof_missing_contexts =
+        exchange_direct_write_result(direct_write_result::failure_missing_context);
+    metrics.direct_decompression.nof_invalid_inputs =
+        exchange_direct_write_result(direct_write_result::failure_invalid_input);
+    metrics.direct_decompression.nof_messages_without_relevant_data =
+        exchange_direct_write_result(direct_write_result::failure_no_relevant_data);
+    metrics.direct_decompression.nof_resource_unavailable_failures =
+        exchange_direct_write_result(direct_write_result::failure_resource_unavailable);
+    metrics.direct_decompression.nof_acceleration_failures =
+        exchange_direct_write_result(direct_write_result::failure_acceleration);
+    metrics.direct_decompression.nof_destination_failures =
+        exchange_direct_write_result(direct_write_result::failure_destination);
 
     uint32_t count_val          = count.load(std::memory_order_relaxed);
     uint32_t min_latency_val_ns = min_latency_ns.load(std::memory_order_relaxed);
@@ -63,6 +92,11 @@ public:
   }
 
 private:
+  unsigned exchange_direct_write_result(direct_write_result result)
+  {
+    return direct_write_results[static_cast<unsigned>(result)].exchange(0, std::memory_order_relaxed);
+  }
+
   /// Default values for min and max latencies.
   static constexpr uint32_t default_min_latency_ns = std::numeric_limits<uint32_t>::max();
   static constexpr uint32_t default_max_latency_ns = std::numeric_limits<uint32_t>::min();
@@ -81,6 +115,9 @@ private:
   std::atomic<uint32_t> min_latency_ns       = default_min_latency_ns;
   std::atomic<uint32_t> max_latency_ns       = default_max_latency_ns;
   std::atomic<uint32_t> nof_dropped_messages = {0};
+  static constexpr unsigned nof_direct_write_results =
+      static_cast<unsigned>(direct_write_result::failure_destination) + 1U;
+  std::array<std::atomic<uint32_t>, nof_direct_write_results> direct_write_results = {};
 
   const bool is_disabled;
 };

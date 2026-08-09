@@ -34,6 +34,11 @@ bool iq_decompressor_selector::supports_resource_grid_decompression() const
   });
 }
 
+bool iq_decompressor_selector::supports_resource_grid_decompression(const ru_compression_params& params) const
+{
+  return decompressors[static_cast<unsigned>(params.type)]->supports_resource_grid_decompression(params);
+}
+
 bool iq_decompressor_selector::supports_prach_buffer_decompression() const
 {
   return std::any_of(decompressors.begin(), decompressors.end(), [](const auto& decompressor) {
@@ -41,29 +46,36 @@ bool iq_decompressor_selector::supports_prach_buffer_decompression() const
   });
 }
 
-bool iq_decompressor_selector::decompress_to_resource_grid(resource_grid_writer&        grid,
-                                                           unsigned                     port,
-                                                           unsigned                     symbol,
-                                                           unsigned                     start_prb,
-                                                           unsigned                     nof_prbs,
-                                                           span<const uint8_t>          compressed_data,
-                                                           const ru_compression_params& params)
+bool iq_decompressor_selector::supports_prach_buffer_decompression(const ru_compression_params& params) const
+{
+  return decompressors[static_cast<unsigned>(params.type)]->supports_prach_buffer_decompression(params);
+}
+
+iq_decompression_result
+iq_decompressor_selector::decompress_to_resource_grid(resource_grid_writer&        grid,
+                                                       unsigned                     port,
+                                                       unsigned                     symbol,
+                                                       unsigned                     start_prb,
+                                                       unsigned                     nof_prbs,
+                                                       span<const uint8_t>          compressed_data,
+                                                       const ru_compression_params& params)
 {
   return decompressors[static_cast<unsigned>(params.type)]->decompress_to_resource_grid(
       grid, port, symbol, start_prb, nof_prbs, compressed_data, params);
 }
 
-bool iq_decompressor_selector::decompress_to_prach_buffer(prach_buffer&                buffer,
-                                                          unsigned                     port,
-                                                          unsigned                     td_occasion,
-                                                          unsigned                     fd_occasion,
-                                                          unsigned                     symbol,
-                                                          unsigned                     start_re,
-                                                          unsigned                     input_start_re,
-                                                          unsigned                     nof_re,
-                                                          unsigned                     nof_prbs,
-                                                          span<const uint8_t>          compressed_data,
-                                                          const ru_compression_params& params)
+iq_decompression_result
+iq_decompressor_selector::decompress_to_prach_buffer(prach_buffer&                buffer,
+                                                     unsigned                     port,
+                                                     unsigned                     td_occasion,
+                                                     unsigned                     fd_occasion,
+                                                     unsigned                     symbol,
+                                                     unsigned                     start_re,
+                                                     unsigned                     input_start_re,
+                                                     unsigned                     nof_re,
+                                                     unsigned                     nof_prbs,
+                                                     span<const uint8_t>          compressed_data,
+                                                     const ru_compression_params& params)
 {
   return decompressors[static_cast<unsigned>(params.type)]->decompress_to_prach_buffer(buffer,
                                                                                        port,

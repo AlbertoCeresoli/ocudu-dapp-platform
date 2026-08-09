@@ -6,6 +6,7 @@
 #include "../support/prach_context_repository.h"
 #include "../support/uplink_cplane_context_repository.h"
 #include "ofh_data_flow_uplane_decoding_metrics_collector.h"
+#include "ofh_host_decompression_policy.h"
 #include "ofh_data_flow_uplane_uplink_prach.h"
 #include "ofh_uplane_prach_data_flow_notifier.h"
 #include "ofh_uplane_prach_symbol_data_flow_writer.h"
@@ -25,6 +26,8 @@ struct data_flow_uplane_uplink_prach_impl_config {
   bool ignore_prach_start_symbol;
   /// Enabled metrics flag.
   bool are_metrics_enabled;
+  /// Policy controlling fallback to host IQ decompression.
+  host_decompression_policy host_decompression = host_decompression_policy::allow;
   /// Uplink PRACH eAxCs.
   static_vector<unsigned, MAX_NOF_SUPPORTED_EAXC> prach_eaxcs;
 };
@@ -70,6 +73,7 @@ private:
   uplane_prach_data_flow_notifier                   notification_sender;
   const unsigned                                    sector_id;
   const bool                                        ignore_prach_start_symbol;
+  const host_decompression_policy                   host_decompression;
   data_flow_message_decoding_metrics_collector      metrics_collector;
 };
 

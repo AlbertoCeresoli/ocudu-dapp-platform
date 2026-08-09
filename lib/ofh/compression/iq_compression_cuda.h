@@ -22,9 +22,9 @@ bool is_iq_compression_cuda_available();
 
 /// \brief CUDA accelerated IQ data compressor and decompressor.
 ///
-/// A failed CUDA handle is quarantined and synchronous host-buffer operations are retried once on a fresh handle.
-/// Only when recovery fails does the equivalent CPU implementation produce the affected symbol, so a CUDA error does
-/// not drop the fronthaul link or allow a failed stream to poison subsequent symbols.
+/// A failed CUDA handle is quarantined and operations are retried once on a fresh handle when the destination can be
+/// safely overwritten. Host-buffer operations use the equivalent CPU implementation only after recovery fails. Direct
+/// device-destination operations return a structured terminal error and never enter host IQ decompression.
 class iq_compression_cuda : public iq_compressor, public iq_decompressor
 {
 public:
@@ -92,25 +92,25 @@ public:
 
   bool supports_prach_buffer_decompression() const override { return true; }
 
-  bool decompress_to_resource_grid(resource_grid_writer&        grid,
-                                   unsigned                     port,
-                                   unsigned                     symbol,
-                                   unsigned                     start_prb,
-                                   unsigned                     nof_prbs,
-                                   span<const uint8_t>          compressed_data,
-                                   const ru_compression_params& params) override;
+  iq_decompression_result decompress_to_resource_grid(resource_grid_writer&        grid,
+                                                       unsigned                     port,
+                                                       unsigned                     symbol,
+                                                       unsigned                     start_prb,
+                                                       unsigned                     nof_prbs,
+                                                       span<const uint8_t>          compressed_data,
+                                                       const ru_compression_params& params) override;
 
-  bool decompress_to_prach_buffer(prach_buffer&                buffer,
-                                  unsigned                     port,
-                                  unsigned                     td_occasion,
-                                  unsigned                     fd_occasion,
-                                  unsigned                     symbol,
-                                  unsigned                     start_re,
-                                  unsigned                     input_start_re,
-                                  unsigned                     nof_re,
-                                  unsigned                     nof_prbs,
-                                  span<const uint8_t>          compressed_data,
-                                  const ru_compression_params& params) override;
+  iq_decompression_result decompress_to_prach_buffer(prach_buffer&                buffer,
+                                                      unsigned                     port,
+                                                      unsigned                     td_occasion,
+                                                      unsigned                     fd_occasion,
+                                                      unsigned                     symbol,
+                                                      unsigned                     start_re,
+                                                      unsigned                     input_start_re,
+                                                      unsigned                     nof_re,
+                                                      unsigned                     nof_prbs,
+                                                      span<const uint8_t>          compressed_data,
+                                                      const ru_compression_params& params) override;
 
   /// Returns the number of times the accelerated path failed and the CPU implementation was used instead.
   uint64_t get_nof_acceleration_failures() const { return nof_acceleration_failures.load(std::memory_order_relaxed); }
@@ -132,11 +132,14 @@ private:
   /// Counts a failure of the accelerated path and logs it at a bounded rate.
   void note_acceleration_failure(const char*                         operation,
                                  const ocudu_ofh_compression_handle* failed_handle = nullptr,
-                                 bool                                injected      = false);
+                                 bool                                injected      = false,
+                                 const char* recovery_action = "using the CPU implementation for this symbol");
 
   /// Number of failures between two consecutive log entries. Failures happen once per symbol and eAxC in the worst
   /// case, so logging every one of them would flood the log backend.
   static constexpr uint64_t failure_log_period = 1000;
+  /// Initial attempt plus one bounded retry on a fresh CUDA handle.
+  static constexpr unsigned max_direct_decompression_attempts = 2;
 
   compression_type                           type;
   ocudulog::basic_logger&                    logger;

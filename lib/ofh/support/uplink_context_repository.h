@@ -65,6 +65,12 @@ public:
     return (grid.grid) ? (grid.grid.get_reader().get_nof_subc() / NOF_SUBCARRIERS_PER_RB) : 0U;
   }
 
+  /// Returns true if the context resource grid accepts device-resident writes.
+  bool supports_device_grid_mapping() const
+  {
+    return grid.grid && grid.grid.get_writer().supports_device_grid_mapping();
+  }
+
   /// Returns the resource grid context.
   const resource_grid_context& get_grid_context() const { return grid.context; }
 
