@@ -10,8 +10,10 @@
 #include "ocudu/phy/support/resource_grid_writer.h"
 #include "ocudu/support/error_handling.h"
 #include "ocudu/support/ocudu_assert.h"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #ifdef ENABLE_CUDA
 #include "ofh_compression.h"
@@ -55,7 +57,10 @@ static bool read_force_first_gpu_failure()
   return (env_value != nullptr) && (env_value[0] != '\0') && (std::strcmp(env_value, "0") != 0);
 }
 
-iq_compression_cuda::iq_compression_cuda(compression_type type_, ocudulog::basic_logger& logger_, float iq_scaling_) :
+iq_compression_cuda::iq_compression_cuda(compression_type        type_,
+                                         ocudulog::basic_logger& logger_,
+                                         float                   iq_scaling_,
+                                         iq_compression_cuda_preallocation_config preallocation) :
   type(type_),
   logger(logger_),
   iq_scaling(iq_scaling_),
@@ -71,11 +76,51 @@ iq_compression_cuda::iq_compression_cuda(compression_type type_, ocudulog::basic
   fallback_compressor   = create_iq_compressor(type, logger, iq_scaling, "cpu_auto");
   fallback_decompressor = create_iq_decompressor(type, logger, "cpu_auto");
 
-  ocudu_ofh_compression_handle* initial_handle = nullptr;
-  report_fatal_error_if_not(ocudu_ofh_compression_create(&initial_handle) != 0,
-                            "Failed to create CUDA OFH compression backend.");
-  handles.push_back(initial_handle);
+  // CUDA allocation APIs may synchronize unrelated pending work. Reserve every configured receive or transmit handle
+  // and its workspaces at construction so allocation never enters the normal real-time path.
+  report_fatal_error_if_not(preallocation.host_buffer_compression_capacity <= std::numeric_limits<unsigned>::max(),
+                            "CUDA OFH compression workspace exceeds the backend size limit.");
+  if (preallocation.direct_decompression_concurrency != 0U) {
+    const size_t required_capacity =
+        std::min(preallocation.direct_decompression_concurrency, static_cast<size_t>(max_nof_handles));
+    handle_capacity = 1U;
+    while (handle_capacity < required_capacity) {
+      handle_capacity *= 2U;
+    }
+  }
+  const bool preallocate_pool =
+      (preallocation.direct_decompression_concurrency != 0U) || (preallocation.host_buffer_compression_capacity != 0U);
+  const unsigned initial_nof_handles = preallocate_pool ? handle_capacity : 1U;
+  all_handles.reserve(handle_capacity);
+  available_handles.reserve(handle_capacity);
+  pending_handles.reserve(handle_capacity);
+  for (unsigned i_handle = 0; i_handle != initial_nof_handles; ++i_handle) {
+    ocudu_ofh_compression_handle* handle = nullptr;
+    report_fatal_error_if_not(ocudu_ofh_compression_create(&handle) != 0,
+                              "Failed to create CUDA OFH compression backend.");
+    if (preallocation.direct_decompression_concurrency != 0U) {
+      ru_compression_params max_params{type, MAX_IQ_WIDTH};
+      unsigned max_input_bytes  = static_cast<unsigned>(MAX_NOF_PRBS * get_compressed_prb_size(max_params).value());
+      unsigned max_output_bytes = static_cast<unsigned>(MAX_NOF_PRBS * NOF_SUBCARRIERS_PER_RB * sizeof(cbf16_t));
+      report_fatal_error_if_not(
+          ocudu_ofh_compression_reserve_direct_decompression(handle, max_input_bytes, max_output_bytes) != 0,
+          "Failed to reserve CUDA OFH direct decompression resources.");
+    }
+    if (preallocation.host_buffer_compression_capacity != 0U) {
+      report_fatal_error_if_not(
+          ocudu_ofh_compression_reserve_host_buffer_compression(
+              handle, static_cast<unsigned>(preallocation.host_buffer_compression_capacity)) != 0,
+          "Failed to reserve CUDA OFH host-buffer compression resources.");
+    }
+    all_handles.push_back(handle);
+    available_handles.push_back(handle);
+  }
+  nof_handles = initial_nof_handles;
+  if (preallocation.direct_decompression_concurrency != 0U) {
+    reclaimer_thread = unique_thread("ofh_cuda_recl", [this]() { run_async_handle_reclaimer(); });
+  }
 #else
+  (void)preallocation;
   report_fatal_error("CUDA OFH compression backend is not available in this build.");
 #endif
 }
@@ -139,6 +184,20 @@ void iq_compression_cuda::note_acceleration_failure(const char*                 
 iq_compression_cuda::~iq_compression_cuda()
 {
 #ifdef ENABLE_CUDA
+  std::vector<ocudu_ofh_compression_handle*> handles;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    shutting_down = true;
+  }
+  reclaimer_cv.notify_all();
+  reclaimer_thread.join();
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    handles = all_handles;
+    all_handles.clear();
+    available_handles.clear();
+    pending_handles.clear();
+  }
   for (ocudu_ofh_compression_handle* handle : handles) {
     ocudu_ofh_compression_destroy(handle);
   }
@@ -148,18 +207,36 @@ iq_compression_cuda::~iq_compression_cuda()
 ocudu_ofh_compression_handle* iq_compression_cuda::acquire_handle()
 {
 #ifdef ENABLE_CUDA
+  ocudu_ofh_compression_handle* acquired_handle = nullptr;
+  bool                          create_handle   = false;
   {
     std::lock_guard<std::mutex> lock(mutex);
-    if (!handles.empty()) {
-      ocudu_ofh_compression_handle* handle = handles.back();
-      handles.pop_back();
-      return handle;
+    if (!available_handles.empty()) {
+      acquired_handle = available_handles.back();
+      available_handles.pop_back();
     }
+    if ((acquired_handle == nullptr) && (nof_handles < handle_capacity)) {
+      ++nof_handles;
+      create_handle = true;
+    }
+  }
+
+  if (acquired_handle != nullptr) {
+    return acquired_handle;
+  }
+  if (!create_handle) {
+    return nullptr;
   }
 
   ocudu_ofh_compression_handle* handle = nullptr;
   if (ocudu_ofh_compression_create(&handle) == 0) {
+    std::lock_guard<std::mutex> lock(mutex);
+    --nof_handles;
     return nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    all_handles.push_back(handle);
   }
   return handle;
 #else
@@ -174,9 +251,92 @@ void iq_compression_cuda::release_handle(ocudu_ofh_compression_handle* acquired_
     return;
   }
   std::lock_guard<std::mutex> lock(mutex);
-  handles.push_back(acquired_handle);
+  available_handles.push_back(acquired_handle);
 #else
   (void)acquired_handle;
+#endif
+}
+
+void iq_compression_cuda::release_async_handle(ocudu_ofh_compression_handle* acquired_handle)
+{
+#ifdef ENABLE_CUDA
+  ocudu_assert(acquired_handle != nullptr, "Cannot asynchronously release a null CUDA OFH handle");
+  ocudu_assert(reclaimer_thread.running(), "CUDA OFH direct decompression requires an asynchronous handle reclaimer");
+  bool notify_reclaimer = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    notify_reclaimer = pending_handles.empty();
+    pending_handles.push_back(acquired_handle);
+  }
+  if (notify_reclaimer) {
+    reclaimer_cv.notify_one();
+  }
+#else
+  (void)acquired_handle;
+#endif
+}
+
+void iq_compression_cuda::run_async_handle_reclaimer()
+{
+#ifdef ENABLE_CUDA
+  std::vector<ocudu_ofh_compression_handle*> handles_to_query;
+  std::vector<ocudu_ofh_compression_handle*> completed_handles;
+  std::vector<ocudu_ofh_compression_handle*> incomplete_handles;
+  std::vector<ocudu_ofh_compression_handle*> failed_handles;
+  handles_to_query.reserve(handle_capacity);
+  completed_handles.reserve(handle_capacity);
+  incomplete_handles.reserve(handle_capacity);
+  failed_handles.reserve(handle_capacity);
+
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      if (pending_handles.empty()) {
+        reclaimer_cv.wait(lock, [this]() { return shutting_down || !pending_handles.empty(); });
+      } else {
+        (void)reclaimer_cv.wait_for(lock, async_handle_poll_period, [this]() { return shutting_down; });
+      }
+      if (shutting_down) {
+        return;
+      }
+      handles_to_query.swap(pending_handles);
+    }
+
+    completed_handles.clear();
+    incomplete_handles.clear();
+    failed_handles.clear();
+    for (ocudu_ofh_compression_handle* handle : handles_to_query) {
+      int completion = ocudu_ofh_compression_query_completion(handle);
+      if (completion > 0) {
+        completed_handles.push_back(handle);
+      } else if (completion < 0) {
+        failed_handles.push_back(handle);
+      } else {
+        incomplete_handles.push_back(handle);
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (shutting_down) {
+        return;
+      }
+      available_handles.insert(available_handles.end(), completed_handles.begin(), completed_handles.end());
+      pending_handles.insert(pending_handles.end(), incomplete_handles.begin(), incomplete_handles.end());
+      for (ocudu_ofh_compression_handle* failed_handle : failed_handles) {
+        auto it = std::find(all_handles.begin(), all_handles.end(), failed_handle);
+        ocudu_assert(it != all_handles.end(), "Failed CUDA OFH handle is not owned by this pool");
+        all_handles.erase(it);
+        --nof_handles;
+      }
+    }
+
+    for (ocudu_ofh_compression_handle* failed_handle : failed_handles) {
+      note_acceleration_failure("asynchronous completion", failed_handle, false, "quarantining the failed CUDA handle");
+      ocudu_ofh_compression_destroy(failed_handle);
+    }
+    handles_to_query.clear();
+  }
 #endif
 }
 
@@ -184,6 +344,13 @@ void iq_compression_cuda::discard_handle(ocudu_ofh_compression_handle* failed_ha
 {
 #ifdef ENABLE_CUDA
   if (failed_handle != nullptr) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      auto                        it = std::find(all_handles.begin(), all_handles.end(), failed_handle);
+      ocudu_assert(it != all_handles.end(), "Discarded CUDA OFH handle is not owned by this pool");
+      all_handles.erase(it);
+      --nof_handles;
+    }
     ocudu_ofh_compression_destroy(failed_handle);
   }
 #else
@@ -706,12 +873,12 @@ void iq_compression_cuda::decompress(span<cbf16_t>                iq_data,
 }
 
 iq_decompression_result iq_compression_cuda::decompress_to_resource_grid(resource_grid_writer&        grid,
-                                                                          unsigned                     port,
-                                                                          unsigned                     symbol,
-                                                                          unsigned                     start_prb,
-                                                                          unsigned                     nof_prbs,
-                                                                          span<const uint8_t>          compressed_data,
-                                                                          const ru_compression_params& params)
+                                                                         unsigned                     port,
+                                                                         unsigned                     symbol,
+                                                                         unsigned                     start_prb,
+                                                                         unsigned                     nof_prbs,
+                                                                         span<const uint8_t>          compressed_data,
+                                                                         const ru_compression_params& params)
 {
 #ifdef ENABLE_CUDA
   if (!grid.supports_device_grid_mapping()) {
@@ -739,10 +906,8 @@ iq_decompression_result iq_compression_cuda::decompress_to_resource_grid(resourc
         note_acceleration_retry("device-grid decompression handle creation", nullptr, false);
         continue;
       }
-      note_acceleration_failure("device-grid decompression handle creation",
-                                nullptr,
-                                false,
-                                "dropping the affected Open Fronthaul message");
+      note_acceleration_failure(
+          "device-grid decompression handle creation", nullptr, false, "dropping the affected Open Fronthaul message");
       return iq_decompression_result::resource_unavailable;
     }
 
@@ -752,19 +917,18 @@ iq_decompression_result iq_compression_cuda::decompress_to_resource_grid(resourc
       return iq_decompression_result::destination_failure;
     }
 
-    bool injected = should_inject_gpu_failure();
-    bool backend_success =
-        !injected && (ocudu_ofh_decompress_to_device_grid_async(handle,
-                                                                to_cuda_compression_type(type),
-                                                                grid.get_device_grid_bf16(),
-                                                                compressed_data.data(),
-                                                                grid.get_nof_symbols(),
-                                                                grid.get_nof_subc(),
-                                                                port,
-                                                                symbol,
-                                                                start_prb,
-                                                                nof_prbs,
-                                                                params.data_width) != 0);
+    bool injected        = should_inject_gpu_failure();
+    bool backend_success = !injected && (ocudu_ofh_decompress_to_device_grid_async(handle,
+                                                                                   to_cuda_compression_type(type),
+                                                                                   grid.get_device_grid_bf16(),
+                                                                                   compressed_data.data(),
+                                                                                   grid.get_nof_symbols(),
+                                                                                   grid.get_nof_subc(),
+                                                                                   port,
+                                                                                   symbol,
+                                                                                   start_prb,
+                                                                                   nof_prbs,
+                                                                                   params.data_width) != 0);
     if (!backend_success) {
       bool synchronized = ocudu_ofh_compression_synchronize(handle) != 0;
       bool cancelled    = grid.cancel_device_grid_mapping();
@@ -773,23 +937,19 @@ iq_decompression_result iq_compression_cuda::decompress_to_resource_grid(resourc
         discard_handle(handle);
         continue;
       }
-      note_acceleration_failure("device-grid decompression",
-                                handle,
-                                injected,
-                                "dropping the affected Open Fronthaul message");
+      note_acceleration_failure(
+          "device-grid decompression", handle, injected, "dropping the affected Open Fronthaul message");
       discard_handle(handle);
       return (synchronized && !cancelled) ? iq_decompression_result::destination_failure
-                                           : iq_decompression_result::acceleration_failure;
+                                          : iq_decompression_result::acceleration_failure;
     }
 
     if (!grid.on_device_grid_mapping_enqueued(stream)) {
       bool synchronized = ocudu_ofh_compression_synchronize(handle) != 0;
       (void)grid.cancel_device_grid_mapping();
       if (!synchronized) {
-        note_acceleration_failure("device-grid decompression synchronization",
-                                  handle,
-                                  false,
-                                  "dropping the affected Open Fronthaul message");
+        note_acceleration_failure(
+            "device-grid decompression synchronization", handle, false, "dropping the affected Open Fronthaul message");
         discard_handle(handle);
         return iq_decompression_result::acceleration_failure;
       }
@@ -797,7 +957,7 @@ iq_decompression_result iq_compression_cuda::decompress_to_resource_grid(resourc
       return iq_decompression_result::destination_failure;
     }
 
-    release_handle(handle);
+    release_async_handle(handle);
     return (attempt == 0) ? iq_decompression_result::success : iq_decompression_result::success_after_retry;
   }
 
@@ -815,16 +975,16 @@ iq_decompression_result iq_compression_cuda::decompress_to_resource_grid(resourc
 }
 
 iq_decompression_result iq_compression_cuda::decompress_to_prach_buffer(prach_buffer&                buffer,
-                                                                         unsigned                     port,
-                                                                         unsigned                     td_occasion,
-                                                                         unsigned                     fd_occasion,
-                                                                         unsigned                     symbol,
-                                                                         unsigned                     start_re,
-                                                                         unsigned                     input_start_re,
-                                                                         unsigned                     nof_re,
-                                                                         unsigned                     nof_prbs,
-                                                                         span<const uint8_t>          compressed_data,
-                                                                         const ru_compression_params& params)
+                                                                        unsigned                     port,
+                                                                        unsigned                     td_occasion,
+                                                                        unsigned                     fd_occasion,
+                                                                        unsigned                     symbol,
+                                                                        unsigned                     start_re,
+                                                                        unsigned                     input_start_re,
+                                                                        unsigned                     nof_re,
+                                                                        unsigned                     nof_prbs,
+                                                                        span<const uint8_t>          compressed_data,
+                                                                        const ru_compression_params& params)
 {
 #ifdef ENABLE_CUDA
   if (!buffer.supports_device_prach_buffer_mapping()) {
@@ -853,10 +1013,8 @@ iq_decompression_result iq_compression_cuda::decompress_to_prach_buffer(prach_bu
         note_acceleration_retry("device PRACH decompression handle creation", nullptr, false);
         continue;
       }
-      note_acceleration_failure("device PRACH decompression handle creation",
-                                nullptr,
-                                false,
-                                "dropping the affected Open Fronthaul message");
+      note_acceleration_failure(
+          "device PRACH decompression handle creation", nullptr, false, "dropping the affected Open Fronthaul message");
       return iq_decompression_result::resource_unavailable;
     }
 
@@ -887,13 +1045,11 @@ iq_decompression_result iq_compression_cuda::decompress_to_prach_buffer(prach_bu
         discard_handle(handle);
         continue;
       }
-      note_acceleration_failure("device PRACH decompression",
-                                handle,
-                                injected,
-                                "dropping the affected Open Fronthaul message");
+      note_acceleration_failure(
+          "device PRACH decompression", handle, injected, "dropping the affected Open Fronthaul message");
       discard_handle(handle);
       return (synchronized && !cancelled) ? iq_decompression_result::destination_failure
-                                           : iq_decompression_result::acceleration_failure;
+                                          : iq_decompression_result::acceleration_failure;
     }
 
     if (!buffer.on_device_prach_buffer_mapping_enqueued(stream)) {
@@ -911,7 +1067,7 @@ iq_decompression_result iq_compression_cuda::decompress_to_prach_buffer(prach_bu
       return iq_decompression_result::destination_failure;
     }
 
-    release_handle(handle);
+    release_async_handle(handle);
     return (attempt == 0) ? iq_decompression_result::success : iq_decompression_result::success_after_retry;
   }
 

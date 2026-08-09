@@ -96,8 +96,19 @@ create_data_flow_uplane_data(const transmitter_config&              tx_config,
 
   std::array<std::unique_ptr<iq_compressor>, NOF_COMPRESSION_TYPES_SUPPORTED> compressors;
   for (unsigned i = 0; i != NOF_COMPRESSION_TYPES_SUPPORTED; ++i) {
-    compressors[i] = create_iq_compressor(
-        static_cast<compression_type>(i), logger, tx_config.iq_scaling, tx_config.compression_acceleration_mode);
+    compression_type compressor_type = static_cast<compression_type>(i);
+    iq_compressor_preallocation_config preallocation;
+    if (compressor_type == tx_config.dl_compr_params.type) {
+      preallocation = {.max_nof_prbs    = config.ru_nof_prbs,
+                       .max_nof_ports   = static_cast<unsigned>(config.dl_eaxc.size()),
+                       .max_nof_symbols = get_nsymb_per_slot(config.cp),
+                       .data_width      = config.compr_params.data_width};
+    }
+    compressors[i] = create_iq_compressor(compressor_type,
+                                          logger,
+                                          tx_config.iq_scaling,
+                                          tx_config.compression_acceleration_mode,
+                                          preallocation);
   }
   dependencies.compressor_sel = create_iq_compressor_selector(std::move(compressors));
 

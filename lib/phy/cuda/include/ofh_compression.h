@@ -26,13 +26,22 @@ typedef struct {
 
 enum { OCUDU_OFH_COMPRESSION_TYPE_NONE = 0, OCUDU_OFH_COMPRESSION_TYPE_BFP = 1 };
 
-int   ocudu_ofh_compression_available(void);
-int   ocudu_ofh_compression_create(ocudu_ofh_compression_handle_t** handle);
+int ocudu_ofh_compression_available(void);
+int ocudu_ofh_compression_create(ocudu_ofh_compression_handle_t** handle);
+/// Preallocates device and pinned-host output workspaces used by device-grid compression to host buffers.
+int ocudu_ofh_compression_reserve_host_buffer_compression(ocudu_ofh_compression_handle_t* handle,
+                                                          unsigned                        max_output_bytes);
+/// Preallocates the buffers and events used by asynchronous direct decompression.
+int   ocudu_ofh_compression_reserve_direct_decompression(ocudu_ofh_compression_handle_t* handle,
+                                                         unsigned                        max_input_bytes,
+                                                         unsigned                        max_output_bytes);
 void  ocudu_ofh_compression_destroy(ocudu_ofh_compression_handle_t* handle);
 void* ocudu_ofh_compression_get_stream(ocudu_ofh_compression_handle_t* handle);
-int   ocudu_ofh_compression_synchronize(ocudu_ofh_compression_handle_t* handle);
-int   ocudu_ofh_compression_get_last_error(const ocudu_ofh_compression_handle_t* handle,
-                                           ocudu_ofh_compression_error_info_t*   error_info);
+/// Returns 1 when all work enqueued on the handle has completed, 0 while work is pending and -1 on a CUDA error.
+int ocudu_ofh_compression_query_completion(ocudu_ofh_compression_handle_t* handle);
+int ocudu_ofh_compression_synchronize(ocudu_ofh_compression_handle_t* handle);
+int ocudu_ofh_compression_get_last_error(const ocudu_ofh_compression_handle_t* handle,
+                                         ocudu_ofh_compression_error_info_t*   error_info);
 
 int ocudu_ofh_compress(ocudu_ofh_compression_handle_t* handle,
                        int                             compression_type,

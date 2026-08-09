@@ -2,14 +2,19 @@
 // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
 
 #include "ocudu/ofh/compression/compression_factory.h"
+#include "ocudu/ofh/compression/compression_properties.h"
 #include "iq_compression_bfp_impl.h"
 #include "iq_compression_cuda.h"
 #include "iq_compression_death_impl.h"
 #include "iq_compression_none_impl.h"
 #include "iq_compressor_selector.h"
 #include "iq_decompressor_selector.h"
+#include "ocudu/phy/antenna_ports.h"
+#include "ocudu/ran/cyclic_prefix.h"
+#include "ocudu/ran/resource_block.h"
 #include "ocudu/support/cpu_features.h"
 #include "ocudu/support/error_handling.h"
+#include <limits>
 
 #ifdef __x86_64__
 #include "iq_compression_bfp_avx2.h"
@@ -72,12 +77,41 @@ static bool is_cpu_auto_compression_requested(const std::string& impl_type)
 std::unique_ptr<iq_compressor> ocudu::ofh::create_iq_compressor(compression_type        type,
                                                                 ocudulog::basic_logger& logger,
                                                                 float                   iq_scaling,
-                                                                const std::string&      impl_type)
+                                                                const std::string&      impl_type,
+                                                                iq_compressor_preallocation_config preallocation)
 {
   std::string resolved_impl_type = resolve_compression_impl_type(impl_type, "OCUDU_OFH_TX_COMPRESSION_IMPL");
 #ifndef ENABLE_CUDA
   report_fatal_error_if_not(!is_cuda_compression_requested(resolved_impl_type),
                             "CUDA OFH compression requested but unavailable.");
+#endif
+
+  const bool preallocation_disabled = (preallocation.max_nof_prbs == 0U) && (preallocation.max_nof_ports == 0U) &&
+                                      (preallocation.max_nof_symbols == 0U) && (preallocation.data_width == 0U);
+  const bool preallocation_complete = (preallocation.max_nof_prbs != 0U) && (preallocation.max_nof_ports != 0U) &&
+                                      (preallocation.max_nof_symbols != 0U) && (preallocation.data_width != 0U);
+  report_fatal_error_if_not(preallocation_disabled || preallocation_complete,
+                            "IQ compression preallocation requires nonzero PRB, port, symbol and data-width bounds.");
+  report_fatal_error_if_not(preallocation_disabled || (preallocation.data_width <= MAX_IQ_WIDTH),
+                            "IQ compression preallocation data width exceeds the supported maximum.");
+  report_fatal_error_if_not(preallocation_disabled || (preallocation.max_nof_prbs <= MAX_NOF_PRBS),
+                            "IQ compression preallocation PRB count exceeds the supported maximum.");
+  report_fatal_error_if_not(preallocation_disabled || (preallocation.max_nof_ports <= MAX_PORTS),
+                            "IQ compression preallocation port count exceeds the supported maximum.");
+  report_fatal_error_if_not(preallocation_disabled || (preallocation.max_nof_symbols <= MAX_NSYMB_PER_SLOT),
+                            "IQ compression preallocation symbol count exceeds the supported maximum.");
+
+#ifdef ENABLE_CUDA
+  size_t preallocated_batch_bytes = 0;
+  if (preallocation_complete && ((type == compression_type::none) || (type == compression_type::BFP))) {
+    ru_compression_params params{type, preallocation.data_width};
+    uint64_t batch_bytes = static_cast<uint64_t>(preallocation.max_nof_prbs) *
+                           get_compressed_prb_size(params).value() * preallocation.max_nof_ports *
+                           preallocation.max_nof_symbols;
+    report_fatal_error_if_not(batch_bytes <= std::numeric_limits<size_t>::max(),
+                              "IQ compression preallocation size exceeds the platform limit.");
+    preallocated_batch_bytes = static_cast<size_t>(batch_bytes);
+  }
 #endif
 
   switch (type) {
@@ -86,7 +120,12 @@ std::unique_ptr<iq_compressor> ocudu::ofh::create_iq_compressor(compression_type
       if (is_cuda_compression_requested(resolved_impl_type)) {
         report_fatal_error_if_not(is_iq_compression_cuda_available(),
                                   "CUDA OFH compression requested but unavailable.");
-        return std::make_unique<iq_compression_cuda>(type, logger, iq_scaling);
+        return std::make_unique<iq_compression_cuda>(
+            type,
+            logger,
+            iq_scaling,
+            iq_compression_cuda_preallocation_config{
+                .host_buffer_compression_capacity = preallocated_batch_bytes});
       }
 #endif
 #ifdef __x86_64__
@@ -116,7 +155,12 @@ std::unique_ptr<iq_compressor> ocudu::ofh::create_iq_compressor(compression_type
       if (is_cuda_compression_requested(resolved_impl_type)) {
         report_fatal_error_if_not(is_iq_compression_cuda_available(),
                                   "CUDA OFH compression requested but unavailable.");
-        return std::make_unique<iq_compression_cuda>(type, logger, iq_scaling);
+        return std::make_unique<iq_compression_cuda>(
+            type,
+            logger,
+            iq_scaling,
+            iq_compression_cuda_preallocation_config{
+                .host_buffer_compression_capacity = preallocated_batch_bytes});
       }
 #endif
 #ifdef __x86_64__
@@ -157,13 +201,30 @@ std::unique_ptr<iq_compressor> ocudu::ofh::create_iq_compressor(compression_type
   }
 }
 
-std::unique_ptr<iq_decompressor>
-ocudu::ofh::create_iq_decompressor(compression_type type, ocudulog::basic_logger& logger, const std::string& impl_type)
+std::unique_ptr<iq_decompressor> ocudu::ofh::create_iq_decompressor(compression_type                     type,
+                                                                    ocudulog::basic_logger&              logger,
+                                                                    const std::string&                   impl_type,
+                                                                    iq_decompressor_preallocation_config preallocation)
 {
   std::string resolved_impl_type = resolve_compression_impl_type(impl_type, "OCUDU_OFH_RX_COMPRESSION_IMPL");
 #ifndef ENABLE_CUDA
   report_fatal_error_if_not(!is_cuda_compression_requested(resolved_impl_type),
                             "CUDA OFH decompression requested but unavailable.");
+#endif
+
+  const bool preallocation_disabled = (preallocation.max_nof_ports == 0U) && (preallocation.max_nof_symbols == 0U);
+  const bool preallocation_complete = (preallocation.max_nof_ports != 0U) && (preallocation.max_nof_symbols != 0U);
+  report_fatal_error_if_not(preallocation_disabled || preallocation_complete,
+                            "IQ decompression preallocation requires nonzero port and symbol bounds.");
+  report_fatal_error_if_not(preallocation_disabled || (preallocation.max_nof_ports <= MAX_PORTS),
+                            "IQ decompression preallocation port count exceeds the supported maximum.");
+  report_fatal_error_if_not(preallocation_disabled || (preallocation.max_nof_symbols <= MAX_NSYMB_PER_SLOT),
+                            "IQ decompression preallocation symbol count exceeds the supported maximum.");
+
+#ifdef ENABLE_CUDA
+  const size_t direct_decompression_concurrency =
+      preallocation_complete ? static_cast<size_t>(preallocation.max_nof_ports) * preallocation.max_nof_symbols
+                             : static_cast<size_t>(MAX_PORTS) * MAX_NSYMB_PER_SLOT;
 #endif
 
   switch (type) {
@@ -172,7 +233,12 @@ ocudu::ofh::create_iq_decompressor(compression_type type, ocudulog::basic_logger
       if (is_cuda_compression_requested(resolved_impl_type)) {
         report_fatal_error_if_not(is_iq_compression_cuda_available(),
                                   "CUDA OFH decompression requested but unavailable.");
-        return std::make_unique<iq_compression_cuda>(type, logger);
+        return std::make_unique<iq_compression_cuda>(
+            type,
+            logger,
+            1.0F,
+            iq_compression_cuda_preallocation_config{.direct_decompression_concurrency =
+                                                         direct_decompression_concurrency});
       }
 #endif
 #ifdef __x86_64__
@@ -202,7 +268,12 @@ ocudu::ofh::create_iq_decompressor(compression_type type, ocudulog::basic_logger
       if (is_cuda_compression_requested(resolved_impl_type)) {
         report_fatal_error_if_not(is_iq_compression_cuda_available(),
                                   "CUDA OFH decompression requested but unavailable.");
-        return std::make_unique<iq_compression_cuda>(type, logger);
+        return std::make_unique<iq_compression_cuda>(
+            type,
+            logger,
+            1.0F,
+            iq_compression_cuda_preallocation_config{.direct_decompression_concurrency =
+                                                         direct_decompression_concurrency});
       }
 #endif
 #ifdef __x86_64__

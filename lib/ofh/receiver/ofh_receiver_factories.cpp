@@ -17,13 +17,18 @@ using namespace ofh;
 
 static std::unique_ptr<uplane_message_decoder> create_uplane_decoder(const receiver_config&       receiver_cfg,
                                                                      ocudulog::basic_logger&      logger,
-                                                                     const ru_compression_params& compr_params)
+                                                                     const ru_compression_params& compr_params,
+                                                                     unsigned                     max_nof_ports)
 {
   // Compressors.
   std::array<std::unique_ptr<iq_decompressor>, NOF_COMPRESSION_TYPES_SUPPORTED> decompr;
   for (unsigned i = 0; i != NOF_COMPRESSION_TYPES_SUPPORTED; ++i) {
-    decompr[i] =
-        create_iq_decompressor(static_cast<compression_type>(i), logger, receiver_cfg.compression_acceleration_mode);
+    decompr[i] = create_iq_decompressor(
+        static_cast<compression_type>(i),
+        logger,
+        receiver_cfg.compression_acceleration_mode,
+        iq_decompressor_preallocation_config{.max_nof_ports   = max_nof_ports,
+                                             .max_nof_symbols = get_nsymb_per_slot(receiver_cfg.cp)});
   }
 
   frequency_range freq_range =
@@ -71,7 +76,8 @@ create_uplink_prach_data_flow(const receiver_config&                            
   dependencies.notifier                  = std::move(notifier);
   dependencies.prach_cplane_context_repo = std::move(prach_cp_context_repo);
   dependencies.prach_context_repo        = std::move(prach_context_repo);
-  dependencies.uplane_decoder = create_uplane_decoder(receiver_cfg, logger, receiver_cfg.prach_compression_params);
+  dependencies.uplane_decoder            = create_uplane_decoder(
+      receiver_cfg, logger, receiver_cfg.prach_compression_params, receiver_cfg.prach_eaxc.size());
 
   return std::make_unique<data_flow_uplane_uplink_prach_impl>(config, std::move(dependencies));
 }
@@ -96,7 +102,8 @@ create_uplink_data_flow(const receiver_config&                            receiv
   dependencies.notifier               = std::move(notifier);
   dependencies.ul_cplane_context_repo = std::move(ul_cp_context_repo);
   dependencies.ul_context_repo        = std::move(ul_slot_context_repo);
-  dependencies.uplane_decoder         = create_uplane_decoder(receiver_cfg, logger, receiver_cfg.ul_compression_params);
+  dependencies.uplane_decoder =
+      create_uplane_decoder(receiver_cfg, logger, receiver_cfg.ul_compression_params, receiver_cfg.ul_eaxc.size());
 
   return std::make_unique<data_flow_uplane_uplink_data_impl>(config, std::move(dependencies));
 }

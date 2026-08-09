@@ -13,8 +13,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <random>
 #include <thread>
@@ -315,6 +317,7 @@ TEST(ofh_iq_compression_cuda_c_api_test, rejects_invalid_arguments_and_requests)
   EXPECT_EQ(ocudu_ofh_compression_synchronize(nullptr), 0);
   ocudu_ofh_compression_error_info_t error_info = {};
   EXPECT_EQ(ocudu_ofh_compression_get_last_error(nullptr, &error_info), 0);
+  EXPECT_EQ(ocudu_ofh_compression_reserve_host_buffer_compression(nullptr, bytes.size()), 0);
   ocudu_ofh_compression_destroy(nullptr);
 
   ocudu_ofh_compression_handle_t* handle = nullptr;
@@ -322,6 +325,7 @@ TEST(ofh_iq_compression_cuda_c_api_test, rejects_invalid_arguments_and_requests)
     GTEST_SKIP() << "CUDA OFH compression backend is not available.";
   }
   ASSERT_NE(handle, nullptr);
+  EXPECT_EQ(ocudu_ofh_compression_reserve_host_buffer_compression(handle, 0), 0);
 
   EXPECT_EQ(ocudu_ofh_compress(nullptr, OCUDU_OFH_COMPRESSION_TYPE_BFP, bytes.data(), input_cbf16.data(), 1, 9, 0.27F),
             0);
@@ -420,6 +424,150 @@ TEST(ofh_iq_compression_cuda_c_api_test, rejects_invalid_arguments_and_requests)
   ocudu_ofh_compression_destroy(handle);
 }
 
+TEST(ofh_iq_compression_cuda_c_api_test, creates_realtime_priority_stream)
+{
+  int least_priority    = 0;
+  int greatest_priority = 0;
+  ASSERT_EQ(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority), cudaSuccess);
+
+  ocudu_ofh_compression_handle_t* handle = nullptr;
+  if (ocudu_ofh_compression_create(&handle) == 0) {
+    GTEST_SKIP() << "CUDA OFH compression backend is not available.";
+  }
+
+  cudaStream_t stream = static_cast<cudaStream_t>(ocudu_ofh_compression_get_stream(handle));
+  ASSERT_NE(stream, nullptr);
+  int stream_priority = 0;
+  ASSERT_EQ(cudaStreamGetPriority(stream, &stream_priority), cudaSuccess);
+  EXPECT_EQ(stream_priority, greatest_priority);
+
+  ocudu_ofh_compression_destroy(handle);
+}
+
+/// Verifies that a reserved device-grid compression workspace avoids CUDA allocation synchronization on the real-time
+/// path. Kernel module loading is primed on a separate handle before an unrelated stream is deliberately blocked.
+TEST(ofh_iq_compression_cuda_c_api_test, reserved_host_buffer_compression_does_not_wait_for_unrelated_stream)
+{
+  static constexpr unsigned nof_prbs         = 64;
+  static constexpr unsigned nof_grid_symbols = 2;
+  static constexpr unsigned nof_ports        = 2;
+  static constexpr unsigned data_width       = 9;
+  static constexpr float    iq_scale         = 0.27F;
+
+  ofh::ru_compression_params params{ofh::compression_type::BFP, data_width};
+  const unsigned             port_bytes  = nof_prbs * ofh::get_compressed_prb_size(params).value();
+  const unsigned             batch_bytes = nof_grid_symbols * nof_ports * port_bytes;
+
+  cbf16_t* device_grid = nullptr;
+  ASSERT_EQ(cudaMallocManaged(&device_grid,
+                              static_cast<size_t>(nof_ports) * nof_grid_symbols * nof_prbs *
+                                  NOF_SUBCARRIERS_PER_RB * sizeof(cbf16_t)),
+            cudaSuccess);
+  std::vector<cbf16_t> source = generate_iq(nof_ports * nof_grid_symbols * nof_prbs);
+  std::copy(source.begin(), source.end(), device_grid);
+
+  std::vector<std::vector<uint8_t>> output(nof_grid_symbols * nof_ports, std::vector<uint8_t>(port_bytes));
+  std::vector<void*>                output_buffers(output.size());
+  for (unsigned i = 0; i != output.size(); ++i) {
+    output_buffers[i] = output[i].data();
+  }
+
+  ocudu_ofh_compression_handle_t* warmup_handle = nullptr;
+  ocudu_ofh_compression_handle_t* test_handle   = nullptr;
+  if ((ocudu_ofh_compression_create(&warmup_handle) == 0) ||
+      (ocudu_ofh_compression_create(&test_handle) == 0)) {
+    ocudu_ofh_compression_destroy(warmup_handle);
+    ocudu_ofh_compression_destroy(test_handle);
+    cudaFree(device_grid);
+    GTEST_SKIP() << "CUDA OFH compression backend is not available.";
+  }
+
+  ASSERT_NE(ocudu_ofh_compress_device_grid_symbol_batch_to_host_buffers(warmup_handle,
+                                                                        OCUDU_OFH_COMPRESSION_TYPE_BFP,
+                                                                        output_buffers.data(),
+                                                                        output_buffers.size(),
+                                                                        port_bytes,
+                                                                        device_grid,
+                                                                        nof_grid_symbols,
+                                                                        nof_prbs * NOF_SUBCARRIERS_PER_RB,
+                                                                        0,
+                                                                        nof_ports,
+                                                                        0,
+                                                                        nof_grid_symbols,
+                                                                        0,
+                                                                        nof_prbs,
+                                                                        data_width,
+                                                                        iq_scale),
+            0);
+  const std::vector<std::vector<uint8_t>> expected = output;
+  ASSERT_NE(ocudu_ofh_compression_reserve_host_buffer_compression(test_handle, batch_bytes), 0);
+
+  struct callback_gate {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+  } gate;
+  cudaStream_t blocked_stream = nullptr;
+  ASSERT_EQ(cudaStreamCreateWithFlags(&blocked_stream, cudaStreamNonBlocking), cudaSuccess);
+  ASSERT_EQ(cudaLaunchHostFunc(
+                blocked_stream,
+                [](void* data) {
+                  auto& callback = *static_cast<callback_gate*>(data);
+                  callback.entered.store(true, std::memory_order_release);
+                  while (!callback.release.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                  }
+                },
+                &gate),
+            cudaSuccess);
+  while (!gate.entered.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+
+  for (auto& buffer : output) {
+    std::fill(buffer.begin(), buffer.end(), 0U);
+  }
+  std::atomic<int>  compression_status{0};
+  std::atomic<bool> compression_finished{false};
+  std::thread compression_thread([&]() {
+    compression_status.store(
+        ocudu_ofh_compress_device_grid_symbol_batch_to_host_buffers(test_handle,
+                                                                    OCUDU_OFH_COMPRESSION_TYPE_BFP,
+                                                                    output_buffers.data(),
+                                                                    output_buffers.size(),
+                                                                    port_bytes,
+                                                                    device_grid,
+                                                                    nof_grid_symbols,
+                                                                    nof_prbs * NOF_SUBCARRIERS_PER_RB,
+                                                                    0,
+                                                                    nof_ports,
+                                                                    0,
+                                                                    nof_grid_symbols,
+                                                                    0,
+                                                                    nof_prbs,
+                                                                    data_width,
+                                                                    iq_scale),
+        std::memory_order_release);
+    compression_finished.store(true, std::memory_order_release);
+  });
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!compression_finished.load(std::memory_order_acquire) && (std::chrono::steady_clock::now() < deadline)) {
+    std::this_thread::yield();
+  }
+  bool completed_without_waiting = compression_finished.load(std::memory_order_acquire);
+  gate.release.store(true, std::memory_order_release);
+  compression_thread.join();
+
+  EXPECT_TRUE(completed_without_waiting);
+  EXPECT_NE(compression_status.load(std::memory_order_acquire), 0);
+  EXPECT_EQ(output, expected);
+
+  EXPECT_EQ(cudaStreamDestroy(blocked_stream), cudaSuccess);
+  ocudu_ofh_compression_destroy(test_handle);
+  ocudu_ofh_compression_destroy(warmup_handle);
+  EXPECT_EQ(cudaFree(device_grid), cudaSuccess);
+}
+
 TEST(ofh_iq_compression_cuda_c_api_test, accepts_zero_length_noop_requests)
 {
   std::vector<cbf16_t> input_cbf16 = generate_iq(1);
@@ -463,6 +611,43 @@ TEST(ofh_iq_compression_cuda_c_api_test, accepts_zero_length_noop_requests)
   EXPECT_NE(ocudu_ofh_decompress_to_device_prach_buffer_async(
                 handle, OCUDU_OFH_COMPRESSION_TYPE_BFP, output_cbf16.data(), 0, bytes.data(), 0, 0, 1, 9),
             0);
+
+  ocudu_ofh_compression_destroy(handle);
+}
+
+TEST(ofh_iq_compression_cuda_c_api_test, reports_stream_completion_by_query)
+{
+  ocudu_ofh_compression_handle_t* handle = nullptr;
+  if (ocudu_ofh_compression_create(&handle) == 0) {
+    GTEST_SKIP() << "CUDA OFH compression backend is not available.";
+  }
+
+  struct callback_gate {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+  } gate;
+
+  cudaStream_t stream = static_cast<cudaStream_t>(ocudu_ofh_compression_get_stream(handle));
+  ASSERT_NE(stream, nullptr);
+  ASSERT_EQ(cudaLaunchHostFunc(
+                stream,
+                [](void* context) {
+                  auto& callback = *static_cast<callback_gate*>(context);
+                  callback.entered.store(true, std::memory_order_release);
+                  while (!callback.release.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                  }
+                },
+                &gate),
+            cudaSuccess);
+  while (!gate.entered.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+
+  EXPECT_EQ(ocudu_ofh_compression_query_completion(handle), 0);
+  gate.release.store(true, std::memory_order_release);
+  ASSERT_EQ(ocudu_ofh_compression_synchronize(handle), 1);
+  EXPECT_EQ(ocudu_ofh_compression_query_completion(handle), 1);
 
   ocudu_ofh_compression_destroy(handle);
 }
@@ -1300,15 +1485,13 @@ TEST_P(ofh_iq_compression_cuda_test, cuda_direct_grid_transient_failure_retries_
   std::vector<cbf16_t>       data   = generate_iq(nof_prbs);
   ofh::ru_compression_params params = {type, 9U};
 
-  std::unique_ptr<ofh::iq_compressor> cpu_compressor =
-      ofh::create_iq_compressor(type, logger, 1.0F, "generic");
-  unsigned             prb_size = ofh::get_compressed_prb_size(params).value();
-  std::vector<uint8_t> compressed(nof_prbs * prb_size);
+  std::unique_ptr<ofh::iq_compressor> cpu_compressor = ofh::create_iq_compressor(type, logger, 1.0F, "generic");
+  unsigned                            prb_size       = ofh::get_compressed_prb_size(params).value();
+  std::vector<uint8_t>                compressed(nof_prbs * prb_size);
   cpu_compressor->compress(compressed, data, params);
 
   ASSERT_EQ(::setenv("OCUDU_OFH_COMPRESSION_FORCE_FIRST_GPU_FAILURE", "1", 1), 0);
-  std::unique_ptr<ofh::iq_decompressor> cuda_decompressor =
-      ofh::create_iq_decompressor(type, logger, "cuda");
+  std::unique_ptr<ofh::iq_decompressor> cuda_decompressor = ofh::create_iq_decompressor(type, logger, "cuda");
   ASSERT_EQ(::unsetenv("OCUDU_OFH_COMPRESSION_FORCE_FIRST_GPU_FAILURE"), 0);
 
   ASSERT_EQ(::setenv("OCUDU_UL_CUDA_VISIBLE_GRID", "managed", 1), 0);
@@ -1321,24 +1504,18 @@ TEST_P(ofh_iq_compression_cuda_test, cuda_direct_grid_transient_failure_retries_
 
   ofh::ru_compression_params invalid_params = params;
   invalid_params.data_width                 = 0;
-  EXPECT_EQ(cuda_decompressor->decompress_to_resource_grid(
-                grid->get_writer(), 0, 0, 0, nof_prbs, compressed, invalid_params),
-            ofh::iq_decompression_result::invalid_input);
-  EXPECT_EQ(cuda_decompressor->decompress_to_resource_grid(
-                grid->get_writer(),
-                0,
-                0,
-                0,
-                nof_prbs,
-                span<const uint8_t>(compressed).first(compressed.size() - 1),
-                params),
-            ofh::iq_decompression_result::invalid_input);
+  EXPECT_EQ(
+      cuda_decompressor->decompress_to_resource_grid(grid->get_writer(), 0, 0, 0, nof_prbs, compressed, invalid_params),
+      ofh::iq_decompression_result::invalid_input);
+  EXPECT_EQ(
+      cuda_decompressor->decompress_to_resource_grid(
+          grid->get_writer(), 0, 0, 0, nof_prbs, span<const uint8_t>(compressed).first(compressed.size() - 1), params),
+      ofh::iq_decompression_result::invalid_input);
 
-  ASSERT_EQ(cuda_decompressor->decompress_to_resource_grid(
-                grid->get_writer(), 0, 0, 0, nof_prbs, compressed, params),
+  ASSERT_EQ(cuda_decompressor->decompress_to_resource_grid(grid->get_writer(), 0, 0, 0, nof_prbs, compressed, params),
             ofh::iq_decompression_result::success_after_retry);
 
-  std::vector<cbf16_t> expected(data.size());
+  std::vector<cbf16_t>                  expected(data.size());
   std::unique_ptr<ofh::iq_decompressor> cpu_decompressor = ofh::create_iq_decompressor(type, logger, "generic");
   cpu_decompressor->decompress(expected, compressed, params);
   span<const cbf16_t> actual = grid->get_reader().get_view(0, 0);
@@ -1348,4 +1525,211 @@ TEST_P(ofh_iq_compression_cuda_test, cuda_direct_grid_transient_failure_retries_
   auto& cuda_decompressor_impl = static_cast<ofh::iq_compression_cuda&>(*cuda_decompressor);
   EXPECT_EQ(cuda_decompressor_impl.get_nof_acceleration_retries(), 1U);
   EXPECT_EQ(cuda_decompressor_impl.get_nof_acceleration_failures(), 0U);
+}
+
+/// Verifies that a delayed consumer of one resource grid cannot hold the serialized O-FH receiver while CUDA maps an
+/// independent grid. The decompressor must not reuse a stream until all asynchronous work previously queued on it has
+/// completed.
+TEST(ofh_iq_compression_cuda_test, cuda_direct_grid_does_not_reuse_a_busy_stream)
+{
+  static constexpr unsigned nof_prbs = 273;
+
+  ocudulog::basic_logger& logger = ocudulog::fetch_basic_logger("TEST", false);
+  logger.set_level(ocudulog::basic_levels::none);
+
+  ofh::ru_compression_params params{ofh::compression_type::BFP, 9U};
+  std::vector<cbf16_t>       data = generate_iq(nof_prbs);
+  std::vector<uint8_t>       compressed(nof_prbs * ofh::get_compressed_prb_size(params).value());
+  std::vector<cbf16_t>       expected(data.size());
+  ofh::create_iq_compressor(ofh::compression_type::BFP, logger, 1.0F, "generic")->compress(compressed, data, params);
+  ofh::create_iq_decompressor(ofh::compression_type::BFP, logger, "generic")->decompress(expected, compressed, params);
+
+  ASSERT_EQ(::setenv("OCUDU_UL_CUDA_VISIBLE_GRID", "managed", 1), 0);
+  std::shared_ptr<resource_grid_factory> grid_factory = create_phy_acceleration_resource_grid_factory(
+      create_resource_grid_factory(), phy_acceleration_resource_grid_direction::uplink, true);
+  ASSERT_EQ(::unsetenv("OCUDU_UL_CUDA_VISIBLE_GRID"), 0);
+  std::unique_ptr<resource_grid> blocked_grid = grid_factory->create(1, 1, nof_prbs * NOF_SUBCARRIERS_PER_RB);
+  std::unique_ptr<resource_grid> ready_grid   = grid_factory->create(1, 1, nof_prbs * NOF_SUBCARRIERS_PER_RB);
+  ASSERT_NE(blocked_grid, nullptr);
+  ASSERT_NE(ready_grid, nullptr);
+  ASSERT_TRUE(blocked_grid->get_writer().supports_device_grid_mapping());
+  ASSERT_TRUE(ready_grid->get_writer().supports_device_grid_mapping());
+
+  std::unique_ptr<ofh::iq_decompressor> cuda_decompressor =
+      ofh::create_iq_decompressor(ofh::compression_type::BFP, logger, "cuda");
+  ASSERT_NE(cuda_decompressor, nullptr);
+  // Prime lazy CUDA module loading before introducing the stream gate. Lazy module loading may synchronize the CUDA
+  // context and is unrelated to the ordering property under test.
+  ASSERT_EQ(
+      cuda_decompressor->decompress_to_resource_grid(ready_grid->get_writer(), 0, 0, 0, nof_prbs, compressed, params),
+      ofh::iq_decompression_result::success);
+  ASSERT_TRUE(ready_grid->get_writer().synchronize_device_grid_mapping());
+  ready_grid->set_all_zero();
+
+  cudaStream_t consumer_stream = nullptr;
+  cudaStream_t release_stream  = nullptr;
+  ASSERT_EQ(cudaStreamCreateWithFlags(&consumer_stream, cudaStreamNonBlocking), cudaSuccess);
+  ASSERT_EQ(cudaStreamCreateWithFlags(&release_stream, cudaStreamNonBlocking), cudaSuccess);
+
+  uint32_t* gate_word = nullptr;
+  ASSERT_EQ(cudaMalloc(&gate_word, sizeof(*gate_word)), cudaSuccess);
+  ASSERT_EQ(cudaMemset(gate_word, 0, sizeof(*gate_word)), cudaSuccess);
+
+  const resource_grid_reader& blocked_reader = blocked_grid->get_reader();
+  ASSERT_TRUE(blocked_reader.prepare_device_grid_reading(consumer_stream));
+  CUresult wait_result = cuStreamWaitValue32(reinterpret_cast<CUstream>(consumer_stream),
+                                             reinterpret_cast<CUdeviceptr>(gate_word),
+                                             1U,
+                                             CU_STREAM_WAIT_VALUE_EQ);
+  if (wait_result == CUDA_ERROR_NOT_SUPPORTED) {
+    (void)cudaFree(gate_word);
+    (void)cudaStreamDestroy(release_stream);
+    (void)cudaStreamDestroy(consumer_stream);
+    GTEST_SKIP() << "CUDA stream memory operations are not supported by this device.";
+  }
+  ASSERT_EQ(wait_result, CUDA_SUCCESS);
+  ASSERT_TRUE(blocked_reader.on_device_grid_reading_enqueued(consumer_stream));
+
+  auto wait_for_flag = [](const std::atomic<bool>& flag) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!flag.load(std::memory_order_acquire) && (std::chrono::steady_clock::now() < deadline)) {
+      std::this_thread::yield();
+    }
+    return flag.load(std::memory_order_acquire);
+  };
+
+  ofh::iq_decompression_result blocked_result =
+      cuda_decompressor->decompress_to_resource_grid(blocked_grid->get_writer(), 0, 0, 0, nof_prbs, compressed, params);
+  ofh::iq_decompression_result ready_result =
+      cuda_decompressor->decompress_to_resource_grid(ready_grid->get_writer(), 0, 0, 0, nof_prbs, compressed, params);
+
+  std::atomic<bool> ready_sync_ok{false};
+  std::atomic<bool> ready_sync_done{false};
+  std::thread       ready_sync_thread([&]() {
+    ready_sync_ok.store(ready_grid->get_writer().synchronize_device_grid_mapping(), std::memory_order_release);
+    ready_sync_done.store(true, std::memory_order_release);
+  });
+
+  bool independent_grid_completed = wait_for_flag(ready_sync_done);
+  EXPECT_EQ(cuStreamWriteValue32(reinterpret_cast<CUstream>(release_stream),
+                                 reinterpret_cast<CUdeviceptr>(gate_word),
+                                 1U,
+                                 CU_STREAM_WRITE_VALUE_DEFAULT),
+            CUDA_SUCCESS);
+  EXPECT_EQ(cudaStreamSynchronize(release_stream), cudaSuccess);
+  EXPECT_EQ(cudaStreamSynchronize(consumer_stream), cudaSuccess);
+  ready_sync_thread.join();
+  EXPECT_EQ(cudaFree(gate_word), cudaSuccess);
+  EXPECT_EQ(cudaStreamDestroy(release_stream), cudaSuccess);
+  EXPECT_EQ(cudaStreamDestroy(consumer_stream), cudaSuccess);
+
+  EXPECT_EQ(blocked_result, ofh::iq_decompression_result::success);
+  EXPECT_EQ(ready_result, ofh::iq_decompression_result::success);
+  EXPECT_TRUE(independent_grid_completed) << "An independent resource grid waited for a busy decompression stream.";
+  EXPECT_TRUE(ready_sync_ok.load(std::memory_order_acquire));
+
+  span<const cbf16_t> blocked_actual = blocked_grid->get_reader().get_view(0, 0);
+  span<const cbf16_t> ready_actual   = ready_grid->get_reader().get_view(0, 0);
+  EXPECT_TRUE(std::equal(expected.begin(), expected.end(), blocked_actual.begin()));
+  EXPECT_TRUE(std::equal(expected.begin(), expected.end(), ready_actual.begin()));
+}
+
+/// Verifies that a configured receive shape bounds the number of CUDA streams without introducing allocation or a
+/// blocking wait when all preallocated handles are in flight.
+TEST(ofh_iq_compression_cuda_test, cuda_direct_grid_respects_configured_concurrency)
+{
+  static constexpr unsigned nof_prbs = 24;
+
+  ocudulog::basic_logger& logger = ocudulog::fetch_basic_logger("TEST", false);
+  logger.set_level(ocudulog::basic_levels::none);
+
+  ofh::ru_compression_params params{ofh::compression_type::BFP, 9U};
+  std::vector<cbf16_t>       data = generate_iq(nof_prbs);
+  std::vector<uint8_t>       compressed(nof_prbs * ofh::get_compressed_prb_size(params).value());
+  ofh::create_iq_compressor(ofh::compression_type::BFP, logger, 1.0F, "generic")->compress(compressed, data, params);
+
+  ASSERT_EQ(::setenv("OCUDU_UL_CUDA_VISIBLE_GRID", "managed", 1), 0);
+  std::shared_ptr<resource_grid_factory> grid_factory = create_phy_acceleration_resource_grid_factory(
+      create_resource_grid_factory(), phy_acceleration_resource_grid_direction::uplink, true);
+  ASSERT_EQ(::unsetenv("OCUDU_UL_CUDA_VISIBLE_GRID"), 0);
+  std::unique_ptr<resource_grid> blocked_grid = grid_factory->create(1, 1, nof_prbs * NOF_SUBCARRIERS_PER_RB);
+  std::unique_ptr<resource_grid> ready_grid   = grid_factory->create(1, 1, nof_prbs * NOF_SUBCARRIERS_PER_RB);
+  ASSERT_NE(blocked_grid, nullptr);
+  ASSERT_NE(ready_grid, nullptr);
+  ASSERT_TRUE(blocked_grid->get_writer().supports_device_grid_mapping());
+  ASSERT_TRUE(ready_grid->get_writer().supports_device_grid_mapping());
+
+  std::unique_ptr<ofh::iq_decompressor> cuda_decompressor =
+      ofh::create_iq_decompressor(ofh::compression_type::BFP,
+                                  logger,
+                                  "cuda",
+                                  ofh::iq_decompressor_preallocation_config{.max_nof_ports = 1, .max_nof_symbols = 1});
+  ASSERT_NE(cuda_decompressor, nullptr);
+
+  // Prime lazy CUDA module loading before introducing the stream gate.
+  ASSERT_EQ(
+      cuda_decompressor->decompress_to_resource_grid(ready_grid->get_writer(), 0, 0, 0, nof_prbs, compressed, params),
+      ofh::iq_decompression_result::success);
+  ASSERT_TRUE(ready_grid->get_writer().synchronize_device_grid_mapping());
+  // Handle reclamation intentionally runs outside the calling thread. Let the helper observe the completed warm-up
+  // before this one-handle test introduces a blocked stream.
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  ready_grid->set_all_zero();
+
+  cudaStream_t consumer_stream = nullptr;
+  cudaStream_t release_stream  = nullptr;
+  ASSERT_EQ(cudaStreamCreateWithFlags(&consumer_stream, cudaStreamNonBlocking), cudaSuccess);
+  ASSERT_EQ(cudaStreamCreateWithFlags(&release_stream, cudaStreamNonBlocking), cudaSuccess);
+
+  uint32_t* gate_word = nullptr;
+  ASSERT_EQ(cudaMalloc(&gate_word, sizeof(*gate_word)), cudaSuccess);
+  ASSERT_EQ(cudaMemset(gate_word, 0, sizeof(*gate_word)), cudaSuccess);
+
+  const resource_grid_reader& blocked_reader = blocked_grid->get_reader();
+  ASSERT_TRUE(blocked_reader.prepare_device_grid_reading(consumer_stream));
+  CUresult wait_result = cuStreamWaitValue32(reinterpret_cast<CUstream>(consumer_stream),
+                                             reinterpret_cast<CUdeviceptr>(gate_word),
+                                             1U,
+                                             CU_STREAM_WAIT_VALUE_EQ);
+  if (wait_result == CUDA_ERROR_NOT_SUPPORTED) {
+    (void)cudaFree(gate_word);
+    (void)cudaStreamDestroy(release_stream);
+    (void)cudaStreamDestroy(consumer_stream);
+    GTEST_SKIP() << "CUDA stream memory operations are not supported by this device.";
+  }
+  ASSERT_EQ(wait_result, CUDA_SUCCESS);
+  ASSERT_TRUE(blocked_reader.on_device_grid_reading_enqueued(consumer_stream));
+
+  EXPECT_EQ(
+      cuda_decompressor->decompress_to_resource_grid(blocked_grid->get_writer(), 0, 0, 0, nof_prbs, compressed, params),
+      ofh::iq_decompression_result::success);
+  EXPECT_EQ(
+      cuda_decompressor->decompress_to_resource_grid(ready_grid->get_writer(), 0, 0, 0, nof_prbs, compressed, params),
+      ofh::iq_decompression_result::resource_unavailable);
+
+  EXPECT_EQ(cuStreamWriteValue32(reinterpret_cast<CUstream>(release_stream),
+                                 reinterpret_cast<CUdeviceptr>(gate_word),
+                                 1U,
+                                 CU_STREAM_WRITE_VALUE_DEFAULT),
+            CUDA_SUCCESS);
+  EXPECT_EQ(cudaStreamSynchronize(release_stream), cudaSuccess);
+  EXPECT_EQ(cudaStreamSynchronize(consumer_stream), cudaSuccess);
+  EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  auto                         retry_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  ofh::iq_decompression_result retry_result   = ofh::iq_decompression_result::resource_unavailable;
+  while ((retry_result == ofh::iq_decompression_result::resource_unavailable) &&
+         (std::chrono::steady_clock::now() < retry_deadline)) {
+    retry_result =
+        cuda_decompressor->decompress_to_resource_grid(ready_grid->get_writer(), 0, 0, 0, nof_prbs, compressed, params);
+    if (retry_result == ofh::iq_decompression_result::resource_unavailable) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  EXPECT_EQ(retry_result, ofh::iq_decompression_result::success);
+  EXPECT_TRUE(ready_grid->get_writer().synchronize_device_grid_mapping());
+
+  EXPECT_EQ(cudaFree(gate_word), cudaSuccess);
+  EXPECT_EQ(cudaStreamDestroy(release_stream), cudaSuccess);
+  EXPECT_EQ(cudaStreamDestroy(consumer_stream), cudaSuccess);
 }

@@ -8,6 +8,8 @@
 #include "ocudu/ofh/serdes/ofh_message_decoder_properties.h"
 #include "ocudu/ofh/serdes/ofh_uplane_message_decoder.h"
 #include "ocudu/ofh/serdes/ofh_uplane_message_decoder_properties.h"
+#include <chrono>
+#include <future>
 #include <gtest/gtest.h>
 #include <numeric>
 #include <vector>
@@ -75,6 +77,12 @@ public:
     nof_prbs  = nof_prbs_;
     section   = &section_;
     payload.assign(section_.compressed_iq_data.begin(), section_.compressed_iq_data.end());
+    if (call_entered != nullptr) {
+      call_entered->set_value();
+    }
+    if (call_release.valid()) {
+      call_release.wait();
+    }
     if (is_iq_decompression_success(result) &&
         !(grid.prepare_device_grid_mapping(nullptr) && grid.on_device_grid_mapping_enqueued(nullptr))) {
       return iq_decompression_result::destination_failure;
@@ -91,6 +99,51 @@ public:
   unsigned                     nof_prbs           = 0;
   const uplane_section_params* section            = nullptr;
   std::vector<uint8_t>         payload;
+  std::promise<void>*          call_entered = nullptr;
+  std::shared_future<void>     call_release;
+};
+
+class blocking_shared_resource_grid_pool : private shared_resource_grid::pool_interface
+{
+public:
+  blocking_shared_resource_grid_pool(resource_grid& grid_, std::shared_future<void> release_allowed_) :
+    grid(grid_), release_allowed(std::move(release_allowed_))
+  {
+  }
+
+  ~blocking_shared_resource_grid_pool() override
+  {
+    report_fatal_error_if_not(ref_count == 0, "A grid is still active in {} scopes.", ref_count.load());
+  }
+
+  shared_resource_grid get_grid()
+  {
+    unsigned expected  = 0;
+    bool     available = ref_count.compare_exchange_strong(expected, 1);
+    ocudu_assert(available, "The grid must not be reserved.");
+    return {*this, ref_count};
+  }
+
+  std::future<void> get_release_entered_future() { return release_entered.get_future(); }
+
+private:
+  resource_grid& get() override
+  {
+    ocudu_assert(ref_count > 0, "The grid must be reserved.");
+    return grid;
+  }
+
+  void notify_release_scope() override
+  {
+    ocudu_assert(ref_count == 0, "The grid cannot be reserved.");
+    release_entered.set_value();
+    release_allowed.wait();
+  }
+
+  resource_grid&           grid;
+  std::atomic<unsigned>    ref_count = {};
+  std::promise<void>       release_entered;
+  std::shared_future<void> release_allowed;
 };
 
 } // namespace
@@ -328,6 +381,69 @@ TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_write_thro
   ASSERT_EQ(1, device_writer.enqueue_count);
   ASSERT_FALSE(device_writer.has_grid_been_written());
   ASSERT_TRUE(all_res_written);
+}
+
+TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, device_grid_callback_does_not_hold_repository_mutex)
+{
+  resource_grid_device_writer_spy   device_writer(nof_prb);
+  resource_grid_spy                 device_grid(rg_reader, device_writer);
+  shared_resource_grid_spy          device_shared_grid(device_grid);
+  std::array<uint8_t, 128>          compressed_payload = {};
+  uplane_message_decoder_device_spy decoder;
+  std::promise<void>                call_entered;
+  std::promise<void>                allow_call_to_finish;
+  std::future<void>                 call_entered_future = call_entered.get_future();
+
+  decoder.call_entered       = &call_entered;
+  decoder.call_release       = allow_call_to_finish.get_future().share();
+  auto& section              = results.sections.back();
+  section.nof_prbs           = nof_prb;
+  section.start_prb          = 0;
+  section.compressed_iq_data = compressed_payload;
+
+  repo->add(
+      {results.params.slot, sector}, device_shared_grid.get_grid(), symbol_range, ocudulog::fetch_basic_logger("TEST"));
+  repo->process_pending_contexts();
+
+  auto write_future = std::async(std::launch::async, [this, &decoder]() {
+    return writer.write_compressed_to_resource_grid(eaxc[0], results, decoder);
+  });
+  if (call_entered_future.wait_for(std::chrono::seconds(1)) != std::future_status::ready) {
+    allow_call_to_finish.set_value();
+    FAIL() << "Timed out waiting for the device-grid callback";
+  }
+
+  auto get_future = std::async(std::launch::async, [this]() { return repo->get(slot, symbol_id).empty(); });
+  EXPECT_EQ(std::future_status::ready, get_future.wait_for(std::chrono::milliseconds(100)));
+
+  allow_call_to_finish.set_value();
+  EXPECT_FALSE(get_future.get());
+  EXPECT_EQ(uplane_rx_symbol_data_flow_writer::direct_write_result::success, write_future.get());
+  repo->clear();
+}
+
+TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, grid_release_does_not_hold_repository_mutex)
+{
+  std::promise<void>                 allow_release_to_finish;
+  std::shared_future<void>           release_allowed = allow_release_to_finish.get_future().share();
+  blocking_shared_resource_grid_pool grid_pool(grid, std::move(release_allowed));
+  std::future<void>                  release_entered = grid_pool.get_release_entered_future();
+
+  repo->add({results.params.slot, sector}, grid_pool.get_grid(), symbol_range, ocudulog::fetch_basic_logger("TEST"));
+  repo->process_pending_contexts();
+
+  auto clear_future = std::async(std::launch::async, [this]() { repo->clear(); });
+  if (release_entered.wait_for(std::chrono::seconds(1)) != std::future_status::ready) {
+    allow_release_to_finish.set_value();
+    FAIL() << "Timed out waiting for the resource-grid release";
+  }
+
+  auto get_future = std::async(std::launch::async, [this]() { return repo->get(slot, symbol_id).empty(); });
+  EXPECT_EQ(std::future_status::ready, get_future.wait_for(std::chrono::milliseconds(100)));
+
+  allow_release_to_finish.set_value();
+  EXPECT_TRUE(get_future.get());
+  clear_future.get();
 }
 
 TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_prbs_request_fallback_when_device_grid_unavailable)

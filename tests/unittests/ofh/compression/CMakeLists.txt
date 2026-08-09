@@ -12,6 +12,7 @@ if (CUDA_ACCEL_FOUND)
             ocudu_upper_phy
             ocudu_phy_support
             ocudu_support
+            CUDA::cuda_driver
             GTest::gtest
             GTest::gtest_main)
     target_compile_definitions(ofh_iq_compression_cuda_test PRIVATE ENABLE_CUDA)

@@ -8,7 +8,11 @@
 #include "ocudu/ofh/compression/compression_params.h"
 #include "ocudu/ofh/compression/iq_compressor.h"
 #include "ocudu/ofh/compression/iq_decompressor.h"
+#include "ocudu/support/executors/unique_thread.h"
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -20,15 +24,24 @@ namespace ofh {
 
 bool is_iq_compression_cuda_available();
 
+struct iq_compression_cuda_preallocation_config {
+  size_t direct_decompression_concurrency = 0;
+  size_t host_buffer_compression_capacity = 0;
+};
+
 /// \brief CUDA accelerated IQ data compressor and decompressor.
 ///
 /// A failed CUDA handle is quarantined and operations are retried once on a fresh handle when the destination can be
 /// safely overwritten. Host-buffer operations use the equivalent CPU implementation only after recovery fails. Direct
-/// device-destination operations return a structured terminal error and never enter host IQ decompression.
+/// device-destination operations return a structured terminal error and never enter host IQ decompression. Handles
+/// with asynchronous work in flight are not reused, so a delayed device consumer cannot block the fronthaul receiver.
 class iq_compression_cuda : public iq_compressor, public iq_decompressor
 {
 public:
-  explicit iq_compression_cuda(compression_type type_, ocudulog::basic_logger& logger_, float iq_scaling_ = 1.0F);
+  explicit iq_compression_cuda(compression_type        type_,
+                               ocudulog::basic_logger& logger_,
+                               float                   iq_scaling_ = 1.0F,
+                               iq_compression_cuda_preallocation_config preallocation = {});
   ~iq_compression_cuda() override;
 
   iq_compression_cuda(const iq_compression_cuda&)            = delete;
@@ -98,24 +111,24 @@ public:
   bool supports_prach_buffer_decompression() const override { return true; }
 
   iq_decompression_result decompress_to_resource_grid(resource_grid_writer&        grid,
-                                                       unsigned                     port,
-                                                       unsigned                     symbol,
-                                                       unsigned                     start_prb,
-                                                       unsigned                     nof_prbs,
-                                                       span<const uint8_t>          compressed_data,
-                                                       const ru_compression_params& params) override;
-
-  iq_decompression_result decompress_to_prach_buffer(prach_buffer&                buffer,
                                                       unsigned                     port,
-                                                      unsigned                     td_occasion,
-                                                      unsigned                     fd_occasion,
                                                       unsigned                     symbol,
-                                                      unsigned                     start_re,
-                                                      unsigned                     input_start_re,
-                                                      unsigned                     nof_re,
+                                                      unsigned                     start_prb,
                                                       unsigned                     nof_prbs,
                                                       span<const uint8_t>          compressed_data,
                                                       const ru_compression_params& params) override;
+
+  iq_decompression_result decompress_to_prach_buffer(prach_buffer&                buffer,
+                                                     unsigned                     port,
+                                                     unsigned                     td_occasion,
+                                                     unsigned                     fd_occasion,
+                                                     unsigned                     symbol,
+                                                     unsigned                     start_re,
+                                                     unsigned                     input_start_re,
+                                                     unsigned                     nof_re,
+                                                     unsigned                     nof_prbs,
+                                                     span<const uint8_t>          compressed_data,
+                                                     const ru_compression_params& params) override;
 
   /// Returns the number of times the accelerated path failed and the CPU implementation was used instead.
   uint64_t get_nof_acceleration_failures() const { return nof_acceleration_failures.load(std::memory_order_relaxed); }
@@ -126,7 +139,9 @@ public:
 private:
   ocudu_ofh_compression_handle* acquire_handle();
   void                          release_handle(ocudu_ofh_compression_handle* acquired_handle);
+  void                          release_async_handle(ocudu_ofh_compression_handle* acquired_handle);
   void                          discard_handle(ocudu_ofh_compression_handle* failed_handle);
+  void                          run_async_handle_reclaimer();
 
   /// Consumes the one-shot failure injection hook used to exercise fresh-handle recovery.
   bool should_inject_gpu_failure();
@@ -145,6 +160,12 @@ private:
   static constexpr uint64_t failure_log_period = 1000;
   /// Initial attempt plus one bounded retry on a fresh CUDA handle.
   static constexpr unsigned max_direct_decompression_attempts = 2;
+  /// A pool of 64 covers a full 14-symbol receive burst over four ports, with headroom for independent grids. It is
+  /// bounded so exhaustion is reported instead of blocking a real-time path.
+  static constexpr unsigned max_nof_handles = 64U;
+  /// Polling runs outside the realtime receive executor. This period keeps reclamation comfortably inside the pool
+  /// headroom while avoiding continuous CUDA completion queries.
+  static constexpr std::chrono::microseconds async_handle_poll_period{50};
 
   compression_type                           type;
   ocudulog::basic_logger&                    logger;
@@ -155,8 +176,15 @@ private:
   std::unique_ptr<iq_decompressor>           fallback_decompressor;
   std::atomic<uint64_t>                      nof_acceleration_retries  = {0};
   std::atomic<uint64_t>                      nof_acceleration_failures = {0};
-  std::vector<ocudu_ofh_compression_handle*> handles;
+  std::vector<ocudu_ofh_compression_handle*> all_handles;
+  std::vector<ocudu_ofh_compression_handle*> available_handles;
+  std::vector<ocudu_ofh_compression_handle*> pending_handles;
+  unsigned                                   handle_capacity = max_nof_handles;
+  unsigned                                   nof_handles     = 0;
+  bool                                       shutting_down   = false;
   std::mutex                                 mutex;
+  std::condition_variable                    reclaimer_cv;
+  unique_thread                              reclaimer_thread;
 };
 
 } // namespace ofh

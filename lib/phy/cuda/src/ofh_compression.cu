@@ -4,29 +4,38 @@
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 #include "ofh_compression.h"
-#include <cuda_runtime.h>
+#include <atomic>
 #include <cstring>
+#include <cuda.h>
+#include <cuda_runtime.h>
 #include <stdint.h>
 #include <thread>
 
 struct ocudu_ofh_compression_handle {
     static constexpr unsigned HOST_INPUT_STAGING_SLOTS = 4U;
 
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream     = nullptr;
     cudaEvent_t  done_event = nullptr;
-    uint8_t*     d_in   = nullptr;
-    uint8_t*     d_out  = nullptr;
-    uint8_t*     h_out  = nullptr;
-    uint8_t*     h_in[HOST_INPUT_STAGING_SLOTS] = {};
-    cudaEvent_t  h_in_ready_events[HOST_INPUT_STAGING_SLOTS] = {};
-    bool         h_in_event_valid[HOST_INPUT_STAGING_SLOTS] = {};
-    size_t       in_cap                                    = 0;
-    size_t       out_cap                                   = 0;
-    size_t       h_out_cap                                 = 0;
-    size_t       h_in_cap[HOST_INPUT_STAGING_SLOTS] = {};
-    unsigned     h_in_slot                         = 0;
-    cudaError_t  last_error                        = cudaSuccess;
-    const char*  last_error_operation              = "none";
+    // Direct decompression writes this mapped flag after all preceding stream work. The host reclaimer can then
+    // observe completion without entering the CUDA driver.
+    uint32_t*         h_completion_flag = nullptr;
+    CUdeviceptr       d_completion_flag = 0;
+    std::atomic<bool> completion_flag_armed{false};
+    uint8_t*          d_in                                        = nullptr;
+    uint8_t*          d_out                                       = nullptr;
+    uint8_t*          h_out                                       = nullptr;
+    uint8_t*          h_direct_in                                 = nullptr;
+    uint8_t*          h_in[HOST_INPUT_STAGING_SLOTS]              = {};
+    cudaEvent_t       h_in_ready_events[HOST_INPUT_STAGING_SLOTS] = {};
+    bool              h_in_event_valid[HOST_INPUT_STAGING_SLOTS]  = {};
+    size_t            in_cap                                      = 0;
+    size_t            out_cap                                     = 0;
+    size_t            h_out_cap                                   = 0;
+    size_t            h_direct_in_cap                             = 0;
+    size_t            h_in_cap[HOST_INPUT_STAGING_SLOTS]          = {};
+    unsigned          h_in_slot                                   = 0;
+    cudaError_t       last_error                                  = cudaSuccess;
+    const char*       last_error_operation                        = "none";
 };
 
 namespace {
@@ -48,6 +57,22 @@ constexpr unsigned DECOMPRESS_12B_RE_PARALLEL_PRB_THRESHOLD = 1024U;
 // The generic RE-parallel decompressor (widths 8, 10, 14, 16) follows the BFP12 threshold.
 constexpr unsigned DECOMPRESS_RE_PARALLEL_PRB_THRESHOLD = 1024U;
 
+static cudaError_t create_realtime_stream(cudaStream_t* stream)
+{
+    int         least_priority    = 0;
+    int         greatest_priority = 0;
+    cudaError_t status            = cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
+    if (status == cudaSuccess) {
+        status = cudaStreamCreateWithPriority(stream, cudaStreamNonBlocking, greatest_priority);
+        if (status == cudaSuccess) {
+            return cudaSuccess;
+        }
+        (void)cudaGetLastError();
+    }
+
+    return cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking);
+}
+
 static void clear_last_error(ocudu_ofh_compression_handle_t* handle)
 {
     if (handle != nullptr) {
@@ -66,6 +91,84 @@ static bool record_cuda_status(ocudu_ofh_compression_handle_t* handle, cudaError
         handle->last_error_operation = operation;
     }
     return false;
+}
+
+static bool record_driver_status(ocudu_ofh_compression_handle_t* handle, CUresult status, const char* operation)
+{
+  if (status == CUDA_SUCCESS) {
+    return true;
+  }
+
+  cudaError_t runtime_status = cudaErrorUnknown;
+  if (status == CUDA_ERROR_INVALID_VALUE) {
+    runtime_status = cudaErrorInvalidValue;
+  } else if (status == CUDA_ERROR_NOT_SUPPORTED) {
+    runtime_status = cudaErrorNotSupported;
+  } else if (status == CUDA_ERROR_OUT_OF_MEMORY) {
+    runtime_status = cudaErrorMemoryAllocation;
+  }
+  return record_cuda_status(handle, runtime_status, operation);
+}
+
+static bool device_supports_stream_memory_operations()
+{
+  int device_ordinal = 0;
+  if (cudaGetDevice(&device_ordinal) != cudaSuccess) {
+    return false;
+  }
+
+  CUdevice device;
+  int      supported = 0;
+  // 64-bit stream memory operation support implies support for the 32-bit write used by the completion flag.
+  return (cuDeviceGet(&device, device_ordinal) == CUDA_SUCCESS) &&
+         (cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS, device) ==
+          CUDA_SUCCESS) &&
+         (supported != 0);
+}
+
+static bool create_completion_flag(ocudu_ofh_compression_handle_t* handle)
+{
+  // Keep cudaStreamQuery as the portable fallback on devices that do not implement stream memory operations.
+  if (!device_supports_stream_memory_operations()) {
+    return true;
+  }
+
+  void* device_flag = nullptr;
+  if (!record_cuda_status(handle,
+                          cudaHostAlloc(reinterpret_cast<void**>(&handle->h_completion_flag),
+                                        sizeof(*handle->h_completion_flag),
+                                        cudaHostAllocMapped),
+                          "allocate mapped compression completion flag") ||
+      !record_cuda_status(handle,
+                          cudaHostGetDevicePointer(&device_flag, handle->h_completion_flag, 0),
+                          "map compression completion flag")) {
+    return false;
+  }
+
+  handle->d_completion_flag = reinterpret_cast<CUdeviceptr>(device_flag);
+  __atomic_store_n(handle->h_completion_flag, 1U, __ATOMIC_RELEASE);
+  return true;
+}
+
+static void arm_async_completion(ocudu_ofh_compression_handle_t* handle)
+{
+  if (handle->h_completion_flag == nullptr) {
+    return;
+  }
+  __atomic_store_n(handle->h_completion_flag, 0U, __ATOMIC_RELEASE);
+  handle->completion_flag_armed.store(true, std::memory_order_release);
+}
+
+static bool enqueue_async_completion(ocudu_ofh_compression_handle_t* handle)
+{
+  if (handle->h_completion_flag == nullptr) {
+    return true;
+  }
+  return record_driver_status(
+      handle,
+      cuStreamWriteValue32(
+          reinterpret_cast<CUstream>(handle->stream), handle->d_completion_flag, 1U, CU_STREAM_WRITE_VALUE_DEFAULT),
+      "enqueue compression completion flag");
 }
 
 static bool use_9b_none_group_compressor(unsigned total_prbs)
@@ -328,7 +431,21 @@ static bool copy_transient_host_to_device(ocudu_ofh_compression_handle_t* handle
                                           const void*                     src,
                                           size_t                          bytes)
 {
-    return copy_host_to_device(handle, dst, src, bytes, true);
+  // A direct-decompression handle is not returned to its pool until the completion marker at the end of this stream
+  // is visible. One handle-owned staging buffer is therefore sufficient and is guaranteed to be idle when the handle
+  // is acquired again. Avoid recording and polling a CUDA event for every packet; those calls enter the context-wide
+  // event machinery even though stream completion already provides the required lifetime guarantee.
+  if (!ensure_host_capacity(handle,
+                            &handle->h_direct_in,
+                            &handle->h_direct_in_cap,
+                            bytes,
+                            "allocate pinned direct decompression input")) {
+    return false;
+  }
+  std::memcpy(handle->h_direct_in, src, bytes);
+  return record_cuda_status(handle,
+                            cudaMemcpyAsync(dst, handle->h_direct_in, bytes, cudaMemcpyHostToDevice, handle->stream),
+                            "copy direct decompression input to device");
 }
 
 __device__ __forceinline__ float bf16_to_float(uint16_t value)
@@ -3322,16 +3439,65 @@ extern "C" int ocudu_ofh_compression_create(ocudu_ofh_compression_handle_t** out
         return 0;
     }
     auto* handle = new ocudu_ofh_compression_handle();
-    if ((cudaStreamCreateWithFlags(&handle->stream, cudaStreamNonBlocking) != cudaSuccess) ||
-        (cudaEventCreateWithFlags(&handle->done_event, cudaEventDisableTiming) != cudaSuccess)) {
-        if (handle->stream != nullptr) {
-            cudaStreamDestroy(handle->stream);
-        }
-        delete handle;
-        return 0;
+    if ((create_realtime_stream(&handle->stream) != cudaSuccess) ||
+        (cudaEventCreateWithFlags(&handle->done_event, cudaEventDisableTiming) != cudaSuccess) ||
+        !create_completion_flag(handle)) {
+      if (handle->h_completion_flag != nullptr) {
+        cudaFreeHost(handle->h_completion_flag);
+      }
+      if (handle->done_event != nullptr) {
+        cudaEventDestroy(handle->done_event);
+      }
+      if (handle->stream != nullptr) {
+        cudaStreamDestroy(handle->stream);
+      }
+      delete handle;
+      return 0;
     }
     *out = handle;
     return 1;
+}
+
+extern "C" int
+ocudu_ofh_compression_reserve_host_buffer_compression(ocudu_ofh_compression_handle_t* handle,
+                                                      unsigned                        max_output_bytes)
+{
+    if ((handle == nullptr) || (max_output_bytes == 0U)) {
+        return 0;
+    }
+    clear_last_error(handle);
+    return ensure_capacity(handle,
+                           &handle->d_out,
+                           &handle->out_cap,
+                           max_output_bytes,
+                           "reserve device-grid compression output") &&
+           ensure_host_capacity(handle,
+                                &handle->h_out,
+                                &handle->h_out_cap,
+                                max_output_bytes,
+                                "reserve pinned device-grid compression output");
+}
+
+extern "C" int ocudu_ofh_compression_reserve_direct_decompression(ocudu_ofh_compression_handle_t* handle,
+                                                                  unsigned                        max_input_bytes,
+                                                                  unsigned                        max_output_bytes)
+{
+    if ((handle == nullptr) || (max_input_bytes == 0U) || (max_output_bytes == 0U)) {
+        return 0;
+    }
+    clear_last_error(handle);
+    if (!ensure_capacity(
+            handle, &handle->d_in, &handle->in_cap, max_input_bytes, "reserve direct decompression input") ||
+        !ensure_capacity(
+            handle, &handle->d_out, &handle->out_cap, max_output_bytes, "reserve direct decompression output")) {
+        return 0;
+    }
+
+    return ensure_host_capacity(handle,
+                                &handle->h_direct_in,
+                                &handle->h_direct_in_cap,
+                                max_input_bytes,
+                                "reserve pinned direct decompression input");
 }
 
 extern "C" void ocudu_ofh_compression_destroy(ocudu_ofh_compression_handle_t* handle)
@@ -3345,6 +3511,9 @@ extern "C" void ocudu_ofh_compression_destroy(ocudu_ofh_compression_handle_t* ha
     if (handle->done_event != nullptr) {
         cudaEventDestroy(handle->done_event);
     }
+    if (handle->h_completion_flag != nullptr) {
+      cudaFreeHost(handle->h_completion_flag);
+    }
     if (handle->d_in != nullptr) {
         cudaFree(handle->d_in);
     }
@@ -3353,6 +3522,9 @@ extern "C" void ocudu_ofh_compression_destroy(ocudu_ofh_compression_handle_t* ha
     }
     if (handle->h_out != nullptr) {
         cudaFreeHost(handle->h_out);
+    }
+    if (handle->h_direct_in != nullptr) {
+      cudaFreeHost(handle->h_direct_in);
     }
     for (unsigned slot = 0; slot != ocudu_ofh_compression_handle::HOST_INPUT_STAGING_SLOTS; ++slot) {
         if (handle->h_in_ready_events[slot] != nullptr) {
@@ -3371,6 +3543,31 @@ extern "C" void ocudu_ofh_compression_destroy(ocudu_ofh_compression_handle_t* ha
 extern "C" void* ocudu_ofh_compression_get_stream(ocudu_ofh_compression_handle_t* handle)
 {
     return (handle == nullptr) ? nullptr : static_cast<void*>(handle->stream);
+}
+
+extern "C" int ocudu_ofh_compression_query_completion(ocudu_ofh_compression_handle_t* handle)
+{
+    if (handle == nullptr) {
+        return -1;
+    }
+
+    if ((handle->h_completion_flag != nullptr) && handle->completion_flag_armed.load(std::memory_order_acquire)) {
+      if (__atomic_load_n(handle->h_completion_flag, __ATOMIC_ACQUIRE) == 0U) {
+        return 0;
+      }
+      handle->completion_flag_armed.store(false, std::memory_order_release);
+      return 1;
+    }
+
+    cudaError_t status = cudaStreamQuery(handle->stream);
+    if (status == cudaSuccess) {
+        return 1;
+    }
+    if (status == cudaErrorNotReady) {
+        return 0;
+    }
+    record_cuda_status(handle, status, "query compression stream completion");
+    return -1;
 }
 
 extern "C" int ocudu_ofh_compression_get_last_error(const ocudu_ofh_compression_handle_t* handle,
@@ -3598,6 +3795,7 @@ extern "C" int ocudu_ofh_decompress_to_device_grid_async(ocudu_ofh_compression_h
         return 0;
     }
 
+    arm_async_completion(handle);
     if (!copy_transient_host_to_device(handle, handle->d_in, input_bytes, in_bytes)) {
         return 0;
     }
@@ -3616,7 +3814,7 @@ extern "C" int ocudu_ofh_decompress_to_device_grid_async(ocudu_ofh_compression_h
     if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
-    return 1;
+    return enqueue_async_completion(handle);
 }
 
 extern "C" int ocudu_ofh_decompress_to_device_prach_buffer_async(ocudu_ofh_compression_handle_t* handle,
@@ -3650,6 +3848,7 @@ extern "C" int ocudu_ofh_decompress_to_device_prach_buffer_async(ocudu_ofh_compr
         return 0;
     }
 
+    arm_async_completion(handle);
     if (!copy_transient_host_to_device(handle, handle->d_in, input_bytes, in_bytes)) {
         return 0;
     }
@@ -3668,7 +3867,7 @@ extern "C" int ocudu_ofh_decompress_to_device_prach_buffer_async(ocudu_ofh_compr
     if (!record_cuda_status(handle, cudaGetLastError(), "launch O-FH compression backend kernel")) {
         return 0;
     }
-    return 1;
+    return enqueue_async_completion(handle);
 }
 
 extern "C" int ocudu_ofh_compress_device_grid_ports(ocudu_ofh_compression_handle_t* handle,

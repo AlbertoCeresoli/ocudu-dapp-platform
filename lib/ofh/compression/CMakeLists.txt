@@ -39,5 +39,5 @@ target_link_libraries(ocudu_ofh_compression ocuduvec)
 
 if (CUDA_ACCEL_FOUND)
     target_compile_definitions(ocudu_ofh_compression PUBLIC ENABLE_CUDA)
-    target_link_libraries(ocudu_ofh_compression ${CUDA_ACCEL_LIBRARIES})
+    target_link_libraries(ocudu_ofh_compression ocudu_support ${CUDA_ACCEL_LIBRARIES})
 endif()
