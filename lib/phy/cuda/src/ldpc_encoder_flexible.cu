@@ -556,6 +556,26 @@ struct FlexibleLdpcEncoder {
     // queues replacements behind that consumer so a resident encoder can change
     // lifting shape without overwriting tables still used by an in-flight kernel.
     cudaStream_t last_encode_stream;
+
+    // Pinned staging for the scaled shift table, plus an event marking when the
+    // upload has consumed it.
+    //
+    // The shifts are recomputed per reconfiguration, so they need a host buffer.
+    // That buffer cannot live on the stack: the upload is asynchronous, and on a
+    // platform where the GPU walks the host page tables directly
+    // (cudaDevAttrPageableMemoryAccessUsesHostPageTables, true on GB10/GH200) an
+    // async copy from pageable memory is not staged through a driver bounce
+    // buffer -- the DMA reads the caller's pages after the call returns. A stack
+    // array is gone by then, and the resulting read of a dead frame surfaces as
+    // an Xid 13 "Out Of Range Address" far from this code, because CUDA errors
+    // are sticky and whatever touches the context next reports it.
+    //
+    // Pinned memory also keeps the copy off the driver's staging path entirely,
+    // and the event lets the next reconfiguration know when the buffer is free
+    // to rewrite instead of assuming it is.
+    int16_t*    h_shifts_staging;
+    cudaEvent_t tables_uploaded;
+    bool        tables_upload_pending;
 };
 
 // ============================================================================
@@ -2475,6 +2495,21 @@ nr_ldpc_status_t ldpc_encoder_create(ldpc_encoder_handle_t* handle) {
 
     memset(enc, 0, sizeof(*enc));
 
+    // Pinned staging for the shift table and the event that guards its reuse.
+    // Allocated once at create so the real-time path never allocates, and pinned
+    // so the upload is a genuine DMA rather than a driver bounce copy.
+    if (cudaHostAlloc(reinterpret_cast<void**>(&enc->h_shifts_staging),
+                      BG1_NNZ * sizeof(int16_t),
+                      cudaHostAllocDefault) != cudaSuccess) {
+        enc->h_shifts_staging = nullptr;
+        delete enc;
+        return NR_LDPC_ERROR_ALLOC_FAILED;
+    }
+    if (cudaEventCreateWithFlags(&enc->tables_uploaded, cudaEventDisableTiming) != cudaSuccess) {
+        enc->tables_uploaded = nullptr;
+    }
+    enc->tables_upload_pending = false;
+
     // Initialize cache to "not cached" state
     enc->cached_base_graph = -1;
     enc->cached_lifting_set_idx = -1;
@@ -2603,8 +2638,18 @@ nr_ldpc_status_t ldpc_encoder_configure(ldpc_encoder_handle_t handle, const nr_l
         CHECK_NVFAILURE_LDPC(cudaMemcpy(enc->d_col_idx, col_idx, enc->nnz * sizeof(int8_t), cudaMemcpyHostToDevice));
     }
 
-    int16_t scaled_shifts[BG1_NNZ];
-    int     Z_ref = get_Z_ref(lifting_set_idx);
+    // Wait for the previous upload to have consumed the staging buffer before
+    // overwriting it. Without this the host would race its own in-flight DMA.
+    if (enc->tables_upload_pending && (enc->tables_uploaded != nullptr)) {
+        CHECK_NVFAILURE_LDPC(cudaEventSynchronize(enc->tables_uploaded));
+        enc->tables_upload_pending = false;
+    }
+
+    int16_t* scaled_shifts = enc->h_shifts_staging;
+    if (scaled_shifts == nullptr) {
+        return NR_LDPC_ERROR_ALLOC_FAILED;
+    }
+    int Z_ref = get_Z_ref(lifting_set_idx);
     for (int i = 0; i < enc->nnz; i++) {
         scaled_shifts[i] = compute_shift(shifts_ref[i], enc->Z, Z_ref);
     }
@@ -2615,6 +2660,16 @@ nr_ldpc_status_t ldpc_encoder_configure(ldpc_encoder_handle_t handle, const nr_l
                                              enc->nnz * sizeof(int16_t),
                                              cudaMemcpyHostToDevice,
                                              enc->last_encode_stream));
+        // Mark when the staging buffer has been consumed, so the next
+        // reconfiguration can tell whether it is safe to rewrite it.
+        if (enc->tables_uploaded != nullptr) {
+            CHECK_NVFAILURE_LDPC(cudaEventRecord(enc->tables_uploaded, enc->last_encode_stream));
+            enc->tables_upload_pending = true;
+        } else {
+            // No event to track the copy: fall back to making it observable now
+            // rather than leaving the staging buffer unguarded.
+            CHECK_NVFAILURE_LDPC(cudaStreamSynchronize(enc->last_encode_stream));
+        }
     } else {
         CHECK_NVFAILURE_LDPC(
             cudaMemcpy(enc->d_shifts, scaled_shifts, enc->nnz * sizeof(int16_t), cudaMemcpyHostToDevice));
@@ -3880,6 +3935,12 @@ nr_ldpc_status_t ldpc_encoder_encode_batch(
 void ldpc_encoder_destroy(ldpc_encoder_handle_t handle) {
     FlexibleLdpcEncoder* enc = reinterpret_cast<FlexibleLdpcEncoder*>(handle);
     if (enc) {
+        // Drain any upload still reading the staging buffer before releasing it.
+        if (enc->tables_upload_pending && (enc->tables_uploaded != nullptr)) {
+            (void)cudaEventSynchronize(enc->tables_uploaded);
+        }
+        if (enc->tables_uploaded) cudaEventDestroy(enc->tables_uploaded);
+        if (enc->h_shifts_staging) cudaFreeHost(enc->h_shifts_staging);
         if (enc->d_row_ptr) cudaFree(enc->d_row_ptr);
         if (enc->d_col_idx) cudaFree(enc->d_col_idx);
         if (enc->d_shifts) cudaFree(enc->d_shifts);
