@@ -6,6 +6,7 @@
 #include "ocudu/ocudulog/logger.h"
 #include "ocudu/ofh/compression/iq_compressor.h"
 #include "ocudu/ofh/compression/iq_decompressor.h"
+#include <cstddef>
 #include <memory>
 
 namespace ocudu {
@@ -23,10 +24,13 @@ struct iq_compressor_preallocation_config {
 
 /// Bounds used to reserve implementation workspaces before real-time decompression starts.
 ///
-/// A default-constructed value preserves the implementation default. Callers that provide bounds must set both fields.
+/// A default-constructed value preserves the implementation default. Callers that provide shape bounds must set both
+/// shape fields. They may also reserve additional concurrent operations to absorb the bounded receive window while
+/// earlier device work remains stream-ordered.
 struct iq_decompressor_preallocation_config {
-  unsigned max_nof_ports   = 0;
-  unsigned max_nof_symbols = 0;
+  unsigned max_nof_ports                 = 0;
+  unsigned max_nof_symbols               = 0;
+  size_t   max_nof_concurrent_operations = 0;
 };
 
 /// \brief Creates and returns an IQ data compressor.

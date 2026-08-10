@@ -25,6 +25,7 @@ struct ocudu_ofh_compression_handle {
     uint8_t*          d_out                                       = nullptr;
     uint8_t*          h_out                                       = nullptr;
     uint8_t*          h_direct_in                                 = nullptr;
+    uint8_t*          d_direct_in_mapped                          = nullptr;
     uint8_t*          h_in[HOST_INPUT_STAGING_SLOTS]              = {};
     cudaEvent_t       h_in_ready_events[HOST_INPUT_STAGING_SLOTS] = {};
     bool              h_in_event_valid[HOST_INPUT_STAGING_SLOTS]  = {};
@@ -34,6 +35,7 @@ struct ocudu_ofh_compression_handle {
     size_t            h_direct_in_cap                             = 0;
     size_t            h_in_cap[HOST_INPUT_STAGING_SLOTS]          = {};
     unsigned          h_in_slot                                   = 0;
+    bool              use_mapped_direct_input                     = false;
     cudaError_t       last_error                                  = cudaSuccess;
     const char*       last_error_operation                        = "none";
 };
@@ -124,6 +126,21 @@ static bool device_supports_stream_memory_operations()
          (cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS, device) ==
           CUDA_SUCCESS) &&
          (supported != 0);
+}
+
+static bool device_supports_coherent_mapped_input()
+{
+  int device_ordinal       = 0;
+  int integrated           = 0;
+  int can_map_host         = 0;
+  int uses_host_page_table = 0;
+  return (cudaGetDevice(&device_ordinal) == cudaSuccess) &&
+         (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device_ordinal) == cudaSuccess) &&
+         (cudaDeviceGetAttribute(&can_map_host, cudaDevAttrCanMapHostMemory, device_ordinal) == cudaSuccess) &&
+         (cudaDeviceGetAttribute(&uses_host_page_table,
+                                 cudaDevAttrPageableMemoryAccessUsesHostPageTables,
+                                 device_ordinal) == cudaSuccess) &&
+         ((integrated != 0) || (uses_host_page_table != 0)) && (can_map_host != 0);
 }
 
 static bool create_completion_flag(ocudu_ofh_compression_handle_t* handle)
@@ -284,6 +301,42 @@ static bool ensure_host_capacity(ocudu_ofh_compression_handle_t* handle,
     return true;
 }
 
+static bool ensure_mapped_host_capacity(ocudu_ofh_compression_handle_t* handle,
+                                        uint8_t**                       host_ptr,
+                                        uint8_t**                       device_ptr,
+                                        size_t*                         capacity,
+                                        size_t                          required,
+                                        const char*                     operation)
+{
+  if ((*capacity >= required) && (*host_ptr != nullptr) && (*device_ptr != nullptr)) {
+    return true;
+  }
+  if (*host_ptr != nullptr) {
+    if (!record_cuda_status(handle, cudaFreeHost(*host_ptr), operation)) {
+      return false;
+    }
+    *host_ptr   = nullptr;
+    *device_ptr = nullptr;
+    *capacity   = 0;
+  }
+  if (required == 0) {
+    return true;
+  }
+  if (!record_cuda_status(
+          handle, cudaHostAlloc(reinterpret_cast<void**>(host_ptr), required, cudaHostAllocMapped), operation) ||
+      !record_cuda_status(
+          handle, cudaHostGetDevicePointer(reinterpret_cast<void**>(device_ptr), *host_ptr, 0), operation)) {
+    if (*host_ptr != nullptr) {
+      cudaFreeHost(*host_ptr);
+      *host_ptr = nullptr;
+    }
+    *device_ptr = nullptr;
+    return false;
+  }
+  *capacity = required;
+  return true;
+}
+
 static bool use_pinned_host_output_transfer(int compression_type, unsigned data_width)
 {
     return (compression_type == OCUDU_OFH_COMPRESSION_TYPE_BFP) &&
@@ -422,10 +475,28 @@ static bool copy_host_to_device(ocudu_ofh_compression_handle_t* handle,
     return true;
 }
 
+__global__ void copy_mapped_input_to_device(uint8_t* dst, const uint8_t* src, size_t bytes)
+{
+  for (size_t index = blockIdx.x * blockDim.x + threadIdx.x; index < bytes; index += blockDim.x * gridDim.x) {
+    dst[index] = src[index];
+  }
+}
+
+static bool warm_mapped_input_copy(ocudu_ofh_compression_handle_t* handle)
+{
+  handle->h_direct_in[0] = 0;
+  copy_mapped_input_to_device<<<1, 1, 0, handle->stream>>>(handle->d_in, handle->d_direct_in_mapped, 1U);
+  return record_cuda_status(handle, cudaGetLastError(), "launch mapped direct decompression input warm-up") &&
+         record_cuda_status(
+             handle, cudaStreamSynchronize(handle->stream), "synchronize mapped direct decompression input warm-up");
+}
+
 // Direct-to-device decompression returns before the stream consumes its input. The caller's packet span is transient
 // and may be recycled as soon as the API returns, so it must always be snapshotted into handle-owned pinned storage.
-// In particular, a pageable cudaMemcpyAsync is genuinely asynchronous on coherent CPU/GPU systems such as GH200 and
-// can otherwise read a later packet after the receive buffer has been reused.
+// Integrated CUDA devices read mapped ingress staging coherently. Enqueue a CUDA copy kernel there instead of
+// cudaMemcpyAsync: on GH200, concurrent small pinned H2D submissions can enter a context-wide driver wait for several
+// milliseconds. The stream still copies the compressed bytes into preallocated device memory before decompression;
+// no host codec or host IQ path is involved.
 static bool copy_transient_host_to_device(ocudu_ofh_compression_handle_t* handle,
                                           uint8_t*                        dst,
                                           const void*                     src,
@@ -435,6 +506,23 @@ static bool copy_transient_host_to_device(ocudu_ofh_compression_handle_t* handle
   // is visible. One handle-owned staging buffer is therefore sufficient and is guaranteed to be idle when the handle
   // is acquired again. Avoid recording and polling a CUDA event for every packet; those calls enter the context-wide
   // event machinery even though stream completion already provides the required lifetime guarantee.
+  if (handle->use_mapped_direct_input) {
+    if (!ensure_mapped_host_capacity(handle,
+                                     &handle->h_direct_in,
+                                     &handle->d_direct_in_mapped,
+                                     &handle->h_direct_in_cap,
+                                     bytes,
+                                     "allocate mapped direct decompression input")) {
+      return false;
+    }
+    std::memcpy(handle->h_direct_in, src, bytes);
+    constexpr unsigned threads_per_block = 256U;
+    unsigned           nof_blocks        = static_cast<unsigned>((bytes + threads_per_block - 1U) / threads_per_block);
+    copy_mapped_input_to_device<<<nof_blocks, threads_per_block, 0, handle->stream>>>(
+        dst, handle->d_direct_in_mapped, bytes);
+    return record_cuda_status(handle, cudaGetLastError(), "launch direct decompression input copy");
+  }
+
   if (!ensure_host_capacity(handle,
                             &handle->h_direct_in,
                             &handle->h_direct_in_cap,
@@ -3439,6 +3527,7 @@ extern "C" int ocudu_ofh_compression_create(ocudu_ofh_compression_handle_t** out
         return 0;
     }
     auto* handle = new ocudu_ofh_compression_handle();
+    handle->use_mapped_direct_input = device_supports_coherent_mapped_input();
     if ((create_realtime_stream(&handle->stream) != cudaSuccess) ||
         (cudaEventCreateWithFlags(&handle->done_event, cudaEventDisableTiming) != cudaSuccess) ||
         !create_completion_flag(handle)) {
@@ -3493,6 +3582,15 @@ extern "C" int ocudu_ofh_compression_reserve_direct_decompression(ocudu_ofh_comp
         return 0;
     }
 
+    if (handle->use_mapped_direct_input) {
+      return ensure_mapped_host_capacity(handle,
+                                         &handle->h_direct_in,
+                                         &handle->d_direct_in_mapped,
+                                         &handle->h_direct_in_cap,
+                                         max_input_bytes,
+                                         "reserve mapped direct decompression input") &&
+             warm_mapped_input_copy(handle);
+    }
     return ensure_host_capacity(handle,
                                 &handle->h_direct_in,
                                 &handle->h_direct_in_cap,

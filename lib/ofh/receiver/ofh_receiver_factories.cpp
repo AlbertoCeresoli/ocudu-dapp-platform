@@ -11,6 +11,7 @@
 #include "ocudu/ofh/ecpri/ecpri_factories.h"
 #include "ocudu/ofh/ethernet/ethernet_factories.h"
 #include "ocudu/ofh/serdes/ofh_serdes_factories.h"
+#include <algorithm>
 
 using namespace ocudu;
 using namespace ofh;
@@ -20,6 +21,17 @@ static std::unique_ptr<uplane_message_decoder> create_uplane_decoder(const recei
                                                                      const ru_compression_params& compr_params,
                                                                      unsigned                     max_nof_ports)
 {
+  const unsigned nof_symbols_per_slot = get_nsymb_per_slot(receiver_cfg.cp);
+  // Direct CUDA writes remain ordered behind earlier users of the destination grid. Reserve enough handles for one
+  // complete slot or every symbol in the accepted receive window, whichever is larger, so a bounded late burst cannot
+  // force a host codec or a realtime CUDA allocation while those streams drain.
+  const unsigned receive_window_symbols =
+      (receiver_cfg.rx_timing_params.sym_end >= receiver_cfg.rx_timing_params.sym_start)
+          ? receiver_cfg.rx_timing_params.sym_end - receiver_cfg.rx_timing_params.sym_start + 1U
+          : nof_symbols_per_slot;
+  const size_t max_nof_concurrent_operations =
+      static_cast<size_t>(max_nof_ports) * std::max(nof_symbols_per_slot, receive_window_symbols);
+
   // Compressors.
   std::array<std::unique_ptr<iq_decompressor>, NOF_COMPRESSION_TYPES_SUPPORTED> decompr;
   for (unsigned i = 0; i != NOF_COMPRESSION_TYPES_SUPPORTED; ++i) {
@@ -27,8 +39,9 @@ static std::unique_ptr<uplane_message_decoder> create_uplane_decoder(const recei
         static_cast<compression_type>(i),
         logger,
         receiver_cfg.compression_acceleration_mode,
-        iq_decompressor_preallocation_config{.max_nof_ports   = max_nof_ports,
-                                             .max_nof_symbols = get_nsymb_per_slot(receiver_cfg.cp)});
+        iq_decompressor_preallocation_config{.max_nof_ports                 = max_nof_ports,
+                                             .max_nof_symbols               = nof_symbols_per_slot,
+                                             .max_nof_concurrent_operations = max_nof_concurrent_operations});
   }
 
   frequency_range freq_range =

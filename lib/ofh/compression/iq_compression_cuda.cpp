@@ -219,6 +219,20 @@ ocudu_ofh_compression_handle* iq_compression_cuda::acquire_handle()
       ++nof_handles;
       create_handle = true;
     }
+
+    // The asynchronous reclaimer is deliberately kept off the real-time receive executor, but it can be delayed by
+    // host scheduling. On pool exhaustion, inspect the stream-ordered completion flags here before rejecting the
+    // packet. This is a bounded, nonblocking query and avoids dropping GPU-resident work merely because a completed
+    // handle has not yet been moved back to the available list.
+    if ((acquired_handle == nullptr) && !create_handle) {
+      auto completed = std::find_if(pending_handles.begin(), pending_handles.end(), [](auto* handle) {
+        return ocudu_ofh_compression_query_completion(handle) > 0;
+      });
+      if (completed != pending_handles.end()) {
+        acquired_handle = *completed;
+        pending_handles.erase(completed);
+      }
+    }
   }
 
   if (acquired_handle != nullptr) {

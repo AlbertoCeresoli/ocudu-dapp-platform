@@ -216,15 +216,23 @@ std::unique_ptr<iq_decompressor> ocudu::ofh::create_iq_decompressor(compression_
   const bool preallocation_complete = (preallocation.max_nof_ports != 0U) && (preallocation.max_nof_symbols != 0U);
   report_fatal_error_if_not(preallocation_disabled || preallocation_complete,
                             "IQ decompression preallocation requires nonzero port and symbol bounds.");
+  report_fatal_error_if_not(preallocation_complete || (preallocation.max_nof_concurrent_operations == 0U),
+                            "IQ decompression concurrency requires port and symbol bounds.");
   report_fatal_error_if_not(preallocation_disabled || (preallocation.max_nof_ports <= MAX_PORTS),
                             "IQ decompression preallocation port count exceeds the supported maximum.");
   report_fatal_error_if_not(preallocation_disabled || (preallocation.max_nof_symbols <= MAX_NSYMB_PER_SLOT),
                             "IQ decompression preallocation symbol count exceeds the supported maximum.");
 
 #ifdef ENABLE_CUDA
-  const size_t direct_decompression_concurrency =
+  const size_t receive_shape_concurrency =
       preallocation_complete ? static_cast<size_t>(preallocation.max_nof_ports) * preallocation.max_nof_symbols
                              : static_cast<size_t>(MAX_PORTS) * MAX_NSYMB_PER_SLOT;
+  report_fatal_error_if_not((preallocation.max_nof_concurrent_operations == 0U) ||
+                                (preallocation.max_nof_concurrent_operations >= receive_shape_concurrency),
+                            "IQ decompression concurrency is smaller than the configured receive shape.");
+  const size_t direct_decompression_concurrency = (preallocation.max_nof_concurrent_operations != 0U)
+                                                      ? preallocation.max_nof_concurrent_operations
+                                                      : receive_shape_concurrency;
 #endif
 
   switch (type) {

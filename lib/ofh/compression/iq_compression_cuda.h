@@ -160,8 +160,8 @@ private:
   static constexpr uint64_t failure_log_period = 1000;
   /// Initial attempt plus one bounded retry on a fresh CUDA handle.
   static constexpr unsigned max_direct_decompression_attempts = 2;
-  /// A pool of 64 covers a full 14-symbol receive burst over four ports, with headroom for independent grids. It is
-  /// bounded so exhaustion is reported instead of blocking a real-time path.
+  /// A pool of 64 covers a full 14-symbol receive burst over four ports or several queued slots for a smaller port
+  /// count. It is bounded so exhaustion is reported instead of blocking a real-time path.
   static constexpr unsigned max_nof_handles = 64U;
   /// Polling runs outside the realtime receive executor. This period keeps reclamation comfortably inside the pool
   /// headroom while avoiding continuous CUDA completion queries.
