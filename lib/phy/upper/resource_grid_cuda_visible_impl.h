@@ -81,6 +81,7 @@ public:
     // Bind to the configured device so backing allocations and events land on the right GPU.
     (void)cudaSetDevice(device_id);
 
+    host_reads_device_memory_directly = host_direct_managed_access(device_id);
     const bool supports_concurrent_access = supports_concurrent_managed_access(device_id);
     concurrent_downlink_writes = enable_concurrent_downlink_writes && !prefetch_enabled && supports_concurrent_access;
     // Keep pages on the GPU when the CPU can access device-resident managed memory directly. This prevents host work
@@ -225,7 +226,12 @@ private:
                    unsigned                                   k_init,
                    const bounded_bitset<MAX_NOF_SUBCARRIERS>& mask) const override
     {
-      report_fatal_error_if_not(parent.prepare_host_access(), "Failed to synchronize CUDA-visible resource grid.");
+      report_fatal_error_if_not(parent.prepare_host_access(),
+                                "Failed to synchronize CUDA-visible resource grid: {} failed: {} ({}). CUDA errors are "
+                                "sticky per context, so the faulting kernel is probably an earlier one on any stream "
+                                "-- check dmesg for an Xid.",
+                                parent.host_access_failure_stage(), parent.host_access_failure_name(),
+                                parent.host_access_failure_text());
       return resource_grid_reader_impl::get(symbols, port, l, k_init, mask);
     }
 
@@ -235,25 +241,45 @@ private:
                       unsigned                                   k_init,
                       const bounded_bitset<MAX_NOF_SUBCARRIERS>& mask) const override
     {
-      report_fatal_error_if_not(parent.prepare_host_access(), "Failed to synchronize CUDA-visible resource grid.");
+      report_fatal_error_if_not(parent.prepare_host_access(),
+                                "Failed to synchronize CUDA-visible resource grid: {} failed: {} ({}). CUDA errors are "
+                                "sticky per context, so the faulting kernel is probably an earlier one on any stream "
+                                "-- check dmesg for an Xid.",
+                                parent.host_access_failure_stage(), parent.host_access_failure_name(),
+                                parent.host_access_failure_text());
       return resource_grid_reader_impl::get(symbols, port, l, k_init, mask);
     }
 
     void get(span<cf_t> symbols, unsigned port, unsigned l, unsigned k_init, unsigned stride = 1) const override
     {
-      report_fatal_error_if_not(parent.prepare_host_access(), "Failed to synchronize CUDA-visible resource grid.");
+      report_fatal_error_if_not(parent.prepare_host_access(),
+                                "Failed to synchronize CUDA-visible resource grid: {} failed: {} ({}). CUDA errors are "
+                                "sticky per context, so the faulting kernel is probably an earlier one on any stream "
+                                "-- check dmesg for an Xid.",
+                                parent.host_access_failure_stage(), parent.host_access_failure_name(),
+                                parent.host_access_failure_text());
       resource_grid_reader_impl::get(symbols, port, l, k_init, stride);
     }
 
     void get(span<cbf16_t> symbols, unsigned port, unsigned l, unsigned k_init) const override
     {
-      report_fatal_error_if_not(parent.prepare_host_access(), "Failed to synchronize CUDA-visible resource grid.");
+      report_fatal_error_if_not(parent.prepare_host_access(),
+                                "Failed to synchronize CUDA-visible resource grid: {} failed: {} ({}). CUDA errors are "
+                                "sticky per context, so the faulting kernel is probably an earlier one on any stream "
+                                "-- check dmesg for an Xid.",
+                                parent.host_access_failure_stage(), parent.host_access_failure_name(),
+                                parent.host_access_failure_text());
       resource_grid_reader_impl::get(symbols, port, l, k_init);
     }
 
     span<const cbf16_t> get_view(unsigned port, unsigned l) const override
     {
-      report_fatal_error_if_not(parent.prepare_host_access(), "Failed to synchronize CUDA-visible resource grid.");
+      report_fatal_error_if_not(parent.prepare_host_access(),
+                                "Failed to synchronize CUDA-visible resource grid: {} failed: {} ({}). CUDA errors are "
+                                "sticky per context, so the faulting kernel is probably an earlier one on any stream "
+                                "-- check dmesg for an Xid.",
+                                parent.host_access_failure_stage(), parent.host_access_failure_name(),
+                                parent.host_access_failure_text());
       return resource_grid_reader_impl::get_view(port, l);
     }
 
@@ -420,6 +446,7 @@ private:
     if (!prefetch_managed_memory(device_location(), stream)) {
       return false;
     }
+    pages_device_resident           = true;
     device_mapping_active           = true;
     device_mapping_replaces_pending = true;
     return true;
@@ -443,7 +470,11 @@ private:
     if (!wait_for_device_mapping_locked(stream)) {
       return false;
     }
-    return prefetch_managed_memory(device_location(), stream);
+    if (!prefetch_managed_memory(device_location(), stream)) {
+      return false;
+    }
+    pages_device_resident = true;
+    return true;
   }
 
   bool synchronize_device_mapping() { return prepare_host_access(); }
@@ -462,25 +493,69 @@ private:
     return prepare_host_access();
   }
 
+  /// Synchronise the grid for host reads.
+  ///
+  /// The failure here is almost never local. CUDA errors are sticky per context,
+  /// so once any kernel anywhere in the process faults -- an out-of-range address
+  /// in an unrelated stage, on an unrelated stream -- every subsequent CUDA call
+  /// returns that error, and this function is usually just the first one to look.
+  /// Returning a bare false made the resulting abort say only "failed to
+  /// synchronize", which is why four of these went unexplained: the one fact that
+  /// identifies the real fault was discarded at the point of detection.
+  ///
+  /// last_host_access_error carries it out to the fatal site instead. Only the
+  /// first is kept, since every call after the first sticky failure reports the
+  /// same code and the earliest is the closest to the cause.
   bool prepare_host_access() const
   {
     std::unique_lock<std::mutex> lock(grid_ready_mutex);
     wait_for_active_device_mapping_locked(lock);
     if (!grid_ready_recorded || pending_grid_ready_events.empty()) {
+      // No producer is outstanding, but "nothing is writing" is not the same as
+      // "the CPU may read this". If the pages were prefetched to the device they
+      // have to come back first on any part that cannot serve host reads from
+      // device-resident managed memory.
+      if (pages_device_resident && !host_reads_device_memory_directly) {
+        if (!prefetch_managed_memory(host_location(), nullptr)) {
+          record_host_access_error(cudaPeekAtLastError(), "prefetch of managed grid to host");
+          return false;
+        }
+        pages_device_resident = false;
+      }
       return true;
     }
     for (void* event : pending_grid_ready_events) {
-      if (cuda_event_synchronize_yielding(static_cast<cudaEvent_t>(event)) != cudaSuccess) {
+      const cudaError_t status = cuda_event_synchronize_yielding(static_cast<cudaEvent_t>(event));
+      if (status != cudaSuccess) {
+        record_host_access_error(status, "cudaEventQuery on grid-ready event");
         return false;
       }
     }
     if (!prefetch_managed_memory(host_location(), nullptr)) {
+      record_host_access_error(cudaPeekAtLastError(), "prefetch of managed grid to host");
       return false;
     }
     pending_grid_ready_events.clear();
-    grid_ready_recorded = false;
+    grid_ready_recorded   = false;
+    pages_device_resident = false;
     return true;
   }
+
+  void record_host_access_error(cudaError_t status, const char* what) const
+  {
+    if (host_access_error == cudaSuccess) {
+      host_access_error = status;
+      host_access_stage = what;
+    }
+  }
+
+  /// What failed, and the CUDA error behind it. Never null.
+  const char* host_access_failure_stage() const
+  {
+    return host_access_stage != nullptr ? host_access_stage : "unknown stage";
+  }
+  const char* host_access_failure_name() const { return cudaGetErrorName(host_access_error); }
+  const char* host_access_failure_text() const { return cudaGetErrorString(host_access_error); }
 
   void* get_next_grid_ready_event() const
   {
@@ -536,6 +611,26 @@ private:
     return true;
   }
 
+  mutable cudaError_t host_access_error{cudaSuccess};
+  mutable const char* host_access_stage{nullptr};
+
+  /// True when the managed pages were last prefetched to the device.
+  ///
+  /// Residency is what decides whether the CPU may touch these pages, but only
+  /// the producer *fences* were ever recorded. Those answer "is the GPU still
+  /// writing", not "where do the pages live", and the two come apart as soon as
+  /// a device prefetch happens with no fence outstanding.
+  mutable bool pages_device_resident{false};
+
+  /// Whether this device lets the CPU read device-resident managed pages.
+  ///
+  /// cudaDevAttrDirectManagedMemAccessFromHost is 1 on GH200, where a host read
+  /// of device-resident managed memory is coherent and migrating back is pure
+  /// overhead. It is 0 on GB10 and on discrete GPUs, where that same read is not
+  /// supported and the pages have to come home first. Querying it keeps one code
+  /// path correct on all three instead of assuming the GH200 answer.
+  bool host_reads_device_memory_directly{false};
+
   static cudaError_t cuda_event_synchronize_yielding(cudaEvent_t event)
   {
     cudaError_t status;
@@ -559,6 +654,14 @@ private:
     }
 
     return cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking);
+  }
+
+  static bool host_direct_managed_access(int device)
+  {
+    int direct_host_access = 0;
+    return (cudaDeviceGetAttribute(&direct_host_access, cudaDevAttrDirectManagedMemAccessFromHost, device) ==
+            cudaSuccess) &&
+           (direct_host_access != 0);
   }
 
   static bool supports_concurrent_managed_access(int device)

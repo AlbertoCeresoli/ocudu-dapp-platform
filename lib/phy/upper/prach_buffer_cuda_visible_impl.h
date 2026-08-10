@@ -270,12 +270,37 @@ private:
       return false;
     }
 
-    // The waits above transfer ownership of all recorded producer fences to the consumer stream. A PRACH buffer is
-    // not returned to its pool until that consumer has completed, so the bounded event pool can be reused by the next
-    // fill cycle. Keeping these events pending forever makes every detection wait on its entire history and allocates
-    // one new CUDA event per received section in device-only pipelines.
+    // Collapse the producer fences into a single consumer-completion fence.
+    //
+    // The waits above ordered *this* stream behind every producer, so carrying the
+    // whole list forward is wasteful: each later detection would wait on the entire
+    // history, and device-only pipelines would grow one CUDA event per received
+    // section. Releasing them back to the bounded pool is the right idea.
+    //
+    // Dropping the record entirely is not. pending_buffer_ready_events is the only
+    // evidence that this buffer still has work outstanding, and a stream wait orders
+    // one stream -- not the host, and not a second consumer. With the list empty,
+    // prepare_host_access() takes its early-out and skips both the wait and, more
+    // importantly, prefetch_managed_memory(host_location()): the call that migrates
+    // the pages back before the CPU reads them.
+    //
+    // That asymmetry is platform-visible. Where the host can read device-resident
+    // managed pages directly (cudaDevAttrDirectManagedMemAccessFromHost, true on
+    // GH200) the missing prefetch is invisible. On a part that reports 0 for it --
+    // GB10 does -- the pages were just pushed device-resident by the prefetch above,
+    // and the host then reads them with no migration and no ordering.
+    //
+    // So keep exactly one fence: recorded on the consumer stream, it still says
+    // "outstanding" to everyone else, and the pool stays bounded at one event.
     pending_buffer_ready_events.clear();
     buffer_ready_recorded = false;
+    if (!buffer_ready_events.empty()) {
+      auto consumer_done = static_cast<cudaEvent_t>(buffer_ready_events[0]);
+      if (cudaEventRecord(consumer_done, static_cast<cudaStream_t>(stream)) == cudaSuccess) {
+        pending_buffer_ready_events.push_back(consumer_done);
+        buffer_ready_recorded = true;
+      }
+    }
     return true;
   }
 
