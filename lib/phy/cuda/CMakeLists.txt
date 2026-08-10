@@ -188,6 +188,10 @@ target_compile_options(ocudu_phy_cuda PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
         --expt-relaxed-constexpr
         -Xcompiler=-Wall
+        # Source-line mapping for device exceptions. Costs nothing at run time;
+        # without it a GPU coredump names the kernel but not the line, and this
+        # library has already needed exactly that once.
+        -lineinfo
     >
 )
 

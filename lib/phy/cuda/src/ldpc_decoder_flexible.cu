@@ -2155,6 +2155,42 @@ struct FlexibleLdpcDecoder {
     int cached_base_graph;      // -1 = not cached
     int cached_Z;               // -1 = not cached
 
+    // Versioned shift tables: a ring of immutable snapshots, one per
+    // configuration change, plus pinned staging for the uploads.
+    //
+    // The original design kept ONE mutable d_scaled_shifts buffer and rewrote it
+    // in place whenever base_graph or Z changed. Decode results are collected
+    // asynchronously, so decode kernels from the previous configuration can
+    // still be running -- or sitting queued -- when the rewrite lands, and a
+    // kernel that reads shifts scaled for Z=384 while executing with Z=18 walks
+    // straight out of its shared-memory APP window (kernel line: app_val =
+    // s_app[col * Z + shifted_z]; the single conditional -Z fold is only valid
+    // for shift < Z). That surfaced OTA as Xid 13 "Out Of Range Address" at one
+    // fixed warp PC, always in a small-Z BG2 decode: msg3 at UE attach and
+    // MCS-churning load are what alternate lifting sizes back to back. GPU
+    // exception coredumps plus an offline reproducer pinned the faulting line.
+    //
+    // Stream-ordering the rewrite is not enough: it protects a single stream's
+    // FIFO order but still mutates a buffer every queued launch dereferences.
+    // Snapshots remove the aliasing instead: each configure that changes the
+    // graph writes a fresh slot, the launch captures that slot's pointer by
+    // value, and an in-flight or queued kernel keeps reading the table it was
+    // launched with no matter what the host does next. Slot reuse waits on an
+    // event recorded at the owning decode's launch, and the ring is deep enough
+    // that the wait is virtually never taken.
+    static constexpr int NUM_SHIFT_SLOTS = 8;
+    int16_t*     d_shift_slots[NUM_SHIFT_SLOTS];
+    cudaEvent_t  shift_slot_last_use[NUM_SHIFT_SLOTS];
+    bool         shift_slot_use_recorded[NUM_SHIFT_SLOTS];
+    int          shift_slot_current;
+    cudaStream_t last_decode_stream;
+    int16_t*     h_shifts_staging;
+    // Recorded after each slot upload; decode streams wait on it device-side so
+    // a decode issued on a different stream than the upload cannot launch ahead
+    // of the table it captured. Waiting is a no-op once the copy has completed.
+    cudaEvent_t  shift_ready;
+    bool         shift_ready_recorded;
+
     // Cache for layered shmem probes (avoid per-batch cudaFuncSetAttribute)
     bool layered_half2_shmem_ok;      // true if 2-CB FULL_SHMEM kernel fits
     bool layered_half_shmem_ok;       // true if 1-CB FULL_SHMEM kernel fits
@@ -5320,6 +5356,18 @@ nr_ldpc_status_t ldpc_decoder_create(ldpc_decoder_handle_t* handle) {
     dec->cached_base_graph = -1;
     dec->cached_Z = -1;
 
+    dec->last_decode_stream   = nullptr;
+    dec->shift_ready          = nullptr;
+    dec->shift_ready_recorded = false;
+    if (cudaEventCreateWithFlags(&dec->shift_ready, cudaEventDisableTiming) != cudaSuccess) {
+        dec->shift_ready = nullptr;
+    }
+    if (cudaHostAlloc(reinterpret_cast<void**>(&dec->h_shifts_staging),
+                      (size_t)FlexibleLdpcDecoder::NUM_SHIFT_SLOTS * BG1_NNZ * sizeof(int16_t),
+                      cudaHostAllocDefault) != cudaSuccess) {
+        dec->h_shifts_staging = nullptr;
+    }
+
     // Detect platform for adaptive kernel selection
     dec->platform_cfg = detect_platform();
 
@@ -5392,16 +5440,37 @@ nr_ldpc_status_t ldpc_decoder_create(ldpc_decoder_handle_t* handle) {
         }
     }
 
-    // Preallocate shift table to BG1 max (largest nnz). Configure only updates contents
-    // via H2D — never free/malloc on the slot path when Z/BG changes.
-    if (cudaMalloc(&dec->d_scaled_shifts, BG1_NNZ * sizeof(int16_t)) != cudaSuccess) {
-        for (int i = 0; i < FlexibleLdpcDecoder::NUM_WORKSPACE_BUFFERS; i++) {
-            cudaEventDestroy(dec->workspace_complete[i]);
+    // Preallocate the versioned shift-table ring, each slot sized to BG1 max
+    // (largest nnz). Configure fills a fresh slot per graph change and repoints
+    // d_scaled_shifts; slot contents are immutable while any launch references
+    // them. See the member comment for the in-flight aliasing this removes.
+    {
+        bool ring_ok = true;
+        for (int i = 0; i < FlexibleLdpcDecoder::NUM_SHIFT_SLOTS; i++) {
+            dec->d_shift_slots[i]           = nullptr;
+            dec->shift_slot_last_use[i]     = nullptr;
+            dec->shift_slot_use_recorded[i] = false;
+            if (cudaMalloc(&dec->d_shift_slots[i], BG1_NNZ * sizeof(int16_t)) != cudaSuccess ||
+                cudaEventCreateWithFlags(&dec->shift_slot_last_use[i], cudaEventDisableTiming) != cudaSuccess) {
+                ring_ok = false;
+                break;
+            }
         }
-        cudaEventDestroy(dec->iteration_stats_event);
-        delete dec;
-        return NR_LDPC_ERROR_ALLOC_FAILED;
+        if (!ring_ok) {
+            for (int i = 0; i < FlexibleLdpcDecoder::NUM_SHIFT_SLOTS; i++) {
+                if (dec->d_shift_slots[i]) cudaFree(dec->d_shift_slots[i]);
+                if (dec->shift_slot_last_use[i]) cudaEventDestroy(dec->shift_slot_last_use[i]);
+            }
+            for (int i = 0; i < FlexibleLdpcDecoder::NUM_WORKSPACE_BUFFERS; i++) {
+                cudaEventDestroy(dec->workspace_complete[i]);
+            }
+            cudaEventDestroy(dec->iteration_stats_event);
+            delete dec;
+            return NR_LDPC_ERROR_ALLOC_FAILED;
+        }
     }
+    dec->shift_slot_current = 0;
+    dec->d_scaled_shifts    = dec->d_shift_slots[0];
     dec->scaled_shifts_capacity = BG1_NNZ;
 
     *handle = reinterpret_cast<ldpc_decoder_handle_t>(dec);
@@ -5497,15 +5566,55 @@ nr_ldpc_status_t ldpc_decoder_configure(
         h_shifts_ref = h_bg2_shifts[iLS];
     }
     dec->Z_ref = LIFTING_SET_Z_REF[iLS];
-    int16_t h_scaled_shifts[BG1_NNZ];
+    if (dec->h_shifts_staging == nullptr) {
+        return NR_LDPC_ERROR_ALLOC_FAILED;
+    }
 
+    // Retire the outgoing slot: mark the point on the decode stream after which
+    // no launch references it. Launches are FIFO per stream, so an event
+    // recorded here lands after every kernel that captured the old pointer.
+    const int cur = dec->shift_slot_current;
+    if ((dec->last_decode_stream != nullptr) && (dec->shift_slot_last_use[cur] != nullptr)) {
+        if (cudaEventRecord(dec->shift_slot_last_use[cur], dec->last_decode_stream) == cudaSuccess) {
+            dec->shift_slot_use_recorded[cur] = true;
+        }
+    }
+
+    // Claim the next slot; if it was ever referenced, wait for its last consumer.
+    // With NUM_SHIFT_SLOTS graph changes between reuse, this wait is essentially
+    // never taken on a live system.
+    const int next = (cur + 1) % FlexibleLdpcDecoder::NUM_SHIFT_SLOTS;
+    if (dec->shift_slot_use_recorded[next] && (dec->shift_slot_last_use[next] != nullptr)) {
+        CHECK_NVFAILURE_LDPC(cudaEventSynchronize(dec->shift_slot_last_use[next]));
+        dec->shift_slot_use_recorded[next] = false;
+    }
+
+    // Per-slot pinned staging: guarded by the same slot event as the device
+    // buffer, so the async copy's host source cannot be rewritten mid-DMA.
+    int16_t* h_scaled_shifts = dec->h_shifts_staging + (size_t)next * BG1_NNZ;
     for (int i = 0; i < dec->nnz; i++) {
         h_scaled_shifts[i] = (int16_t)compute_shift(h_shifts_ref[i], dec->Z, dec->Z_ref);
     }
 
-    // Copy pre-scaled shifts to device (in-place into preallocated buffer)
-    CHECK_NVFAILURE_LDPC (cudaMemcpy(dec->d_scaled_shifts, h_scaled_shifts,
-               dec->nnz * sizeof(int16_t), cudaMemcpyHostToDevice));
+    if (dec->last_decode_stream != nullptr) {
+        CHECK_NVFAILURE_LDPC(cudaMemcpyAsync(dec->d_shift_slots[next], h_scaled_shifts,
+                                             dec->nnz * sizeof(int16_t), cudaMemcpyHostToDevice,
+                                             dec->last_decode_stream));
+        if (dec->shift_ready != nullptr) {
+            CHECK_NVFAILURE_LDPC(cudaEventRecord(dec->shift_ready, dec->last_decode_stream));
+            dec->shift_ready_recorded = true;
+        } else {
+            CHECK_NVFAILURE_LDPC(cudaStreamSynchronize(dec->last_decode_stream));
+        }
+    } else {
+        CHECK_NVFAILURE_LDPC(cudaMemcpy(dec->d_shift_slots[next], h_scaled_shifts,
+                                        dec->nnz * sizeof(int16_t), cudaMemcpyHostToDevice));
+    }
+
+    // Publish the snapshot. Every launch from here on captures this pointer by
+    // value; nothing ever rewrites the buffer behind a captured pointer.
+    dec->d_scaled_shifts    = dec->d_shift_slots[next];
+    dec->shift_slot_current = next;
 
     // Update cache
     dec->cached_base_graph = dec->base_graph;
@@ -5524,6 +5633,12 @@ nr_ldpc_status_t ldpc_decoder_decode_batch(
     FlexibleLdpcDecoder* dec = reinterpret_cast<FlexibleLdpcDecoder*>(handle);
     if (!dec || !d_llr_input || !d_output || num_codewords <= 0) {
         return NR_LDPC_ERROR_INVALID_CONFIG;
+    }
+    // Table rewrites order themselves on the stream that consumes them; if the
+    // active table's upload ran on a different stream, wait for it device-side.
+    dec->last_decode_stream = stream;
+    if (dec->shift_ready_recorded && (dec->shift_ready != nullptr) && (stream != nullptr)) {
+        (void)cudaStreamWaitEvent(stream, dec->shift_ready, 0);
     }
 
     // Prefer ldpc_decoder_preallocate_workspace at max batch so these branches never run on
@@ -5692,6 +5807,12 @@ nr_ldpc_status_t ldpc_decoder_decode_batch_half(
     FlexibleLdpcDecoder* dec = reinterpret_cast<FlexibleLdpcDecoder*>(handle);
     if (!dec || !d_llr_input_half || !d_output || num_codewords <= 0) {
         return NR_LDPC_ERROR_INVALID_CONFIG;
+    }
+    // Table rewrites order themselves on the stream that consumes them; if the
+    // active table's upload ran on a different stream, wait for it device-side.
+    dec->last_decode_stream = stream;
+    if (dec->shift_ready_recorded && (dec->shift_ready != nullptr) && (stream != nullptr)) {
+        (void)cudaStreamWaitEvent(stream, dec->shift_ready, 0);
     }
 
     const __half* d_llr_half = static_cast<const __half*>(d_llr_input_half);
@@ -6228,6 +6349,12 @@ nr_ldpc_status_t ldpc_decoder_decode_batch_half_from_rate_matched(
         num_codewords <= 0 || Q_m <= 0 || Q_m > 8) {
         return NR_LDPC_ERROR_INVALID_CONFIG;
     }
+    // Table rewrites order themselves on the stream that consumes them; if the
+    // active table's upload ran on a different stream, wait for it device-side.
+    dec->last_decode_stream = stream;
+    if (dec->shift_ready_recorded && (dec->shift_ready != nullptr) && (stream != nullptr)) {
+        (void)cudaStreamWaitEvent(stream, dec->shift_ready, 0);
+    }
 
     if (dec->base_graph != 1 || dec->Z != 384 || !dec->params.use_boxplus) {
         return NR_LDPC_ERROR_INVALID_CONFIG;
@@ -6521,7 +6648,16 @@ nr_ldpc_status_t ldpc_decoder_preallocate_workspace(ldpc_decoder_handle_t handle
 void ldpc_decoder_destroy(ldpc_decoder_handle_t handle) {
     FlexibleLdpcDecoder* dec = reinterpret_cast<FlexibleLdpcDecoder*>(handle);
     if (dec) {
-        if (dec->d_scaled_shifts) cudaFree(dec->d_scaled_shifts);
+        // Drain outstanding consumers, then release the shift-table ring.
+        for (int i = 0; i < FlexibleLdpcDecoder::NUM_SHIFT_SLOTS; i++) {
+            if (dec->shift_slot_use_recorded[i] && dec->shift_slot_last_use[i]) {
+                (void)cudaEventSynchronize(dec->shift_slot_last_use[i]);
+            }
+            if (dec->shift_slot_last_use[i]) cudaEventDestroy(dec->shift_slot_last_use[i]);
+            if (dec->d_shift_slots[i]) cudaFree(dec->d_shift_slots[i]);
+        }
+        if (dec->shift_ready) cudaEventDestroy(dec->shift_ready);
+        if (dec->h_shifts_staging) cudaFreeHost(dec->h_shifts_staging);
         // Free FP32 single-buffer workspace
         if (dec->d_app) cudaFree(dec->d_app);
         if (dec->d_c2v) cudaFree(dec->d_c2v);
