@@ -487,8 +487,7 @@ void worker_manager::create_ofh_executors(const worker_manager_config::ru_ofh_co
     std::vector<os_sched_affinity_bitmask> uplink_affinity_masks;
     uplink_affinity_masks.reserve(config.nof_cells);
     for (unsigned i = 0; i != config.nof_cells; ++i) {
-      uplink_affinity_masks.push_back(
-          main_pool_affinity_mng.calcute_affinity_mask(sched_affinity_mask_types::main));
+      uplink_affinity_masks.push_back(main_pool_affinity_mng.calcute_affinity_mask(sched_affinity_mask_types::main));
     }
 
     create_worker_pool(name,

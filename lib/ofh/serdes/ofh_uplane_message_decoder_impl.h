@@ -82,23 +82,23 @@ public:
 
   // See interface for documentation.
   iq_decompression_result decompress_to_resource_grid(resource_grid_writer&        grid,
-                                                       unsigned                     port,
-                                                       unsigned                     symbol,
-                                                       unsigned                     start_prb,
-                                                       unsigned                     nof_prbs,
-                                                       const uplane_section_params& section) override;
+                                                      unsigned                     port,
+                                                      unsigned                     symbol,
+                                                      unsigned                     start_prb,
+                                                      unsigned                     nof_prbs,
+                                                      const uplane_section_params& section) override;
 
   // See interface for documentation.
   iq_decompression_result decompress_to_prach_buffer(prach_buffer&                buffer,
-                                                      unsigned                     port,
-                                                      unsigned                     td_occasion,
-                                                      unsigned                     fd_occasion,
-                                                      unsigned                     symbol,
-                                                      unsigned                     start_re,
-                                                      unsigned                     input_start_re,
-                                                      unsigned                     nof_re,
-                                                      unsigned                     nof_prbs,
-                                                      const uplane_section_params& section) override;
+                                                     unsigned                     port,
+                                                     unsigned                     td_occasion,
+                                                     unsigned                     fd_occasion,
+                                                     unsigned                     symbol,
+                                                     unsigned                     start_re,
+                                                     unsigned                     input_start_re,
+                                                     unsigned                     nof_re,
+                                                     unsigned                     nof_prbs,
+                                                     const uplane_section_params& section) override;
 
 private:
   /// Decodes the given message. Optionally keeps section IQ payloads compressed.

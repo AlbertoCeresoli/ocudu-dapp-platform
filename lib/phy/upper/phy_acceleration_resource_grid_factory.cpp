@@ -30,10 +30,10 @@ bool ocudu::phy_acceleration_cuda_current_device_is_discrete(int nvcuda_device_i
 }
 
 std::shared_ptr<resource_grid_factory>
-ocudu::create_phy_acceleration_resource_grid_factory(std::shared_ptr<resource_grid_factory>   fallback_factory,
-                                                     phy_acceleration_resource_grid_direction direction,
-                                                     bool                                     enable_accelerated_grid,
-                                                     int                                      nvcuda_device_id,
+ocudu::create_phy_acceleration_resource_grid_factory(std::shared_ptr<resource_grid_factory>     fallback_factory,
+                                                     phy_acceleration_resource_grid_direction   direction,
+                                                     bool                                       enable_accelerated_grid,
+                                                     int                                        nvcuda_device_id,
                                                      phy_acceleration_resource_grid_memory_mode memory_mode)
 {
   if (!enable_accelerated_grid) {
@@ -58,9 +58,8 @@ ocudu::create_phy_acceleration_resource_grid_factory(std::shared_ptr<resource_gr
       return std::make_shared<resource_grid_cuda_visible_factory>(
           resource_grid_cuda_visible_factory::direction::downlink, nvcuda_device_id, use_managed_grid);
     case phy_acceleration_resource_grid_direction::uplink:
-      return std::make_shared<resource_grid_cuda_visible_factory>(resource_grid_cuda_visible_factory::direction::uplink,
-                                                                  nvcuda_device_id,
-                                                                  use_managed_grid);
+      return std::make_shared<resource_grid_cuda_visible_factory>(
+          resource_grid_cuda_visible_factory::direction::uplink, nvcuda_device_id, use_managed_grid);
   }
 #else
   report_fatal_error_if_not(memory_mode != phy_acceleration_resource_grid_memory_mode::managed,

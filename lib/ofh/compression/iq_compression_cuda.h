@@ -38,9 +38,9 @@ struct iq_compression_cuda_preallocation_config {
 class iq_compression_cuda : public iq_compressor, public iq_decompressor
 {
 public:
-  explicit iq_compression_cuda(compression_type        type_,
-                               ocudulog::basic_logger& logger_,
-                               float                   iq_scaling_ = 1.0F,
+  explicit iq_compression_cuda(compression_type                         type_,
+                               ocudulog::basic_logger&                  logger_,
+                               float                                    iq_scaling_   = 1.0F,
                                iq_compression_cuda_preallocation_config preallocation = {});
   ~iq_compression_cuda() override;
 

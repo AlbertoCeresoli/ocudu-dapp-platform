@@ -460,8 +460,8 @@ TEST(ofh_iq_compression_cuda_c_api_test, reserved_host_buffer_compression_does_n
 
   cbf16_t* device_grid = nullptr;
   ASSERT_EQ(cudaMallocManaged(&device_grid,
-                              static_cast<size_t>(nof_ports) * nof_grid_symbols * nof_prbs *
-                                  NOF_SUBCARRIERS_PER_RB * sizeof(cbf16_t)),
+                              static_cast<size_t>(nof_ports) * nof_grid_symbols * nof_prbs * NOF_SUBCARRIERS_PER_RB *
+                                  sizeof(cbf16_t)),
             cudaSuccess);
   std::vector<cbf16_t> source = generate_iq(nof_ports * nof_grid_symbols * nof_prbs);
   std::copy(source.begin(), source.end(), device_grid);
@@ -474,8 +474,7 @@ TEST(ofh_iq_compression_cuda_c_api_test, reserved_host_buffer_compression_does_n
 
   ocudu_ofh_compression_handle_t* warmup_handle = nullptr;
   ocudu_ofh_compression_handle_t* test_handle   = nullptr;
-  if ((ocudu_ofh_compression_create(&warmup_handle) == 0) ||
-      (ocudu_ofh_compression_create(&test_handle) == 0)) {
+  if ((ocudu_ofh_compression_create(&warmup_handle) == 0) || (ocudu_ofh_compression_create(&test_handle) == 0)) {
     ocudu_ofh_compression_destroy(warmup_handle);
     ocudu_ofh_compression_destroy(test_handle);
     cudaFree(device_grid);
@@ -528,7 +527,7 @@ TEST(ofh_iq_compression_cuda_c_api_test, reserved_host_buffer_compression_does_n
   }
   std::atomic<int>  compression_status{0};
   std::atomic<bool> compression_finished{false};
-  std::thread compression_thread([&]() {
+  std::thread       compression_thread([&]() {
     compression_status.store(
         ocudu_ofh_compress_device_grid_symbol_batch_to_host_buffers(test_handle,
                                                                     OCUDU_OFH_COMPRESSION_TYPE_BFP,

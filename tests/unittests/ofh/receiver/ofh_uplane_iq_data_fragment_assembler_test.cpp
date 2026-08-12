@@ -3,8 +3,8 @@
 
 #include "../../../../lib/ofh/receiver/ofh_uplane_iq_data_fragment_assembler.h"
 #include "ocudu/ofh/compression/compression_properties.h"
-#include <gtest/gtest.h>
 #include <algorithm>
+#include <gtest/gtest.h>
 #include <numeric>
 #include <vector>
 
@@ -32,18 +32,12 @@ std::vector<uint8_t> make_payload(unsigned payload_nof_prbs)
 TEST(ofh_uplane_iq_data_fragment_assembler_test, assembles_in_order_fragments)
 {
   uplane_iq_data_fragment_assembler assembler;
-  std::vector<uint8_t>               payload  = make_payload(nof_prbs);
-  unsigned                           prb_size = get_compressed_prb_size(bfp9).value();
+  std::vector<uint8_t>              payload  = make_payload(nof_prbs);
+  unsigned                          prb_size = get_compressed_prb_size(bfp9).value();
 
   ASSERT_EQ(uplane_iq_data_fragment_assembler::result::incomplete,
-            assembler.add_fragment(test_slot,
-                                   symbol,
-                                   port,
-                                   nof_prbs,
-                                   0,
-                                   25,
-                                   span<const uint8_t>(payload).first(25 * prb_size),
-                                   bfp9));
+            assembler.add_fragment(
+                test_slot, symbol, port, nof_prbs, 0, 25, span<const uint8_t>(payload).first(25 * prb_size), bfp9));
   ASSERT_EQ(uplane_iq_data_fragment_assembler::result::complete,
             assembler.add_fragment(test_slot,
                                    symbol,
@@ -59,8 +53,8 @@ TEST(ofh_uplane_iq_data_fragment_assembler_test, assembles_in_order_fragments)
 TEST(ofh_uplane_iq_data_fragment_assembler_test, assembles_out_of_order_fragments)
 {
   uplane_iq_data_fragment_assembler assembler;
-  std::vector<uint8_t>               payload  = make_payload(nof_prbs);
-  unsigned                           prb_size = get_compressed_prb_size(bfp9).value();
+  std::vector<uint8_t>              payload  = make_payload(nof_prbs);
+  unsigned                          prb_size = get_compressed_prb_size(bfp9).value();
 
   ASSERT_EQ(uplane_iq_data_fragment_assembler::result::incomplete,
             assembler.add_fragment(test_slot,
@@ -72,32 +66,20 @@ TEST(ofh_uplane_iq_data_fragment_assembler_test, assembles_out_of_order_fragment
                                    span<const uint8_t>(payload).subspan(25 * prb_size, 26 * prb_size),
                                    bfp9));
   ASSERT_EQ(uplane_iq_data_fragment_assembler::result::complete,
-            assembler.add_fragment(test_slot,
-                                   symbol,
-                                   port,
-                                   nof_prbs,
-                                   0,
-                                   25,
-                                   span<const uint8_t>(payload).first(25 * prb_size),
-                                   bfp9));
+            assembler.add_fragment(
+                test_slot, symbol, port, nof_prbs, 0, 25, span<const uint8_t>(payload).first(25 * prb_size), bfp9));
   ASSERT_TRUE(std::equal(payload.begin(), payload.end(), assembler.get_assembled_data().begin()));
 }
 
 TEST(ofh_uplane_iq_data_fragment_assembler_test, rejects_overlapping_and_short_fragments)
 {
   uplane_iq_data_fragment_assembler assembler;
-  std::vector<uint8_t>               payload  = make_payload(nof_prbs);
-  unsigned                           prb_size = get_compressed_prb_size(bfp9).value();
+  std::vector<uint8_t>              payload  = make_payload(nof_prbs);
+  unsigned                          prb_size = get_compressed_prb_size(bfp9).value();
 
   ASSERT_EQ(uplane_iq_data_fragment_assembler::result::incomplete,
-            assembler.add_fragment(test_slot,
-                                   symbol,
-                                   port,
-                                   nof_prbs,
-                                   0,
-                                   25,
-                                   span<const uint8_t>(payload).first(25 * prb_size),
-                                   bfp9));
+            assembler.add_fragment(
+                test_slot, symbol, port, nof_prbs, 0, 25, span<const uint8_t>(payload).first(25 * prb_size), bfp9));
   ASSERT_EQ(uplane_iq_data_fragment_assembler::result::invalid,
             assembler.add_fragment(test_slot,
                                    symbol,
@@ -121,18 +103,12 @@ TEST(ofh_uplane_iq_data_fragment_assembler_test, rejects_overlapping_and_short_f
 TEST(ofh_uplane_iq_data_fragment_assembler_test, a_new_symbol_replaces_an_incomplete_ring_entry)
 {
   uplane_iq_data_fragment_assembler assembler;
-  std::vector<uint8_t>               payload  = make_payload(nof_prbs);
-  unsigned                           prb_size = get_compressed_prb_size(bfp9).value();
+  std::vector<uint8_t>              payload  = make_payload(nof_prbs);
+  unsigned                          prb_size = get_compressed_prb_size(bfp9).value();
 
   ASSERT_EQ(uplane_iq_data_fragment_assembler::result::incomplete,
-            assembler.add_fragment(test_slot,
-                                   symbol,
-                                   port,
-                                   nof_prbs,
-                                   0,
-                                   1,
-                                   span<const uint8_t>(payload).first(prb_size),
-                                   bfp9));
+            assembler.add_fragment(
+                test_slot, symbol, port, nof_prbs, 0, 1, span<const uint8_t>(payload).first(prb_size), bfp9));
   ASSERT_EQ(uplane_iq_data_fragment_assembler::result::complete,
             assembler.add_fragment(slot_point{1, 2, 4}, symbol, port, nof_prbs, 0, nof_prbs, payload, bfp9));
   ASSERT_TRUE(std::equal(payload.begin(), payload.end(), assembler.get_assembled_data().begin()));

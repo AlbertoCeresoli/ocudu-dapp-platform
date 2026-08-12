@@ -40,9 +40,9 @@ public:
   void set_results(const uplane_message_decoder_results& results) { spy_results = results; }
 
   bool     direct_decompression_enabled = false;
-  bool     compressed_decode_succeeds    = true;
-  unsigned host_decode_count             = 0;
-  unsigned compressed_decode_count       = 0;
+  bool     compressed_decode_succeeds   = true;
+  unsigned host_decode_count            = 0;
+  unsigned compressed_decode_count      = 0;
 };
 
 } // namespace
@@ -189,7 +189,7 @@ TEST_P(data_flow_uplane_uplink_prach_impl_fixture, valid_message_containing_all_
 
 TEST_P(data_flow_uplane_uplink_prach_impl_fixture, expired_cuda_packet_is_not_decoded_on_host)
 {
-  uplane_message_decoder_results deco_results = build_valid_decoder_results();
+  uplane_message_decoder_results deco_results      = build_valid_decoder_results();
   deco_results.sections.front().compressed_iq_data = span<const uint8_t>(reinterpret_cast<const uint8_t*>("x"), 1);
   uplane_decoder->set_results(deco_results);
   uplane_decoder->direct_decompression_enabled = true;
@@ -211,7 +211,7 @@ TEST_P(data_flow_uplane_uplink_prach_impl_fixture, required_direct_decompression
   config.host_decompression = host_decompression_policy::forbid;
   data_flow_uplane_uplink_prach_impl strict_data_flow(config, get_dependencies());
 
-  uplane_message_decoder_results deco_results = build_valid_decoder_results();
+  uplane_message_decoder_results deco_results      = build_valid_decoder_results();
   deco_results.sections.front().compressed_iq_data = span<const uint8_t>(reinterpret_cast<const uint8_t*>("x"), 1);
   uplane_decoder->set_results(deco_results);
   uplane_decoder->direct_decompression_enabled = true;
@@ -234,7 +234,7 @@ TEST_P(data_flow_uplane_uplink_prach_impl_fixture, required_direct_decompression
   data_flow_uplane_uplink_prach_impl strict_data_flow(config, get_dependencies());
 
   uplane_decoder->direct_decompression_enabled = true;
-  uplane_decoder->compressed_decode_succeeds    = false;
+  uplane_decoder->compressed_decode_succeeds   = false;
 
   strict_data_flow.decode_type1_message(eaxc, {});
 

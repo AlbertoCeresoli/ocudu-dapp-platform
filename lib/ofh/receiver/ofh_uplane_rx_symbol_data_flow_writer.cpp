@@ -143,7 +143,7 @@ uplane_rx_symbol_data_flow_writer::write_compressed_to_resource_grid(unsigned   
   }
 
   bool recovered_after_retry = false;
-  bool fragment_buffered      = false;
+  bool fragment_buffered     = false;
   for (const auto& section : results.sections) {
     if (section.start_prb >= du_nof_prbs) {
       continue;
@@ -158,7 +158,7 @@ uplane_rx_symbol_data_flow_writer::write_compressed_to_resource_grid(unsigned   
     const uplane_section_params*       section_to_write   = &section;
     uplane_iq_data_fragment_assembler* fragment_assembler = nullptr;
     if (decoder.prefers_full_symbol_decompression(section.ud_comp_hdr)) {
-      fragment_assembler = &get_fragment_assembler(slot, symbol, rg_port);
+      fragment_assembler   = &get_fragment_assembler(slot, symbol, rg_port);
       auto assembly_result = fragment_assembler->add_fragment(slot,
                                                               symbol,
                                                               rg_port,
@@ -186,19 +186,15 @@ uplane_rx_symbol_data_flow_writer::write_compressed_to_resource_grid(unsigned   
     trace_point write_rg_tp = ofh_tracer.now();
 
     iq_decompression_result decompression_result = iq_decompression_result::destination_failure;
-    bool written = ul_context_repo->write_grid_device(
+    bool                    written              = ul_context_repo->write_grid_device(
         slot,
         rg_port,
         symbol,
         section_to_write->start_prb * NOF_SUBCARRIERS_PER_RB,
         section_to_write->nof_prbs * NOF_SUBCARRIERS_PER_RB,
         [&decoder, &decompression_result, rg_port, symbol, section_to_write](resource_grid_writer& writer) {
-          decompression_result = decoder.decompress_to_resource_grid(writer,
-                                                                      rg_port,
-                                                                      symbol,
-                                                                      section_to_write->start_prb,
-                                                                      section_to_write->nof_prbs,
-                                                                      *section_to_write);
+          decompression_result = decoder.decompress_to_resource_grid(
+              writer, rg_port, symbol, section_to_write->start_prb, section_to_write->nof_prbs, *section_to_write);
           return is_iq_decompression_success(decompression_result);
         });
     if (fragment_assembler != nullptr) {

@@ -57,9 +57,9 @@ static bool read_force_first_gpu_failure()
   return (env_value != nullptr) && (env_value[0] != '\0') && (std::strcmp(env_value, "0") != 0);
 }
 
-iq_compression_cuda::iq_compression_cuda(compression_type        type_,
-                                         ocudulog::basic_logger& logger_,
-                                         float                   iq_scaling_,
+iq_compression_cuda::iq_compression_cuda(compression_type                         type_,
+                                         ocudulog::basic_logger&                  logger_,
+                                         float                                    iq_scaling_,
                                          iq_compression_cuda_preallocation_config preallocation) :
   type(type_),
   logger(logger_),
@@ -107,10 +107,9 @@ iq_compression_cuda::iq_compression_cuda(compression_type        type_,
           "Failed to reserve CUDA OFH direct decompression resources.");
     }
     if (preallocation.host_buffer_compression_capacity != 0U) {
-      report_fatal_error_if_not(
-          ocudu_ofh_compression_reserve_host_buffer_compression(
-              handle, static_cast<unsigned>(preallocation.host_buffer_compression_capacity)) != 0,
-          "Failed to reserve CUDA OFH host-buffer compression resources.");
+      report_fatal_error_if_not(ocudu_ofh_compression_reserve_host_buffer_compression(
+                                    handle, static_cast<unsigned>(preallocation.host_buffer_compression_capacity)) != 0,
+                                "Failed to reserve CUDA OFH host-buffer compression resources.");
     }
     all_handles.push_back(handle);
     available_handles.push_back(handle);

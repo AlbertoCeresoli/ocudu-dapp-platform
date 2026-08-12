@@ -43,10 +43,10 @@ struct iq_decompressor_preallocation_config {
 ///                       best CPU implementation.
 /// \param[in] preallocation Optional maximum batch shape used to reserve implementation workspaces before use.
 /// \return IQ data compressor.
-std::unique_ptr<iq_compressor> create_iq_compressor(compression_type        type,
-                                                    ocudulog::basic_logger& logger,
-                                                    float                   iq_scaling    = 1.0,
-                                                    const std::string&      impl_type     = "auto",
+std::unique_ptr<iq_compressor> create_iq_compressor(compression_type                   type,
+                                                    ocudulog::basic_logger&            logger,
+                                                    float                              iq_scaling    = 1.0,
+                                                    const std::string&                 impl_type     = "auto",
                                                     iq_compressor_preallocation_config preallocation = {});
 
 /// Creates and returns a selector of IQ data compressors.

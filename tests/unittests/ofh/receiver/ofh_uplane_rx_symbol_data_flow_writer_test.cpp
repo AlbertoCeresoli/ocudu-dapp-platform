@@ -57,17 +57,14 @@ public:
 
   bool supports_resource_grid_decompression() const override { return true; }
 
-  bool prefers_full_symbol_decompression(const ru_compression_params&) const override
-  {
-    return assemble_fragments;
-  }
+  bool prefers_full_symbol_decompression(const ru_compression_params&) const override { return assemble_fragments; }
 
   iq_decompression_result decompress_to_resource_grid(resource_grid_writer&        grid,
-                                                       unsigned                     port_,
-                                                       unsigned                     symbol_,
-                                                       unsigned                     start_prb_,
-                                                       unsigned                     nof_prbs_,
-                                                       const uplane_section_params& section_) override
+                                                      unsigned                     port_,
+                                                      unsigned                     symbol_,
+                                                      unsigned                     start_prb_,
+                                                      unsigned                     nof_prbs_,
+                                                      const uplane_section_params& section_) override
   {
     (void)grid;
     called    = true;
@@ -521,8 +518,8 @@ TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_fragments_are_a
   ASSERT_EQ(0, device_writer.prepare_count);
   ASSERT_TRUE(repo->get(slot, symbol_id).get_re_written_mask().front().none());
 
-  section.start_prb          = 25;
-  section.nof_prbs           = nof_prb - section.start_prb;
+  section.start_prb = 25;
+  section.nof_prbs  = nof_prb - section.start_prb;
   section.compressed_iq_data =
       span<const uint8_t>(compressed_payload).subspan(section.start_prb * prb_size, section.nof_prbs * prb_size);
 
@@ -540,15 +537,15 @@ TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, compressed_fragments_are_a
 
 TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, wideband_wire_fragments_are_assembled_into_one_device_grid_write)
 {
-  static constexpr unsigned     wideband_nof_prb = 273;
-  static constexpr unsigned     fragment_nof_prb = 52;
-  resource_grid_reader_spy      wideband_reader(nof_ports, symbol_range.stop(), wideband_nof_prb);
-  resource_grid_device_writer_spy wideband_writer(wideband_nof_prb);
-  resource_grid_spy               wideband_grid(wideband_reader, wideband_writer);
-  shared_resource_grid_spy        wideband_shared_grid(wideband_grid);
-  const ru_compression_params     compression = {compression_type::BFP, 9};
-  const unsigned                  prb_size = get_compressed_prb_size(compression).value();
-  std::vector<uint8_t>            compressed_payload(wideband_nof_prb * prb_size);
+  static constexpr unsigned         wideband_nof_prb = 273;
+  static constexpr unsigned         fragment_nof_prb = 52;
+  resource_grid_reader_spy          wideband_reader(nof_ports, symbol_range.stop(), wideband_nof_prb);
+  resource_grid_device_writer_spy   wideband_writer(wideband_nof_prb);
+  resource_grid_spy                 wideband_grid(wideband_reader, wideband_writer);
+  shared_resource_grid_spy          wideband_shared_grid(wideband_grid);
+  const ru_compression_params       compression = {compression_type::BFP, 9};
+  const unsigned                    prb_size    = get_compressed_prb_size(compression).value();
+  std::vector<uint8_t>              compressed_payload(wideband_nof_prb * prb_size);
   uplane_message_decoder_device_spy decoder;
   decoder.assemble_fragments = true;
   std::iota(compressed_payload.begin(), compressed_payload.end(), uint8_t{0});
@@ -562,11 +559,11 @@ TEST_F(ofh_uplane_rx_symbol_data_flow_writer_fixture, wideband_wire_fragments_ar
   auto& section       = results.sections.back();
   section.ud_comp_hdr = compression;
   for (unsigned start_prb = 0; start_prb != wideband_nof_prb;) {
-    section.start_prb          = start_prb;
-    section.nof_prbs           = std::min(fragment_nof_prb, wideband_nof_prb - start_prb);
-    section.compressed_iq_data = span<const uint8_t>(compressed_payload)
-                                     .subspan(static_cast<size_t>(start_prb) * prb_size,
-                                              static_cast<size_t>(section.nof_prbs) * prb_size);
+    section.start_prb = start_prb;
+    section.nof_prbs  = std::min(fragment_nof_prb, wideband_nof_prb - start_prb);
+    section.compressed_iq_data =
+        span<const uint8_t>(compressed_payload)
+            .subspan(static_cast<size_t>(start_prb) * prb_size, static_cast<size_t>(section.nof_prbs) * prb_size);
 
     auto expected = (start_prb + section.nof_prbs == wideband_nof_prb)
                         ? uplane_rx_symbol_data_flow_writer::direct_write_result::success

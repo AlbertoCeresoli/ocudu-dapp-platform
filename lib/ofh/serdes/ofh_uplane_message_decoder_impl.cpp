@@ -56,13 +56,12 @@ bool uplane_message_decoder_impl::decode_with_compressed_iq(uplane_message_decod
   return decode_impl(results, message, false);
 }
 
-iq_decompression_result
-uplane_message_decoder_impl::decompress_to_resource_grid(resource_grid_writer&        grid,
-                                                         unsigned                     port,
-                                                         unsigned                     symbol,
-                                                         unsigned                     start_prb,
-                                                         unsigned                     nof_prbs,
-                                                         const uplane_section_params& section)
+iq_decompression_result uplane_message_decoder_impl::decompress_to_resource_grid(resource_grid_writer&        grid,
+                                                                                 unsigned                     port,
+                                                                                 unsigned                     symbol,
+                                                                                 unsigned                     start_prb,
+                                                                                 unsigned                     nof_prbs,
+                                                                                 const uplane_section_params& section)
 {
   if (section.compressed_iq_data.empty() || (start_prb != section.start_prb) || (nof_prbs > section.nof_prbs)) {
     return iq_decompression_result::invalid_input;
@@ -72,17 +71,16 @@ uplane_message_decoder_impl::decompress_to_resource_grid(resource_grid_writer&  
       grid, port, symbol, start_prb, nof_prbs, section.compressed_iq_data, section.ud_comp_hdr);
 }
 
-iq_decompression_result
-uplane_message_decoder_impl::decompress_to_prach_buffer(prach_buffer&                buffer,
-                                                        unsigned                     port,
-                                                        unsigned                     td_occasion,
-                                                        unsigned                     fd_occasion,
-                                                        unsigned                     symbol,
-                                                        unsigned                     start_re,
-                                                        unsigned                     input_start_re,
-                                                        unsigned                     nof_re,
-                                                        unsigned                     nof_prbs,
-                                                        const uplane_section_params& section)
+iq_decompression_result uplane_message_decoder_impl::decompress_to_prach_buffer(prach_buffer& buffer,
+                                                                                unsigned      port,
+                                                                                unsigned      td_occasion,
+                                                                                unsigned      fd_occasion,
+                                                                                unsigned      symbol,
+                                                                                unsigned      start_re,
+                                                                                unsigned      input_start_re,
+                                                                                unsigned      nof_re,
+                                                                                unsigned      nof_prbs,
+                                                                                const uplane_section_params& section)
 {
   if (section.compressed_iq_data.empty() || (nof_prbs > section.nof_prbs)) {
     return iq_decompression_result::invalid_input;

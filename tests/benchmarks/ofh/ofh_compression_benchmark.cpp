@@ -119,9 +119,9 @@ static void parse_args(int argc, char** argv)
         grid_mode = std::string(optarg);
         if ((grid_mode != "host") && (grid_mode != "device") && (grid_mode != "device-fragments") &&
             (grid_mode != "device-batch") && (grid_mode != "device-host-buffer-batch") &&
-            (grid_mode != "device-device-batch") &&
-            (grid_mode != "device-symbol-batch") && (grid_mode != "device-host-buffer-symbol-batch") &&
-            (grid_mode != "device-device-symbol-batch") && (grid_mode != "device-device-symbol-batch-async")) {
+            (grid_mode != "device-device-batch") && (grid_mode != "device-symbol-batch") &&
+            (grid_mode != "device-host-buffer-symbol-batch") && (grid_mode != "device-device-symbol-batch") &&
+            (grid_mode != "device-device-symbol-batch-async")) {
           fmt::print("Invalid grid mode\n");
           invalid_arg = true;
         }
@@ -289,9 +289,8 @@ int main(int argc, char** argv)
 #ifdef ENABLE_CUDA
     if ((grid_mode == "device") || (grid_mode == "device-fragments") || (grid_mode == "device-batch") ||
         (grid_mode == "device-host-buffer-batch") || (grid_mode == "device-device-batch") ||
-        (grid_mode == "device-symbol-batch") ||
-        (grid_mode == "device-host-buffer-symbol-batch") || (grid_mode == "device-device-symbol-batch") ||
-        (grid_mode == "device-device-symbol-batch-async")) {
+        (grid_mode == "device-symbol-batch") || (grid_mode == "device-host-buffer-symbol-batch") ||
+        (grid_mode == "device-device-symbol-batch") || (grid_mode == "device-device-symbol-batch-async")) {
       if (impl_type != "cuda") {
         fmt::print(stderr, "Device grid mode requires -F cuda.\n");
         std::exit(1);
@@ -509,27 +508,26 @@ int main(int argc, char** argv)
           // Match the BFP9 IQ payload observed on the 1500-byte O-RU simulator wire profile: five 52-PRB fragments
           // followed by one 13-PRB fragment for a 273-PRB symbol.
           constexpr unsigned fragment_payload_bytes = 1456U;
-          unsigned fragment_nof_prbs = std::max(1U, fragment_payload_bytes / comp_prb_size);
+          unsigned           fragment_nof_prbs      = std::max(1U, fragment_payload_bytes / comp_prb_size);
           for (unsigned symbol = 0; symbol != nof_batch_symbols; ++symbol) {
             for (unsigned i = 0; i != nof_ports; ++i) {
               for (unsigned start_prb = 0; start_prb < nof_prbs; start_prb += fragment_nof_prbs) {
                 unsigned current_nof_prbs = std::min<unsigned>(fragment_nof_prbs, nof_prbs - start_prb);
-                check_cuda_backend(
-                    ocudu_ofh_decompress_to_device_grid_async(
-                        cuda_handle,
-                        to_cuda_compression_type(params.type),
-                        device_output_grid,
-                        compressed_data[i].data() + static_cast<size_t>(symbol) * port_stride_bytes +
-                            static_cast<size_t>(start_prb) * comp_prb_size,
-                        nof_batch_symbols,
-                        nof_prbs * NOF_SUBCARRIERS_PER_RB,
-                        i,
-                        symbol,
-                        start_prb,
-                        current_nof_prbs,
-                        params.data_width) != 0,
-                    cuda_handle,
-                    "ocudu_ofh_decompress_to_device_grid_async fragments");
+                check_cuda_backend(ocudu_ofh_decompress_to_device_grid_async(
+                                       cuda_handle,
+                                       to_cuda_compression_type(params.type),
+                                       device_output_grid,
+                                       compressed_data[i].data() + static_cast<size_t>(symbol) * port_stride_bytes +
+                                           static_cast<size_t>(start_prb) * comp_prb_size,
+                                       nof_batch_symbols,
+                                       nof_prbs * NOF_SUBCARRIERS_PER_RB,
+                                       i,
+                                       symbol,
+                                       start_prb,
+                                       current_nof_prbs,
+                                       params.data_width) != 0,
+                                   cuda_handle,
+                                   "ocudu_ofh_decompress_to_device_grid_async fragments");
               }
             }
           }

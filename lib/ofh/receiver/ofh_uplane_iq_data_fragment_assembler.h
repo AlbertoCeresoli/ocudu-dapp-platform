@@ -52,7 +52,7 @@ private:
              unsigned                     prb_size,
              const ru_compression_params& params);
 
-  bool                         active          = false;
+  bool                         active = false;
   slot_point                   assembly_slot;
   unsigned                     assembly_symbol = 0;
   unsigned                     assembly_port   = 0;

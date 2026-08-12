@@ -20,8 +20,7 @@ enum class iq_decompression_result {
 /// Returns true when direct IQ decompression completed successfully.
 constexpr bool is_iq_decompression_success(iq_decompression_result result)
 {
-  return (result == iq_decompression_result::success) ||
-         (result == iq_decompression_result::success_after_retry);
+  return (result == iq_decompression_result::success) || (result == iq_decompression_result::success_after_retry);
 }
 
 } // namespace ofh

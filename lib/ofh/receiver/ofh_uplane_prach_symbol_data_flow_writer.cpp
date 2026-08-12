@@ -106,10 +106,9 @@ bool uplane_prach_symbol_data_flow_writer::write_to_prach_buffer(unsigned       
 }
 
 uplane_prach_symbol_data_flow_writer::direct_write_result
-uplane_prach_symbol_data_flow_writer::write_compressed_to_prach_buffer(
-    unsigned                              eaxc,
-    const uplane_message_decoder_results& results,
-    uplane_message_decoder&               decoder)
+uplane_prach_symbol_data_flow_writer::write_compressed_to_prach_buffer(unsigned                              eaxc,
+                                                                       const uplane_message_decoder_results& results,
+                                                                       uplane_message_decoder&               decoder)
 {
   slot_point slot = results.params.slot;
 
@@ -190,7 +189,7 @@ uplane_prach_symbol_data_flow_writer::write_compressed_to_prach_buffer(
     unsigned iq_size_re = std::min(section_nof_re, prach_nof_res);
 
     iq_decompression_result decompression_result = iq_decompression_result::destination_failure;
-    bool written = prach_context_repo->write_iq_device(
+    bool                    written              = prach_context_repo->write_iq_device(
         slot,
         port,
         results.params.symbol_id,

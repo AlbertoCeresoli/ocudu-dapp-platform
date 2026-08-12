@@ -81,7 +81,7 @@ public:
     // Bind to the configured device so backing allocations and events land on the right GPU.
     (void)cudaSetDevice(device_id);
 
-    host_reads_device_memory_directly = host_direct_managed_access(device_id);
+    host_reads_device_memory_directly     = host_direct_managed_access(device_id);
     const bool supports_concurrent_access = supports_concurrent_managed_access(device_id);
     concurrent_downlink_writes = enable_concurrent_downlink_writes && !prefetch_enabled && supports_concurrent_access;
     // Keep pages on the GPU when the CPU can access device-resident managed memory directly. This prevents host work
@@ -230,7 +230,8 @@ private:
                                 "Failed to synchronize CUDA-visible resource grid: {} failed: {} ({}). CUDA errors are "
                                 "sticky per context, so the faulting kernel is probably an earlier one on any stream "
                                 "-- check dmesg for an Xid.",
-                                parent.host_access_failure_stage(), parent.host_access_failure_name(),
+                                parent.host_access_failure_stage(),
+                                parent.host_access_failure_name(),
                                 parent.host_access_failure_text());
       return resource_grid_reader_impl::get(symbols, port, l, k_init, mask);
     }
@@ -245,7 +246,8 @@ private:
                                 "Failed to synchronize CUDA-visible resource grid: {} failed: {} ({}). CUDA errors are "
                                 "sticky per context, so the faulting kernel is probably an earlier one on any stream "
                                 "-- check dmesg for an Xid.",
-                                parent.host_access_failure_stage(), parent.host_access_failure_name(),
+                                parent.host_access_failure_stage(),
+                                parent.host_access_failure_name(),
                                 parent.host_access_failure_text());
       return resource_grid_reader_impl::get(symbols, port, l, k_init, mask);
     }
@@ -256,7 +258,8 @@ private:
                                 "Failed to synchronize CUDA-visible resource grid: {} failed: {} ({}). CUDA errors are "
                                 "sticky per context, so the faulting kernel is probably an earlier one on any stream "
                                 "-- check dmesg for an Xid.",
-                                parent.host_access_failure_stage(), parent.host_access_failure_name(),
+                                parent.host_access_failure_stage(),
+                                parent.host_access_failure_name(),
                                 parent.host_access_failure_text());
       resource_grid_reader_impl::get(symbols, port, l, k_init, stride);
     }
@@ -267,7 +270,8 @@ private:
                                 "Failed to synchronize CUDA-visible resource grid: {} failed: {} ({}). CUDA errors are "
                                 "sticky per context, so the faulting kernel is probably an earlier one on any stream "
                                 "-- check dmesg for an Xid.",
-                                parent.host_access_failure_stage(), parent.host_access_failure_name(),
+                                parent.host_access_failure_stage(),
+                                parent.host_access_failure_name(),
                                 parent.host_access_failure_text());
       resource_grid_reader_impl::get(symbols, port, l, k_init);
     }
@@ -278,7 +282,8 @@ private:
                                 "Failed to synchronize CUDA-visible resource grid: {} failed: {} ({}). CUDA errors are "
                                 "sticky per context, so the faulting kernel is probably an earlier one on any stream "
                                 "-- check dmesg for an Xid.",
-                                parent.host_access_failure_stage(), parent.host_access_failure_name(),
+                                parent.host_access_failure_stage(),
+                                parent.host_access_failure_name(),
                                 parent.host_access_failure_text());
       return resource_grid_reader_impl::get_view(port, l);
     }
@@ -764,8 +769,8 @@ class resource_grid_cuda_visible_factory : public resource_grid_factory
 public:
   enum class direction { generic, downlink, uplink };
 
-  explicit resource_grid_cuda_visible_factory(direction           grid_direction_ = direction::generic,
-                                              int                 cuda_device_id_ = 0,
+  explicit resource_grid_cuda_visible_factory(direction           grid_direction_           = direction::generic,
+                                              int                 cuda_device_id_           = 0,
                                               std::optional<bool> use_managed_grid_override = std::nullopt) :
     grid_direction(grid_direction_),
     device_id(cuda_device_id_),
@@ -782,9 +787,8 @@ public:
       if (grid->is_valid()) {
         return grid;
       }
-      report_fatal_error_if_not(!managed_grid_required,
-                                "Failed to allocate a required CUDA managed resource grid on device {}",
-                                device_id);
+      report_fatal_error_if_not(
+          !managed_grid_required, "Failed to allocate a required CUDA managed resource grid on device {}", device_id);
     }
     return fallback_factory->create(nof_ports, nof_symbols, nof_subc);
   }

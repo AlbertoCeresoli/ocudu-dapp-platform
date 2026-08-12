@@ -267,12 +267,12 @@ TEST(cuda_visible_phy_support_test, explicit_managed_mode_overrides_pinned_envir
   scoped_env_var grid_mode("OCUDU_UL_CUDA_VISIBLE_GRID");
   ASSERT_TRUE(grid_mode.set("pinned"));
 
-  std::shared_ptr<resource_grid_factory> factory = create_phy_acceleration_resource_grid_factory(
-      create_resource_grid_factory(),
-      phy_acceleration_resource_grid_direction::uplink,
-      true,
-      0,
-      phy_acceleration_resource_grid_memory_mode::managed);
+  std::shared_ptr<resource_grid_factory> factory =
+      create_phy_acceleration_resource_grid_factory(create_resource_grid_factory(),
+                                                    phy_acceleration_resource_grid_direction::uplink,
+                                                    true,
+                                                    0,
+                                                    phy_acceleration_resource_grid_memory_mode::managed);
   ASSERT_NE(factory, nullptr);
 
   std::unique_ptr<resource_grid> grid = factory->create(1, 1, 24);

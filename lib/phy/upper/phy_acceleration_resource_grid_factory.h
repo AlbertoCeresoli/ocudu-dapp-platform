@@ -22,13 +22,12 @@ enum class phy_acceleration_resource_grid_memory_mode { auto_select, managed, pi
 ///
 /// When acceleration is disabled, or when the build has no accelerated implementation, the fallback factory is
 /// returned.
-std::shared_ptr<resource_grid_factory>
-create_phy_acceleration_resource_grid_factory(std::shared_ptr<resource_grid_factory>   fallback_factory,
-                                              phy_acceleration_resource_grid_direction direction,
-                                              bool                                     enable_accelerated_grid,
-                                              int                                      nvcuda_device_id = 0,
-                                              phy_acceleration_resource_grid_memory_mode memory_mode =
-                                                  phy_acceleration_resource_grid_memory_mode::auto_select);
+std::shared_ptr<resource_grid_factory> create_phy_acceleration_resource_grid_factory(
+    std::shared_ptr<resource_grid_factory>     fallback_factory,
+    phy_acceleration_resource_grid_direction   direction,
+    bool                                       enable_accelerated_grid,
+    int                                        nvcuda_device_id = 0,
+    phy_acceleration_resource_grid_memory_mode memory_mode = phy_acceleration_resource_grid_memory_mode::auto_select);
 
 /// Returns true when the given NVIDIA CUDA device is known to be discrete. Unknown devices return false.
 bool phy_acceleration_cuda_current_device_is_discrete(int nvcuda_device_id = 0);

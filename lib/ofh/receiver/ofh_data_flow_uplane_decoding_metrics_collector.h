@@ -112,11 +112,11 @@ private:
     max_latency_ns.store(default_max_latency_ns, std::memory_order_relaxed);
   }
 
-  std::atomic<uint32_t> count                = {};
-  std::atomic<uint64_t> sum_elapsed_ns       = {};
-  std::atomic<uint32_t> min_latency_ns       = default_min_latency_ns;
-  std::atomic<uint32_t> max_latency_ns       = default_max_latency_ns;
-  std::atomic<uint32_t> nof_dropped_messages = {0};
+  std::atomic<uint32_t>     count                = {};
+  std::atomic<uint64_t>     sum_elapsed_ns       = {};
+  std::atomic<uint32_t>     min_latency_ns       = default_min_latency_ns;
+  std::atomic<uint32_t>     max_latency_ns       = default_max_latency_ns;
+  std::atomic<uint32_t>     nof_dropped_messages = {0};
   static constexpr unsigned nof_direct_write_results =
       static_cast<unsigned>(direct_write_result::failure_destination) + 1U;
   std::array<std::atomic<uint32_t>, nof_direct_write_results> direct_write_results = {};

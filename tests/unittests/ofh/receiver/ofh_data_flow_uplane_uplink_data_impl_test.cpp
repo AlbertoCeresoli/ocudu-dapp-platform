@@ -55,17 +55,14 @@ public:
 
   bool supports_resource_grid_decompression() const override { return direct_decompression_enabled; }
 
-  bool prefers_full_symbol_decompression(const ru_compression_params&) const override
-  {
-    return assemble_fragments;
-  }
+  bool prefers_full_symbol_decompression(const ru_compression_params&) const override { return assemble_fragments; }
 
   iq_decompression_result decompress_to_resource_grid(resource_grid_writer&,
-                                                       unsigned,
-                                                       unsigned,
-                                                       unsigned,
-                                                       unsigned,
-                                                       const uplane_section_params&) override
+                                                      unsigned,
+                                                      unsigned,
+                                                      unsigned,
+                                                      unsigned,
+                                                      const uplane_section_params&) override
   {
     ++direct_decompression_count;
     return iq_decompression_result::success;
@@ -81,11 +78,11 @@ public:
   void set_results(const uplane_message_decoder_results& results) { spy_results = results; }
 
   bool     direct_decompression_enabled = false;
-  bool     assemble_fragments            = false;
-  bool     compressed_decode_succeeds    = true;
-  unsigned host_decode_count             = 0;
-  unsigned compressed_decode_count       = 0;
-  unsigned direct_decompression_count     = 0;
+  bool     assemble_fragments           = false;
+  bool     compressed_decode_succeeds   = true;
+  unsigned host_decode_count            = 0;
+  unsigned compressed_decode_count      = 0;
+  unsigned direct_decompression_count   = 0;
 };
 
 } // namespace
@@ -198,7 +195,7 @@ TEST_F(data_flow_uplane_uplink_data_impl_fixture, valid_message_containing_all_s
 
 TEST_F(data_flow_uplane_uplink_data_impl_fixture, expired_cuda_packet_is_not_decoded_on_host)
 {
-  uplane_message_decoder_results deco_results = build_valid_decoder_results();
+  uplane_message_decoder_results deco_results      = build_valid_decoder_results();
   deco_results.sections.front().compressed_iq_data = span<const uint8_t>(reinterpret_cast<const uint8_t*>("x"), 1);
   uplane_decoder->set_results(deco_results);
   uplane_decoder->direct_decompression_enabled = true;
@@ -217,7 +214,7 @@ TEST_F(data_flow_uplane_uplink_data_impl_fixture, expired_cuda_packet_is_not_dec
 TEST_F(data_flow_uplane_uplink_data_impl_fixture, buffered_cuda_fragment_is_not_notified_or_decoded_on_host)
 {
   constexpr ru_compression_params compression = {compression_type::BFP, 9};
-  unsigned                        prb_size     = get_compressed_prb_size(compression).value();
+  unsigned                        prb_size    = get_compressed_prb_size(compression).value();
   std::vector<uint8_t>            compressed_payload(25 * prb_size);
   uplane_message_decoder_results  deco_results = build_valid_decoder_results();
   auto&                           section      = deco_results.sections.front();
@@ -226,8 +223,8 @@ TEST_F(data_flow_uplane_uplink_data_impl_fixture, buffered_cuda_fragment_is_not_
   section.compressed_iq_data                   = compressed_payload;
   uplane_decoder->set_results(deco_results);
   uplane_decoder->direct_decompression_enabled = true;
-  uplane_decoder->assemble_fragments            = true;
-  rg_writer.device_mapping_enabled              = true;
+  uplane_decoder->assemble_fragments           = true;
+  rg_writer.device_mapping_enabled             = true;
 
   data_flow.decode_type1_message(eaxc, {});
 
@@ -245,7 +242,7 @@ TEST_F(data_flow_uplane_uplink_data_impl_fixture, buffered_cuda_fragment_is_not_
 
 TEST_F(data_flow_uplane_uplink_data_impl_fixture, unavailable_device_grid_falls_back_before_writing)
 {
-  uplane_message_decoder_results deco_results = build_valid_decoder_results();
+  uplane_message_decoder_results deco_results      = build_valid_decoder_results();
   deco_results.sections.front().compressed_iq_data = span<const uint8_t>(reinterpret_cast<const uint8_t*>("x"), 1);
   uplane_decoder->set_results(deco_results);
   uplane_decoder->direct_decompression_enabled = true;
@@ -267,7 +264,7 @@ TEST_F(data_flow_uplane_uplink_data_impl_fixture, required_direct_decompression_
   config.host_decompression = host_decompression_policy::forbid;
   data_flow_uplane_uplink_data_impl strict_data_flow(config, get_dependencies());
 
-  uplane_message_decoder_results deco_results = build_valid_decoder_results();
+  uplane_message_decoder_results deco_results      = build_valid_decoder_results();
   deco_results.sections.front().compressed_iq_data = span<const uint8_t>(reinterpret_cast<const uint8_t*>("x"), 1);
   uplane_decoder->set_results(deco_results);
   uplane_decoder->direct_decompression_enabled = true;
@@ -291,7 +288,7 @@ TEST_F(data_flow_uplane_uplink_data_impl_fixture, required_direct_decompression_
   data_flow_uplane_uplink_data_impl strict_data_flow(config, get_dependencies());
 
   uplane_decoder->direct_decompression_enabled = true;
-  uplane_decoder->compressed_decode_succeeds    = false;
+  uplane_decoder->compressed_decode_succeeds   = false;
 
   strict_data_flow.decode_type1_message(eaxc, {});
 

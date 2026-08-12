@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
 
 #include "ocudu/ofh/compression/compression_factory.h"
-#include "ocudu/ofh/compression/compression_properties.h"
 #include "iq_compression_bfp_impl.h"
 #include "iq_compression_cuda.h"
 #include "iq_compression_death_impl.h"
 #include "iq_compression_none_impl.h"
 #include "iq_compressor_selector.h"
 #include "iq_decompressor_selector.h"
+#include "ocudu/ofh/compression/compression_properties.h"
 #include "ocudu/phy/antenna_ports.h"
 #include "ocudu/ran/cyclic_prefix.h"
 #include "ocudu/ran/resource_block.h"
@@ -74,10 +74,10 @@ static bool is_cpu_auto_compression_requested(const std::string& impl_type)
   return (impl_type == "auto") || (impl_type == "cpu_auto");
 }
 
-std::unique_ptr<iq_compressor> ocudu::ofh::create_iq_compressor(compression_type        type,
-                                                                ocudulog::basic_logger& logger,
-                                                                float                   iq_scaling,
-                                                                const std::string&      impl_type,
+std::unique_ptr<iq_compressor> ocudu::ofh::create_iq_compressor(compression_type                   type,
+                                                                ocudulog::basic_logger&            logger,
+                                                                float                              iq_scaling,
+                                                                const std::string&                 impl_type,
                                                                 iq_compressor_preallocation_config preallocation)
 {
   std::string resolved_impl_type = resolve_compression_impl_type(impl_type, "OCUDU_OFH_TX_COMPRESSION_IMPL");
@@ -105,9 +105,8 @@ std::unique_ptr<iq_compressor> ocudu::ofh::create_iq_compressor(compression_type
   size_t preallocated_batch_bytes = 0;
   if (preallocation_complete && ((type == compression_type::none) || (type == compression_type::BFP))) {
     ru_compression_params params{type, preallocation.data_width};
-    uint64_t batch_bytes = static_cast<uint64_t>(preallocation.max_nof_prbs) *
-                           get_compressed_prb_size(params).value() * preallocation.max_nof_ports *
-                           preallocation.max_nof_symbols;
+    uint64_t batch_bytes = static_cast<uint64_t>(preallocation.max_nof_prbs) * get_compressed_prb_size(params).value() *
+                           preallocation.max_nof_ports * preallocation.max_nof_symbols;
     report_fatal_error_if_not(batch_bytes <= std::numeric_limits<size_t>::max(),
                               "IQ compression preallocation size exceeds the platform limit.");
     preallocated_batch_bytes = static_cast<size_t>(batch_bytes);
@@ -124,8 +123,7 @@ std::unique_ptr<iq_compressor> ocudu::ofh::create_iq_compressor(compression_type
             type,
             logger,
             iq_scaling,
-            iq_compression_cuda_preallocation_config{
-                .host_buffer_compression_capacity = preallocated_batch_bytes});
+            iq_compression_cuda_preallocation_config{.host_buffer_compression_capacity = preallocated_batch_bytes});
       }
 #endif
 #ifdef __x86_64__
@@ -159,8 +157,7 @@ std::unique_ptr<iq_compressor> ocudu::ofh::create_iq_compressor(compression_type
             type,
             logger,
             iq_scaling,
-            iq_compression_cuda_preallocation_config{
-                .host_buffer_compression_capacity = preallocated_batch_bytes});
+            iq_compression_cuda_preallocation_config{.host_buffer_compression_capacity = preallocated_batch_bytes});
       }
 #endif
 #ifdef __x86_64__

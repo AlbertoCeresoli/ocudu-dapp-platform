@@ -94,11 +94,11 @@ public:
   /// \param[in]  section   Previously decoded U-Plane section.
   /// \return Structured result describing whether the operation completed and, on failure, why it did not.
   virtual iq_decompression_result decompress_to_resource_grid(resource_grid_writer&        grid,
-                                                               unsigned                     port,
-                                                               unsigned                     symbol,
-                                                               unsigned                     start_prb,
-                                                               unsigned                     nof_prbs,
-                                                               const uplane_section_params& section)
+                                                              unsigned                     port,
+                                                              unsigned                     symbol,
+                                                              unsigned                     start_prb,
+                                                              unsigned                     nof_prbs,
+                                                              const uplane_section_params& section)
   {
     (void)grid;
     (void)port;
@@ -123,15 +123,15 @@ public:
   /// \param[in]  section        Previously decoded U-Plane section.
   /// \return Structured result describing whether the operation completed and, on failure, why it did not.
   virtual iq_decompression_result decompress_to_prach_buffer(prach_buffer&                buffer,
-                                                              unsigned                     port,
-                                                              unsigned                     td_occasion,
-                                                              unsigned                     fd_occasion,
-                                                              unsigned                     symbol,
-                                                              unsigned                     start_re,
-                                                              unsigned                     input_start_re,
-                                                              unsigned                     nof_re,
-                                                              unsigned                     nof_prbs,
-                                                              const uplane_section_params& section)
+                                                             unsigned                     port,
+                                                             unsigned                     td_occasion,
+                                                             unsigned                     fd_occasion,
+                                                             unsigned                     symbol,
+                                                             unsigned                     start_re,
+                                                             unsigned                     input_start_re,
+                                                             unsigned                     nof_re,
+                                                             unsigned                     nof_prbs,
+                                                             const uplane_section_params& section)
   {
     (void)buffer;
     (void)port;

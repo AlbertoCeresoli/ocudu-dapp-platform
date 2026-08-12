@@ -38,19 +38,19 @@ void uplane_iq_data_fragment_assembler::start(slot_point                   slot,
   assembled_data.resize(static_cast<size_t>(nof_symbol_prbs) * fragment_prb_size);
 }
 
-uplane_iq_data_fragment_assembler::result uplane_iq_data_fragment_assembler::add_fragment(
-    slot_point                   slot,
-    unsigned                     symbol,
-    unsigned                     port,
-    unsigned                     nof_symbol_prbs,
-    unsigned                     start_prb,
-    unsigned                     fragment_nof_prbs,
-    span<const uint8_t>          compressed_data,
-    const ru_compression_params& params)
+uplane_iq_data_fragment_assembler::result
+uplane_iq_data_fragment_assembler::add_fragment(slot_point                   slot,
+                                                unsigned                     symbol,
+                                                unsigned                     port,
+                                                unsigned                     nof_symbol_prbs,
+                                                unsigned                     start_prb,
+                                                unsigned                     fragment_nof_prbs,
+                                                span<const uint8_t>          compressed_data,
+                                                const ru_compression_params& params)
 {
   if ((nof_symbol_prbs == 0) || (nof_symbol_prbs > MAX_NOF_PRBS) || (fragment_nof_prbs == 0) ||
-      (start_prb >= nof_symbol_prbs) || (fragment_nof_prbs > nof_symbol_prbs - start_prb) ||
-      (params.data_width == 0) || (params.data_width > MAX_IQ_WIDTH)) {
+      (start_prb >= nof_symbol_prbs) || (fragment_nof_prbs > nof_symbol_prbs - start_prb) || (params.data_width == 0) ||
+      (params.data_width > MAX_IQ_WIDTH)) {
     clear();
     return result::invalid;
   }
@@ -79,9 +79,7 @@ uplane_iq_data_fragment_assembler::result uplane_iq_data_fragment_assembler::add
     return result::invalid;
   }
 
-  std::memcpy(assembled_data.data() + static_cast<size_t>(start_prb) * prb_size,
-              compressed_data.data(),
-              fragment_size);
+  std::memcpy(assembled_data.data() + static_cast<size_t>(start_prb) * prb_size, compressed_data.data(), fragment_size);
   received_prbs.fill(start_prb, start_prb + fragment_nof_prbs);
   return received_prbs.all() ? result::complete : result::incomplete;
 }

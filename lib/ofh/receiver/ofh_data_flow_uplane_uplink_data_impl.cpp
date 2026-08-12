@@ -47,8 +47,7 @@ void data_flow_uplane_uplink_data_impl::decode_type1_message(unsigned eaxc, span
         return;
       }
       if (is_direct_write_success(write_result)) {
-        notification_sender.notify_received_symbol(compressed_results.params.slot,
-                                                   compressed_results.params.symbol_id);
+        notification_sender.notify_received_symbol(compressed_results.params.slot, compressed_results.params.symbol_id);
         return;
       }
       if (!allows_host_decompression_fallback(write_result)) {
