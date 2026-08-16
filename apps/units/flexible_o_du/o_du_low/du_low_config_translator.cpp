@@ -208,7 +208,9 @@ static odu::du_low_config generate_du_low_config(const du_low_unit_config&      
     upper_phy_cell.nof_tx_ports               = cell.nof_tx_antennas;
     upper_phy_cell.nof_rx_ports               = cell.nof_rx_antennas;
     upper_phy_cell.nof_dl_rg                  = dl_pipeline_depth + 2 + get_env_unsigned("OCUDU_DU_LOW_EXTRA_DL_RG", 0);
-    upper_phy_cell.nof_ul_rg                  = ul_pipeline_depth;
+    // Default reuse period is one 10 ms frame. PUSCH tails > that (PBC + GPU
+    // contention) make get_pdu_slot_repository fail → "UL processor is busy".
+    upper_phy_cell.nof_ul_rg = ul_pipeline_depth + get_env_unsigned("OCUDU_DU_LOW_EXTRA_UL_RG", 0);
     upper_phy_cell.nof_prach_buffer           = du_low.expert_phy_cfg.max_processing_delay_slots + 2;
     upper_phy_cell.max_nof_td_prach_occasions = prach_cfg.nof_occasions_within_slot;
     upper_phy_cell.max_nof_fd_prach_occasions = 1;
