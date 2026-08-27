@@ -51,6 +51,9 @@ public:
   /// Transport-block resident decode result type.
   using tb_decode_result = pusch_resident_codeblock_decoder::tb_decode_result;
 
+  // See pusch_resident_codeblock_decoder.
+  bool export_resident_softbits(span<span<log_likelihood_ratio>> rm_buffers) override;
+
   /// CRC calculators used in shared channels.
   struct sch_crc {
     /// For short TB checksums.
@@ -243,6 +246,26 @@ private:
   static constexpr int NUM_DECODE_BUFFERS                    = 3;
   void*                d_llr_batch_half_[NUM_DECODE_BUFFERS] = {nullptr, nullptr, nullptr};
   int                  current_decode_buf_                   = 0; ///< Rotating buffer index for triple-buffering
+
+  /// Bookkeeping of the last resident decode for export_resident_softbits().
+  struct resident_export_state {
+    /// True when d_llr_batch_half_[buffer] holds the dematched LLRs of the last resident decode.
+    bool valid = false;
+    /// Decode buffer that holds the dematched fp16 LLRs.
+    int buffer = 0;
+    /// Stream the resident decode ran on.
+    cudaStream_t stream = nullptr;
+    /// Lifting size of the last resident decode.
+    unsigned lifting_size = 0;
+    /// Per-codeblock stride of the fp16 buffer, in LLRs.
+    unsigned stride = 0;
+    /// Number of codeblocks of the last resident decode.
+    unsigned nof_cbs = 0;
+  };
+  resident_export_state resident_export_;
+
+  /// Host staging for exported fp16 dematched LLRs.
+  std::vector<uint16_t> h_export_half_;
 
   /// Device memory for batched output bits (all CBs contiguous).
   uint32_t* d_output_batch_ = nullptr;

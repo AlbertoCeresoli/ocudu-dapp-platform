@@ -311,6 +311,18 @@ Current production support boundaries:
 - Transform-precoded PUSCH is limited to one layer in the resident path. It is
   useful for Msg3-style smoke coverage, but non-transform Type-1 DM-RS remains
   the primary latency and sensitivity target for the bring-up platform.
+- HARQ retransmissions always decode on the host LDPC path (`decode_batch`
+  with `new_data=false`), soft-combining with the rate-matching buffer of the
+  HARQ process. Because a resident first transmission keeps its dematched LLRs
+  on the device, the decoder exports them into that buffer when the resident
+  transport block fails its CRC (`export_resident_softbits`, fp16 device LLRs
+  on the demodulator's x4 host scale, punctured 2Z prefix skipped). If the
+  backend cannot export (direct rate-match→LDPC kernel for ≥32 codeblocks),
+  the buffer is zeroed so the retransmission decodes on its own instead of
+  against stale soft bits of an unrelated transport block. Before this, OTA
+  retransmissions on the reference cell failed at 94% while the same bursts
+  decoded standalone; `pusch_codeblock_decoder_cuda_batch_test` pins the
+  export against the host rate dematcher.
 - PDSCH direct device-grid mapping supports one-layer allocations and
   multi-layer identity-style allocations where the number of layers equals the
   number of ports. Other precoding layouts use the host resource-grid writer.

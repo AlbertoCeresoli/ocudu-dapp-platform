@@ -38,6 +38,17 @@ if(CUDA_ACCEL_FOUND)
         gtest_main)
     add_test(ldpc_decoder_gpu_cpu_test ldpc_decoder_gpu_cpu_test)
 
+    add_executable(pusch_codeblock_decoder_cuda_batch_test pusch_codeblock_decoder_cuda_batch_test.cpp)
+    target_include_directories(pusch_codeblock_decoder_cuda_batch_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc/cuda)
+    target_link_libraries(pusch_codeblock_decoder_cuda_batch_test
+        ocudu_channel_coding
+        ocudu_ldpc_cuda
+        ocudulog
+        gtest
+        gtest_main)
+    add_test(pusch_codeblock_decoder_cuda_batch_test pusch_codeblock_decoder_cuda_batch_test)
+
 endif()
 
 # GPU tests must not run concurrently with each other. The CUDA runtime rejects allocations with

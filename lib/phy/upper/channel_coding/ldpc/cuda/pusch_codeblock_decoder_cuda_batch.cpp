@@ -765,6 +765,87 @@ void pusch_codeblock_decoder_cuda_batch::rate_dematch_only(span<const log_likeli
   dematcher_->rate_dematch(rm_buffer, cb_llrs, new_data, metadata);
 }
 
+namespace {
+
+/// Converts a device fp16 LLR to the host int8 LLR scale. Must stay bit-for-bit consistent with the demodulator's D2H
+/// conversion (pusch_demodulator_gpu_impl fp16_to_int8_lut: value x 4, rounded, clipped to +/-LLR_MAX), otherwise a
+/// retransmission demodulated on the host would be combined with first-transmission soft bits on a different scale.
+inline log_likelihood_ratio fp16_llr_to_host(uint16_t bits)
+{
+  constexpr int host_max = log_likelihood_ratio::max().to_int();
+  const uint32_t sign = (bits >> 15) & 0x1;
+  const uint32_t exp  = (bits >> 10) & 0x1f;
+  const uint32_t mant = bits & 0x3ff;
+  float          val;
+  if (exp == 0) {
+    val = (sign ? -1.0f : 1.0f) * (static_cast<float>(mant) / 1024.0f) * (1.0f / 16384.0f);
+  } else if (exp == 31) {
+    val = sign ? -static_cast<float>(host_max) : static_cast<float>(host_max);
+  } else {
+    val = (sign ? -1.0f : 1.0f) * (1.0f + static_cast<float>(mant) / 1024.0f) *
+          std::ldexp(1.0f, static_cast<int>(exp) - 15);
+  }
+  int scaled = static_cast<int>(std::lround(val * 4.0f));
+  scaled     = std::max(-host_max, std::min(host_max, scaled));
+  return log_likelihood_ratio(static_cast<int8_t>(scaled));
+}
+
+} // namespace
+
+bool pusch_codeblock_decoder_cuda_batch::export_resident_softbits(span<span<log_likelihood_ratio>> rm_buffers)
+{
+  const resident_export_state state = resident_export_;
+  // One export per resident decode: the decode buffers rotate, so a second call could read another TB.
+  resident_export_.valid = false;
+  if (!state.valid || state.nof_cbs == 0 || rm_buffers.size() != state.nof_cbs || state.stride == 0 ||
+      state.lifting_size == 0 || d_llr_batch_half_[state.buffer] == nullptr) {
+    return false;
+  }
+
+  const size_t total = static_cast<size_t>(state.nof_cbs) * state.stride;
+  if (h_export_half_.size() < total) {
+    h_export_half_.resize(total);
+  }
+  // The resident decode already synchronised this stream, so the dematched LLRs are final; this copy only has to
+  // wait for itself.
+  cudaError_t cuda_status = cudaMemcpyAsync(h_export_half_.data(),
+                                            d_llr_batch_half_[state.buffer],
+                                            total * sizeof(uint16_t),
+                                            cudaMemcpyDeviceToHost,
+                                            state.stream);
+  if (cuda_status != cudaSuccess) {
+    static_cast<void>(cudaGetLastError());
+    return false;
+  }
+  cuda_status = cudaStreamSynchronizeYielding(state.stream);
+  if (cuda_status != cudaSuccess) {
+    static_cast<void>(cudaGetLastError());
+    return false;
+  }
+
+  // The device buffer holds the full codeword including the 2Z punctured systematic positions at the front (see the
+  // CPU fallback in decode_batch, which writes the host soft buffer at puncture_offset). The host soft buffer starts
+  // after the punctured bits.
+  const unsigned puncture_offset = 2U * state.lifting_size;
+  if (state.stride <= puncture_offset) {
+    return false;
+  }
+  const unsigned available = state.stride - puncture_offset;
+  for (unsigned cb = 0; cb != state.nof_cbs; ++cb) {
+    span<log_likelihood_ratio> rm_buffer = rm_buffers[cb];
+    const uint16_t*            src       = h_export_half_.data() + static_cast<size_t>(cb) * state.stride + puncture_offset;
+    const unsigned             count     = std::min<unsigned>(rm_buffer.size(), available);
+    for (unsigned i = 0; i != count; ++i) {
+      rm_buffer[i] = fp16_llr_to_host(src[i]);
+    }
+    // Positions the device never produced (limited buffer) start clean.
+    if (count < rm_buffer.size()) {
+      std::fill(rm_buffer.begin() + count, rm_buffer.end(), log_likelihood_ratio(0));
+    }
+  }
+  return true;
+}
+
 void pusch_codeblock_decoder_cuda_batch::extract_decoded_bits(bit_buffer& output, unsigned cb_idx, unsigned nof_bits)
 {
   // Get pointer to this CB's output in the batch buffer.
@@ -1548,6 +1629,15 @@ pusch_codeblock_decoder_cuda_batch::tb_decode_result pusch_codeblock_decoder_cud
   int gpu_tb_crc_ok     = *h_tb_crc_result_pinned_;
   result.tb_crc_ok      = all_cb_crcs_ok && (gpu_tb_crc_ok == 1);
   result.all_cb_crcs_ok = all_cb_crcs_ok;
+
+  // Remember where the dematched LLRs live so a failed first transmission can seed the host HARQ soft buffers
+  // (export_resident_softbits). The direct rate-match→LDPC kernel never materialises them.
+  resident_export_.valid        = !direct_rm_ldpc_path;
+  resident_export_.buffer       = buf_idx;
+  resident_export_.stream       = stream;
+  resident_export_.lifting_size = lifting_size;
+  resident_export_.stride       = llr_stride_;
+  resident_export_.nof_cbs      = nof_cbs;
 
   // Get actual average iterations from the decoder.
   auto  avg_iters_start = timing_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

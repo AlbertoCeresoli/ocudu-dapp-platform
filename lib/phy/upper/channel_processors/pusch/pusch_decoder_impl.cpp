@@ -821,6 +821,23 @@ bool pusch_decoder_impl::try_decode_resident(const resident_softbit_buffer& code
   gpu_tb_crc_result_              = tb_result.tb_crc_ok;
   last_acceleration_timing_stats_ = gpu_decoder->get_last_timing_stats();
 
+  // A resident decode never touches the host rate-matching buffers, but a retransmission of this transport block is
+  // decoded on the host path and soft-combines with them (rate_dematch with new_data=false). Seed them with the
+  // dematched first-transmission LLRs so HARQ combining works; if the backend cannot export them, reset the buffers so
+  // the retransmission at least decodes on its own instead of against stale soft bits of an unrelated TB.
+  if (!tb_result.tb_crc_ok) {
+    static_vector<span<log_likelihood_ratio>, MAX_NOF_SEGMENTS> rm_buffers;
+    for (unsigned cb_id = 0; cb_id != nof_codeblocks; ++cb_id) {
+      const unsigned cb_length = codeblock_llrs[cb_id].second.cb_specific.full_length;
+      rm_buffers.push_back(unique_rm_buffer->get_codeblock_soft_bits(cb_id, cb_length));
+    }
+    if (!gpu_decoder->export_resident_softbits(rm_buffers)) {
+      for (span<log_likelihood_ratio> rm_buffer : rm_buffers) {
+        ocuduvec::zero(rm_buffer);
+      }
+    }
+  }
+
   // Update per-CB CRC status and stats.
   span<bool> cb_crcs = unique_rm_buffer->get_codeblocks_crc();
   for (unsigned cb_id = 0; cb_id < nof_codeblocks; ++cb_id) {

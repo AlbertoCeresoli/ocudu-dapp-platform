@@ -111,6 +111,18 @@ public:
                                  bool                             new_data,
                                  const codeblock_metadata&        metadata) = 0;
 
+  /// \brief Exports the rate-dematched soft bits of the most recent resident decode into host HARQ soft buffers.
+  ///
+  /// A resident decode keeps the dematched LLRs on the device, so the host rate-matching buffers that a later
+  /// retransmission combines with are never written. Call this after a failed resident decode so the retransmission
+  /// can be soft-combined with the first transmission (TS38.212 Section 5.4.2.1 buffer semantics). The exported values
+  /// use the host LLR scale of pusch_decoder_impl (identical to the D2H LLR conversion of the demodulator).
+  ///
+  /// \param[out] rm_buffers One host soft buffer per codeblock of the last resident decode (full codeblock length).
+  /// \return True if every buffer was written, false if the last resident decode left no exportable dematched LLRs
+  ///         (the caller must then reset the buffers itself, otherwise stale soft bits are combined).
+  virtual bool export_resident_softbits(span<span<log_likelihood_ratio>> rm_buffers) = 0;
+
   /// Decode resident softbits and write the reassembled transport block.
   virtual tb_decode_result decode_resident_softbits(void*                                                resident_llrs,
                                                     size_t                                               nof_softbits,
