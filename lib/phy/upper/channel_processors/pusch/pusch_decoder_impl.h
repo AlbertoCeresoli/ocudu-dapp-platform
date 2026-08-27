@@ -192,6 +192,10 @@ public:
     demod_sync_us_               = demod_sync_us;
   }
 
+  void set_demod_device_grid_used(bool used) override { demod_device_grid_used_ = used; }
+
+  void set_demod_owned_device_grid_used(bool used) override { demod_owned_device_grid_used_ = used; }
+
   // See interface for the documentation.
   void set_detailed_gap_timing(float decode_call_us, float sinr_readback_us) override
   {
@@ -278,8 +282,10 @@ private:
   /// Last GPU decoder timing copied before releasing a pooled decoder.
   pusch_resident_codeblock_decoder_timing_stats last_acceleration_timing_stats_;
   /// Demodulator gap timing (set before decode, applied to result after).
-  float demod_grid_staging_us_ = 0;
-  float demod_sync_us_         = 0;
+  float demod_grid_staging_us_        = 0;
+  float demod_sync_us_                = 0;
+  bool  demod_device_grid_used_       = false;
+  bool  demod_owned_device_grid_used_ = false;
   /// Detailed gap timing from processor.
   float ch_estimate_us_        = 0;
   float process_data_setup_us_ = 0;

@@ -107,6 +107,17 @@ public:
   /// Records that device-grid mapping has been enqueued on an opaque execution stream.
   virtual bool on_device_grid_mapping_enqueued(void*) { return true; }
 
+  /// Returns true when the writer can publish an immutable device-owned copy of the mapped grid.
+  virtual bool supports_owned_device_grid_snapshot() const { return false; }
+
+  /// Publishes an immutable device-owned grid snapshot on the producer stream.
+  ///
+  /// This is called after the producer has enqueued the complete grid and before
+  /// on_device_grid_mapping_enqueued(). It allows asynchronous device consumers
+  /// to retain a stable input even if a host consumer subsequently migrates the
+  /// live CUDA-managed grid.
+  virtual bool publish_owned_device_grid_snapshot(void*) { return false; }
+
   /// Cancels a device-grid mapping attempt before it records completion.
   virtual bool cancel_device_grid_mapping() { return true; }
 

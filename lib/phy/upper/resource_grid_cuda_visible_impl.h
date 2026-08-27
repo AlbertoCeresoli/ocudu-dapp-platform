@@ -118,6 +118,15 @@ public:
       }
       grid_ready_events.push_back(event);
     }
+    owned_snapshot_read_events.reserve(initial_ready_events);
+    pending_owned_snapshot_reads.reserve(initial_ready_events);
+    for (unsigned i_event = 0; i_event != initial_ready_events; ++i_event) {
+      cudaEvent_t event = nullptr;
+      if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+        break;
+      }
+      owned_snapshot_read_events.push_back(event);
+    }
     cudaStream_t stream = nullptr;
     if (create_realtime_stream(&stream) == cudaSuccess) {
       maintenance_stream = stream;
@@ -136,7 +145,8 @@ public:
     writer = std::make_unique<writer_impl>(*this, *rg_buffer, alloc_mask);
     reader = std::make_unique<reader_impl>(*this, *rg_buffer, alloc_mask);
 
-    const uint64_t words = managed_bytes / sizeof(uint32_t);
+    const uint64_t words               = managed_bytes / sizeof(uint32_t);
+    unsigned       nof_owned_snapshots = 0;
     for (unsigned i = 0; i != owned_snapshot_ring; ++i) {
       cudaEvent_t ev = nullptr;
       if (cudaMalloc(&owned_snapshot[i], managed_bytes) != cudaSuccess ||
@@ -148,7 +158,21 @@ public:
         break;
       }
       owned_snapshot_ready[i] = ev;
-      owned_snapshot_words    = words;
+      ++nof_owned_snapshots;
+    }
+    if (nof_owned_snapshots == owned_snapshot_ring) {
+      owned_snapshot_words = words;
+    } else {
+      for (unsigned i = 0; i != owned_snapshot_ring; ++i) {
+        if (owned_snapshot_ready[i] != nullptr) {
+          cudaEventDestroy(static_cast<cudaEvent_t>(owned_snapshot_ready[i]));
+          owned_snapshot_ready[i] = nullptr;
+        }
+        if (owned_snapshot[i] != nullptr) {
+          cudaFree(owned_snapshot[i]);
+          owned_snapshot[i] = nullptr;
+        }
+      }
     }
 
     // Pinned staging buffer for host→owned H2D (Class-C). Always try when
@@ -178,6 +202,11 @@ public:
     grid_ready_events.clear();
     pending_grid_ready_events.clear();
     grid_ready_event = nullptr;
+    for (void* event : owned_snapshot_read_events) {
+      cudaEventDestroy(static_cast<cudaEvent_t>(event));
+    }
+    owned_snapshot_read_events.clear();
+    pending_owned_snapshot_reads.clear();
     if (maintenance_stream != nullptr) {
       cudaStreamDestroy(static_cast<cudaStream_t>(maintenance_stream));
       maintenance_stream = nullptr;
@@ -214,8 +243,9 @@ public:
       return;
     }
 
-    owned_snapshot_ready_ok = false;
-    host_pinned_valid       = false;
+    owned_snapshot_ready_ok         = false;
+    owned_snapshot_pusch_compatible = false;
+    host_pinned_valid               = false;
 
     if (alloc_mask.is_empty()) {
       return;
@@ -307,6 +337,23 @@ private:
 
     void* get_owned_device_snapshot_ready_event() const override { return parent.owned_snapshot_event(); }
 
+    bool owned_device_snapshot_is_pusch_compatible() const override
+    {
+      return parent.owned_snapshot_is_pusch_compatible();
+    }
+
+    bool prepare_owned_device_snapshot_reading(void* stream) const override
+    {
+      return parent.prepare_owned_snapshot_reading(stream);
+    }
+
+    bool on_owned_device_snapshot_reading_enqueued(void* stream) const override
+    {
+      return parent.record_owned_snapshot_reading(stream);
+    }
+
+    void release_owned_device_snapshot_reading() const override { parent.release_owned_snapshot_read_hold(); }
+
     bool stage_owned_snapshot_from_host() const override { return parent.stage_owned_snapshot_from_host(); }
 
     void* get_owned_host_mapped_device_ptr() const override { return parent.owned_host_mapped_ptr(); }
@@ -331,7 +378,7 @@ private:
         parent.log_host_access_failure("read");
         return symbols;
       }
-      symb                    = symb.subspan(k_init, mask.size());
+      symb                      = symb.subspan(k_init, mask.size());
       const unsigned mask_count = mask.count();
       if (mask_count && mask.is_contiguous()) {
         ocuduvec::convert(symbols.first(mask_count), symb.subspan(mask.find_lowest(), mask_count));
@@ -517,6 +564,13 @@ private:
         mark_port_allocated(port);
       }
       return true;
+    }
+
+    bool supports_owned_device_grid_snapshot() const override { return parent.owned_snapshot_words != 0; }
+
+    bool publish_owned_device_grid_snapshot(void* stream) override
+    {
+      return parent.publish_owned_snapshot_from_device(stream);
     }
 
     bool cancel_device_grid_mapping() override { return parent.cancel_device_mapping(); }
@@ -837,9 +891,9 @@ private:
       if (host_pinned[i] != nullptr && host_pinned_ready[i] != nullptr) {
         continue;
       }
-      void*       pinned  = nullptr;
-      void*       mapped  = nullptr;
-      cudaEvent_t ev      = nullptr;
+      void*       pinned = nullptr;
+      void*       mapped = nullptr;
+      cudaEvent_t ev     = nullptr;
       if (cudaHostAlloc(&pinned, managed_bytes, cudaHostAllocMapped) != cudaSuccess ||
           cudaHostGetDevicePointer(&mapped, pinned, 0) != cudaSuccess ||
           cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
@@ -871,8 +925,7 @@ private:
         if (host_pinned_valid && host_pinned_index == i) {
           return true;
         }
-        void* ready = owned_snapshot_ready[i] != nullptr ? owned_snapshot_ready[i] : host_pinned_ready[i];
-        const cudaError_t st = cuda_event_synchronize_yielding(static_cast<cudaEvent_t>(ready));
+        const cudaError_t st = cuda_event_synchronize_yielding(static_cast<cudaEvent_t>(host_pinned_ready[i]));
         if (st == cudaSuccess) {
           host_pinned_index = i;
           host_pinned_valid = true;
@@ -894,8 +947,7 @@ private:
     if (!materialize_owned_snapshot_to_host()) {
       return {};
     }
-    if (host_pinned_valid && host_pinned_index < owned_snapshot_ring &&
-        host_pinned[host_pinned_index] != nullptr) {
+    if (host_pinned_valid && host_pinned_index < owned_snapshot_ring && host_pinned[host_pinned_index] != nullptr) {
       auto* p = static_cast<const cbf16_t*>(host_pinned[host_pinned_index]);
       return span<const cbf16_t>(p + (static_cast<size_t>(port) * nof_symbols + l) * nof_subc, nof_subc);
     }
@@ -907,8 +959,7 @@ private:
     if (!materialize_owned_snapshot_to_host()) {
       return {};
     }
-    if (host_pinned_valid && host_pinned_index < owned_snapshot_ring &&
-        host_pinned[host_pinned_index] != nullptr) {
+    if (host_pinned_valid && host_pinned_index < owned_snapshot_ring && host_pinned[host_pinned_index] != nullptr) {
       auto* p = static_cast<const cbf16_t*>(host_pinned[host_pinned_index]);
       return span<const cbf16_t>(p, static_cast<size_t>(nof_ports) * nof_symbols * nof_subc);
     }
@@ -920,10 +971,7 @@ private:
     return span<cbf16_t>(host_shadow.data() + (static_cast<size_t>(port) * nof_symbols + l) * nof_subc, nof_subc);
   }
 
-  span<const cbf16_t> host_shadow_all() const
-  {
-    return span<const cbf16_t>(host_shadow.data(), host_shadow.size());
-  }
+  span<const cbf16_t> host_shadow_all() const { return span<const cbf16_t>(host_shadow.data(), host_shadow.size()); }
 
   /// What failed, and the CUDA error behind it. Never null.
   const char* host_access_failure_stage() const
@@ -1033,6 +1081,45 @@ private:
     return stage_owned_snapshot_from_host();
   }
 
+  bool publish_owned_snapshot_from_device(void* stream)
+  {
+    if (stream == nullptr || managed_data == nullptr || managed_bytes == 0 || owned_snapshot_words == 0) {
+      return false;
+    }
+
+    std::unique_lock<std::mutex> lock(grid_ready_mutex);
+    if (!device_mapping_active || !wait_for_owned_snapshot_read_holds_locked(lock)) {
+      return false;
+    }
+
+    const unsigned next = (owned_snapshot_index + 1U) % owned_snapshot_ring;
+    if (owned_snapshot[next] == nullptr || owned_snapshot_ready[next] == nullptr) {
+      return false;
+    }
+
+#ifdef ENABLE_CUDA
+    cudaStream_t producer_stream = static_cast<cudaStream_t>(stream);
+    if (!enqueue_owned_snapshot_overwrite_waits_locked(next, producer_stream) ||
+        (host_pinned_ready[next] != nullptr &&
+         cudaStreamWaitEvent(producer_stream, static_cast<cudaEvent_t>(host_pinned_ready[next]), 0) != cudaSuccess) ||
+        cudaStreamWaitEvent(producer_stream, static_cast<cudaEvent_t>(owned_snapshot_ready[next]), 0) != cudaSuccess ||
+        cudaMemcpyAsync(owned_snapshot[next], managed_data, managed_bytes, cudaMemcpyDeviceToDevice, producer_stream) !=
+            cudaSuccess ||
+        cudaEventRecord(static_cast<cudaEvent_t>(owned_snapshot_ready[next]), producer_stream) != cudaSuccess) {
+      return false;
+    }
+    owned_snapshot_writing          = next;
+    owned_snapshot_index            = next;
+    owned_snapshot_ready_ok         = true;
+    owned_snapshot_pusch_compatible = true;
+    host_pinned_enqueued[next]      = false;
+    host_pinned_valid               = false;
+    return true;
+#else
+    return false;
+#endif
+  }
+
   /// After PUSCH has released the live VA: home pages, CPU-copy into pinned,
   /// H2D into owned cudaMalloc. Never cudaMemcpy the live pointer.
   bool stage_owned_snapshot_from_host() const
@@ -1040,24 +1127,66 @@ private:
     if (owned_snapshot_words == 0 || managed_data == nullptr) {
       return false;
     }
+    std::unique_lock<std::mutex> lock(grid_ready_mutex);
+    if (!allocate_host_pinned()) {
+      return false;
+    }
+
+#ifdef ENABLE_CUDA
+    // A full-slot CUDA producer already supplied the authoritative immutable
+    // image. Class-C consumers need a host view, but replacing that image with
+    // a host-staged snapshot before the deferred PUSCH task starts defeats the
+    // integration boundary. Fork the host view from the owned cudaMalloc
+    // instead: this never migrates the live managed grid and preserves the
+    // PUSCH-compatible snapshot and its ready event.
+    if (owned_snapshot_ready_ok && owned_snapshot_pusch_compatible && owned_snapshot_index < owned_snapshot_ring) {
+      const unsigned i = owned_snapshot_index;
+      if (host_pinned_enqueued[i]) {
+        return true;
+      }
+      if (owned_snapshot[i] == nullptr || owned_snapshot_ready[i] == nullptr || host_pinned[i] == nullptr ||
+          host_pinned_ready[i] == nullptr || maintenance_stream == nullptr) {
+        return false;
+      }
+      cudaStream_t ms = static_cast<cudaStream_t>(maintenance_stream);
+      if (cudaStreamWaitEvent(ms, static_cast<cudaEvent_t>(owned_snapshot_ready[i]), 0) != cudaSuccess ||
+          cudaMemcpyAsync(host_pinned[i], owned_snapshot[i], managed_bytes, cudaMemcpyDeviceToHost, ms) !=
+              cudaSuccess ||
+          cudaEventRecord(static_cast<cudaEvent_t>(host_pinned_ready[i]), ms) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+      }
+      host_pinned_enqueued[i] = true;
+      host_pinned_valid       = false;
+      static std::atomic<bool> logged_device_fork{false};
+      if (!logged_device_fork.exchange(true, std::memory_order_relaxed)) {
+        fmt::print(stderr,
+                   "OCUDU: UL Class-C host snapshot forked from producer-owned CUDA grid (live grid untouched)\n");
+      }
+      return true;
+    }
+#endif
+
     if (owned_snapshot_ready_ok && owned_snapshot_index < owned_snapshot_ring &&
         host_pinned_enqueued[owned_snapshot_index]) {
       return true;
     }
-    // Hold the grid mutex across pages-home AND the host memcpy: with the lock
-    // dropped in between, a device producer can regain residency and launch on
-    // the same VA, and the memcpy then faults the PTEs home mid-kernel (the
-    // Xid 31 class this staging path exists to avoid).
-    std::unique_lock<std::mutex> lock(grid_ready_mutex);
-    if (!pull_pages_home_locked(lock)) {
-      return false;
-    }
-    if (!allocate_host_pinned()) {
+
+    // No device producer snapshot is available. Hold the grid mutex across
+    // pages-home AND the host memcpy: with the lock dropped in between, a
+    // device producer can regain residency and launch on the same VA, and the
+    // memcpy then faults the PTEs home mid-kernel (the Xid 31 class this
+    // staging path exists to avoid).
+    if (!pull_pages_home_locked(lock) || !wait_for_owned_snapshot_read_holds_locked(lock)) {
       return false;
     }
     const unsigned next = (owned_snapshot_index + 1U) % owned_snapshot_ring;
     if (owned_snapshot[next] == nullptr || owned_snapshot_ready[next] == nullptr || host_pinned[next] == nullptr ||
         maintenance_stream == nullptr) {
+      return false;
+    }
+    if (host_pinned_ready[next] != nullptr &&
+        cuda_event_synchronize_yielding(static_cast<cudaEvent_t>(host_pinned_ready[next])) != cudaSuccess) {
       return false;
     }
     if (owned_snapshot_ready[next] != nullptr) {
@@ -1066,23 +1195,22 @@ private:
     std::memcpy(host_pinned[next], managed_data, managed_bytes);
 #ifdef ENABLE_CUDA
     cudaStream_t ms = static_cast<cudaStream_t>(maintenance_stream);
-    if (cudaMemcpyAsync(owned_snapshot[next],
-                        host_pinned[next],
-                        managed_bytes,
-                        cudaMemcpyHostToDevice,
-                        ms) != cudaSuccess ||
-        cudaEventRecord(static_cast<cudaEvent_t>(owned_snapshot_ready[next]), ms) != cudaSuccess) {
+    if (!enqueue_owned_snapshot_overwrite_waits_locked(next, ms) ||
+        cudaMemcpyAsync(owned_snapshot[next], host_pinned[next], managed_bytes, cudaMemcpyHostToDevice, ms) !=
+            cudaSuccess ||
+        cudaEventRecord(static_cast<cudaEvent_t>(owned_snapshot_ready[next]), ms) != cudaSuccess ||
+        cudaEventRecord(static_cast<cudaEvent_t>(host_pinned_ready[next]), ms) != cudaSuccess) {
       (void)cudaGetLastError();
       return false;
     }
-    owned_snapshot_writing            = next;
-    owned_snapshot_index              = next;
-    owned_snapshot_ready_ok           = true;
-    host_pinned_enqueued[next]        = true;
+    owned_snapshot_writing          = next;
+    owned_snapshot_index            = next;
+    owned_snapshot_ready_ok         = true;
+    owned_snapshot_pusch_compatible = false;
+    host_pinned_enqueued[next]      = true;
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
-      fmt::print(stderr,
-                 "OCUDU: UL Class-C snapshot armed (host-home + pinned H2D, no live GPU load)\n");
+      fmt::print(stderr, "OCUDU: UL Class-C snapshot armed (host-home + pinned H2D, no live GPU load)\n");
     }
     return true;
 #else
@@ -1100,14 +1228,20 @@ private:
     if (!uplink_no_host_migrate && !host_reads_device_memory_directly) {
       return nullptr;
     }
+    std::unique_lock<std::mutex> lock(grid_ready_mutex);
+    if (!wait_for_owned_snapshot_read_holds_locked(lock)) {
+      return nullptr;
+    }
     // Write the buffer that is not currently advertised so mid-slot Class-C
     // still sees the previous completed snapshot (never the live VA).
     const unsigned next = (owned_snapshot_index + 1U) % owned_snapshot_ring;
     if (owned_snapshot[next] == nullptr || owned_snapshot_ready[next] == nullptr) {
       return nullptr;
     }
-    if (host_pinned_ready[next] != nullptr) {
-      (void)cuda_event_synchronize_yielding(static_cast<cudaEvent_t>(host_pinned_ready[next]));
+    if ((host_pinned_ready[next] != nullptr &&
+         cuda_event_synchronize_yielding(static_cast<cudaEvent_t>(host_pinned_ready[next])) != cudaSuccess) ||
+        !synchronize_owned_snapshot_overwrite_locked(next)) {
+      return nullptr;
     }
     owned_snapshot_writing = next;
     return owned_snapshot[next];
@@ -1121,17 +1255,20 @@ private:
       return false;
     }
 #ifdef ENABLE_CUDA
-    if (cudaEventRecord(static_cast<cudaEvent_t>(owned_snapshot_ready[w]),
-                        static_cast<cudaStream_t>(stream)) != cudaSuccess) {
+    if (cudaEventRecord(static_cast<cudaEvent_t>(owned_snapshot_ready[w]), static_cast<cudaStream_t>(stream)) !=
+        cudaSuccess) {
       return false;
     }
-    owned_snapshot_index    = w;
-    owned_snapshot_ready_ok = true;
+    owned_snapshot_index            = w;
+    owned_snapshot_ready_ok         = true;
+    owned_snapshot_pusch_compatible = true;
 
     // Fade kernel writes mapped-pinned host from registers on this stream.
     // The snapshot-ready event is also the host-ready event — no D2H.
     if (host_pinned[w] != nullptr && host_pinned_dev[w] != nullptr) {
-      host_pinned_enqueued[w] = true;
+      host_pinned_enqueued[w] =
+          host_pinned_ready[w] != nullptr && cudaEventRecord(static_cast<cudaEvent_t>(host_pinned_ready[w]),
+                                                             static_cast<cudaStream_t>(stream)) == cudaSuccess;
     }
     return true;
 #else
@@ -1150,6 +1287,117 @@ private:
     return owned_snapshot_ready_ok ? owned_snapshot_ready[owned_snapshot_index] : nullptr;
   }
 
+  bool owned_snapshot_is_pusch_compatible() const { return owned_snapshot_ready_ok && owned_snapshot_pusch_compatible; }
+
+  bool prepare_owned_snapshot_reading(void* stream) const
+  {
+    std::lock_guard<std::mutex> lock(grid_ready_mutex);
+    if (stream == nullptr || !owned_snapshot_ready_ok || owned_snapshot_index >= owned_snapshot_ring ||
+        owned_snapshot[owned_snapshot_index] == nullptr || owned_snapshot_ready[owned_snapshot_index] == nullptr) {
+      return false;
+    }
+#ifdef ENABLE_CUDA
+    if (cudaStreamWaitEvent(static_cast<cudaStream_t>(stream),
+                            static_cast<cudaEvent_t>(owned_snapshot_ready[owned_snapshot_index]),
+                            0) != cudaSuccess) {
+      return false;
+    }
+    ++owned_snapshot_read_holds;
+    return true;
+#else
+    return false;
+#endif
+  }
+
+  bool record_owned_snapshot_reading(void* stream) const
+  {
+    std::lock_guard<std::mutex> lock(grid_ready_mutex);
+    void*                       event = get_next_owned_snapshot_read_event();
+    if (event == nullptr ||
+        cudaEventRecord(static_cast<cudaEvent_t>(event), static_cast<cudaStream_t>(stream)) != cudaSuccess) {
+      if (owned_snapshot_read_holds > 0) {
+        --owned_snapshot_read_holds;
+      }
+      return false;
+    }
+    pending_owned_snapshot_reads.push_back({event, owned_snapshot_index});
+    if (owned_snapshot_read_holds > 0) {
+      --owned_snapshot_read_holds;
+    }
+    return true;
+  }
+
+  void release_owned_snapshot_read_hold() const
+  {
+    std::lock_guard<std::mutex> lock(grid_ready_mutex);
+    if (owned_snapshot_read_holds > 0) {
+      --owned_snapshot_read_holds;
+    }
+  }
+
+  bool wait_for_owned_snapshot_read_holds_locked(std::unique_lock<std::mutex>& lock) const
+  {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
+    while (owned_snapshot_read_holds > 0) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      lock.unlock();
+      sched_yield();
+      lock.lock();
+    }
+    return true;
+  }
+
+  bool enqueue_owned_snapshot_overwrite_waits_locked(unsigned snapshot_index, cudaStream_t stream) const
+  {
+    for (auto it = pending_owned_snapshot_reads.begin(); it != pending_owned_snapshot_reads.end();) {
+      if (it->snapshot_index != snapshot_index) {
+        ++it;
+        continue;
+      }
+      if (cudaStreamWaitEvent(stream, static_cast<cudaEvent_t>(it->event), 0) != cudaSuccess) {
+        return false;
+      }
+      it = pending_owned_snapshot_reads.erase(it);
+    }
+    return true;
+  }
+
+  bool synchronize_owned_snapshot_overwrite_locked(unsigned snapshot_index) const
+  {
+    for (auto it = pending_owned_snapshot_reads.begin(); it != pending_owned_snapshot_reads.end();) {
+      if (it->snapshot_index != snapshot_index) {
+        ++it;
+        continue;
+      }
+      if (cuda_event_synchronize_yielding(static_cast<cudaEvent_t>(it->event)) != cudaSuccess) {
+        return false;
+      }
+      it = pending_owned_snapshot_reads.erase(it);
+    }
+    return true;
+  }
+
+  void* get_next_owned_snapshot_read_event() const
+  {
+    for (void* event : owned_snapshot_read_events) {
+      const auto pending =
+          std::find_if(pending_owned_snapshot_reads.begin(),
+                       pending_owned_snapshot_reads.end(),
+                       [event](const owned_snapshot_read_fence& fence) { return fence.event == event; });
+      if (pending == pending_owned_snapshot_reads.end()) {
+        return event;
+      }
+    }
+    cudaEvent_t event = nullptr;
+    if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+      return nullptr;
+    }
+    owned_snapshot_read_events.push_back(event);
+    return event;
+  }
+
   void* owned_host_mapped_ptr() const
   {
     const unsigned w = owned_snapshot_writing;
@@ -1159,16 +1407,25 @@ private:
     return host_pinned_dev[w];
   }
 
-  mutable void*    owned_snapshot[owned_snapshot_ring]{};
-  mutable void*    owned_snapshot_ready[owned_snapshot_ring]{};
-  mutable void*    host_pinned[owned_snapshot_ring]{};
-  mutable void*    host_pinned_dev[owned_snapshot_ring]{};
-  mutable void*    host_pinned_ready[owned_snapshot_ring]{};
-  mutable bool     host_pinned_enqueued[owned_snapshot_ring]{};
-  mutable unsigned owned_snapshot_index{0};
-  mutable unsigned owned_snapshot_writing{0};
-  mutable bool     owned_snapshot_ready_ok{false};
-  uint64_t         owned_snapshot_words{0};
+  struct owned_snapshot_read_fence {
+    void*    event;
+    unsigned snapshot_index;
+  };
+
+  mutable void*                                  owned_snapshot[owned_snapshot_ring]{};
+  mutable void*                                  owned_snapshot_ready[owned_snapshot_ring]{};
+  mutable void*                                  host_pinned[owned_snapshot_ring]{};
+  mutable void*                                  host_pinned_dev[owned_snapshot_ring]{};
+  mutable void*                                  host_pinned_ready[owned_snapshot_ring]{};
+  mutable bool                                   host_pinned_enqueued[owned_snapshot_ring]{};
+  mutable unsigned                               owned_snapshot_index{0};
+  mutable unsigned                               owned_snapshot_writing{0};
+  mutable bool                                   owned_snapshot_ready_ok{false};
+  mutable bool                                   owned_snapshot_pusch_compatible{false};
+  mutable unsigned                               owned_snapshot_read_holds{0};
+  mutable std::vector<void*>                     owned_snapshot_read_events;
+  mutable std::vector<owned_snapshot_read_fence> pending_owned_snapshot_reads;
+  uint64_t                                       owned_snapshot_words{0};
 
   /// True when a GPU kernel last produced this allocation (map / apply / clear).
   ///
@@ -1219,7 +1476,7 @@ private:
   }
 
   static cuda_visible_managed_access_policy query_cuda_visible_managed_access_policy(int  device,
-                                                                                    bool enable_concurrent_downlink)
+                                                                                     bool enable_concurrent_downlink)
   {
     return make_cuda_visible_managed_access_policy(
         query_cuda_device_flag(device, cudaDevAttrConcurrentManagedAccess),
@@ -1283,7 +1540,7 @@ private:
     }
     if (is_host_location(destination)) {
       return cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) == cudaSuccess ? managed_prefetch_status::done
-                                                                                    : managed_prefetch_status::failed;
+                                                                                     : managed_prefetch_status::failed;
     }
     return managed_prefetch_status::done;
   }
@@ -1335,12 +1592,8 @@ public:
       // UL fade is skipped (Xid 31 @ 0x140000). PUCCH must host-read the
       // live grid — do not set uplink_no_host_migrate or CSI is zeros and
       // UEs RLF.
-      auto grid = std::make_unique<cuda_visible_resource_grid>(nof_ports,
-                                                              nof_symbols,
-                                                              nof_subc,
-                                                              device_id,
-                                                              grid_direction == direction::downlink,
-                                                              false);
+      auto grid = std::make_unique<cuda_visible_resource_grid>(
+          nof_ports, nof_symbols, nof_subc, device_id, grid_direction == direction::downlink, false);
       if (grid->is_valid()) {
         return grid;
       }

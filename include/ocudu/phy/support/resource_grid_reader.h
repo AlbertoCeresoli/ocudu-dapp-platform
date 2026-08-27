@@ -153,6 +153,18 @@ public:
   /// Event recorded after the latest owned snapshot copy completed.
   virtual void* get_owned_device_snapshot_ready_event() const { return nullptr; }
 
+  /// True when the advertised snapshot is a complete PUSCH-compatible grid.
+  virtual bool owned_device_snapshot_is_pusch_compatible() const { return false; }
+
+  /// Orders \p stream after the latest owned-snapshot producer.
+  virtual bool prepare_owned_device_snapshot_reading(void*) const { return false; }
+
+  /// Records that owned-snapshot reading has been enqueued on \p stream.
+  virtual bool on_owned_device_snapshot_reading_enqueued(void*) const { return true; }
+
+  /// Drops a prepare_owned_device_snapshot_reading() hold when the caller will not enqueue.
+  virtual void release_owned_device_snapshot_reading() const {}
+
   /// Home the live UL VA (PUCCH-safe), CPU-copy into pinned, H2D into the owned
   /// cudaMalloc snapshot. Never GPU-loads the live managed pointer.
   virtual bool stage_owned_snapshot_from_host() const { return false; }

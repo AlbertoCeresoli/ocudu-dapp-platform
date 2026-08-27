@@ -33,9 +33,11 @@ struct pusch_decoder_result {
     unsigned nof_cbs         = 0;
     bool     valid           = false;
     /// Gap profiling: host-side overhead components (microseconds).
-    float extract_bits_us = 0; ///< CPU extract_decoded_bits time.
-    float grid_staging_us = 0; ///< CPU grid staging memcpy time.
-    float demod_sync_us   = 0; ///< Resident demodulator synchronization time.
+    float extract_bits_us        = 0;     ///< CPU extract_decoded_bits time.
+    float grid_staging_us        = 0;     ///< CPU grid staging memcpy time.
+    float demod_sync_us          = 0;     ///< Resident demodulator synchronization time.
+    bool  device_grid_used       = false; ///< GPU consumed a CUDA-visible grid directly.
+    bool  owned_device_grid_used = false; ///< GPU consumed the immutable producer-owned snapshot.
     /// Detailed gap profiling: timestamps for critical path analysis.
     float ch_estimate_us        = 0; ///< CPU channel estimation time (estimator.estimate callback).
     float process_data_setup_us = 0; ///< process_data() config/setup overhead.

@@ -141,6 +141,12 @@ public:
   /// \brief Get last grid staging time in microseconds (gap profiling).
   virtual float get_last_grid_staging_us() const { return 0; }
 
+  /// \brief Returns true when the last demodulation consumed the CUDA-visible grid directly.
+  virtual bool used_device_grid() const { return false; }
+
+  /// \brief Returns true when the last demodulation consumed the immutable producer-owned snapshot.
+  virtual bool used_owned_device_grid() const { return false; }
+
   /// \brief Get last demod sync time in microseconds (gap profiling).
   virtual float get_last_demod_sync_us() const { return 0; }
 

@@ -94,6 +94,7 @@ void run_ci16_fast_path_match(unsigned window_offset)
       gpu_grid_factory.create(1, get_nsymb_per_slot(config.cp), config.bw_rb * NOF_SUBCARRIERS_PER_RB);
   ASSERT_NE(gpu_grid, nullptr);
   ASSERT_TRUE(gpu_grid->get_writer().supports_device_grid_mapping());
+  ASSERT_TRUE(gpu_grid->get_writer().supports_owned_device_grid_snapshot());
 
   cpu_demodulator->demodulate(cpu_grid->get_writer(), input_quantized, 0, symbol_index);
   ASSERT_TRUE(gpu_demodulator->demodulate_ci16(gpu_grid->get_writer(), input_ci16, input_scale, 0, symbol_index));
@@ -157,6 +158,7 @@ void run_ci16_multiport_all_symbols_match(unsigned window_offset)
   std::unique_ptr<resource_grid>     gpu_grid = gpu_grid_factory.create(nof_ports, nsymb, nof_subc);
   ASSERT_NE(gpu_grid, nullptr);
   ASSERT_TRUE(gpu_grid->get_writer().supports_device_grid_mapping());
+  ASSERT_TRUE(gpu_grid->get_writer().supports_owned_device_grid_snapshot());
 
   std::mt19937                          rgen(100 + window_offset);
   std::uniform_real_distribution<float> dist(-0.05F, 0.05F);
@@ -206,7 +208,7 @@ void run_ci16_multiport_all_symbols_match(unsigned window_offset)
   }
 }
 
-void run_ci16_symbol_batch_slot_match(unsigned window_offset)
+void run_ci16_symbol_batch_slot_match(unsigned window_offset, bool split_slot_batch = false)
 {
   ASSERT_EQ(setenv("OCUDU_UL_CUDA_VISIBLE_GRID", "managed", 1), 0);
   ASSERT_EQ(setenv("OCUDU_LOWPHY_RX_ACCELERATION", "enabled", 1), 0);
@@ -251,12 +253,15 @@ void run_ci16_symbol_batch_slot_match(unsigned window_offset)
   std::unique_ptr<resource_grid>     gpu_grid = gpu_grid_factory.create(nof_ports, nsymb, nof_subc);
   ASSERT_NE(gpu_grid, nullptr);
   ASSERT_TRUE(gpu_grid->get_writer().supports_device_grid_mapping());
+  ASSERT_TRUE(gpu_grid->get_writer().supports_owned_device_grid_snapshot());
 
   std::mt19937                          rgen(200 + window_offset);
   std::uniform_real_distribution<float> dist(-0.05F, 0.05F);
   std::array<unsigned, nof_ports>       port_indices = {0, 1};
 
   for (unsigned slot_index = 0; slot_index != get_nof_slots_per_subframe(scs); ++slot_index) {
+    cpu_grid->set_all_zero();
+    gpu_grid->set_all_zero();
     std::vector<std::array<std::vector<ci16_t>, nof_ports>> input_ci16(nsymb);
     std::vector<std::array<std::vector<cf_t>, nof_ports>>   input_quantized(nsymb);
     std::vector<const ci16_t*>                              input_ptrs(nsymb * nof_ports);
@@ -284,14 +289,24 @@ void run_ci16_symbol_batch_slot_match(unsigned window_offset)
       }
     }
 
-    ASSERT_TRUE(gpu_demodulator->demodulate_ci16_symbol_batch_ports(
-        gpu_grid->get_writer(),
-        span<const ci16_t* const>(input_ptrs.data(), input_ptrs.size()),
-        span<const unsigned>(symbol_sample_counts.data(), symbol_sample_counts.size()),
-        input_scale,
-        span<const unsigned>(port_indices.data(), nof_ports),
-        first_symbol_index,
-        nsymb));
+    const auto gpu_demodulate_batch = [&](unsigned first_symbol, unsigned nof_batch_symbols) {
+      return gpu_demodulator->demodulate_ci16_symbol_batch_ports(
+          gpu_grid->get_writer(),
+          span<const ci16_t* const>(input_ptrs.data() + first_symbol * nof_ports, nof_batch_symbols * nof_ports),
+          span<const unsigned>(symbol_sample_counts.data() + first_symbol, nof_batch_symbols),
+          input_scale,
+          span<const unsigned>(port_indices.data(), nof_ports),
+          first_symbol_index + first_symbol,
+          nof_batch_symbols);
+    };
+    if (split_slot_batch) {
+      const unsigned split_symbol = nsymb / 2;
+      ASSERT_TRUE(gpu_demodulate_batch(0, split_symbol));
+      ASSERT_FALSE(gpu_grid->get_reader().owned_device_snapshot_is_pusch_compatible());
+      ASSERT_TRUE(gpu_demodulate_batch(split_symbol, nsymb - split_symbol));
+    } else {
+      ASSERT_TRUE(gpu_demodulate_batch(0, nsymb));
+    }
     ASSERT_TRUE(gpu_grid->get_writer().synchronize_device_grid_mapping());
 
     for (unsigned i_symbol = 0; i_symbol != nsymb; ++i_symbol) {
@@ -306,6 +321,32 @@ void run_ci16_symbol_batch_slot_match(unsigned window_offset)
           EXPECT_NEAR(cpu.imag(), gpu.imag(), 0.03F);
         }
       }
+    }
+
+    // The whole-slot CUDA producer must leave an immutable device snapshot
+    // that remains readable after the host validation above has migrated the
+    // live managed allocation home (the GB10 PUCCH/PUSCH ordering case).
+    const resource_grid_reader& gpu_reader = gpu_grid->get_reader();
+    ASSERT_TRUE(gpu_reader.owned_device_snapshot_is_pusch_compatible());
+    ASSERT_NE(gpu_reader.get_owned_device_snapshot_cbf16(), nullptr);
+    cudaStream_t snapshot_stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&snapshot_stream, cudaStreamNonBlocking), cudaSuccess);
+    ASSERT_TRUE(gpu_reader.prepare_owned_device_snapshot_reading(snapshot_stream));
+    std::vector<cbf16_t> snapshot_symbol(nof_subc);
+    ASSERT_EQ(cudaMemcpyAsync(snapshot_symbol.data(),
+                              gpu_reader.get_owned_device_snapshot_cbf16(),
+                              snapshot_symbol.size() * sizeof(cbf16_t),
+                              cudaMemcpyDeviceToHost,
+                              snapshot_stream),
+              cudaSuccess);
+    ASSERT_TRUE(gpu_reader.on_owned_device_snapshot_reading_enqueued(snapshot_stream));
+    ASSERT_EQ(cudaStreamSynchronize(snapshot_stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(snapshot_stream), cudaSuccess);
+    span<const cbf16_t> cpu_symbol = cpu_grid->get_reader().get_view(0, 0);
+    ASSERT_EQ(snapshot_symbol.size(), cpu_symbol.size());
+    for (unsigned i_re = 0; i_re != snapshot_symbol.size(); ++i_re) {
+      EXPECT_NEAR(to_cf(snapshot_symbol[i_re]).real(), to_cf(cpu_symbol[i_re]).real(), 0.03F);
+      EXPECT_NEAR(to_cf(snapshot_symbol[i_re]).imag(), to_cf(cpu_symbol[i_re]).imag(), 0.03F);
     }
   }
 }
@@ -342,4 +383,12 @@ TEST(ofdm_demodulator_cuda, gpu_ci16_full_slot_batch_matches_cpu_with_phase_comp
     GTEST_SKIP() << "CUDA is not available.";
   }
   run_ci16_symbol_batch_slot_match(8);
+}
+
+TEST(ofdm_demodulator_cuda, gpu_ci16_split_slot_tail_batch_publishes_owned_snapshot)
+{
+  if (!cuda_available()) {
+    GTEST_SKIP() << "CUDA is not available.";
+  }
+  run_ci16_symbol_batch_slot_match(8, true);
 }

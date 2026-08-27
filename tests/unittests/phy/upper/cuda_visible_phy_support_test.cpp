@@ -129,6 +129,16 @@ testing::AssertionResult cuda_concurrent_managed_access_available()
   return testing::AssertionSuccess();
 }
 
+bool cuda_direct_managed_host_access_available()
+{
+  int device_id = 0;
+  int direct_managed_access_from_host = 0;
+  return (cudaGetDevice(&device_id) == cudaSuccess) &&
+         (cudaDeviceGetAttribute(
+              &direct_managed_access_from_host, cudaDevAttrDirectManagedMemAccessFromHost, device_id) == cudaSuccess) &&
+         (direct_managed_access_from_host != 0);
+}
+
 bool wait_for_flag(const std::atomic<bool>& flag, std::chrono::milliseconds timeout)
 {
   auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -361,7 +371,7 @@ TEST(cuda_visible_phy_support_test, resource_grid_device_mapping_is_visible_to_h
   }
 }
 
-TEST(cuda_visible_phy_support_test, resource_grid_host_writer_is_visible_to_device_reader)
+TEST(cuda_visible_phy_support_test, resource_grid_host_writer_obeys_platform_device_read_policy)
 {
   testing::AssertionResult cuda_available = cuda_managed_memory_available();
   if (!cuda_available) {
@@ -391,6 +401,13 @@ TEST(cuda_visible_phy_support_test, resource_grid_host_writer_is_visible_to_devi
 
   cuda_stream_guard stream;
   ASSERT_TRUE(stream.create());
+
+  if (!cuda_direct_managed_host_access_available()) {
+    // GB10 and discrete GPUs must not directly device-read managed pages after
+    // a host write. A new GPU producer must publish residency first.
+    EXPECT_FALSE(reader.prepare_device_grid_reading(stream.get()));
+    return;
+  }
 
   ASSERT_TRUE(reader.prepare_device_grid_reading(stream.get()));
   std::vector<cbf16_t> copied(expected.size());
@@ -521,6 +538,22 @@ TEST(cuda_visible_phy_support_test, resource_grid_repeated_device_mapping_and_re
     const unsigned symbol = iteration % nof_symbols;
     const size_t   offset = (static_cast<size_t>(port) * nof_symbols + symbol) * nof_subc;
     expect_equal(reader.get_view(port, symbol), span<const cbf16_t>(payload.data() + offset, nof_subc));
+
+    if (!cuda_direct_managed_host_access_available()) {
+      // The host read above revokes direct-read residency on GB10/discrete.
+      EXPECT_FALSE(reader.prepare_device_grid_reading(stream.get()));
+
+      // A subsequent GPU producer republishes the allocation and its ready
+      // event, making direct device consumption legal again.
+      ASSERT_TRUE(writer.prepare_device_grid_mapping(stream.get()));
+      ASSERT_EQ(cudaMemcpyAsync(writer.get_device_grid_bf16(),
+                                payload.data(),
+                                payload.size() * sizeof(cbf16_t),
+                                cudaMemcpyHostToDevice,
+                                stream.get()),
+                cudaSuccess);
+      ASSERT_TRUE(writer.on_device_grid_mapping_enqueued(stream.get()));
+    }
 
     ASSERT_TRUE(reader.prepare_device_grid_reading(stream.get()));
     std::vector<cbf16_t> copied(nof_subc);

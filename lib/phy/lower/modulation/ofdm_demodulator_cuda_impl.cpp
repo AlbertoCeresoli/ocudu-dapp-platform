@@ -521,6 +521,38 @@ bool ofdm_symbol_demodulator_cuda_impl::demodulate_gpu_ci16_symbol_batch_ports(
                                 first_symbol_index);
   }
 
+  // Publish a stable device-owned full-slot image on the producer stream
+  // before upper-PHY notification. PUCCH may then migrate the live managed
+  // allocation home without racing asynchronous CUDA PUSCH consumption.
+  // Pinned/discrete grids do not advertise this capability and keep their
+  // conventional host-to-device PUSCH staging path.
+  const bool reaches_slot_boundary   = first_symbol_slot + nof_symbols == grid.get_nof_symbols();
+  const bool supports_owned_snapshot = grid.supports_owned_device_grid_snapshot();
+  const bool published_owned_snapshot =
+      reaches_slot_boundary && supports_owned_snapshot && grid.publish_owned_device_grid_snapshot(stream);
+  if (reaches_slot_boundary && supports_owned_snapshot && !published_owned_snapshot) {
+    static std::atomic<bool> logged_snapshot_publish_failure{false};
+    if (!logged_snapshot_publish_failure.exchange(true)) {
+      ocudulog::fetch_basic_logger("PHY").warning(
+          "Lower-PHY RX could not publish the producer-owned CUDA grid snapshot; PUSCH may stage from host.");
+    }
+  }
+  const char* grid_diagnostics = std::getenv("OCUDU_PUSCH_GRID_PATH_DIAGNOSTICS");
+  if (grid_diagnostics != nullptr && !env_flag_disabled("OCUDU_PUSCH_GRID_PATH_DIAGNOSTICS")) {
+    static std::atomic<bool> logged_snapshot_shape{false};
+    if (!logged_snapshot_shape.exchange(true)) {
+      ocudulog::fetch_basic_logger("PHY").warning(
+          "Lower-PHY RX snapshot publication: first_symbol={} symbols={} grid_symbols={} reaches_boundary={} "
+          "supported={} published={}.",
+          first_symbol_slot,
+          nof_symbols,
+          grid.get_nof_symbols(),
+          reaches_slot_boundary,
+          supports_owned_snapshot,
+          published_owned_snapshot);
+    }
+  }
+
   if (timing_enabled) {
     stage_start = std::chrono::steady_clock::now();
   }

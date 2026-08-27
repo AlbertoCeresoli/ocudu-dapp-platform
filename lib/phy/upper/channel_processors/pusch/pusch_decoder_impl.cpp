@@ -644,16 +644,18 @@ void pusch_decoder_impl::join_and_notify()
   // CUDA-event sub-phases are only present when OCUDU_PUSCH_ACCELERATION_TIMING is set.
 #ifdef ENABLE_CUDA
   if (supports_resident_decode() && collect_acceleration_timing_) {
-    const auto& t                                            = last_acceleration_timing_stats_;
-    stats.acceleration_pipeline_timing.ch_estimate_us        = ch_estimate_us_;
-    stats.acceleration_pipeline_timing.process_data_setup_us = process_data_setup_us_;
-    stats.acceleration_pipeline_timing.demod_call_us         = demod_call_us_;
-    stats.acceleration_pipeline_timing.grid_staging_us       = demod_grid_staging_us_;
-    stats.acceleration_pipeline_timing.demod_sync_us         = demod_sync_us_;
-    stats.acceleration_pipeline_timing.decode_call_us        = decode_call_us_;
-    stats.acceleration_pipeline_timing.sinr_readback_us      = sinr_readback_us_;
-    stats.acceleration_pipeline_timing.nof_cbs               = t.nof_cbs != 0 ? t.nof_cbs : nof_cbs;
-    stats.acceleration_pipeline_timing.valid                 = true;
+    const auto& t                                             = last_acceleration_timing_stats_;
+    stats.acceleration_pipeline_timing.ch_estimate_us         = ch_estimate_us_;
+    stats.acceleration_pipeline_timing.process_data_setup_us  = process_data_setup_us_;
+    stats.acceleration_pipeline_timing.demod_call_us          = demod_call_us_;
+    stats.acceleration_pipeline_timing.grid_staging_us        = demod_grid_staging_us_;
+    stats.acceleration_pipeline_timing.demod_sync_us          = demod_sync_us_;
+    stats.acceleration_pipeline_timing.device_grid_used       = demod_device_grid_used_;
+    stats.acceleration_pipeline_timing.owned_device_grid_used = demod_owned_device_grid_used_;
+    stats.acceleration_pipeline_timing.decode_call_us         = decode_call_us_;
+    stats.acceleration_pipeline_timing.sinr_readback_us       = sinr_readback_us_;
+    stats.acceleration_pipeline_timing.nof_cbs                = t.nof_cbs != 0 ? t.nof_cbs : nof_cbs;
+    stats.acceleration_pipeline_timing.valid                  = true;
     if (t.timing_enabled) {
       stats.acceleration_pipeline_timing.deinterleave_us      = t.deinterleave_us;
       stats.acceleration_pipeline_timing.rate_dematch_us      = t.rate_dematch_us;

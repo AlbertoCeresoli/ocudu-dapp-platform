@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <cuComplex.h>
 #include <limits>
@@ -57,9 +58,16 @@ inline int clamp_host_llr(int value)
 }
 
 std::atomic<bool> logged_pusch_direct_grid_path{false};
+std::atomic<bool> logged_pusch_owned_grid_path{false};
 std::atomic<bool> logged_pusch_host_grid_path{false};
 std::atomic<bool> logged_pusch_noncompact_grid_path{false};
 std::atomic<bool> logged_pusch_prepare_failed_grid_path{false};
+
+bool pusch_grid_path_diagnostics_enabled()
+{
+  static const bool enabled = phy_acceleration_env_flag_enabled("OCUDU_PUSCH_GRID_PATH_DIAGNOSTICS", false);
+  return enabled;
+}
 
 inline bool should_log_clamp(uint16_t rnti, const char* tag, float period_s = 10.0f)
 {
@@ -204,12 +212,6 @@ inline pusch_demodulator_notifier::demodulation_stats build_e2e_final_stats(floa
   }
 
   return stats;
-}
-
-bool prefer_cpu_for_small_pusch_grants(const pusch_demodulator::configuration& config)
-{
-  static const unsigned min_gpu_prb = pusch_acceleration_read_min_rb();
-  return pusch_acceleration_prefers_cpu_for_demodulator_grant(config.rb_mask.count(), min_gpu_prb);
 }
 
 static unsigned pusch_gpu_e2e_timing_warn_us()
@@ -1311,6 +1313,8 @@ void pusch_demodulator_gpu_impl::demodulate(pusch_codeword_buffer&              
 
   // Reset GPU LLR state from previous demodulation.
   gpu_llrs_valid_                    = false;
+  last_device_grid_used_ = false;
+  last_owned_device_grid_used_       = false;
   gpu_uci_llrs_valid_                = false;
   gpu_uci_decoded_valid_             = false;
   gpu_harq_ack_decoded_              = false;
@@ -1349,10 +1353,9 @@ void pusch_demodulator_gpu_impl::demodulate(pusch_codeword_buffer&              
 
   bool supported_gpu_mimo = (config.nof_tx_layers == 1) || (config.nof_tx_layers == 2) || (config.nof_tx_layers == 3) ||
                             (config.nof_tx_layers == 4);
-  bool prefer_cpu_small_grant = prefer_cpu_for_small_pusch_grants(config);
-  bool can_use_gpu_eq         = use_gpu_equalization_ && supported_gpu_mimo &&
+  bool can_use_gpu_eq = use_gpu_equalization_ && supported_gpu_mimo &&
                         (nof_rx_ports == 1 || nof_rx_ports == 2 || nof_rx_ports == 4 || nof_rx_ports == 8) &&
-                        (config.nof_tx_layers <= nof_rx_ports) && !prefer_cpu_small_grant; // Layers <= ports required
+                        (config.nof_tx_layers <= nof_rx_ports); // Layers <= ports required
 
   // Stats accumulators.
   unsigned total_sinr_softbit_count   = 0;
@@ -1590,8 +1593,8 @@ void pusch_demodulator_gpu_impl::demodulate(pusch_codeword_buffer&              
       auto gpu_e2e_us  = std::chrono::duration_cast<std::chrono::microseconds>(gpu_e2e_end - gpu_e2e_start);
       ocudulog::fetch_basic_logger("PHY").info("PUSCH GPU: E2E path time: {} us", gpu_e2e_us.count());
     }
-  } else if (!can_use_gpu_eq && !prefer_cpu_small_grant && (config.nof_tx_layers == 1) &&
-             accumulated_count_ >= MIN_GPU_SYMBOLS && gpu_available_) {
+  } else if (!can_use_gpu_eq && (config.nof_tx_layers == 1) && accumulated_count_ >= MIN_GPU_SYMBOLS &&
+             gpu_available_) {
     // GPU soft demod with CPU equalization.
     if (enable_path_tracing_) {
       ocudulog::fetch_basic_logger("PHY").warning(
@@ -1971,46 +1974,76 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
     rx_ports_are_compact = config.rx_ports[port] == port;
   }
   struct device_grid_hold {
+    enum class kind { none, live_grid, owned_snapshot };
     const resource_grid_reader* g{nullptr};
     void*                       stream{nullptr};
-    bool                        armed{false};
-    void                        arm(const resource_grid_reader& grid, void* s)
+    kind                        armed_kind{kind::none};
+    void                        arm_live(const resource_grid_reader& grid, void* s)
     {
-      g      = &grid;
-      stream = s;
-      armed  = true;
+      g          = &grid;
+      stream     = s;
+      armed_kind = kind::live_grid;
+    }
+    void arm_owned(const resource_grid_reader& grid, void* s)
+    {
+      g          = &grid;
+      stream     = s;
+      armed_kind = kind::owned_snapshot;
     }
     void commit()
     {
-      if (armed && g != nullptr) {
-        if (!g->on_device_grid_reading_enqueued(stream)) {
+      if (armed_kind != kind::none && g != nullptr) {
+        const bool recorded = armed_kind == kind::owned_snapshot ? g->on_owned_device_snapshot_reading_enqueued(stream)
+                                                                 : g->on_device_grid_reading_enqueued(stream);
+        if (!recorded) {
           // No fence event could be recorded, so the enqueued grid read is
           // invisible to pull_pages_home; drain it before a host access can
           // migrate the pages out from under it (Xid 31 on GB10).
           cudaStreamSynchronizeYielding(static_cast<cudaStream_t>(stream));
         }
-        armed = false;
+        armed_kind = kind::none;
       }
     }
     void drop()
     {
-      if (armed && g != nullptr) {
-        g->release_device_grid_reading();
-        armed = false;
+      if (armed_kind != kind::none && g != nullptr) {
+        if (armed_kind == kind::owned_snapshot) {
+          g->release_owned_device_snapshot_reading();
+        } else {
+          g->release_device_grid_reading();
+        }
+        armed_kind = kind::none;
       }
     }
     ~device_grid_hold() { drop(); }
   } grid_hold;
 
-  bool use_device_grid_reader = false;
-  if (rx_ports_are_compact && grid.supports_device_grid_reading() && (grid.get_device_grid_cbf16() != nullptr)) {
+  bool        use_device_grid_reader       = false;
+  bool        use_owned_device_grid_reader = false;
+  const void* owned_grid                   = grid.get_owned_device_snapshot_cbf16();
+  if (rx_ports_are_compact && owned_grid != nullptr && grid.owned_device_snapshot_is_pusch_compatible() &&
+      grid.prepare_owned_device_snapshot_reading(stream_)) {
+    d_grid_cbf16_                = const_cast<void*>(owned_grid);
+    use_device_grid_reader       = true;
+    use_owned_device_grid_reader = true;
+    grid_hold.arm_owned(grid, stream_);
+  } else if (rx_ports_are_compact && grid.supports_device_grid_reading() && (grid.get_device_grid_cbf16() != nullptr)) {
     use_device_grid_reader = grid.prepare_device_grid_reading(stream_);
     if (use_device_grid_reader) {
       d_grid_cbf16_ = const_cast<void*>(grid.get_device_grid_cbf16());
-      grid_hold.arm(grid, stream_);
+      grid_hold.arm_live(grid, stream_);
     }
   }
-  if (use_device_grid_reader) {
+  if (use_owned_device_grid_reader) {
+    auto& path_logger = ocudulog::fetch_basic_logger("PHY");
+    if (!logged_pusch_owned_grid_path.exchange(true)) {
+      if (pusch_grid_path_diagnostics_enabled()) {
+        path_logger.warning("PUSCH GPU grid path selected: owned CUDA snapshot (live managed grid untouched).");
+      } else {
+        path_logger.info("PUSCH GPU grid path selected: owned CUDA snapshot (live managed grid untouched).");
+      }
+    }
+  } else if (use_device_grid_reader) {
     auto& path_logger = ocudulog::fetch_basic_logger("PHY");
     if (!logged_pusch_direct_grid_path.exchange(true)) {
       path_logger.info("PUSCH GPU grid path selected: direct CUDA-visible resource-grid reader.");
@@ -2032,6 +2065,8 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
       path_logger.warning("PUSCH GPU grid path selected: host grid copy.");
     }
   }
+  last_device_grid_used_       = use_device_grid_reader;
+  last_owned_device_grid_used_ = use_owned_device_grid_reader;
 
   // Validate FP16 LLR buffer capacity (pre-allocated at MAX in constructor).
   size_t llrs_half_bytes = num_llrs * sizeof(uint16_t);

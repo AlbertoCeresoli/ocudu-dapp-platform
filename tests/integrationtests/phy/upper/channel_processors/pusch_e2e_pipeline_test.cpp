@@ -154,6 +154,34 @@ static std::string gpu_output_buffer_mode = "vector";
 
 namespace {
 
+#ifdef ENABLE_CUDA
+class cuda_stream_guard
+{
+public:
+  cuda_stream_guard()
+  {
+    cudaError_t status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+    if (status != cudaSuccess) {
+      throw std::runtime_error(
+          fmt::format("Failed to create CUDA grid-producer stream: {}", cudaGetErrorString(status)));
+    }
+  }
+
+  ~cuda_stream_guard()
+  {
+    if (stream != nullptr) {
+      (void)cudaStreamSynchronize(stream);
+      (void)cudaStreamDestroy(stream);
+    }
+  }
+
+  cudaStream_t get() const { return stream; }
+
+private:
+  cudaStream_t stream = nullptr;
+};
+#endif
+
 class pusch_processor_notifier_adaptor : public pusch_processor_result_notifier
 {
 public:
@@ -448,6 +476,8 @@ struct test_results {
   unsigned byte_mismatches       = 0;
   unsigned output_guard_failures = 0;
   unsigned gpu_e2e_count         = 0; ///< Number of iterations with resident GPU pipeline timing.
+  unsigned gpu_device_grid_count = 0; ///< Number of iterations that consumed the producer-owned device grid.
+  unsigned gpu_owned_grid_count  = 0; ///< Number of iterations that consumed the immutable owned snapshot.
 
   latency_stats cpu_latency;
   latency_stats gpu_latency;
@@ -594,13 +624,20 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
   auto                           tx_grid = grid_factory->create(nof_layers, MAX_NSYMB_PER_SLOT, MAX_NOF_SUBCARRIERS);
   std::unique_ptr<resource_grid> rx_grid;
 #ifdef ENABLE_CUDA
+  std::unique_ptr<resource_grid>     direct_managed_rx_grid;
+  std::unique_ptr<cuda_stream_guard> direct_managed_producer_stream;
   if (rx_device_grid_mode == "direct-managed") {
     auto managed_grid =
         std::make_unique<cuda_visible_resource_grid>(nof_rx_ports, MAX_NSYMB_PER_SLOT, MAX_NOF_SUBCARRIERS);
     if (!managed_grid->is_valid()) {
       throw std::runtime_error("Failed to allocate direct managed PUSCH RX resource grid.");
     }
-    rx_grid = std::move(managed_grid);
+    // Keep the CPU reference on an independent host grid. A CPU decode of the
+    // same managed allocation would migrate it home before the GPU decode and
+    // invalidate the producer->consumer residency contract we intend to test.
+    rx_grid                        = grid_factory->create(nof_rx_ports, MAX_NSYMB_PER_SLOT, MAX_NOF_SUBCARRIERS);
+    direct_managed_rx_grid         = std::move(managed_grid);
+    direct_managed_producer_stream = std::make_unique<cuda_stream_guard>();
   } else if (rx_device_grid_mode == "auto") {
     resource_grid_cuda_visible_factory cuda_grid_factory(resource_grid_cuda_visible_factory::direction::uplink);
     rx_grid = cuda_grid_factory.create(nof_rx_ports, MAX_NSYMB_PER_SLOT, MAX_NOF_SUBCARRIERS);
@@ -842,15 +879,69 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
       cpu_us         = std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count();
     }
 
-    // GPU decode.
+    // GPU decode. For direct-managed mode, publish the asynchronous producer
+    // immediately before consumption. There is deliberately no host sync or
+    // CPU decode in between: correctness depends on the grid-ready event.
+#ifdef ENABLE_CUDA
+    if (direct_managed_rx_grid) {
+      span<const cbf16_t> source      = rx_grid->get_reader().get_contiguous_view();
+      const size_t        expected_re = static_cast<size_t>(nof_rx_ports) * MAX_NSYMB_PER_SLOT * MAX_NOF_SUBCARRIERS;
+      if (source.size() != expected_re) {
+        throw std::runtime_error(
+            fmt::format("Host reference grid is not contiguous ({} RE, expected {}).", source.size(), expected_re));
+      }
+
+      resource_grid_writer& gpu_writer = direct_managed_rx_grid->get_writer();
+      cudaStream_t          producer   = direct_managed_producer_stream->get();
+      if (!gpu_writer.prepare_device_grid_mapping(producer)) {
+        throw std::runtime_error("CUDA-visible grid rejected the GPU producer mapping.");
+      }
+      cudaError_t copy_status = cudaMemcpyAsync(gpu_writer.get_device_grid_bf16(),
+                                                source.data(),
+                                                source.size() * sizeof(cbf16_t),
+                                                cudaMemcpyHostToDevice,
+                                                producer);
+      if (copy_status != cudaSuccess) {
+        (void)gpu_writer.cancel_device_grid_mapping();
+        throw std::runtime_error(
+            fmt::format("Failed to enqueue CUDA-visible grid producer: {}", cudaGetErrorString(copy_status)));
+      }
+      if (!gpu_writer.supports_owned_device_grid_snapshot() ||
+          !gpu_writer.publish_owned_device_grid_snapshot(producer)) {
+        (void)gpu_writer.cancel_device_grid_mapping();
+        throw std::runtime_error("CUDA-visible grid failed to publish the immutable producer-owned snapshot.");
+      }
+      if (!gpu_writer.on_device_grid_mapping_enqueued(producer)) {
+        (void)gpu_writer.cancel_device_grid_mapping();
+        throw std::runtime_error("CUDA-visible grid failed to publish the GPU producer completion event.");
+      }
+
+      // Model the live GB10 ordering hazard: a CPU PUCCH-style read migrates
+      // the managed allocation home after lower-PHY publication but before the
+      // asynchronous PUSCH task claims its input. PUSCH must still consume the
+      // immutable device-owned snapshot, not stage the live grid from host.
+      const resource_grid_reader& direct_reader = direct_managed_rx_grid->get_reader();
+      if (!direct_reader.stage_owned_snapshot_from_host() ||
+          !direct_reader.owned_device_snapshot_is_pusch_compatible()) {
+        throw std::runtime_error("Class-C host staging replaced or invalidated the immutable PUSCH producer snapshot.");
+      }
+      span<const cbf16_t> host_visible = direct_reader.get_view(0, 0);
+      if (host_visible.empty()) {
+        throw std::runtime_error("Host consumer could not read the published managed grid.");
+      }
+    }
+#endif
+
     unique_rx_buffer gpu_buffer =
         gpu_pool->get_pool().reserve(pusch_pdu.slot, trx_buffer_identifier(to_rnti(rnti), 1), nof_codeblocks, true);
 
     pusch_processor_notifier_adaptor gpu_notifier;
 #ifdef ENABLE_CUDA
     const resource_grid_reader& gpu_grid_reader =
-        gpu_device_grid_reader ? static_cast<const resource_grid_reader&>(*gpu_device_grid_reader)
-                               : rx_grid->get_reader();
+        direct_managed_rx_grid
+            ? direct_managed_rx_grid->get_reader()
+            : (gpu_device_grid_reader ? static_cast<const resource_grid_reader&>(*gpu_device_grid_reader)
+                                      : rx_grid->get_reader());
 #else
     const resource_grid_reader& gpu_grid_reader = rx_grid->get_reader();
 #endif
@@ -903,6 +994,12 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
     // GPU pipeline timing breakdown (may not be populated on all builds/configs).
     if (gpu_result.data.acceleration_pipeline_timing.valid) {
       results.gpu_e2e_count++;
+      if (gpu_result.data.acceleration_pipeline_timing.device_grid_used) {
+        results.gpu_device_grid_count++;
+      }
+      if (gpu_result.data.acceleration_pipeline_timing.owned_device_grid_used) {
+        results.gpu_owned_grid_count++;
+      }
       results.gpu_grid_staging.add(gpu_result.data.acceleration_pipeline_timing.grid_staging_us);
       results.gpu_demod_sync.add(gpu_result.data.acceleration_pipeline_timing.demod_sync_us);
       results.gpu_deinterleave.add(gpu_result.data.acceleration_pipeline_timing.deinterleave_us);
@@ -1084,6 +1181,8 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
              100.0 * results.gpu_fail / measured_iters,
              results.gpu_e2e_count,
              measured_iters);
+  fmt::print("GPU producer-owned grid: {}/{} measured iterations\n", results.gpu_device_grid_count, measured_iters);
+  fmt::print("GPU immutable owned snapshot: {}/{} measured iterations\n", results.gpu_owned_grid_count, measured_iters);
   fmt::print("Disagreements: {}\n", results.disagreements);
   fmt::print("Byte mismatches: {}\n", results.byte_mismatches);
   fmt::print("Output guard failures: {}\n", results.output_guard_failures);
@@ -1256,10 +1355,22 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
 
   // === Final verdict ===
   bool resident_requirement_failed = require_gpu_resident && (results.gpu_e2e_count != measured_iters);
+  bool device_grid_requirement_failed =
+      (rx_device_grid_mode == "direct-managed") && (results.gpu_device_grid_count != measured_iters);
+  bool owned_grid_requirement_failed =
+      (rx_device_grid_mode == "direct-managed") && (results.gpu_owned_grid_count != measured_iters);
 
   if (resident_requirement_failed) {
     fmt::print("\n*** FAIL: resident GPU pipeline active for {}/{} measured iterations ***\n",
                results.gpu_e2e_count,
+               measured_iters);
+  } else if (device_grid_requirement_failed) {
+    fmt::print("\n*** FAIL: producer-owned CUDA grid consumed directly for {}/{} measured iterations ***\n",
+               results.gpu_device_grid_count,
+               measured_iters);
+  } else if (owned_grid_requirement_failed) {
+    fmt::print("\n*** FAIL: immutable owned snapshot consumed for {}/{} measured iterations ***\n",
+               results.gpu_owned_grid_count,
                measured_iters);
   } else if (results.output_guard_failures > 0) {
     fmt::print("\n*** FAIL: {} GPU output guard corruptions ***\n", results.output_guard_failures);
@@ -1275,7 +1386,7 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
   }
 
   worker_pool->stop();
-  if (resident_requirement_failed) {
+  if (resident_requirement_failed || device_grid_requirement_failed) {
     std::exit(2);
   }
 }

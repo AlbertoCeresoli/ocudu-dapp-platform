@@ -141,6 +141,10 @@ public:
 
   float get_last_grid_staging_us() const override { return accelerated_demodulator->get_last_grid_staging_us(); }
 
+  bool used_device_grid() const override { return accelerated_demodulator->used_device_grid(); }
+
+  bool used_owned_device_grid() const override { return accelerated_demodulator->used_owned_device_grid(); }
+
   float get_last_demod_sync_us() const override { return accelerated_demodulator->get_last_demod_sync_us(); }
 
   float report_deferred_sinr(pusch_demodulator_notifier& notifier) override

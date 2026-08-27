@@ -104,6 +104,12 @@ public:
     (void)demod_sync_us;
   }
 
+  /// \brief Records whether demodulation consumed a CUDA-visible grid directly.
+  virtual void set_demod_device_grid_used(bool used) { (void)used; }
+
+  /// \brief Records whether demodulation consumed the producer-owned device snapshot.
+  virtual void set_demod_owned_device_grid_used(bool used) { (void)used; }
+
   /// \brief Pass processor-side timing stages for inclusion in decode results.
   virtual void set_processor_stage_timing(float ch_estimate_us, float process_data_setup_us, float demod_call_us)
   {

@@ -297,8 +297,6 @@ Useful environment hooks:
 | `OCUDU_OFH_TX_COMPRESSION_IMPL` | same as above | Implementation-selection override for OFH TX compression only. |
 | `OCUDU_OFH_RX_COMPRESSION_IMPL` | same as above | Implementation-selection override for OFH RX decompression only. |
 | `OCUDU_PUSCH_ACCELERATION_TIMING` | `1`, `0`, `true`, `false`, `on`, `off` | Enables the resident PUSCH per-stage timing breakdown printed by the integration benchmarks. Total latency is still measured without it. |
-| `OCUDU_PUSCH_ACCELERATION_MIN_RB` | positive integer or unset | Keeps small PUSCH SCH grants on CPU when the allocation has fewer RBs than the threshold. |
-| `OCUDU_PUSCH_ACCELERATION_MIN_ULSCH_BITS` | positive integer or unset | Keeps small PUSCH SCH grants on CPU when the encoded UL-SCH payload is below the threshold. |
 | `OCUDU_PUSCH_ENABLE_ACCELERATED_UCI` | `1`, `0`, `true`, `false`, `on`, `off` | Opts into resident PUSCH HARQ/CSI Part 1 demux/decode. Leave unset for OTA unless that path is under test. |
 
 Current production support boundaries:
@@ -318,8 +316,8 @@ Current production support boundaries:
   number of ports. Other precoding layouts use the host resource-grid writer.
 - `pusch_e2e_sensitivity_sweep` currently uses a host resource grid, so it
   validates BLER parity but not the direct CUDA-visible RX-grid path. Use
-  `pusch_e2e_pipeline_test --rx-device-grid managed` for direct-grid latency
-  coverage.
+  `pusch_e2e_pipeline_test --rx-device-grid direct-managed --require-gpu-resident`
+  for producer-event ordering, direct-grid enforcement and latency coverage.
 
 ## Support of multi-GPU hosts
 

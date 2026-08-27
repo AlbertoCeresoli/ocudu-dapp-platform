@@ -152,6 +152,10 @@ public:
   /// \brief Get last grid staging time in microseconds.
   float get_last_grid_staging_us() const override { return last_grid_staging_us_; }
 
+  bool used_device_grid() const override { return last_device_grid_used_; }
+
+  bool used_owned_device_grid() const override { return last_owned_device_grid_used_; }
+
   /// \brief Get last demod sync time in microseconds.
   float get_last_demod_sync_us() const override { return last_demod_sync_us_; }
 
@@ -780,8 +784,10 @@ private:
   std::array<bool, NUM_BUFFERS>                                d_csi_part1_re_indices_uploaded_ = {false, false, false};
 
   /// Gap profiling: last measured grid staging and demod sync times.
-  float last_grid_staging_us_ = 0;
-  float last_demod_sync_us_   = 0;
+  float last_grid_staging_us_        = 0;
+  float last_demod_sync_us_          = 0;
+  bool  last_device_grid_used_       = false;
+  bool  last_owned_device_grid_used_ = false;
 };
 
 } // namespace ocudu

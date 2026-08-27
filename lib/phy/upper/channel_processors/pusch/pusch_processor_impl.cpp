@@ -50,13 +50,6 @@ bool supports_resident_accelerated_pusch_demodulation(const pusch_processor::pdu
          (!transform_precoding || (pdu.nof_tx_layers == 1));
 }
 
-bool prefer_cpu_for_small_pusch_grants(const pusch_processor::pdu_t& pdu, const ulsch_information& info)
-{
-  static const pusch_acceleration_thresholds thresholds = pusch_acceleration_read_thresholds();
-  return pusch_acceleration_prefers_cpu_for_sch_grant(
-      info.sch.has_value(), pdu.freq_alloc.get_nof_rb(), info.nof_ul_sch_bits.value(), thresholds);
-}
-
 bool resident_sch_device_uci_enabled()
 {
   // Device-side UCI demux remains opt-in. OTA testing showed silent HARQ/CSI publication misses in this path, which can
@@ -74,7 +67,6 @@ struct resident_sch_plan {
   bool supports_resident_demod  = false;
   bool supports_resident_decode = false;
   bool supports_pdu             = false;
-  bool small_grant_prefers_cpu  = false;
   bool device_uci_enabled       = false;
 
   bool can_use_accelerated_pusch() const
@@ -85,7 +77,7 @@ struct resident_sch_plan {
 
   bool can_bypass_channel_estimator() const
   {
-    return can_use_accelerated_pusch() && has_ul_sch_softbits && first_transmission && !small_grant_prefers_cpu;
+    return can_use_accelerated_pusch() && has_ul_sch_softbits && first_transmission;
   }
 
   bool use_resident_decode() const { return use_resident_sch_only() || use_resident_sch_with_device_uci(); }
@@ -97,14 +89,14 @@ struct resident_sch_plan {
   // decode path, whose rate-dematcher combines with the buffered softbits.
   bool use_resident_sch_only() const
   {
-    return has_ul_sch_softbits && first_transmission && no_uci && supports_resident_demod &&
-           supports_resident_decode && supports_pdu && !small_grant_prefers_cpu;
+    return has_ul_sch_softbits && first_transmission && no_uci && supports_resident_demod && supports_resident_decode &&
+           supports_pdu;
   }
 
   bool use_resident_sch_with_device_uci() const
   {
     return device_uci_enabled && has_ul_sch_softbits && first_transmission && !no_uci && no_csi_part2 &&
-           supports_resident_demod && supports_resident_decode && supports_pdu && !small_grant_prefers_cpu;
+           supports_resident_demod && supports_resident_decode && supports_pdu;
   }
 };
 
@@ -122,7 +114,6 @@ resident_sch_plan make_resident_sch_plan(const pusch_processor::pdu_t& pdu,
   plan.supports_resident_demod  = demodulator.supports_resident_mode();
   plan.supports_resident_decode = decoder.supports_resident_decode();
   plan.supports_pdu             = supports_resident_accelerated_pusch_demodulation(pdu);
-  plan.small_grant_prefers_cpu  = plan.has_ul_sch_softbits && prefer_cpu_for_small_pusch_grants(pdu, info);
   plan.device_uci_enabled       = resident_sch_device_uci_enabled();
   return plan;
 }
@@ -729,6 +720,8 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
       if (collect_accelerator_timing) {
         // Pass demodulator gap timing to decoder for inclusion in results.
         decoder->set_demod_gap_timing(demodulator.get_last_grid_staging_us(), demodulator.get_last_demod_sync_us());
+        decoder->set_demod_device_grid_used(demodulator.used_device_grid());
+        decoder->set_demod_owned_device_grid_used(demodulator.used_owned_device_grid());
         decoder->set_processor_stage_timing(ch_estimate_us, process_data_setup_us, demod_call_us);
       }
 
