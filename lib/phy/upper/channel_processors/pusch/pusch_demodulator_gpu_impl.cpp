@@ -1970,11 +1970,44 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   for (unsigned port = 0; port != nof_rx_ports && rx_ports_are_compact; ++port) {
     rx_ports_are_compact = config.rx_ports[port] == port;
   }
+  struct device_grid_hold {
+    const resource_grid_reader* g{nullptr};
+    void*                       stream{nullptr};
+    bool                        armed{false};
+    void                        arm(const resource_grid_reader& grid, void* s)
+    {
+      g      = &grid;
+      stream = s;
+      armed  = true;
+    }
+    void commit()
+    {
+      if (armed && g != nullptr) {
+        if (!g->on_device_grid_reading_enqueued(stream)) {
+          // No fence event could be recorded, so the enqueued grid read is
+          // invisible to pull_pages_home; drain it before a host access can
+          // migrate the pages out from under it (Xid 31 on GB10).
+          cudaStreamSynchronizeYielding(static_cast<cudaStream_t>(stream));
+        }
+        armed = false;
+      }
+    }
+    void drop()
+    {
+      if (armed && g != nullptr) {
+        g->release_device_grid_reading();
+        armed = false;
+      }
+    }
+    ~device_grid_hold() { drop(); }
+  } grid_hold;
+
   bool use_device_grid_reader = false;
   if (rx_ports_are_compact && grid.supports_device_grid_reading() && (grid.get_device_grid_cbf16() != nullptr)) {
     use_device_grid_reader = grid.prepare_device_grid_reading(stream_);
     if (use_device_grid_reader) {
       d_grid_cbf16_ = const_cast<void*>(grid.get_device_grid_cbf16());
+      grid_hold.arm(grid, stream_);
     }
   }
   if (use_device_grid_reader) {
@@ -2007,6 +2040,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
         "PUSCH GPU E2E: LLR workload exceeds pre-allocated capacity ({}/{} bytes)",
         llrs_half_bytes,
         d_llrs_half_capacity_[0]);
+    grid_hold.drop();
     process_cpu_grid_fallback(codeword_buffer, notifier, grid, est_results, config);
     return;
   }
@@ -2074,6 +2108,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
           d_sch_llrs_half_capacity_[buf_idx],
           h_sch_re_indices_.size(),
           d_sch_re_indices_capacity_[buf_idx]);
+      grid_hold.drop();
       process_cpu_grid_fallback(codeword_buffer, notifier, grid, est_results, config);
       return;
     }
@@ -2098,6 +2133,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
             harq_ack_llrs,
             h_csi_part1_re_indices_.size(),
             csi_part1_llrs);
+        grid_hold.drop();
         process_cpu_grid_fallback(codeword_buffer, notifier, grid, est_results, config);
         return;
       }
@@ -2284,6 +2320,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
     if (status != NR_LDPC_SUCCESS) {
       ocudulog::fetch_basic_logger("PHY").warning("PUSCH GPU E2E configure failed with status {}; falling back to CPU.",
                                                   static_cast<int>(status));
+      grid_hold.drop();
       process_cpu_grid_fallback(codeword_buffer, notifier, grid, est_results, config);
       return;
     }
@@ -2317,6 +2354,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
     if (status != NR_LDPC_SUCCESS) {
       ocudulog::fetch_basic_logger("PHY").warning(
           "PUSCH GPU E2E data-params update failed with status {}; falling back to CPU.", static_cast<int>(status));
+      grid_hold.drop();
       process_cpu_grid_fallback(codeword_buffer, notifier, grid, est_results, config);
       return;
     }
@@ -2520,13 +2558,13 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
         "PUSCH GPU E2E kernel failed with status {} (CUDA: {}); falling back to CPU.",
         static_cast<int>(status),
         cudaGetErrorString(cuda_status));
+    grid_hold.drop();
     process_cpu_grid_fallback(codeword_buffer, notifier, grid, est_results, config);
     return;
   }
 
-  if (use_device_grid_reader && !grid.on_device_grid_reading_enqueued(stream_)) {
-    // Keep CUDA-visible grid lifetime correct even if the event hook fails.
-    cudaStreamSynchronizeYielding(stream_);
+  if (use_device_grid_reader) {
+    grid_hold.commit();
   }
 
   if (compact_sch_llrs) {

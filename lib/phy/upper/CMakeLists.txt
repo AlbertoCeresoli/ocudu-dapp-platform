@@ -55,6 +55,8 @@ target_link_libraries(ocudu_upper_phy
         $<$<BOOL:${CUDA_ACCEL_FOUND}>:CUDA::cudart>)
 if(CUDA_ACCEL_FOUND)
     target_compile_definitions(ocudu_upper_phy PRIVATE ENABLE_CUDA)
+    # Owned-snapshot copy kernel for CUDA-visible grids (host reads never touch the live managed VA).
+    target_sources(ocudu_upper_phy PRIVATE owned_grid_snapshot_copy.cu)
 endif()
 
 add_library(log_likelihood_ratio log_likelihood_ratio.cpp)

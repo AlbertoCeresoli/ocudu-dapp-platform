@@ -231,10 +231,10 @@ srs_estimator_result srs_estimator_cuda_impl::estimate(const resource_grid_reade
   ocudu_assert(handle_validation(msg, srs_validator_generic_impl(max_nof_prb).is_valid(config)), "{}", msg);
 
   if (!gpu_available || (handle == nullptr) || (stream == nullptr)) {
-    return fallback->estimate(grid, config);
+    return {};
   }
   if (cudaSetDevice(device_id) != cudaSuccess) {
-    return fallback->estimate(grid, config);
+    return {};
   }
 
   unsigned nof_rx_ports         = config.ports.size();
@@ -256,16 +256,18 @@ srs_estimator_result srs_estimator_cuda_impl::estimate(const resource_grid_reade
 
   if ((sequence_length == 0) || (sequence_length > SRS_ESTIMATOR_MAX_SEQUENCE_LENGTH) ||
       (nof_rx_ports > SRS_ESTIMATOR_MAX_RX_PORTS) || (nof_antenna_ports > SRS_ESTIMATOR_MAX_TX_PORTS)) {
-    return fallback->estimate(grid, config);
+    return {};
   }
 
   unsigned dft_size = get_gpu_ta_dft_size(sequence_length);
   if (dft_size > SRS_ESTIMATOR_MAX_DFT_SIZE) {
-    return fallback->estimate(grid, config);
+    return {};
   }
 
   if (!force_gpu_path && !is_srs_gpu_workload_large_enough(nof_rx_ports, nof_symbols, sequence_length)) {
-    return fallback->estimate(grid, config);
+    // Do not fall back to the CPU estimator: that get()s the live UL grid and
+    // pull_pages_home on GB10. The next fade/PUSCH GPU load Xid 31's @ 0x140000.
+    return {};
   }
 
   srs_information info_port0         = get_srs_information(config.resource, /*i_antenna_port=*/0);
@@ -347,28 +349,31 @@ srs_estimator_result srs_estimator_cuda_impl::estimate(const resource_grid_reade
 
     if (!is_success(srs_estimator_configure(handle, &gpu_cfg, sequences.data(), stream))) {
       gpu_configured = false;
-      return fallback->estimate(grid, config);
+      return {};
     }
     last_config_signature = std::move(config_signature);
     gpu_configured        = true;
   }
 
-  const void* d_grid_cbf16       = nullptr;
-  bool        direct_device_grid = false;
-  if (grid.supports_device_grid_reading() && (grid.get_device_grid_cbf16() != nullptr) &&
-      grid.prepare_device_grid_reading(stream)) {
-    d_grid_cbf16       = grid.get_device_grid_cbf16();
-    direct_device_grid = true;
+  // Class-C / ISAC already consume the owned fade snapshot. SRS must do the
+  // same: a GPU load of the live managed UL VA Xid 31's FAULT_PTE @ 0x140000
+  // on GB10 after any host migrate (or even without one, on a late stream).
+  const void* d_grid_cbf16  = nullptr;
+  const void* owned         = grid.get_owned_device_snapshot_cbf16();
+  void*       owned_ready   = grid.get_owned_device_snapshot_ready_event();
+  if (owned == nullptr || owned_ready == nullptr) {
+    if (grid.stage_owned_snapshot_from_host()) {
+      owned       = grid.get_owned_device_snapshot_cbf16();
+      owned_ready = grid.get_owned_device_snapshot_ready_event();
+    }
+  }
+  if (owned != nullptr && owned_ready != nullptr &&
+      cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), static_cast<cudaEvent_t>(owned_ready), 0) ==
+          cudaSuccess) {
+    d_grid_cbf16 = owned;
   } else {
-    if ((staged_grid_source != &grid) || !staged_grid_reader) {
-      staged_grid_reader = std::make_unique<pusch_device_grid_reader_cuda>(grid);
-      staged_grid_source = &grid;
-    }
-
-    if (!staged_grid_reader->stage_host_grid_async(stream)) {
-      return fallback->estimate(grid, config);
-    }
-    d_grid_cbf16 = staged_grid_reader->get_device_grid_cbf16();
+    static_cast<void>(cudaGetLastError());
+    return {};
   }
 
   srs_estimator_metrics_t        metrics            = {};
@@ -376,10 +381,7 @@ srs_estimator_result srs_estimator_cuda_impl::estimate(const resource_grid_reade
   if ((d_grid_cbf16 == nullptr) ||
       !is_success(srs_estimator_estimate_auto_ta(
           handle, d_grid_cbf16, static_cast<float>(max_ta), &gpu_time_alignment, &metrics, stream))) {
-    return fallback->estimate(grid, config);
-  }
-  if (direct_device_grid && !grid.on_device_grid_reading_enqueued(stream)) {
-    cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+    return {};
   }
 
   srs_estimator_result result;

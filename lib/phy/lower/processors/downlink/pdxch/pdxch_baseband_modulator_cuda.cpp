@@ -147,8 +147,12 @@ public:
             "Lower-PHY TX GPU path selected: direct CUDA-visible downlink resource-grid reader.");
       }
       bool enqueued = ocudu_lowphy_tx_process(handle, grid.get_device_grid_cbf16(), output_ports.data(), stream) != 0;
-      if (enqueued && !grid.on_device_grid_reading_enqueued(stream)) {
-        (void)ocudu_lowphy_tx_synchronize(handle);
+      if (enqueued) {
+        if (!grid.on_device_grid_reading_enqueued(stream)) {
+          (void)ocudu_lowphy_tx_synchronize(handle);
+        }
+      } else {
+        grid.release_device_grid_reading();
       }
       return submit(enqueued);
     }

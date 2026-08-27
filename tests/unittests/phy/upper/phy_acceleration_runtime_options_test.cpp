@@ -146,6 +146,57 @@ TEST(phy_acceleration_runtime_options_test, cuda_visible_grid_mode_reports_absen
   EXPECT_TRUE(phy_acceleration_cuda_visible_grid_managed_requested());
 }
 
+TEST(phy_acceleration_runtime_options_test, managed_access_policy_matches_platform_capability_matrix)
+{
+  // GH200 / Grace-Hopper: fully coherent. Prefetch is overhead and would
+  // disable concurrent host DMRS vs GPU PDSCH.
+  {
+    const auto p = make_cuda_visible_managed_access_policy(true, true, true, true);
+    EXPECT_TRUE(cuda_visible_managed_access_is_fully_coherent(true, true, true));
+    EXPECT_TRUE(p.host_reads_device_resident_directly);
+    EXPECT_FALSE(p.prefetch_by_default);
+    EXPECT_TRUE(p.prefer_device_memory);
+    EXPECT_TRUE(p.allow_concurrent_downlink_writes);
+  }
+
+  // GB10 / typical Jetson: GPU can walk host page tables, CPU cannot read
+  // GPU-resident managed pages. Must prefetch; never overlap host writes.
+  {
+    const auto p = make_cuda_visible_managed_access_policy(true, true, false, true);
+    EXPECT_FALSE(cuda_visible_managed_access_is_fully_coherent(true, true, false));
+    EXPECT_FALSE(p.host_reads_device_resident_directly);
+    EXPECT_TRUE(p.prefetch_by_default);
+    EXPECT_FALSE(p.prefer_device_memory);
+    EXPECT_FALSE(p.allow_concurrent_downlink_writes);
+  }
+
+  // Discrete GPU (or older Jetson): no ATS. Auto factory uses pinned memory;
+  // if managed is forced, same conservative defaults as the row above.
+  {
+    const auto p = make_cuda_visible_managed_access_policy(false, false, false, true);
+    EXPECT_FALSE(cuda_visible_managed_access_is_fully_coherent(false, false, false));
+    EXPECT_FALSE(p.host_reads_device_resident_directly);
+    EXPECT_TRUE(p.prefetch_by_default);
+    EXPECT_FALSE(p.prefer_device_memory);
+    EXPECT_FALSE(p.allow_concurrent_downlink_writes);
+  }
+
+  // Partial ATS (CMA without host page tables) is not fully coherent.
+  {
+    const auto p = make_cuda_visible_managed_access_policy(true, false, false, true);
+    EXPECT_TRUE(p.prefetch_by_default);
+    EXPECT_FALSE(p.allow_concurrent_downlink_writes);
+  }
+
+  // Concurrent DL writes stay off when the caller did not ask for them, even
+  // on a fully coherent part.
+  {
+    const auto p = make_cuda_visible_managed_access_policy(true, true, true, false);
+    EXPECT_FALSE(p.allow_concurrent_downlink_writes);
+    EXPECT_FALSE(p.prefetch_by_default);
+  }
+}
+
 TEST(phy_acceleration_runtime_options_test, pdsch_auto_enable_discrete_override_reports_configured_state)
 {
   scoped_env_var env("OCUDU_PDSCH_AUTO_ENABLE_DISCRETE");

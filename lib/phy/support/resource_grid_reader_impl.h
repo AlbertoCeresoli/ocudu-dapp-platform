@@ -63,6 +63,8 @@ public:
   // See interface for documentation.
   span<const cbf16_t> get_view(unsigned port, unsigned l) const override;
 
+  span<const cbf16_t> get_contiguous_view() const override;
+
 private:
   const storage_type&                  data;
   const resource_grid_allocation_info& alloc_mask;

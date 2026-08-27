@@ -221,3 +221,9 @@ span<const cbf16_t> resource_grid_reader_impl::get_view(unsigned port, unsigned 
   // Access the OFDM symbol from the resource grid.
   return data.get_view({l, port});
 }
+
+span<const cbf16_t> resource_grid_reader_impl::get_contiguous_view() const
+{
+  const std::size_t nof_elements = static_cast<std::size_t>(get_nof_ports()) * get_nof_symbols() * get_nof_subc();
+  return span<const cbf16_t>(data.get_view({0, 0}).data(), nof_elements);
+}

@@ -68,6 +68,7 @@ bool resident_sch_device_uci_enabled()
 struct resident_sch_plan {
   bool has_sch_data             = false;
   bool has_ul_sch_softbits      = false;
+  bool first_transmission       = false;
   bool no_uci                   = false;
   bool no_csi_part2             = false;
   bool supports_resident_demod  = false;
@@ -84,21 +85,26 @@ struct resident_sch_plan {
 
   bool can_bypass_channel_estimator() const
   {
-    return can_use_accelerated_pusch() && has_ul_sch_softbits && !small_grant_prefers_cpu;
+    return can_use_accelerated_pusch() && has_ul_sch_softbits && first_transmission && !small_grant_prefers_cpu;
   }
 
   bool use_resident_decode() const { return use_resident_sch_only() || use_resident_sch_with_device_uci(); }
 
+  // Resident decode has no soft-combining input: a retransmission decoded
+  // standalone at rv>0 is mostly self-undecodable, so it burns every HARQ
+  // attempt and, once the rx_buffer expires, floods "identifier for
+  // retransmissions not found". Retx therefore always take the host-visible
+  // decode path, whose rate-dematcher combines with the buffered softbits.
   bool use_resident_sch_only() const
   {
-    return has_ul_sch_softbits && no_uci && supports_resident_demod && supports_resident_decode && supports_pdu &&
-           !small_grant_prefers_cpu;
+    return has_ul_sch_softbits && first_transmission && no_uci && supports_resident_demod &&
+           supports_resident_decode && supports_pdu && !small_grant_prefers_cpu;
   }
 
   bool use_resident_sch_with_device_uci() const
   {
-    return device_uci_enabled && has_ul_sch_softbits && !no_uci && no_csi_part2 && supports_resident_demod &&
-           supports_resident_decode && supports_pdu && !small_grant_prefers_cpu;
+    return device_uci_enabled && has_ul_sch_softbits && first_transmission && !no_uci && no_csi_part2 &&
+           supports_resident_demod && supports_resident_decode && supports_pdu && !small_grant_prefers_cpu;
   }
 };
 
@@ -110,6 +116,7 @@ resident_sch_plan make_resident_sch_plan(const pusch_processor::pdu_t& pdu,
   resident_sch_plan plan;
   plan.has_sch_data             = pdu.codeword.has_value();
   plan.has_ul_sch_softbits      = plan.has_sch_data && (info.nof_ul_sch_bits.value() != 0);
+  plan.first_transmission       = plan.has_sch_data && pdu.codeword->new_data;
   plan.no_uci                   = (pdu.uci.nof_harq_ack == 0) && (pdu.uci.nof_csi_part1 == 0);
   plan.no_csi_part2             = pdu.uci.csi_part2_size.entries.empty();
   plan.supports_resident_demod  = demodulator.supports_resident_mode();

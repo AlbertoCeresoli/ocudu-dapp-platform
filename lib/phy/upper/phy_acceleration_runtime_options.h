@@ -108,4 +108,50 @@ inline bool phy_acceleration_pdsch_auto_enable_discrete_requested()
   return phy_acceleration_env_flag_enabled("OCUDU_PDSCH_AUTO_ENABLE_DISCRETE");
 }
 
+/// Capability-derived defaults for a CUDA-visible managed resource grid.
+///
+/// Inputs are the three CUDA device attributes that actually differ across the
+/// boxes we run on. Product names are only examples; the policy never keys off
+/// them.
+///
+/// | class | CMA | host PT | CPU→GPU-resident | examples | default |
+/// |---|---|---|---|---|---|
+/// | fully coherent | 1 | 1 | 1 | GH200, Grace-Hopper | no prefetch; concurrent DL writes; prefer device |
+/// | GPU sees host pages, CPU cannot read GPU-resident | 1 | 1 | 0 | GB10, many Jetson | prefetch both ways; no concurrent writes |
+/// | migrate-on-fault / no ATS | 0 or host PT 0 | * | 0 | discrete, older Jetson | same as the row above if managed is forced (auto uses pinned) |
+///
+/// `cudaMemPrefetchAsync` returning NotSupported is a later no-op, so turning
+/// prefetch on by default is safe on parts that cannot migrate.
+struct cuda_visible_managed_access_policy {
+  bool host_reads_device_resident_directly = false;
+  bool prefetch_by_default                 = false;
+  bool prefer_device_memory                = false;
+  bool allow_concurrent_downlink_writes    = false;
+};
+
+/// True when CPU and GPU can touch the same managed pages with no migration.
+inline bool cuda_visible_managed_access_is_fully_coherent(bool concurrent_managed_access,
+                                                          bool host_uses_host_page_tables,
+                                                          bool direct_managed_access_from_host)
+{
+  return concurrent_managed_access && host_uses_host_page_tables && direct_managed_access_from_host;
+}
+
+inline cuda_visible_managed_access_policy
+make_cuda_visible_managed_access_policy(bool concurrent_managed_access,
+                                        bool host_uses_host_page_tables,
+                                        bool direct_managed_access_from_host,
+                                        bool enable_concurrent_downlink_writes = false)
+{
+  const bool fully_coherent = cuda_visible_managed_access_is_fully_coherent(
+      concurrent_managed_access, host_uses_host_page_tables, direct_managed_access_from_host);
+
+  cuda_visible_managed_access_policy policy;
+  policy.host_reads_device_resident_directly = direct_managed_access_from_host;
+  policy.prefetch_by_default                 = !fully_coherent;
+  policy.prefer_device_memory                = fully_coherent;
+  policy.allow_concurrent_downlink_writes    = enable_concurrent_downlink_writes && fully_coherent;
+  return policy;
+}
+
 } // namespace ocudu

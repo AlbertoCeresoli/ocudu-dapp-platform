@@ -217,15 +217,20 @@ void uplink_processor_impl::process_symbol_pdus(unsigned end_symbol_index)
       pdu_repository.get_pucch_f1_repository(end_symbol_index);
   span<const uplink_pdu_slot_repository::srs_pdu> srs_pdus = pdu_repository.get_srs_pdus(end_symbol_index);
 
-  // If the phy tap is configured, send the UL symbols through the tap interface along with their associated PDUs.
+  // PUSCH first so the GPU reader claims the live grid before any host
+  // snapshot / PUCCH home. Spectrum tap must run AFTER PUSCH: staging the
+  // Class-C snapshot homes the live VA (CPU copy + H2D). Doing that before
+  // PUSCH GPU-loads live is Xid 31 @ 0x140000.
+  for (const auto& pdu : pusch_pdus) {
+    process_pusch(pdu);
+  }
+
   if (ul_tap) {
-    // Extract PUCCH Format 1 common PDU parameters.
     static_vector<pucch_processor::format1_common_configuration, MAX_PUCCH_PDUS_PER_SLOT> pucch_f1_common_configs;
     for (const auto& pucch_f1 : pucch_f1_pdus) {
       pucch_f1_common_configs.push_back(pucch_f1.config.common_config);
     }
-
-    // Send the symbols to the tap plugin for external analysis and processing.
+    (void)grid->get_reader().stage_owned_snapshot_from_host();
     ul_tap->handle_ul_symbol(grid->get_writer(),
                              grid->get_reader(),
                              current_slot,
@@ -236,17 +241,12 @@ void uplink_processor_impl::process_symbol_pdus(unsigned end_symbol_index)
                              srs_pdus);
   }
 
-  // Process each PDU.
   for (const auto& pdu : pucch_pdus) {
     process_pucch(pdu);
   }
 
   for (const auto& collection : pucch_f1_pdus) {
     process_pucch_f1(collection);
-  }
-
-  for (const auto& pdu : pusch_pdus) {
-    process_pusch(pdu);
   }
 
   for (const auto& pdu : srs_pdus) {
