@@ -1,0 +1,380 @@
+<!-- SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc. -->
+<!-- SPDX-License-Identifier: BSD-3-Clause-Clear -->
+
+# E3 management guide
+
+Guided path: the [step-by-step tutorial series](README.md#start-here) walks
+every workflow this reference covers.
+
+Working version **v1**.  
+**Normative schema:** `schemas/e3/e3sm-ocudu-dapp-mgmt-v1.asn1`  
+**Doxygen page:** `e3_management`  
+**Wire details:** [e3_wire.md](e3_wire.md) · **Architecture:** [e3_system_design.md](e3_system_design.md)
+
+This guide is the operator and integrator reference for the **embedded OCUDU E3
+dApp management agent**: what you can ask, how clients work, and how lifecycle
+jobs and generations compose safely.
+
+## What E3 is (and is not)
+
+| E3 **is** | E3 **is not** |
+|-----------|---------------|
+| Control plane for dApp inventory, lifecycle, configuration, models, metrics, incidents. Only the local socket is credentialed (`SO_PEERCRED` UID check); the SCTP carriers admit peers **by address only** — no authentication | The real-time L1 or scheduler data path |
+| ASN.1 APER over a same-host Unix socket **and** over SCTP (E3AP-OCUDU-V1) | A ratified O-RAN E3AP profile (the module is a project definition aligned with the E3AP procedure set) |
+| Push telemetry subscriptions for out-of-process dApps and dashboards (PUSCH symbols/CRC, SRS and DM-RS estimates, gNB JSON metrics, Class-C snapshots) | High-rate spectrum/SRS tensor transport (SHM / CUDA-IPC) |
+| Generation-safe, transactional mutations | A channel for filesystem paths, argv, or route descriptors |
+
+Service models: **E3SM-OCUDU-DAPP-MGMT-V1** (management) and
+**OCUDU-TELEMETRY-SM** (observation). Both are project definitions, not
+ratified O-RAN specifications.
+
+## Enabling the endpoints
+
+Build with `-DENABLE_DAPP=ON`, `-DENABLE_E3=ON` and `-DENABLE_E3_ASN1_CODEC=ON`
+(asn1c with APER support; `flatc` additionally enables the FlatBuffers data
+profile). Configure any combination of carriers:
+
+```yaml
+dapp:
+  catalog_root: /opt/ocudu/dapps
+  native_preflight_helper: /opt/ocudu/bin/ocudu-dapp-preflight  # absolute path, required
+  package_signature_mode: allow_unsigned    # lab posture; see the signing tutorial
+  minimum_trust_policy_epoch: 0
+  package_manifests: [ ... ]
+  local_e3:                      # same-host, SO_PEERCRED-authenticated
+    socket_path: /run/ocudu/dapp-management.sock
+    request_timeout_ms: 1000
+  e3ap_sctp:                     # E3AP-OCUDU-V1 over SCTP, loopback by default
+    port: 36423
+  e3dp_sctp:                     # FlatBuffers data profile for the reference client
+    port: 38472
+```
+
+The agent opens only after declarative `initial_instances` (if any) complete.
+`dapp_service::stop()` closes the SCTP endpoints first, then the local socket,
+then the job executor, after DU producers stop.
+
+## Clients
+
+| Client | Carrier | Location |
+|--------|---------|----------|
+| `ocudu-dappctl` (C++) | local socket | `apps/tools/dappctl` |
+| `ocudu_dappctl.py` | local socket **or** E3AP SCTP (`--sctp host:port`) | `apps/tools/dappctl/ocudu_dappctl.py` (requires `asn1tools`) |
+| `python3 -m ocudu_e3` | E3AP SCTP | `python/ocudu_e3` — catalog, telemetry subscriptions, inventory/health/metrics |
+| `ref_spectrum_e3_cpu` / `ref_srs_isac_e3_cpu` (SDK, `OCUDU_DAPP_REF_EXTRAS=ON`) | local E3 socket | standalone C++ portable consumers |
+
+```bash
+# Same-host management through the credentialed socket
+python3 apps/tools/dappctl/ocudu_dappctl.py --socket /run/ocudu/dapp-management.sock inventory
+
+# The same request as an E3AP control action (no root socket needed)
+python3 apps/tools/dappctl/ocudu_dappctl.py --sctp 127.0.0.1:36423 inventory
+
+# Discover RAN functions and streams, then watch two telemetry streams
+export OCUDU_E3_SCHEMA_DIR=schemas/e3
+python3 -m ocudu_e3 --port 36423 catalog
+python3 -m ocudu_e3 --port 36423 subscribe pusch.crc gnb.metrics_json --duration 10
+python3 -m ocudu_e3 --port 36423 subscribe pusch.symbols --rnti 0x4601 --json --maximum 5
+
+# Request a capture interval, filter by cell, keep the association open on exit
+python3 -m ocudu_e3 subscribe pusch.symbols --periodicity-ms 100 --cell 0 --no-release
+
+# Metric descriptors (schema) instead of samples for one instance
+python3 -m ocudu_e3 metrics <instance-hex> --schema
+```
+
+Both `dappctl` implementations share one exit contract: `0` accepted,
+`1` transport failure, `2` invalid input, `3` the agent refused the
+operation.
+
+`ocudu_dappctl.py` defaults: `--socket` falls back to `OCUDU_DAPP_E3_SOCKET`
+or `/run/ocudu/dapp-management.sock`; `--sctp` falls back to `OCUDU_DAPP_E3_SCTP`
+(empty = use the local socket). Common flags: `--transaction` (16-byte id),
+`--server-uid`, `--timeout-ms`, `--dapp-name`. `ocudu_dappctl.py
+codec-self-test` verifies the APER codec against independent golden vectors
+without contacting a server.
+
+## Request model
+
+Every request carries a **RequestHeader**:
+
+| Field | Role |
+|-------|------|
+| `transactionId` | 16-byte opaque id; responses echo it |
+| `instanceId` | Required for instance-scoped ops |
+| `expectedInstanceGeneration` | Optimistic concurrency for instance mutations |
+| `expectedInventoryGeneration` | Optional inventory CAS |
+| `dryRun` | Validate without committing |
+
+**Result codes** (selected): `success`, `dryRunSuccess`, `accepted` (async job
+queued), `notFound`, `conflict`, `invalidRequest`, `incompatible`,
+`verificationFailed`, `loadFailed`, `lifecycleFailed`, `transactionMismatch`,
+`resourceExhausted`.
+
+**String contract**: management `STRING` *values* are length-carried and **not
+NUL-terminated** — consumers must use the carried `{bytes, size}` pair and
+never call `strlen` on them. The `key`, `description`, and `detail` fields
+*are* validated as NUL-terminated by the host. E3 clients and management
+tooling must honor this distinction when decoding config and metric records.
+
+### Jobs
+
+Mutating operations typically return `accepted` + `jobId`. Poll:
+
+```bash
+... jobs list
+... jobs get --job <job-id>
+... jobs cancel --job <job-id>
+```
+
+Terminal job states: `succeeded`, `failed`, `cancelled`. On success, read
+`instanceGeneration` / `inventoryGeneration` from the result and pass the new
+value on the next mutation. Stale generations fail with **conflict**.
+
+## Operation catalog
+
+### Inventory
+
+```bash
+... inventory
+... inventory --omit-packages
+... inventory --omit-instances
+```
+
+Returns package records (id, name, vendor, version, content hash, placement
+mask, backends, interfaces, compatibility, signature status, sequence, policy
+epoch, SBOM hash), lifecycle instance records (state, generation, placement,
+backend, interfaces, last error/incident), and the bounded set of current E3
+associations. Each association reports its peer, setup identity, subscriptions,
+telemetry identifiers, and control-request count. External observer dApps are
+reported as connections, not incorrectly represented as LCM-loaded instances.
+
+### Lifecycle
+
+```bash
+... load --package <uuid> --placement in-process|process --backend cpu|cuda|other
+... lifecycle prepare|arm|shadow|activate|deactivate|retry|unload \
+      --instance <uuid> --expected-generation N [--timeout-us U]
+```
+
+| Action | Alias (C++) | Meaning |
+|--------|-------------|---------|
+| load | — | Create instance from admitted package |
+| prepare | — | Module create / prepare |
+| arm | — | Worker readiness |
+| enterShadow | shadow | Warm without hook authority |
+| activate | enable | Bind hooks |
+| deactivate | disable | Remove authority |
+| retryQuiescence | retry | Retry uncertain native quiescence |
+| unload | — | Destroy after quiescence |
+| breakerProbe | — | Policy-controlled breaker probe |
+
+Recommended first enable: stop at **shadow**, inspect metrics schema / stage
+models, then **activate**. Disable: **deactivate** then **unload**. Never force
+unload of uncertain resident GPU work — prefer retry or maintenance restart.
+
+### Configuration
+
+```bash
+... config schema --instance I
+... config get --instance I
+... config set --instance I --expected-generation G --config-generation C \
+      --boundary immediate|invocation|slot|restart \
+      --set key=bool|i64|u64|f64|str|hex:value
+```
+
+### Model management
+
+```bash
+... model stage|validate|warm|activate|rollback|retire \
+      --instance I --expected-generation G \
+      --model NAME --model-generation M [--version V] [--artifact path]
+```
+
+Artifact size is bounded (≤ 1 MiB on the management path in current clients).
+Stage/validate/warm are off the hot path; activate is a generation publication.
+
+### Metrics
+
+```bash
+... metrics schema --instance I
+... metrics get --instance I
+```
+
+Counters are cumulative per instance generation; rates are computed by the
+monitor from two samples. Host-owned Class A/B/C metrics are defined in
+`dapp_observability` / metric catalog headers.
+
+### Incidents
+
+```bash
+... incidents list [--instance I] [--cause deadlineMiss|heartbeatLoss|...] [--after N] [--limit K]
+... incidents clear --through N
+```
+
+Causes include returned errors, exceptions, invalid I/O, deadline, device,
+resource, process exit, heartbeat loss, lease expired, quiescence timeout,
+security violation, policy rejection.
+
+### Health
+
+```bash
+... health
+```
+
+Aggregate counters: exceptions, deadline misses, breakers, fallbacks,
+quarantines, ring drops, last incident id, etc.
+
+### RAN control
+
+```bash
+... ue-release --pci 1 --rnti 0x4601 --dry-run
+... ue-release --pci 1 --rnti 0x4601
+```
+
+```bash
+... ue-handover --pci 1 --rnti 0x4601 --target-pci 2 [--dry-run]
+... rf-gain --direction rx --port 0 --gain-db 55 [--dry-run]
+... cell-info
+```
+
+`cell-info` returns the served cells (PCI, PLMN/TAC, NCI, band, DL/UL ARFCN
+and centre frequency, bandwidth and PRBs, SCS, antenna counts, TDD pattern,
+PRACH configuration, RU gains, barred flag) together with the RAN-control
+capabilities the host can honour (`ueRelease`, `handover`, `txGain`,
+`rxGain`). `ue-handover` asks the CU-CP mobility handler to move a UE to the
+target PCI (PLMN/TAC resolved from the cell table); `rf-gain` sets a radio-unit
+TX or RX gain through the RU gain controller and is applied immediately (not
+deferred), so use `--dry-run` first and expect link quality to change.
+
+`ue-release` requests a host-authoritative transition of the identified UE to
+RRC idle. A successful non-dry-run response means the request was accepted by
+the CU-CP control executor; it is not proof that the UE existed or that the
+subsequent radio procedure completed. The E3/SCTP session thread only admits
+and defers the request—it never mutates CU-CP state directly. Use dry-run to
+validate the control path without affecting a UE.
+
+### Quiet reservations
+
+```bash
+... quiet-reservations [--instance I] [--cell C] [--limit K]
+```
+
+Lists host-authoritative quiet grants/clamps/rejections. Spectrum packages
+request quiet; the host alone admits duty-bounded reservations.
+
+### Portable Class-C data and telemetry (pull path)
+
+```bash
+... data subscribe --subscription <uuid> --interface <id> \
+      [--cell C] [--sample-every N] [--queue-depth D] \
+      [--chunk-bytes B] [--lease-us U] \
+      [--drop-policy drop-newest|drop-oldest|coalesce-latest]
+... data list
+... data poll --subscription <uuid> [--limit N]
+... data remove --subscription <uuid>
+```
+
+Requires DU `portable_e3_data` configuration. Interfaces `0x00010001`
+(spectrum) and `0x00010002` (SRS-ISAC) return the Class-C `OCC3` envelope plus
+tensor; interfaces `0x00020001`…`0x00020006` return the packed telemetry
+records (`ocudu_e3.decode_store_publication` decodes them; `0x00020006` is
+`pusch.grid`). Prefer process SHM/CUDA-IPC for high rate.
+
+## Telemetry subscriptions over E3AP
+
+The E3AP carrier turns the same store into a push interface. After setup the
+agent advertises RAN function **10** (`OCUDU-TELEMETRY-SM`) with these
+telemetry identifiers:
+
+| Id | Stream | Content | Typical consumer |
+|----|--------|---------|------------------|
+| 1 | `pusch.symbols` | per-UE equalized PUSCH symbols plus SINR/EPRE/RSRP/EVM/TA/CFO | constellation, link-quality history |
+| 2 | `pusch.crc` | per-TB CRC outcome | BLER |
+| 3 | `srs.channel` | Per-subcarrier SRS channel response per port pair plus RSRP/EPRE/TA | SRS pane, positioning experiments |
+| 4 | `pusch.dmrs_channel` | PUSCH DM-RS channel estimate | channel research |
+| 5 | `gnb.metrics_json` | the periodic gNB JSON metrics report (needs `metrics.enable_json: true`) | UE table, MCS/BLER/throughput history, cell/DU/CU metrics |
+| 6 | `classc.spectrum` | Class-C spectrum snapshot (`OCC3` metadata + resource grid) | spectrum sensing observers |
+| 7 | `classc.srs_isac` | Class-C SRS-ISAC snapshot | ISAC observers |
+| 8 | `pusch.grid` | raw pre-equalization PUSCH resource grid (all Rx ports, DM-RS included) plus the grant parameters | offline CE/EQ research, recorders |
+
+Per-telemetry filters ride in `subscriptionData` (`Telemetry-SubscriptionConfig`):
+cell filter, `sampleEveryN`, drop policy (`coalesceLatest` by default so a slow
+dApp always sees the freshest object), `minimumIntervalMs`, and an RNTI list.
+Each subscribed telemetry reserves its own bounded store queue: 64 chunks for
+streams whose objects can reach the store's maximum object size
+(`pusch.symbols`, Class-C snapshots) and 8–16 chunks for the small-record
+streams, so a dashboard subscribing to four streams uses about 12 MiB of the
+default 128 MiB / 32-subscription store (`portable_e3_data`).
+`E3-SubscriptionRequest.periodicity` (or a per-telemetry `minimumIntervalMs`)
+is the per-RNTI capture interval this subscription asks for; `0` requests
+every event and the producer honours the fastest active request, thinning
+slower subscriptions individually. The configured `telemetry_*_hard_floor_ms`
+is enforced as an aggregate per-stream bound: the stream as a whole never
+publishes faster than the hard floor, whatever the mix of UEs and requests.
+Subscriptions live as long as the association; a
+release or a dropped association removes them and the producers stop
+publishing within one poll period.
+
+```python
+from ocudu_e3 import E3Client, SubscriptionConfig
+
+with E3Client("127.0.0.1", 36423, dapp_name="my-observer") as client:
+    setup = client.setup()
+    client.subscribe(["pusch.symbols", "pusch.crc"],
+                     configs=[SubscriptionConfig("pusch.symbols", rnti_filter=[0x4601])])
+    for indication in client.indications(timeout=1.0):
+        print(indication.stream, indication.record)
+    health = client.health()           # management over the same association
+```
+
+Management requests travel on RAN function **11** as control actions; the
+agent acknowledges acceptance and returns the `ManagementResponse` in an
+`E3-ControlResponse`. Telemetry indications and management responses can be
+interleaved on one persistent association; clients do not need a new SCTP
+association per operation. All authority rules of the local socket apply.
+
+## Standard enable / disable recipes
+
+**Enable package to active:**
+
+1. `inventory` — confirm package present and compatible.  
+2. `load` — note `instanceId`, `instanceGeneration`.  
+3. `lifecycle prepare` → `arm` → `shadow` → (optional model/config) → `activate`.  
+4. `metrics get` / `health` under traffic.
+
+**Disable:**
+
+1. `lifecycle deactivate`  
+2. `lifecycle unload`  
+3. Confirm inventory shows unloaded / no live authority.
+
+**Boot-time enable:** use `initial_instances` (see [yaml_configuration.md](yaml_configuration.md)).
+
+## Safety properties operators rely on
+
+1. **No path smuggling** — only catalog-relative manifests from DU config.  
+2. **Generation CAS** — concurrent clients cannot clobber silently.  
+3. **Dry-run** — validate mutations without commit.  
+4. **Fail-closed signatures** — bad sidecars rejected even in allow_unsigned when present.  
+5. **Jobs** — long work off the request thread; cancel when supported.  
+6. **Conventional fallback** — radio continues when dApps fault.
+
+## Related tools
+
+- `ocudu-dapp-package` — offline signing (not over E3)  
+- `ocudu-dapp-preflight` — native preflight before DU `dlopen`  
+- Dummy-RU integration tests under `tests/integrationtests/dapp/`
+
+## Related documents
+
+- [e3_wire.md](e3_wire.md) — encoding and message layout  
+- [e3_system_design.md](e3_system_design.md) — where the agent sits  
+- Doxygen `dapp_operations`, `dapp_observability`, `dapp_release_provisioning`
+
+## MCP companion
+
+The dApp SDK ships an out-of-process Model Context Protocol server that exposes
+this management model and the telemetry service model as assistant tools
+(sector state, UEs, KPIs, dApp configuration/lifecycle, cell info, RAN control),
+all over one E3AP association. See `ocudu-dapp-sdk/docs/mcp_companion.md`.

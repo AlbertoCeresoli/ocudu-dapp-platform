@@ -1,0 +1,574 @@
+/* SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+ * SPDX-License-Identifier: BSD-3-Clause-Clear
+ */
+
+/*! \page dapp_quickstart OCUDU dApp Quickstart
+
+This page is the end-to-end walkthrough for building an out-of-tree dApp
+repository, packaging it, installing it into an OCUDU DU (gNB DU / O-DU)
+catalog, enabling and disabling it, monitoring it, and verifying that it is
+working. Working contracts remain ABI and package schema v1 until a formal
+release decision.
+
+Related pages:
+
+- \ref dapp_operations — operator policy, signing, Class-B evaluation, process
+  hardening, and the failure gallery
+- \ref dapp_observability — metric and copy-accounting contract
+- \ref dapp_release_provisioning — offline key custody, rollover, and revocation
+- Git Markdown companion: \c docs/dapp/quickstart.md
+- Standalone SDK document \c docs/ocudu_dapp_quickstart.md — scaffold detail
+- SDK \c docs/class_a_cuda_authoring.md, \c class_b_accelerator_authoring.md,
+  \c class_c_cuda_process_authoring.md, and \c observer_authority.md
+- E3: \ref e3_management, \ref e3_wire, \ref e3_system_design
+
+\section dapp_qs_model Mental model
+
+OCUDU embeds one dApp Runtime inside the DU process. A dApp is not an external
+side-car that the modem calls by path. It is a hash-bound catalog package that
+the DU admits, preflights, and drives through a fixed lifecycle:
+
+\code{.text}
+out-of-tree dApp repo  --build-->  artifact + manifest-v1 + SPDX SBOM
+                                         |
+                                         v
+                              operator catalog root
+                                         |
+                    (production) ocudu-dapp-package sign / trust
+                                         |
+                                         v
+                    DU YAML: package_manifests (+ initial_instances)
+                                         |
+                                         v
+         E3: load -> prepare -> arm -> shadow -> activate
+                                         |
+                                         v
+              metrics / health / incidents  (prove it is working)
+\endcode
+
+Three timing classes share one management plane, not one real-time bus:
+
+| Class | Role | Placement | Examples |
+|-------|------|-----------|----------|
+| A | Resident inline L1 | In-process only | CE, CE+EQ, full receiver |
+| B | Bounded RT control | In-process authority | Scheduler intent / PRB avoid |
+| C | Async observation | Native or supervised process | Spectrum, SRS--ISAC |
+
+Hard safety rules:
+
+- dApps never call each other; the host owns composition.
+- E3 never supplies filesystem paths, executable arguments, or route descriptors.
+- Conventional PHY and scheduler remain the fallback when a dApp is absent or fails.
+- Production defaults require detached package signatures and an offline trust policy.
+- \c ocudu_dapp_query_v1 stays pure; CUDA init, weights, and threads belong to lifecycle or model hooks.
+
+Repository split:
+
+- \b ocudu owns the public ABI headers (via install), runtime, E3, PHY and
+  scheduler adapters, preflight, catalog, \c ocudu-dappctl, and
+  \c ocudu-dapp-package.
+- \b ocudu-dapp-sdk owns out-of-tree references, process helpers, scaffolds,
+  certifiers, and authoring guides.
+- \b Your dApp repository owns only the algorithm and package identity, and
+  compiles exclusively against the installed \c OCUDUDAppSDK CMake package.
+
+\section dapp_qs_build_ocudu Build OCUDU with dApp plugins
+
+Configure a Release (or deployment) build with the dApp service and E3
+management plane. CUDA is required only for resident Class-A CUDA packages and
+CUDA Class-C paths:
+
+\code{.sh}
+cmake -S /path/to/ocudu -B /path/to/ocudu/build-dapp \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=$HOME/ocudu-install \
+  -DENABLE_DAPP=ON \
+  -DENABLE_E3=ON \
+  -DENABLE_CUDA=ON
+cmake --build /path/to/ocudu/build-dapp -j
+cmake --install /path/to/ocudu/build-dapp
+\endcode
+
+Confirm the installed SDK package exists under the prefix
+(\c lib/cmake/OCUDUDAppSDK). Without \c ENABLE_DAPP the DU has no dApp service
+symbols. With the feature compiled in, omitting the YAML \c dapp: block still
+leaves the modem path unchanged.
+
+Build the standalone SDK once against that prefix so reference packages and
+\c certify_class_a_cuda are available:
+
+\code{.sh}
+cmake -S /path/to/ocudu-dapp-sdk -B /path/to/ocudu-dapp-sdk/build-cuda \
+  -DCMAKE_PREFIX_PATH=$HOME/ocudu-install \
+  -DCMAKE_CUDA_ARCHITECTURES=121
+cmake --build /path/to/ocudu-dapp-sdk/build-cuda -j
+ctest --test-dir /path/to/ocudu-dapp-sdk/build-cuda --output-on-failure
+\endcode
+
+\section dapp_qs_new_repo Create a new dApp repository
+
+\subsection Class-A CUDA scaffold (recommended product path)
+
+Generate a new git root outside the SDK tree. The generator refuses to overwrite
+an existing directory:
+
+\code{.sh}
+PACKAGE_ID="$(uuidgen)"
+python3 /path/to/ocudu-dapp-sdk/tools/scaffold_class_a_cuda.py \
+  --kind receiver \
+  --target my_neural_rx_cuda \
+  --global-name com.example.ran.neural-rx.cuda \
+  --package-id "$PACKAGE_ID" \
+  --vendor "Example Vendor" \
+  --version 1 \
+  --output $HOME/src/my-neural-rx-dapp
+\endcode
+
+| \c --kind | Interface | Output contract |
+|-----------|-----------|-----------------|
+| \c ce | \c 0x00010003 | Port-major channel + noise |
+| \c equalizer | \c 0x00010004 | Compact symbols + post-EQ noise |
+| \c receiver | \c 0x00010005 | Compact FP16 LLRs, pre-descramble |
+
+The generated project:
+
+- depends only on installed \c OCUDUDAppSDK;
+- exports pure \c ocudu_dapp_query_v1;
+- emits a shared object, hash-bound manifest-v1, and digest-bound SPDX 2.3 SBOM;
+- keeps lifecycle and model shells in \c module_support.cpp so authors replace
+  \c algorithm.cu.
+
+Initialize version control in the new directory and keep signing private keys
+out of the repository, CI artifacts, and DU images.
+
+\subsection Class B and Class C
+
+There is no separate scaffold binary for Class B or Class C. Copy one SDK
+reference surface and rewrite package UUID, global name, vendor, version, and
+CMake target names:
+
+| Goal | SDK starting point |
+|------|--------------------|
+| Scheduler policy | \c reference/scheduler |
+| Spectrum native | \c reference/spectrum or \c spectrum_cuda |
+| Spectrum process | \c reference/process patterns for \c ref_spectrumd_* |
+| Observer-only spectrum | \c ref_spectrum_observerd_cpu |
+| SRS--ISAC | \c reference/srs_isac* and process variants |
+
+See the corresponding SDK authoring pages for placement, backend, and
+capability rules.
+
+\section dapp_qs_implement Implement the package
+
+\subsection Class A (resident)
+
+Keep \c module.cpp as the pure query trampoline and \c module_support.cpp as
+the lifecycle and dispatch shell. Replace only the algorithm entry and kernels
+in \c algorithm.cu. On invoke: validate tensors, reject out-of-profile shapes,
+enqueue only on \c invocation.execution_stream, write only caller-owned
+outputs, and return without host-side stream synchronize, allocation, E3, or
+blocking I/O. Allocate weights and scratch in prepare or model warm. The
+reference v1 envelope admits up to two layers, all QAM, DM-RS types 1 and 2,
+DC-capable operation, and no transform precoding.
+
+Equalizer packages must write valid finite post-EQ noise: after equalizer-dApp
+inline success the host derives scheduler-facing SINR from mean post-EQ noise
+into CRC \c ul_sinr (resident CE stub leaves CSI empty; conventional E2E SINR
+D2H is skipped). Host may set \c dmrs.reserved[0] to an optional OFDM-symbol
+DMRS bitmask; packages may ignore it. Soft completion wall budgets default
+to 2000 us (demod) / 800 us (CE); tests may inject tighter limits. See
+Markdown \c docs/dapp/quickstart.md and SDK \c class_a_cuda_authoring.md.
+
+\subsection Class B
+
+The hook is synchronous, in-process, and host-record based. A package may use
+CUDA internally but must still return complete host-visible intent inside the
+deadline. Prefer \c scheduler_evaluation_only in the DU configuration while
+measuring; that mode is ACTIVE and bound, yet conventional authority is
+retained. It is not lifecycle SHADOW.
+
+\subsection Class C
+
+Producers never wait on consumers. Native placement shares the DU address
+space; process placement uses credentialed shared-memory rings or a fixed CUDA
+export pool. Exactly one spectrum result authority may be active; observers may
+coexist. Process workers set Linux \c no_new_privs, answer authenticated
+heartbeats, and release every lease before completion.
+
+\section dapp_qs_certify Build, test, and certify offline
+
+\code{.sh}
+cd $HOME/src/my-neural-rx-dapp
+cmake -S . -B build \
+  -DCMAKE_PREFIX_PATH=$HOME/ocudu-install \
+  -DCMAKE_CUDA_ARCHITECTURES=121
+cmake --build build -j
+\endcode
+
+Expected products:
+
+\code{.text}
+build/my_neural_rx_cuda.so
+build/my_neural_rx_cuda.manifest.json
+build/my_neural_rx_cuda.spdx.json
+\endcode
+
+Run the offline Class-A positive certificate against the final DSO before the
+package enters a DU catalog:
+
+\code{.sh}
+/path/to/ocudu-dapp-sdk/build-cuda/certify_class_a_cuda \
+  build/my_neural_rx_cuda.so 0x00010005
+\endcode
+
+Preserve the JSON result beside the manifest. Extend the matrix with
+deployment-specific shapes and model artifacts as needed. Compute Sanitizer
+memcheck should use the default boundary shape set; racecheck may use
+\c --shape-set compact.
+
+\section dapp_qs_catalog Install into the DU catalog
+
+Copy the three bound products together beneath an operator-controlled catalog
+root. Do not rename the manifest without regenerating the hash binding.
+
+\code{.sh}
+export CATALOG=/opt/ocudu/dapps
+mkdir -p "$CATALOG"
+cp build/my_neural_rx_cuda.so \
+   build/my_neural_rx_cuda.manifest.json \
+   build/my_neural_rx_cuda.spdx.json \
+   "$CATALOG/"
+\endcode
+
+\subsection Development unsigned admission
+
+\c package_signature_mode: allow_unsigned admits a genuinely absent sidecar.
+A present malformed, unknown-key, revoked, stale, or invalid signature still
+fails closed. Do not provision production systems with this mode.
+
+\subsection Production signed admission
+
+Private keys remain offline with mode 0600:
+
+\code{.sh}
+ocudu-dapp-package keygen \
+  --private-key /secure/operator-dapp-key.pem \
+  --public-key /secure/operator-dapp-key.pub.pem
+ocudu-dapp-package sign \
+  --catalog-root /opt/ocudu/dapps \
+  --manifest my_neural_rx_cuda.manifest.json \
+  --private-key /secure/operator-dapp-key.pem \
+  --package-sequence 1
+ocudu-dapp-package trust \
+  --output /etc/ocudu/dapp-trust.json --policy-epoch 1 \
+  --public-key /secure/operator-dapp-key.pub.pem \
+  --package <package-uuid>:1
+ocudu-dapp-package inspect \
+  --catalog-root /opt/ocudu/dapps \
+  --manifest my_neural_rx_cuda.manifest.json \
+  --trust-store /etc/ocudu/dapp-trust.json \
+  --minimum-policy-epoch 1
+\endcode
+
+See \ref dapp_release_provisioning for custody, immutable generation, two-key
+rollover, and installed-platform qualification.
+
+\section dapp_qs_du_yaml Configure the gNB DU
+
+The same \c dapp: schema is shared by dynamic, split-8, and split-7.2 DU
+front-ends. List only catalog-relative manifests.
+
+\subsection Minimum development configuration
+
+\code{.yaml}
+dapp:
+  catalog_root: /opt/ocudu/dapps
+  native_preflight_helper: /opt/ocudu/bin/ocudu-dapp-preflight  # absolute path, required
+  package_signature_mode: allow_unsigned
+  minimum_trust_policy_epoch: 0     # must be 0 when no trust store is configured
+  package_manifests:
+    - my_neural_rx_cuda.manifest.json
+  local_e3:
+    socket_path: /run/ocudu/dapp-management.sock
+    request_timeout_ms: 1000
+\endcode
+
+\subsection Production-signed configuration
+
+\code{.yaml}
+dapp:
+  catalog_root: /opt/ocudu/dapps
+  native_preflight_helper: /opt/ocudu/bin/ocudu-dapp-preflight  # absolute path, required
+  package_signature_mode: required
+  package_trust_store: /etc/ocudu/dapp-trust.json
+  minimum_trust_policy_epoch: 1
+  package_manifests:
+    - my_neural_rx_cuda.manifest.json
+  local_e3:
+    socket_path: /run/ocudu/dapp-management.sock
+    request_timeout_ms: 1000
+\endcode
+
+\subsection Declarative instances at every DU start
+
+Use \c initial_instances when packages must be present without racing radio
+startup. Each entry names a manifest already listed under
+\c package_manifests. Targets are only \c shadow and \c active. Startup is
+synchronous, all-or-nothing, and completes before E3 ingress; any failure
+unwinds every selected instance in reverse through deactivate, quiesce, and
+unload.
+
+\code{.yaml}
+dapp:
+  catalog_root: /opt/ocudu/dapps
+  native_preflight_helper: /opt/ocudu/bin/ocudu-dapp-preflight  # absolute path, required
+  package_signature_mode: allow_unsigned
+  minimum_trust_policy_epoch: 0     # must be 0 when no trust store is configured
+  package_manifests:
+    - my_neural_rx_cuda.manifest.json
+    - ref_spectrumd_cpu.manifest.json
+  initial_instances:
+    - package_manifest: my_neural_rx_cuda.manifest.json
+      placement: in_process
+      backend: cuda
+      target: shadow
+      lifecycle_timeout_ms: 1000
+    - package_manifest: ref_spectrumd_cpu.manifest.json
+      placement: out_of_process
+      backend: cpu
+      target: active
+      lifecycle_timeout_ms: 2000
+  local_e3:
+    socket_path: /run/ocudu/dapp-management.sock
+    request_timeout_ms: 1000
+\endcode
+
+\subsection Class-B evaluation-only mode
+
+\code{.yaml}
+dapp:
+  scheduler_evaluation_only: true
+  package_manifests:
+    - ref_scheduler_cpu.manifest.json
+  # ... catalog_root, local_e3, signatures as above ...
+\endcode
+
+\section dapp_qs_lifecycle Enable and disable at runtime
+
+Management clients are \c ocudu-dappctl (C++) and
+\c apps/tools/dappctl/ocudu_dappctl.py (Python/JSON). Both speak the same local
+APER schema. Mutations are asynchronous jobs: wait for terminal success and
+carry the returned instance generation into the next mutation. Stale
+generations fail closed with conflict rather than applying twice.
+
+\code{.sh}
+export OCUDU_DAPP_E3_SOCKET=/run/ocudu/dapp-management.sock
+DAPPCTL=(python3 /path/to/ocudu/apps/tools/dappctl/ocudu_dappctl.py
+  --socket "$OCUDU_DAPP_E3_SOCKET"
+  --schema /path/to/ocudu/schemas/e3/e3sm-ocudu-dapp-mgmt-v1.asn1
+  --timeout-ms 2000)
+
+"${DAPPCTL[@]}" inventory
+"${DAPPCTL[@]}" load \
+  --package <package-uuid> \
+  --placement in-process \
+  --backend cuda
+\endcode
+
+Lifecycle actions (C++ aliases in parentheses):
+
+| Action | Meaning |
+|--------|---------|
+| \c prepare | Create module state; still unbound |
+| \c arm | Worker readiness |
+| \c shadow (\c enter-shadow) | Warm without hook authority |
+| \c activate (\c enable) | Bind hooks; path may use the dApp |
+| \c deactivate (\c disable) | Remove authority; keep the instance |
+| \c unload | Destroy after quiescence |
+| \c retry (\c retry-quiescence) | Retry uncertain native quiescence |
+
+Enable sequence:
+
+\code{.sh}
+# INSTANCE and GEN come from each completed job payload.
+for action in prepare arm shadow activate; do
+  "${DAPPCTL[@]}" lifecycle "$action" \
+    --instance "$INSTANCE" \
+    --expected-generation "$GEN" \
+    --timeout-us 2000000
+done
+\endcode
+
+For a new package, stop at \c shadow first, inspect inventory and metrics
+schema, optionally stage a model, then \c activate.
+
+Disable sequence:
+
+\code{.sh}
+"${DAPPCTL[@]}" lifecycle deactivate \
+  --instance "$INSTANCE" --expected-generation "$GEN" --timeout-us 2000000
+"${DAPPCTL[@]}" lifecycle unload \
+  --instance "$INSTANCE" --expected-generation "$GEN" --timeout-us 2000000
+\endcode
+
+If native quiescence is uncertain, retry quiescence. Prefer a maintenance DU
+restart over forcing resident code out of the address space while device work
+may still be outstanding.
+
+Disable without deleting catalog files: \c deactivate and optional \c unload,
+or remove the package from \c initial_instances / \c package_manifests and
+restart the DU. Full removal also deletes the three catalog products and
+updates signed trust floors when signatures are required.
+
+Receiver model path (while shadow or active, subject to package capabilities):
+
+\code{.sh}
+"${DAPPCTL[@]}" model stage \
+  --instance "$INSTANCE" --expected-generation "$GEN" \
+  --model neural-rx --version 1 --model-generation 1 \
+  --artifact /secure/weights.bin
+# then model validate, warm, activate with returned model generations
+\endcode
+
+\section dapp_qs_monitor Monitor
+
+\code{.sh}
+"${DAPPCTL[@]}" health
+"${DAPPCTL[@]}" jobs list
+"${DAPPCTL[@]}" metrics schema --instance "$INSTANCE"
+"${DAPPCTL[@]}" metrics get --instance "$INSTANCE"
+"${DAPPCTL[@]}" incidents list --instance "$INSTANCE" --limit 100
+"${DAPPCTL[@]}" quiet-reservations --instance "$INSTANCE"
+\endcode
+
+Class-A host-owned signals include \c class_a.fallback.* (bypass before or
+instead of trusting a result) and \c class_a.completion.deadline_misses (GPU
+finished late; the current result was not conventionally replayed). Under UL
+traffic with an equalizer package active, scheduler UE \c pusch_snr_db should
+be present (not blank): the host derives it from mean post-EQ noise after
+equalizer-dApp success. Class-B host measurements include
+\c class_b.policy.invocations, \c class_b.policy.dapp_time_ns,
+\c class_b.policy.deadline_misses, and related counters. Class-C process health
+includes route publications, copy or export counters, heartbeat progress,
+restart counts, and result protocol failures.
+Observer workers must not emit map-shaped results; protocol failures are
+security incidents. Metric name and unit contracts are defined in
+\ref dapp_observability.
+
+\section dapp_qs_verify Verify it is working
+
+Work top-down and stop at the first hard failure.
+
+\subsection Package admission
+
+- \c inventory lists the package with expected interface, placement, backend,
+  and capabilities.
+- Production signature status is verified; package sequence and policy epoch
+  match the trust store.
+- \c ocudu-dapp-package inspect still accepts the staged artifact and SBOM digests.
+
+\subsection Lifecycle
+
+- \c load, \c prepare, \c arm, \c shadow, and \c activate succeed with advancing
+  generations.
+- Inventory reports state \c active.
+- Management jobs reach terminal \c succeeded.
+
+### Data path
+
+| Class | Working means |
+|-------|----------------|
+| A | \c dapp.invoke.count advances under UL traffic; in-profile fallbacks are not spiking; completion deadline misses stay inside site policy |
+| B | \c class_b.policy.invocations advances; no unexpected validation rejections; evaluation versus authority mode is intentional |
+| C authority | Publications and accepted results advance; single-writer map present when declared |
+| C observer | Publications consumed; zero map or result protocol emissions; heartbeats advance |
+
+### Failure containment
+
+- Conventional PHY or scheduler remains healthy when the dApp is deactivated or
+  faults.
+- Class-C worker kill restarts within bounds when process placement is used.
+- \c deactivate / \c unload clear live authority without DU crash.
+
+### Registered campaigns
+
+\code{.sh}
+ctest --test-dir /path/to/ocudu/build-dapp --output-on-failure \
+  -R '^dapp_dummy_ru_e2e\.'
+ctest --test-dir /path/to/ocudu/build-dapp --output-on-failure \
+  -R '^dapp_dummy_ru_e2e\.operator_failure_gallery$'
+\endcode
+
+Class-A latency release admission uses
+\c tests/benchmarks/dapp/run_class_a_cuda_qualification.py with an
+operator-approved policy. A development report that fails only because controls
+are unapproved is tooling evidence, not a field pass. Functional success in
+this quickstart is not a production tail or multi-hour soak claim.
+
+\section dapp_qs_recipe Lab recipe
+
+Prove packaging first with the unmodified scaffold algorithm, then replace
+\c algorithm.cu:
+
+\code{.sh}
+set -euo pipefail
+OCUDU_PREFIX=$HOME/ocudu-install
+SDK=/path/to/ocudu-dapp-sdk
+DAPP=$HOME/src/my-neural-rx-dapp
+CATALOG=/tmp/ocudu-dapps
+PACKAGE_ID=$(uuidgen)
+
+python3 $SDK/tools/scaffold_class_a_cuda.py \
+  --kind receiver \
+  --target my_neural_rx_cuda \
+  --global-name com.example.ran.neural-rx.cuda \
+  --package-id "$PACKAGE_ID" \
+  --vendor "Example Vendor" \
+  --version 1 \
+  --output "$DAPP"
+
+cmake -S "$DAPP" -B "$DAPP/build" \
+  -DCMAKE_PREFIX_PATH="$OCUDU_PREFIX" \
+  -DCMAKE_CUDA_ARCHITECTURES=121
+cmake --build "$DAPP/build" -j
+
+$SDK/build-cuda/certify_class_a_cuda \
+  "$DAPP/build/my_neural_rx_cuda.so" 0x00010005 \
+  | tee "$DAPP/build/certify.json"
+
+mkdir -p "$CATALOG"
+cp "$DAPP/build/my_neural_rx_cuda".{so,manifest.json,spdx.json} "$CATALOG/"
+# Point the DU YAML at $CATALOG, start the DU, then:
+# inventory -> load -> prepare -> arm -> shadow -> activate -> metrics get
+\endcode
+
+\section dapp_qs_troubleshoot Troubleshooting
+
+| Symptom | Likely cause | Response |
+|---------|--------------|----------|
+| Package missing from inventory | Wrong \c catalog_root or manifest name | Use catalog-relative names listed under \c package_manifests |
+| Load fails signature | Trust sequence or epoch mismatch | \c ocudu-dapp-package inspect; raise sequence or update floors |
+| Preflight timeout | CUDA init in query, or profiler on preflight | Keep query pure; do not treat relaxed preflight as qualification |
+| Activate fails second spectrum authority | Single-writer map rule | Deactivate the current authority first |
+| High \c class_a.fallback.* | Profile mismatch or open breaker | Inspect metrics schema and incidents |
+| Only \c class_a.completion.deadline_misses | Late GPU completion | Optimize kernels or platform clocks; breaker may open on repeat |
+| Process restart storm | Crash or heartbeat miss | Incidents \c processExit / \c heartbeatLoss; check limits |
+| Generation conflict | Stale expected generation | Re-query inventory; retry with a new transaction |
+| Unload quarantine | Uncertain native quiescence | \c lifecycle retry; maintenance restart if needed |
+
+The deterministic operator failure gallery and its JSON report are described in
+\ref dapp_operations.
+
+\section dapp_qs_next Next steps
+
+- Authoring depth: SDK Class-A/B/C and observer documents.
+- Operator policy detail: \ref dapp_operations.
+- Metrics contract: \ref dapp_observability.
+- Release keys: \ref dapp_release_provisioning.
+- Normative architecture: design-tree PDF
+  \c ocudu_dapp_architecture_design.pdf.
+
+All OCUDU-owned package, ABI, E3, FlatBuffers, and evidence contracts remain v1
+until a formal release decision. SPDX 2.3 is the external SBOM format
+identifier, not a local package version bump.
+*/

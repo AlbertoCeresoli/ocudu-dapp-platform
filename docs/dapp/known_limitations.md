@@ -1,0 +1,28 @@
+<!-- SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc. -->
+<!-- SPDX-License-Identifier: BSD-3-Clause-Clear -->
+
+# dApp release known limitations
+
+- Historical binary compatibility can be tested only after the first public ABI/toolkit fixture is frozen.
+- GH200 and RTX 4090 claims require native reports produced on those platforms; lack of local hardware is not a passing result.
+- Final GB10 Class A and Class B qualification reports must meet explicit deadline and authority policies before the release tag.
+- OTA qualification requires a stable RF and UE baseline. Radio-link failures without correlated dApp incidents do not establish a dApp regression.
+- Reference dApps are extensible, validated starting implementations; their included algorithms are not claims of universally optimal PHY, scheduler, spectrum, or sensing performance.
+- In-process native modules remain fully trusted code. Preflight and runtime containment reduce failure impact but are not a security sandbox.
+- Class C process mode is bounded fault containment, not hostile multi-tenant isolation. Python examples are research/authoring conveniences outside the production real-time path.
+- E3 over SCTP has no TLS/DTLS or token authentication in v1. The E3AP and data-profile endpoints bind loopback by default and admit peers by literal address only; off-host exposure requires an external boundary (IPsec, VPN, network policy).
+- E3AP-OCUDU-V1 mirrors the E3AP procedure set and field vocabulary of libe3 but is not byte-compatible with it (extensible sequences, wider identifier ranges, fragmentation, control responses with payloads); interworking needs an envelope adapter.
+- Telemetry attribution is single-cell: every publisher stream reports the publisher's `default_cell_id` (0 today) because upper-PHY diagnostics carry no cell identity. The `srs.channel` stream carries the per-subcarrier least-squares response (one record per receive/transmit port pair, `nofSubcarriers` = comb sequence length, TA phase ramp removed); the Class-C SRS-ISAC snapshot remains the source for the raw multi-symbol estimate.
+- The `gnb.metrics_json` telemetry relays the gNB JSON metrics report as generated; it is available only when `metrics.enable_json` is on and follows that report period.
+- The E3 data-profile carrier serves the reference client's transport discipline, but the client tarball ships a trimmed `class-c-publication-v1.fbs` with different enumerator numbering; regenerate the client from the normative OCUDU schema before interop.
+- Real-time cost of subscribed telemetry: `pusch.grid` captures and the per-subcarrier `srs.channel` recompute read the resource grid on PHY threads; on accelerated (CUDA-visible) grids each read stages the grid to the host (`prepare_host_access`). Both are gated by `should_collect` (one atomic acquire load when no subscriber exists; three atomic loads plus the timestamp check when a subscriber is active) and rate-limited: the default/requested floors apply per RNTI, while a configured hard floor bounds the stream as a whole across all RNTIs — `pusch.grid` carries a 20 ms default hard floor. The equalized-symbol capture bound is 262144 samples (≈2 MiB copied per published grant); use `telemetry_pusch_symbols_hard_floor_ms` on production cells if full-rate recorders are not wanted.
+- Class-C observation is a stream, not guaranteed single-shot delivery: a record published while an isolated worker is still initializing (CUDA context setup takes seconds) expires at its lease and is dropped by design. Publishers must keep publishing fresh observations — as the live PHY does naturally — rather than expect a single publication to survive worker start-up.
+- Host inline Class-C copies the full resource grid on the UL-PHY thread: the three-fragment publication's tensor fragment is the whole grid (a 273-PRB / 14-symbol / 4-port cbf16 grid is ~734 KB, roughly 50–100 µs of memcpy per UL slot per cell) before any dApp work. The CUDA route avoids this entirely with a device-to-device snapshot into the export pool. **Host Class-C is not a 5-cell configuration**; use the CUDA route, or budget host Class-C for low cell counts only.
+- All telemetry rate hard floors now default non-zero (`pusch.symbols` 10 ms, `pusch.crc` 1 ms, `srs.channel` 5 ms, `pusch.dmrs_channel` 5 ms, `pusch.grid` 20 ms). A subscriber requesting a faster interval — including interval 0 — is clamped to the advertised `hardFloorIntervalUs` at admission. Operators who want full-rate capture must set the corresponding `telemetry_*_hard_floor_ms` key to 0 explicitly.
+- Third-party module deadlines are advisory for a slow-but-successful module: the deadline is measured and recorded (`dapp_time_ns`, `deadline_miss`) but the invocation is not preempted, and the circuit breaker opens only on `EXCEPTION`/`DEVICE_ERROR`/`INTERNAL_ERROR` status or repeated failures — not on deadline misses alone. The bound on a slow module is the surrounding admission gate and feature-time pre-check, plus operator action on the published deadline-miss metrics. This is a deliberate v1 decision: preempting native code mid-invocation cannot be done safely, and process placement (Class C) is the containment answer for untrusted timing.
+- On the resident Class-A inline path the conventional CSI measurement
+  kernels are skipped: `pusch.symbols` telemetry and the E3 diagnostics
+  carry post-EQ SINR only, with EPRE / RSRP / CFO / TA absent for those
+  grants. Planned fix: the Class-A CE/EQ output contract gains
+  reserved-slot fields so the dApp reports its own DMRS-derived
+  measurements.

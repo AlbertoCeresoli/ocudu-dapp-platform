@@ -1,0 +1,80 @@
+/* SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+ * SPDX-License-Identifier: BSD-3-Clause-Clear
+ */
+
+/*! \page dapp_observability dApp Metrics and Copy Accounting
+
+Operational enable/disable and monitoring steps live in \ref dapp_quickstart.
+This page defines the metric name/unit contract and copy-accounting rules that
+those monitors must interpret.
+
+\section dapp_metric_contract Metric contract
+
+Metric names, units and meanings are part of the public dApp contract. The
+canonical cross-vendor names are defined in
+\c ocudu/dapp/abi/v1/metric_catalog.h. An implementation may add metrics in a
+vendor namespace, but must not publish an equivalent value under a different
+name or unit.
+
+Every descriptor is either a cumulative counter
+(\c OCUDU_DAPP_METRIC_COUNTER_V1) or a point-in-time gauge
+(\c OCUDU_DAPP_METRIC_GAUGE_V1). Counters never decrease during one instance
+generation. Monitoring systems compute rates from two counter samples and
+their monotonic timestamps; the DU does not maintain unbounded time series.
+Unknown flags and a descriptor claiming both kinds are rejected. A zero flag
+is retained only for ABI-v1 compatibility with early modules.
+
+The standard module metrics include \c dapp.invoke.count,
+\c dapp.invoke.latency_ns, \c dapp.fallback.count and
+\c dapp.breaker.open. A module publishes only values it can measure honestly;
+the host-owned process metrics remain separate from application metrics.
+
+\section dapp_copy_contract Copy contract
+
+"Zero-copy" means that no tensor byte moves after producer readiness for the
+selected placement. Metadata construction, descriptor transfer and cache-line
+traffic do not turn a tensor snapshot into zero-copy. The canonical reasons
+are:
+
+- \c lease: the consumer borrows producer storage under an explicit lifetime;
+- \c snapshot: CPU tensor bytes are copied into an isolated process route;
+- \c export: tensor bytes are copied into a dedicated accelerator export pool;
+- \c e3_payload: tensor bytes are materialized into a portable E3 payload.
+
+Each reason has a cumulative operation count and, where bytes move, a byte
+counter. The implemented CPU process route increments exactly one snapshot
+operation and the tensor byte length only after the shared-ring record commits.
+A full or invalid publication increments a drop counter and no copy counter.
+Tensorless coordination records increment publication/payload counters but no
+tensor-copy counter. \c class_c.route.payload_bytes includes the complete
+record (header, metadata, padding and tensor), while
+\c class_c.copy.snapshot.bytes contains tensor bytes only. This distinction
+makes a second bulk copy visible instead of hiding it in transport overhead.
+
+Per-route targets retain these fixed atomic counters. The supervised instance
+reports their bounded aggregate through the ordinary E3 metric query alongside
+process health. No formatting, allocation, ASN.1 work or management lock is
+added to a producer callback.
+
+\section dapp_metric_benchmark Benchmark
+
+Build and run the OCUDU-style non-sanitized benchmark with:
+
+\code{.sh}
+cmake --build <release-build> --target dapp_runtime_benchmark
+<release-build>/tests/benchmarks/dapp/dapp_runtime_benchmark -R 10000
+\endcode
+
+It reports P50/P75/P90/P99/P99.9/P99.99/worst for unbound and disabled hook
+bypass, active native Class-C dispatch, Class-A CE fixture dispatch and output
+validation, scheduler context acquire/release, a four-receive-port full-slot
+CPU process snapshot, and authenticated process get-config forwarding. It also
+asserts the exact snapshot-copy count and bytes. The banner records host,
+machine, kernel, compiler and build kind.
+
+Sanitizer, emulated, assertion-heavy, frequency-unstable or contended runs are
+functional evidence only and must never be published as latency qualification.
+Production admission additionally requires isolated target-hardware runs,
+deadline miss rates, allocation/copy counters, and end-to-end modem impact.
+
+*/

@@ -1,0 +1,78 @@
+/* SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+ * SPDX-License-Identifier: BSD-3-Clause-Clear
+ */
+
+/*! \page e3_management E3 Management and Telemetry Guide
+
+Git Markdown companion: \c docs/dapp/e3_management.md (normative prose).
+
+\section e3_mgmt_scope Scope
+
+The embedded OCUDU E3 agent offers three carriers that share one
+\ref ocudu::dapp::e3::management_service and one
+\ref ocudu::dapp::e3::portable_data_store:
+
+- \c dapp.local_e3: same-host credentialed management socket (APER over
+  \c AF_UNIX).
+- \c dapp.e3ap_sctp: E3AP-OCUDU-V1 over SCTP for out-of-process dApps and
+  dashboards; adds push telemetry subscriptions and carries management as
+  control actions (\ref ocudu::dapp::e3::e3ap_sctp_server).
+- \c dapp.e3dp_sctp: FlatBuffers E3 data profile for the standalone reference
+  SCTP client (\ref ocudu::dapp::e3::e3dp_sctp_server).
+
+\section e3_mgmt_clients Clients
+
+- \c ocudu-dappctl (C++) and \c apps/tools/dappctl/ocudu_dappctl.py
+  (\c --socket or \c --sctp host:port) for management operations.
+- \c python3 -m ocudu_e3 (\c python/ocudu_e3) for E3AP: \c catalog,
+  \c subscribe, \c inventory, \c health, \c metrics.
+- Independent clients follow \ref e3_wire.
+
+\section e3_mgmt_operations Management operations
+
+Inventory, lifecycle (load, prepare, arm, shadow, activate, deactivate,
+retry quiescence, unload, breaker probe), configuration schema/get/set with
+generation compare-and-swap, model stage/validate/warm/activate/rollback/retire,
+metrics schema/snapshot, incidents list/clear, health, jobs get/list/cancel,
+quiet reservations, portable data subscribe/list/poll/remove, RAN control
+(\c ranControl: UE release to idle, UE handover, radio-unit TX/RX gain) and
+\c cellInfo (served-cell table plus RAN-control capabilities). Inventory also
+reports the current downstream E3 connections and their subscriptions.
+Mutations return \c accepted plus a job id; the job record carries the
+outcome.
+
+\section e3_mgmt_telemetry Telemetry subscriptions
+
+RAN function 10 (\c OCUDU-TELEMETRY-SM) advertises streams 1..8:
+\c pusch.symbols, \c pusch.crc, \c srs.channel, \c pusch.dmrs_channel,
+\c gnb.metrics_json, \c classc.spectrum, \c classc.srs_isac, \c pusch.grid
+(raw pre-equalization resource grid plus grant parameters). Subscriptions
+carry per-telemetry filters (cell, sampleEveryN, drop policy, minimum interval,
+RNTI list) and live as long as the association. Producers publish through
+\ref ocudu::dapp::e3::telemetry_publisher into the bounded store; the agent
+drains admitted objects into fragmented indications. Default per-RNTI
+publication floors are configured with \c telemetry_*_min_interval_ms and can
+be lowered further by subscribers; a configured
+\c telemetry_*_hard_floor_ms is an aggregate per-stream bound the stream as a
+whole never publishes faster than (default 20 ms for \c pusch.grid).
+
+\section e3_mgmt_recipes Recipes
+
+Enable: inventory → load → prepare → arm → shadow → activate; verify with
+metrics/health under traffic. Disable: deactivate → unload. Observe: subscribe
+to \c pusch.crc and \c gnb.metrics_json for BLER and scheduler feedback, add
+\c pusch.symbols with an RNTI filter for constellations. Boot-time enable uses
+\c initial_instances.
+
+\section e3_mgmt_safety Safety properties
+
+No path smuggling, generation compare-and-swap, dry-run, fail-closed
+signatures, asynchronous jobs, conventional fallback, bounded store with
+explicit drop accounting, loopback-by-default SCTP endpoints with literal-peer
+admission.
+
+\section e3_mgmt_related Related
+
+\ref e3_wire, \ref e3_system_design, \ref dapp_operations,
+\ref dapp_observability.
+*/

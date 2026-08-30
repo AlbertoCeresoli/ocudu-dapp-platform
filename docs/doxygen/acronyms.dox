@@ -44,6 +44,30 @@
     <td style="border-style:none"> Downlink Control Information </td>
   </tr>
   <tr>
+    <td style="border-style:none"> dApp </td>
+    <td style="border-style:none"> Distributed / DU Application (OCUDU plugin package) </td>
+  </tr>
+  <tr>
+    <td style="border-style:none"> E3 </td>
+    <td style="border-style:none"> Embedded management plane for OCUDU dApps (local APER agent) </td>
+  </tr>
+  <tr>
+    <td style="border-style:none"> E3SM </td>
+    <td style="border-style:none"> E3 Service Model (project ASN.1 profile) </td>
+  </tr>
+  <tr>
+    <td style="border-style:none"> APER </td>
+    <td style="border-style:none"> Aligned Packed Encoding Rules (ASN.1) </td>
+  </tr>
+  <tr>
+    <td style="border-style:none"> ODR </td>
+    <td style="border-style:none"> OCUDU dApp Runtime </td>
+  </tr>
+  <tr>
+    <td style="border-style:none"> SBOM </td>
+    <td style="border-style:none"> Software Bill of Materials </td>
+  </tr>
+  <tr>
     <td style="border-style:none"> FEC </td>
     <td style="border-style:none"> Forward Error Correction </td>
   </tr>

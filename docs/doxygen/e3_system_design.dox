@@ -1,0 +1,70 @@
+/* SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+ * SPDX-License-Identifier: BSD-3-Clause-Clear
+ */
+
+/*! \page e3_system_design E3 and dApp Runtime System Design
+
+Git Markdown companion: \c docs/dapp/e3_system_design.md (normative prose).
+
+\section e3_design_goals Goals
+
+Fault-contained trusted packages near the modem; hard real-time isolation of
+management, staging and telemetry from slot workers; backend-neutral C ABI;
+composable sensing and control through host caches; operable lifecycle with
+generations, jobs, metrics and incidents; observation for out-of-process
+dApps without touching the radio path.
+
+\section e3_design_components Components
+
+\ref ocudu::app_services::dapp_service owns the catalog, verifier,
+instance manager and native hook registry, and the embedded E3 agent:
+\ref ocudu::dapp::e3::embedded_agent (jobs),
+\ref ocudu::dapp::e3::management_service (request validation and dispatch),
+\ref ocudu::dapp::e3::portable_data_store (bounded publication queues),
+\ref ocudu::dapp::e3::telemetry_publisher (upper-PHY diagnostics and gNB JSON
+into the store), \ref ocudu::dapp::e3::local_management_server,
+\ref ocudu::dapp::e3::e3ap_sctp_server and
+\ref ocudu::dapp::e3::e3dp_sctp_server (carriers). The SCTP carriers share
+\ref ocudu::dapp::e3::sctp_association_server, a single-threaded association
+core with message-boundary framing, bounded outbound queues, peer filtering and
+idle close.
+
+\section e3_design_timing Timing classes
+
+Class A resident inline L1 (enqueue-bound, in process), Class B deadline-bound
+decisions (~100 µs boundary, in-process authority), Class C open-loop analytics
+(native or supervised process). Telemetry and E3 are Class-C-adjacent
+observation: producers pay one bounded copy and never wait.
+
+\section e3_design_data Data paths
+
+Native CPU/CUDA routes, process SHM/CUDA-IPC routes, portable E3 host
+snapshots (pull over the management socket or push over E3AP), and telemetry
+streams (PUSCH symbols/CRC, SRS/DM-RS estimates, gNB JSON) gated by
+\c has_active before capture. Single spectrum result authority; observers only
+consume.
+
+\section e3_design_placement Agent placement
+
+Management executors only; one non-real-time thread per SCTP carrier; never
+invoked from slot indication or PUSCH worker threads. Store queues are
+preallocated per subscription; overload drops whole objects according to the
+subscription's drop policy and is counted.
+
+\section e3_design_trust Trust posture
+
+Admitted packages are trusted native code; signing binds what was admitted.
+Supervised Class C adds fault containment. SCTP endpoints bind loopback by
+default; there is no TLS in v1. Management over E3AP carries full management
+authority.
+
+\section e3_design_versioning Versioning
+
+Manifest schema v1, management ASN.1 v1, E3AP and telemetry ASN.1 v1, Class-C
+FlatBuffers v1, data-profile FlatBuffers v1, public C ABI v1. Extension
+additions live behind \c ... markers.
+
+\section e3_design_related Related
+
+\ref e3_wire, \ref e3_management, \ref dapp_observability.
+*/

@@ -1,0 +1,120 @@
+/* SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+ * SPDX-License-Identifier: BSD-3-Clause-Clear
+ */
+
+/*! \page dapp_release_provisioning dApp v1 Release-Key Provisioning
+
+For the full package authoring and DU enablement walkthrough, see
+\ref dapp_quickstart. This page is only the offline release-key custody,
+immutable catalog generation, rollover, and revocation runbook.
+
+\section dapp_release_scope Scope and version rule
+
+This runbook provisions the existing OCUDU dApp package protocol. Every
+OCUDU-owned contract remains version 1 until a formal release decision:
+manifest, detached signature, trust policy, ASN.1 management service, ABI,
+FlatBuffers publication envelope, and provisioning report. New optional fields
+must preserve the v1 compatibility rules. The installed authoring SDK and
+OCUDU-owned reference packages likewise report version 1; finer-grained release
+numbers are intentionally deferred until a formal release. \c SPDX-2.3
+identifies the external SPDX document format and is not an OCUDU
+protocol-version change.
+
+The DU never holds a signing private key, contacts a signing service, downloads
+a trust root, or changes trust policy through E3. It reads a locally
+provisioned, immutable v1 trust policy during startup and verifies the exact
+manifest, SPDX SBOM, and artifact before preflight or execution. This keeps
+offline release authority outside the latency and failure domain of the modem.
+
+\section dapp_release_roles Roles and custody boundary
+
+Use at least two named human roles for a production ceremony:
+
+- A release builder produces immutable artifacts, manifests, and SPDX SBOMs,
+  but does not possess the release private key.
+- A key custodian controls the offline signing environment and authorizes the
+  monotonically increasing package sequence and trust-policy epoch.
+- A deployment operator receives only public catalog material and the approved
+  trust policy, installs it atomically, and records the configured minimum
+  policy epoch.
+- A reviewer independently compares package IDs, digests, sequence floors,
+  key IDs, and ceremony evidence before deployment.
+
+The v1 reference tool uses an unencrypted PEM key with mode 0600 so that the
+file admission and protocol can be tested without a runtime dependency. For a
+real release, keep that file on encrypted offline media or an equivalently
+controlled ephemeral signing host, never in source control, CI artifacts,
+shell history, a DU image, or an E3 response. HSM-backed signing can later be
+added behind the offline tool without changing the v1 sidecar or DU verifier.
+The ceremony must define two-person access, inventory, encrypted backup,
+recovery testing, media destruction, incident response, and an audit-retention
+period under the organization's security policy.
+
+\section dapp_release_initial Initial provisioning
+
+1. Install the \c dapp_sdk CMake component into a clean staging prefix. Use the
+   installed \c bin/ocudu-dapp-package and the schemas beneath
+   \c share/ocudu/dapp/schema; do not qualify a build-tree-only tool.
+2. Verify modes, ownership, and SHA-256 for the installed tool and all v1
+   schemas. Generate the offline P-256 key pair into an already protected
+   directory. Record only the public-key ID.
+3. Verify every SDK-produced manifest and digest-bound SPDX SBOM, then sign the
+   exact read-only manifest at a nonzero, never-reused package sequence.
+4. Build a v1 trust policy at a nonzero monotonic epoch. It contains the active
+   public key and one minimum sequence for every admitted package ID.
+5. Use \c inspect with the deployment's minimum policy epoch for every package.
+   Copy the catalog and trust policy to a new deployment generation, fsync it,
+   and atomically change the local startup configuration. E3 may report the
+   resulting non-secret signer state, but may not select paths or trust roots.
+6. Retain public evidence and securely remove ephemeral private-key material.
+   Keep the conventional DU fallback and the prior public catalog generation
+   until the new generation has completed ordinary bootstrap and lifecycle
+   validation.
+
+Never overwrite a signature sidecar in place. The tool deliberately uses
+exclusive creation. Stage a new immutable catalog generation and promote the
+directory or configuration reference atomically.
+
+\section dapp_release_rollover Two-key rollover
+
+Rollover is three monotonic public-policy steps, not a key-file replacement:
+
+1. Publish a higher-epoch overlap policy containing both old and new public
+   keys while retaining the old package floors. Both the old catalog and the
+   newly signed higher-sequence catalog must inspect successfully.
+2. Deploy and validate the new-key catalog. All package sequences increase;
+   none is reused, even when artifact content is unchanged.
+3. Publish another higher-epoch final policy containing the public keys needed
+   for attribution, listing the old key ID as revoked, and raising each package
+   floor to its new sequence. Set the DU's configured minimum epoch to this
+   final value. Verify that the new catalog passes, the old key is rejected as
+   revoked, below-floor new-key packages are rejected, and the overlap policy
+   is rejected as an epoch rollback.
+
+Revocation always wins over key presence. Do not lower an epoch or package
+floor to recover a failed deployment. Restore service with a newly signed,
+higher-sequence package and a same-or-higher policy epoch. If the new key is
+suspected, stop signing, preserve public evidence, generate a distinct key in
+the approved offline environment, and execute another rollover with the
+compromised key explicitly revoked.
+
+\section dapp_release_qualification Installed-flow evidence
+
+The registered test
+\c dapp_dummy_ru_e2e.installed_release_provisioning_v1 installs only the
+\c dapp_sdk component into a clean prefix, validates the installed tool and
+schemas, signs all six CPU reference packages with old and new keys, exercises
+overlap, revocation, sequence-floor and epoch-rollback outcomes, removes the
+temporary private-key paths, and admits the final rotated catalog through the
+ordinary dummy-RU bootstrap and E3 lifecycle. It emits a strict
+\c ocudu.dapp.release-provisioning-report.v1 document validated by the
+installed \c release-provisioning-report-v1.schema.json.
+
+Run the unchanged test on every declared release architecture and preserve one
+report per exact build and platform. A passing Arm64 report does not qualify
+x86-64, another libc/toolchain, CUDA, or a vendor SoC. The software exercise
+proves installed packaging and cryptographic state transitions; it does not by
+itself approve organizational custody, physical controls, HSM operation, or
+production timing. Those remain explicit release gates.
+
+*/

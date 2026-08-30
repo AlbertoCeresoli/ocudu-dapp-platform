@@ -1,0 +1,448 @@
+/* SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+ * SPDX-License-Identifier: BSD-3-Clause-Clear
+ */
+
+/*! \page dapp_operations dApp Operator and Author Quickstart
+
+For a single end-to-end walkthrough from a new out-of-tree repository through
+catalog install, enable/disable, monitoring, and verification, start with
+\ref dapp_quickstart. This page records operator policy detail: roles, signing,
+declarative startup, Class-B evaluation, process hardening, Class-A
+qualification commands, and the failure gallery.
+
+\section dapp_roles Spectrum observer and authority roles
+
+Class-C input subscription does not imply permission to affect the DU. A
+spectrum package declaring neither
+OCUDU_DAPP_SPECTRUM_CAP_INTERFERENCE_MAP_V1 nor
+OCUDU_DAPP_SPECTRUM_CAP_QUIET_PERIOD_INTENT_V1 is an observer. It may consume
+grids and maintain bounded private state, but it must not return either output.
+The future-UL-plan capability requests an additional input route and is not, by
+itself, result authority.
+
+The DU permits one active spectrum result authority across native and
+supervised-process placement. Capability-zero process observers may coexist
+within the configured route, memory and process limits. ABI v1 retains one
+native binding per interface, so process placement is the supported fanout
+profile for multiple simultaneous observers. The SDK artifact
+ref_spectrum_observerd_cpu is the executable reference.
+
+An observer result is a protocol violation, not advisory output. The supervisor
+withdraws every route before applying bounded restart policy; ordinary E3
+metrics and incidents expose the event. Direct dApp-to-dApp calls are not an
+alternative authority path. Cross-dApp composition uses host-owned typed
+contexts and validates a single writer.
+
+\section dapp_operator_flow Operator flow
+
+At deployment time:
+
+- Copy each immutable artifact and its generated manifest beneath the approved
+  catalog root.
+- Sign each exact manifest with \c ocudu-dapp-package, and configure a
+  rollback-protected offline trust policy. Production defaults to rejecting
+  unsigned packages.
+- List normalized catalog-relative manifests in the DU configuration. Do not
+  accept artifact paths, executable arguments or route descriptors over E3.
+- Query inventory and verify package identity, interface, placement, backend
+  and capability bits before loading.
+- For each instance, run load, prepare, arm, shadow and activate in order. Wait
+  for each asynchronous job and carry its returned instance generation into the
+  next mutation.
+- Query metric schema once, then monitor metric snapshots, health and incidents.
+  Deactivate before unload; retry quiescence rather than forcing uncertain
+  native code out of the address space.
+
+For packages that must be present at every DU start, select a bounded initial
+instance in the same operator YAML rather than scripting a race against radio
+startup:
+
+\code{.yaml}
+dapp:
+  package_manifests:
+    - vendor-receiver.manifest.json
+    - spectrum-observer.manifest.json
+  initial_instances:
+    - package_manifest: vendor-receiver.manifest.json
+      placement: in_process
+      backend: cuda
+      target: shadow
+      lifecycle_timeout_ms: 1000
+    - package_manifest: spectrum-observer.manifest.json
+      placement: out_of_process
+      backend: cpu
+      target: active
+      lifecycle_timeout_ms: 2000
+\endcode
+
+Each entry must uniquely name one manifest already present in
+\c package_manifests. At most 64 entries are accepted. Placement and backend
+are checked against the signed manifest and host capabilities by the ordinary
+load path; the timeout applies independently to prepare, arm, shadow, activate,
+and any required cleanup transition. The only startup targets are \c shadow
+and \c active. Use shadow when an operator must inspect inventory, stage a
+model, or set module configuration through E3 before granting hook authority.
+
+Initial startup is synchronous, all-or-nothing, and occurs before embedded or
+local E3 ingress opens. A load, preflight, worker-readiness, lifecycle, target
+state, or hook-authority failure unwinds every selected instance in reverse
+through deactivate/quiesce/unload and fails DU service construction. Ordinary
+service shutdown similarly retires startup-owned instances after management
+ingress closes and after DU producers have stopped. Startup YAML cannot pass
+opaque module arguments, artifact paths, or route descriptors and does not
+define a second loader. Successfully started instances appear in normal E3
+inventory and thereafter use the same lifecycle, configuration, model,
+metrics, health, and incident operations as manually loaded instances. These
+compatible fields remain part of working version v1.
+
+The registered qualification campaign exercises this exact operator path with
+both an unsigned development catalog and a required signed, SBOM-bound catalog.
+It starts native spectrum active and a supervised SRS--ISAC worker in shadow,
+changes the worker's v1 configuration, completes a v1 model
+stage/validate/warm/activate sequence while publication remains zero, then
+activates it and proves live publications before ordinary E3 unload. This is a
+startup-policy test, not a second package or model version.
+
+\subsection dapp_package_signing Offline package signing
+
+Package authenticity is checked before native preflight, \c dlopen, or process
+spawn. The detached \c MANIFEST.sig.json binds the exact manifest bytes and
+a nonzero monotonic package sequence with ECDSA P-256/SHA-256. The manifest
+continues to bind the immutable artifact SHA-256 independently. The operator
+trust document names active public keys, revoked key IDs, a nonzero policy
+epoch, and a minimum sequence for every admitted package ID. Revocation wins;
+the configured minimum epoch and package floors reject rollback without a
+network service or wall clock.
+
+Create an offline file-backed operator key and sign a catalog manifest:
+
+\code{.sh}
+ocudu-dapp-package keygen \
+  --private-key /secure/operator-dapp-key.pem \
+  --public-key /secure/operator-dapp-key.pub.pem
+ocudu-dapp-package sign \
+  --catalog-root /opt/ocudu/dapps \
+  --manifest vendor-receiver.manifest.json \
+  --private-key /secure/operator-dapp-key.pem \
+  --package-sequence 42
+\endcode
+
+Build a trust policy with every deployed package floor, then verify the exact
+package before changing the DU configuration:
+
+\code{.sh}
+ocudu-dapp-package trust \
+  --output /etc/ocudu/dapp-trust.json --policy-epoch 9 \
+  --public-key /secure/operator-dapp-key.pub.pem \
+  --package 01234567-89ab-cdef-0123-456789abcdef:42
+ocudu-dapp-package inspect \
+  --catalog-root /opt/ocudu/dapps \
+  --manifest vendor-receiver.manifest.json \
+  --trust-store /etc/ocudu/dapp-trust.json \
+  --minimum-policy-epoch 9
+\endcode
+
+Configure \c package_signature_mode: required, the absolute
+\c package_trust_store path, and the same or higher
+\c minimum_trust_policy_epoch. Key rotation is an overlapping-key operation:
+publish a higher-epoch trust policy containing old and new keys, re-sign at a
+higher package sequence, then remove or revoke the old key in another
+higher-epoch policy. Trust files and signature sidecars are bounded strict JSON;
+their formal schemas are installed with the dApp SDK.
+
+\c allow_unsigned is only an explicit local-development escape hatch. It admits
+a genuinely absent sidecar, but a present malformed, unknown-key, revoked,
+stale, or invalid signature still fails closed. Do not provision production
+systems with this mode. E3 inventory reports only non-secret verification
+status, signing-key ID, package sequence, and trust-policy epoch; it cannot
+alter trust roots or unsigned policy. The v1 file-backed private key is
+unencrypted and must remain offline with mode 0600; HSM integration is a future
+operator-tool extension, not a DU runtime dependency.
+
+The complete custody, immutable-generation, two-key rollover, revocation, and
+installed-platform qualification procedure is defined in
+\ref dapp_release_provisioning. All OCUDU-owned package and evidence contracts
+remain v1 until a formal release decision; SPDX 2.3 is only the external SBOM
+format identifier.
+
+For a healthy process observer,
+class_c.route.publications and class_c.copy.snapshot.count advance while
+process.results_accepted, process.result_protocol_failures and steady-state
+process.successful_restarts remain zero. Heartbeat responses must advance.
+Activating a second authority fails with lifecycleFailed and a diagnostic that
+another authority is active. Deactivate and unload the rejected error-state
+instance, or first retire the current authority and retry with a fresh
+transaction and generation.
+
+Quiet-period intents are requests to host scheduling authority, not grants. The
+operator bounds retained PRB-slot volume, PRBs suppressed in any one slot, and
+PRB-slot volume in every rolling slot window with
+quiet_max_retained_prb_slots, quiet_max_prbs_per_slot,
+quiet_duty_window_slots and quiet_max_prb_slots_per_window. A conflict or duty
+denial returns bypass to the originating dApp, preserves conventional
+scheduling, and records a policyRejection incident with source instance,
+generation, cell and invocation context. Such a denial is expected policy
+behavior and does not open the dApp circuit breaker. Repeated equivalent
+denials aggregate in bounded incident history and remain queryable through E3.
+
+\section dapp_class_b_evaluation Class-B evaluation mode
+
+Set scheduler_evaluation_only before DU startup to evaluate an admitted
+Class-B scheduler package without granting it scheduling authority. The
+instance still follows the ordinary prepare, arm, shadow and activate
+lifecycle. Once active, each scheduler lane first computes the conventional
+policy, invokes the dApp with the real bounded input, and validates the complete
+dApp output. A valid dApp decision is then discarded and the conventional
+decision remains authoritative. Invalid output is reported through the normal
+incident and breaker path even in evaluation mode; suppressing authority does
+not make malformed native output safe.
+
+Evaluation mode is not the lifecycle SHADOW state. SHADOW prepares and warms a
+native instance without binding it to radio hooks, so it cannot provide
+representative callback timing or decision-quality evidence. Evaluation mode
+is an ACTIVE, bound operating mode that provides such evidence while preserving
+the conventional result. It is configured locally rather than mutated over E3
+so that every scheduler lane has one immutable policy mode during operation.
+
+E3 metric schema and snapshot operations expose the following cumulative host
+measurements for a Class-B scheduler instance:
+
+- class_b.policy.invocations
+- class_b.policy.conventional_time_ns
+- class_b.policy.dapp_time_ns
+- class_b.policy.validation_time_ns
+- class_b.policy.accepted
+- class_b.policy.evaluation_accepted
+- class_b.policy.fallbacks
+- class_b.policy.validation_rejections
+- class_b.policy.deadline_misses
+
+The host records these measurements after the guarded callback rather than
+trusting module-supplied telemetry. Before enabling authoritative mode,
+operators should measure a representative workload, require zero validation
+rejections, investigate every fallback and deadline miss, and compare dApp
+latency and radio outcomes against a deployment-specific acceptance policy.
+ABI v1 provides the evidence and static startup choice; dynamic promotion and
+automatic KPI-based promotion are intentionally deferred until their safety
+policy is specified and validated.
+
+\section dapp_process_hardening Supervised-process hardening
+
+Every admitted Class-C worker must set Linux no_new_privs before the host sends
+any shared-memory route descriptor. A deployment may additionally require
+Linux seccomp filter mode with class_c_process_require_seccomp_filter. The host
+verifies both kernel states through procfs before transferring descriptors and
+also requires the READY capability bit. A worker that does not satisfy the
+selected profile is killed without receiving a route. Reference workers use a
+TSYNC seccomp deny-list that blocks executable-image replacement, process
+injection and privileged kernel administration while retaining the file/device
+operations needed for CUDA initialization.
+
+The supervisor installs irrevocable soft and hard RLIMIT_NOFILE bounds.
+class_c_process_max_core_file_bytes defaults to zero, which disables worker CPU
+cores. A nonzero field-debug value bounds RLIMIT_CORE; protect and prune the
+kernel core destination because cores may contain tensor or model data. CUDA
+workers receive only the allow-listed CUDA coredump environment when this limit
+is nonzero. Operators may also set
+class_c_process_max_address_space_bytes; zero inherits the deployment limit,
+while a nonzero value must be at least 64 MiB and becomes RLIMIT_AS. The default
+open-file ceiling is 512 and must accommodate the control endpoint plus three
+descriptors per producer shard.
+
+These controls reduce privilege-escalation and resource-exhaustion exposure;
+they do not make arbitrary native code trustworthy. Package hashing,
+capability checks, credential binding, bounded protocols, heartbeat recovery
+and result validation remain required. Deployment-specific cgroups,
+namespaces, distinct service identities, cgroups or Landlock may add stronger
+containment, but are not core DU dependencies in ABI v1.
+
+\section dapp_author_flow Author flow
+
+Authors compile only against the installed OCUDUDAppSDK package. Use the
+versioned C descriptor, one declared timing class, explicit placement/backend
+masks, and only the capability bits actually implemented. Keep algorithm state
+inside the opaque instance and per-worker contexts; do not use global mutable
+state to bypass lane ownership. Return bounded status codes, never allow an
+exception to cross the C ABI, and perform no E3, allocation, blocking I/O or
+unbounded logging in a deadline-bearing callback.
+
+For an observer process, consume and release every borrowed publication, answer
+the authenticated control heartbeat, and emit no result record. The reference
+worker and its manifest test demonstrate this contract. For an authority,
+populate only the declared typed result, echo the admitted source identity, and
+let the host stamp producer identity, validate time/generation, and commit it.
+
+\section dapp_class_a_authoring Class-A CUDA authoring and qualification
+
+Start a resident CE, CE+EQ or RX project with the standalone SDK repository's
+\c tools/scaffold_class_a_cuda.py command. Select exactly one of \c ce,
+\c equalizer or \c receiver and provide a new target, reverse-DNS global name,
+package UUID and output directory. The generated project consumes only an
+installed \c OCUDUDAppSDK package and contains only the selected algorithm
+surface. It refuses to overwrite an existing directory.
+
+Replace \c reference/HOOK/algorithm.cu, not the C ABI query trampoline or
+lifecycle shell. Keep descriptor query pure. Allocate weights and immutable
+instance state during prepare/model activation, and fixed lane scratch while
+creating worker state. The invocation must use the caller's CUDA stream and
+prepared output tensors; it must not allocate, synchronize, perform E3 work or
+retain an invocation tensor. Keep the generated exception guard and, for RX,
+the model-generation completion fence. A non-neural conventional algorithm is
+a valid implementation of any of these hook contracts.
+
+Equalizer (CE+EQ) outputs must include finite post-EQ noise for every admitted
+data RE: after equalizer-dApp inline success the host derives CRC/scheduler
+SINR from mean post-EQ noise (resident CE stub does not fill CSI). Host may
+set optional \c dmrs.reserved[0] OFDM-symbol DMRS bitmask; packages may ignore
+it and use coordinates. Soft host wall budgets default to 2000 us (demod) /
+800 us (CE). See Markdown \c docs/dapp/quickstart.md and SDK
+\c class_a_cuda_authoring.md.
+
+Build the generated project against the installed SDK, then run the SDK's
+\c certify_class_a_cuda against the final DSO and interface ID. The certificate
+checks the declared minimum, representative and maximum shapes; one and two
+concurrent streams; all four QAM orders; DM-RS Types 1 and 2; dense compact
+outputs; caller-owned nonzero-offset storage and guards; lifecycle; metrics;
+and optional receiver model generations. Keep its JSON result with the
+separately hash-verified package manifest.
+
+For host integration, build \c dapp_class_a_cuda_benchmark in a Release CUDA
+configuration whose \c OCUDU_DAPP_REFERENCE_CUDA_DIR names the independently
+built SDK artifacts. On an otherwise idle target GPU, run for example:
+
+\code{.sh}
+tests/benchmarks/dapp/dapp_class_a_cuda_benchmark \
+  -R 1000 -W 100 -N 2 -P 25,106,273 -L 1,2 -M 2,4,6,8 \
+  -C 100 -D 150 -G -O class-a-qualification.csv
+\endcode
+
+That command is one strict trial. Release admission uses the reproducible
+protocol wrapper and an operator-owned policy copied from
+\c tests/benchmarks/dapp/class_a_cuda_qualification_policy.example.json:
+
+\code{.sh}
+python3 tests/benchmarks/dapp/run_class_a_cuda_qualification.py \
+  --benchmark build-release/tests/benchmarks/dapp/dapp_class_a_cuda_benchmark \
+  --policy class-a-gb10-release-policy.json \
+  --output-dir class-a-qualification-2026-07-13 \
+  --trials 3 --lane-counts 1,2
+\endcode
+
+The output directory must not already exist. The runner fixes the v1 shape,
+warm-up, sample, deadline, preflight and exclusive-GPU arguments rather than
+forwarding arbitrary benchmark options. It runs at least three trials for the
+one-lane baseline and each declared maximum-lane profile, continues after an
+honest deadline failure, and independently recomputes matrix coverage,
+admission, production misses and the P99.9 gate. Exit status zero means every
+trial and policy check passed, two means valid evidence failed qualification,
+and one means the evidence or execution was invalid. The final JSON hashes the
+benchmark, every CSV and every log and uses
+\c schemas/dapp/class-a-cuda-qualification-report-v1.schema.json. Preserve the
+entire directory as one evidence unit.
+
+The policy is not a performance waiver. It names the intended release platform
+and exact scheduler, priority, CPU affinity and inherited PUSCH stream policy;
+it also states the deployment GPU clock/power control and maximum temperature.
+Optional fields constrain GPU identity, persistence/compute mode, minimum SM
+clock and enforced power limit. The runner observes and validates what the
+benchmark can measure but never changes scheduling, affinity, clocks or power.
+An operator must replace every example value, arrange those controls before the
+run, and explicitly attest that they are approved for release admission. A
+false attestation value preserves useful evidence but makes the report fail.
+
+\c -N selects the concurrent PUSCH-lane load; its default is one. Each lane is
+one production-decorated demodulator with an immutable lane binding, inherited
+CUDA stream and module worker context. One persistent host thread drives each
+lane during a sampling phase. The benchmark never invokes one demodulator
+object concurrently. It pools the per-lane samples and records the lane count
+in every CSV row. Qualify both the one-lane baseline and the maximum simultaneous
+PUSCH-lane profile admitted by the intended deployment; a one-lane pass cannot
+qualify a multi-lane deployment.
+
+\c -F selects packages whose global name contains the supplied substring and
+records that filter in the CSV. It is intended for focused profiling (for
+example, \c -F receiver); omit it for the complete qualification matrix. The
+conventional comparison remains present in either mode, and a filter that
+matches no registered package fails the run. \c -G refuses a package filter so
+that qualification evidence always covers the complete package matrix.
+
+Nsight instrumentation also enters the disposable native preflight helper and
+can make its production 500-ms timeout expire before the measured path starts.
+For a diagnostic-only profiler run, \c -T may raise that timeout up to 60~s and
+records it in the CSV. \c -G refuses any value other than 500~ms; a relaxed
+preflight run is never qualification evidence.
+
+\c -G is the admission gate: it refuses unavailable/unhealthy NVML observation
+or a pre-existing foreign compute client before constructing a PUSCH fixture,
+and it fails if a client appears during the run, any resident path is bypassed,
+the production completion deadline reports a miss, or device-pipeline P99.9
+exceeds its budget. \c -X explicitly permits a monitored shared-GPU contention
+run; such a result is diagnostic and must not be labeled exclusive
+qualification. The CSV also records the OCUDU build, host, architecture, GPU
+UUID/PCI identity, CUDA driver/runtime, NVML driver, CPU affinity, scheduler
+policy/priority, requested PUSCH CUDA stream priority, and observed temperature,
+SM/memory clocks, power, persistence, compute mode and performance-state
+ranges. A value of -1 or \c unavailable means the platform did not expose that
+telemetry and must never be presented as a controlled-value claim. The tool
+observes but does not change those settings: run it with the same isolated CPU,
+real-time scheduling and accelerator clock/power policy intended for the DU.
+A failed tail gate is performance evidence, not permission to relax the budget
+or relabel functional coverage as latency qualification. Run the focused
+resident correctness/fallback tests and final DSO Compute Sanitizer
+certificates in the same release before deployment.
+
+\section dapp_failure_gallery Failure gallery
+
+<table>
+<tr><th>Failure</th><th>Host evidence</th><th>Required response</th></tr>
+<tr><td>Second result authority</td><td>Activation job fails before publication enablement</td><td>Keep the current authority or deactivate/unload it before retry</td></tr>
+<tr><td>Observer emits result</td><td>Protocol-failure metric and security incident; routes withdrawn</td><td>Disable/unload and correct the manifest or implementation</td></tr>
+<tr><td>Worker misses heartbeat</td><td>Heartbeat-loss incident, exit/restart counters and new PID/generation</td><td>Inspect recurrence; unload if bounded recovery cannot stabilize it</td></tr>
+<tr><td>Ring full</td><td>Backpressure/drop metric; producer continues</td><td>Reduce rate or change measured bounded resources</td></tr>
+<tr><td>Stale E3 generation</td><td>Conflict; no state change</td><td>Refresh inventory and retry with a new transaction</td></tr>
+<tr><td>Callback throws or returns invalid output</td><td>Incident, breaker/fallback metric; conventional path retained where defined</td><td>Inspect incident and probe/reset only under policy</td></tr>
+<tr><td>Quiet intent exceeds duty budget or conflicts</td><td>policyRejection incident; dApp remains active and conventional scheduling continues</td><td>Inspect the reason and tune the intent or operator duty envelope</td></tr>
+<tr><td>Native quiescence uncertain</td><td>Resident quarantine</td><td>Retry quiescence or use a maintenance DU restart; never force unload</td></tr>
+</table>
+
+The live dummy-RU integration scenario runs one native authority and one real
+process observer concurrently, rejects a second process authority, hands
+authority to a process instance while the observer remains active, verifies
+zero observer results/protocol failures/restarts, then exercises worker recovery
+and clean unload through the shipped APER client.
+
+The deterministic operator gallery is a separate registered campaign:
+
+\code{.sh}
+ctest --test-dir build --output-on-failure \
+  -R '^dapp_dummy_ru_e2e\.operator_failure_gallery$'
+\endcode
+
+It uses four SDK artifacts that exist only when the standalone SDK is built
+with \c BUILD_TESTING: native CE modules that throw, replace caller-owned
+storage, or return a deadline status, and a process spectrum worker that emits
+a source-invalid result. The campaign also creates an authority conflict,
+stops a real worker long enough to miss its authenticated heartbeat, and kills
+its restarted process. It requires conventional Class-A fallback, worker-local
+breaker isolation, rejected process authority, bounded process recovery, E3
+incident visibility, zero accepted invalid process results, terminal jobs, and
+an empty live-instance inventory.
+
+On success it atomically publishes
+\c tests/integrationtests/dapp/dapp-failure-gallery-report.json beneath the
+build tree. The report hash-binds the running DU and exact fault-package
+manifests and conforms to
+\c schemas/dapp/failure-gallery-report-v1.schema.json. Preserve that JSON as
+functional containment evidence; it is not a latency or RF qualification
+report.
+
+The live CPU gallery's deadline module returns a synchronous deadline status,
+so it proves fallback, breaker, metric, and incident behavior without claiming
+to reproduce CUDA event timing. Accelerator completion that exceeds its
+deadline cannot retroactively fall back the already returned invocation. Its
+separate semantics and E3 observability are deterministically covered by
+\c dapp_native_instance.async_completion_deadline_is_an_incident_but_not_a_current_call_fallback
+and the PUSCH resident-adapter one-nanosecond completion-deadline fixtures.
+Production CUDA qualification remains responsible for observing real event
+completion under deployment load.
+*/

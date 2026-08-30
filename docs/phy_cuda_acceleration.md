@@ -317,7 +317,9 @@ Current production support boundaries:
   on the device, the decoder exports them into that buffer when the resident
   transport block fails its CRC (`export_resident_softbits`, fp16 device LLRs
   on the demodulator's x4 host scale, punctured 2Z prefix skipped). If the
-  backend cannot export (direct rate-match→LDPC kernel for ≥32 codeblocks),
+  backend cannot export (direct rate-match→LDPC kernel, used for ≥32
+  codeblocks by default — tunable via `OCUDU_LDPC_DIRECT_RM_MIN_CBS`, or
+  disabled with `OCUDU_LDPC_DIRECT_RM=0`),
   the buffer is zeroed so the retransmission decodes on its own instead of
   against stale soft bits of an unrelated transport block. Before this, OTA
   retransmissions on the reference cell failed at 94% while the same bursts

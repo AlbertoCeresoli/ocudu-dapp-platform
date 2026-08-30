@@ -23,4 +23,16 @@ documentation](https://docs.srsran.com/projects/project).
 Architecture notes for optional PHY acceleration are available in
 \ref phy_acceleration_architecture.
 
+Optional dApp Runtime and E3 documentation:
+
+- \ref dapp_quickstart — end-to-end walkthrough (package, catalog, enable/disable, monitor, verify)
+- \ref dapp_operations — operator and author policy
+- \ref dapp_observability — metrics and copy accounting
+- \ref dapp_release_provisioning — offline package signing custody
+- \ref e3_management — E3 management operations and clients
+- \ref e3_wire — APER wire format for E3SM-OCUDU-DAPP-MGMT-V1
+- \ref e3_system_design — dApp Runtime and E3 architecture
+
+Git-rendered Markdown index: \c docs/dapp/README.md
+
 */
