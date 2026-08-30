@@ -20,12 +20,15 @@
 
 namespace ocudu {
 
+class scheduler_dapp_hook_provider;
+
 /// \brief Interface of data scheduler that is used to allocate UE DL and UL grants in a given slot.
 /// The data_scheduler object will be common to all cells and slots.
 class ue_scheduler_impl final : public ue_scheduler
 {
 public:
-  explicit ue_scheduler_impl(const scheduler_ue_expert_config& expert_cfg_);
+  explicit ue_scheduler_impl(const scheduler_ue_expert_config&             expert_cfg_,
+                             std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks_ = {});
 
 private:
   ue_cell_scheduler* do_add_cell(const ue_cell_scheduler_creation_request& params) override;
@@ -101,8 +104,9 @@ private:
     }
   };
 
-  const scheduler_ue_expert_config& expert_cfg;
-  ocudulog::basic_logger&           logger;
+  const scheduler_ue_expert_config&             expert_cfg;
+  std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks;
+  ocudulog::basic_logger&                       logger;
 
   // List of cells of the UE scheduler.
   slotted_array<cell_context, MAX_NOF_DU_CELLS> cells;

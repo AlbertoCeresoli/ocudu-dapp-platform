@@ -10,6 +10,7 @@
 #include "ocudu/pcap/dlt_pcap.h"
 #include "ocudu/ran/band_helper.h"
 #include "ocudu/ran/pdsch/pdsch_constants.h"
+#include "ocudu/scheduler/dapp/scheduler_dapp_policy.h"
 #include "ocudu/scheduler/result/sched_result.h"
 #include "ocudu/support/async/async_timer.h"
 #include "ocudu/support/async/execute_on_blocking.h"
@@ -22,23 +23,25 @@ using namespace ocudu;
 /// Maximum PDSH K0 value as per TS38.331 "PDSCH-TimeDomainResourceAllocation".
 static constexpr size_t MAX_K0_DELAY = 32;
 
-mac_cell_processor::mac_cell_processor(const mac_cell_creation_request& cell_cfg_req_,
-                                       mac_scheduler_cell_info_handler& sched_,
-                                       mac_slot_time_handler&           sfn_time_mapper_,
-                                       du_rnti_table&                   rnti_table,
-                                       mac_cell_result_notifier&        phy_notifier_,
-                                       task_executor&                   cell_exec_,
-                                       task_executor&                   slot_exec_,
-                                       task_executor&                   ctrl_exec_,
-                                       mac_pcap&                        pcap_,
-                                       timer_manager&                   timers_,
-                                       mac_cell_config_dependencies     dependencies) :
+mac_cell_processor::mac_cell_processor(const mac_cell_creation_request&              cell_cfg_req_,
+                                       mac_scheduler_cell_info_handler&              sched_,
+                                       mac_slot_time_handler&                        sfn_time_mapper_,
+                                       du_rnti_table&                                rnti_table,
+                                       mac_cell_result_notifier&                     phy_notifier_,
+                                       task_executor&                                cell_exec_,
+                                       task_executor&                                slot_exec_,
+                                       task_executor&                                ctrl_exec_,
+                                       mac_pcap&                                     pcap_,
+                                       timer_manager&                                timers_,
+                                       mac_cell_config_dependencies                  dependencies,
+                                       std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks_) :
   logger(ocudulog::fetch_basic_logger("MAC")),
   cell_cfg(cell_cfg_req_),
   cell_exec(cell_exec_),
   slot_exec(slot_exec_),
   ctrl_exec(ctrl_exec_),
   phy_cell(phy_notifier_),
+  dapp_hooks(std::move(dapp_hooks_)),
   timers(timers_),
   ue_mng(rnti_table),
   dl_harq_buffers(band_helper::get_n_rbs_from_bw(cell_cfg.dl_carrier.carrier_bw,
@@ -396,6 +399,9 @@ void mac_cell_processor::handle_slot_indication_impl(slot_point_extended      sl
     mac_ul_sched_result mac_ul_res{};
     mac_ul_res.slot   = sl_tx;
     mac_ul_res.ul_res = &sl_res.ul;
+    if (dapp_hooks) {
+      dapp_hooks->publish_ul_plan(static_cast<uint32_t>(cell_cfg.cell_index), sl_tx, sl_res.ul);
+    }
     phy_cell.on_new_uplink_scheduler_results(mac_ul_res);
 
     metrics_meas.on_ul_tti_req();

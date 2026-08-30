@@ -23,10 +23,12 @@
 #include "ocudu/scheduler/config/scheduler_expert_config.h"
 #include "ocudu/scheduler/scheduler_metrics.h"
 #include <map>
+#include <memory>
 
 namespace ocudu {
 
 class timer_manager;
+class scheduler_dapp_hook_provider;
 
 namespace odu {
 
@@ -84,6 +86,8 @@ struct du_high_dependencies {
   rlc_pcap*                rlc_p              = nullptr;
   /// Optional notifier invoked once after a successful F1 Setup.
   du_f1_setup_complete_notifier* f1_setup_notifier = nullptr;
+  /// Optional construction-time scheduler policy decorator.
+  std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks;
 };
 
 } // namespace odu

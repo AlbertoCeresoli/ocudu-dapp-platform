@@ -178,7 +178,9 @@ public:
                         rx_buffer_pool&                  rm_buffer_pool_,
                         upper_phy_rx_results_notifier&   notifier_,
                         unsigned                         max_nof_prb,
-                        unsigned                         max_nof_layers);
+                        unsigned                         max_nof_layers,
+                        uint32_t                         cell_id,
+                        uint32_t                         producer_shard);
 
   // See uplink_processor interface for documentation.
   unique_uplink_pdu_slot_repository get_pdu_slot_repository(slot_point slot) override;

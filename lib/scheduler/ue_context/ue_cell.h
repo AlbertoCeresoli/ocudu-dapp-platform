@@ -193,7 +193,70 @@ public:
     return *components.pcell_state;
   }
 
+  /// One-shot Class-B UL CRC snapshot. seq increments on each HARQ-matched CRC.
+  struct dapp_ul_crc_snapshot {
+    uint32_t seq      = 0;
+    bool     crc_ok   = false;
+    uint8_t  used_mcs = 0;
+  };
+
+  dapp_ul_crc_snapshot dapp_peek_ul_crc() const { return dapp_ul_crc_; }
+  bool dapp_ul_crc_is_fresh() const { return dapp_ul_crc_.seq != 0 && dapp_ul_crc_.seq != dapp_ul_crc_consumed_seq_; }
+  void dapp_mark_ul_crc_consumed(uint32_t seq) const
+  {
+    if (seq != 0 && seq == dapp_ul_crc_.seq) {
+      dapp_ul_crc_consumed_seq_ = seq;
+    }
+  }
+
+  /// One-shot Class-B DL HARQ-ACK snapshot (first transmissions, non-DTX).
+  /// Without this the package's DL OLLA and auto-tune run open-loop: the
+  /// candidate outcome fields were only ever filled on the UL path.
+  dapp_ul_crc_snapshot dapp_peek_dl_ack() const { return dapp_dl_ack_; }
+  bool dapp_dl_ack_is_fresh() const { return dapp_dl_ack_.seq != 0 && dapp_dl_ack_.seq != dapp_dl_ack_consumed_seq_; }
+  void dapp_mark_dl_ack_consumed(uint32_t seq) const
+  {
+    if (seq != 0 && seq == dapp_dl_ack_.seq) {
+      dapp_dl_ack_consumed_seq_ = seq;
+    }
+  }
+
+  /// Bounded first-transmission BLER estimate exported to the Class-B scheduler.
+  struct dapp_bler_snapshot {
+    float    bler             = 0.0f;
+    uint32_t nof_observations = 0;
+  };
+
+  dapp_bler_snapshot dapp_dl_bler() const { return dapp_dl_bler_.snapshot(); }
+  dapp_bler_snapshot dapp_ul_bler() const { return dapp_ul_bler_.snapshot(); }
+
 private:
+  /// Exact error ratio over the most recent 64 first-transmission outcomes.
+  /// Keeping the observation count prevents consumers from treating a cold
+  /// one-sample estimate as a mature BLER measurement.
+  struct dapp_bler_window {
+    void push(bool error) noexcept
+    {
+      constexpr uint32_t window_size = 64;
+      if (nof_observations == window_size) {
+        nof_errors -= (outcomes & (uint64_t{1} << (window_size - 1U))) != 0;
+      } else {
+        ++nof_observations;
+      }
+      outcomes = (outcomes << 1U) | static_cast<uint64_t>(error);
+      nof_errors += error;
+    }
+
+    dapp_bler_snapshot snapshot() const noexcept
+    {
+      return {nof_observations == 0 ? 0.0f : static_cast<float>(nof_errors) / nof_observations, nof_observations};
+    }
+
+    uint64_t outcomes{};
+    uint32_t nof_observations{};
+    uint32_t nof_errors{};
+  };
+
   /// \brief Performs link adaptation procedures such as cancelling HARQs etc.
   void apply_link_adaptation_procedures(const csi_report_data& csi_report);
 
@@ -207,6 +270,15 @@ private:
 
   /// \brief Whether cell is currently active.
   bool active = true;
+
+  /// Last UL CRC for Class-B OLLA / TPC. consumed_seq is mutable so the
+  /// const get_cc() path can one-shot the outcome onto a single invoke.
+  mutable dapp_ul_crc_snapshot dapp_ul_crc_{};
+  mutable uint32_t             dapp_ul_crc_consumed_seq_ = 0;
+  mutable dapp_ul_crc_snapshot dapp_dl_ack_{};
+  mutable uint32_t             dapp_dl_ack_consumed_seq_ = 0;
+  dapp_bler_window             dapp_dl_bler_{};
+  dapp_bler_window             dapp_ul_bler_{};
 };
 
 } // namespace ocudu

@@ -47,11 +47,12 @@ void to_json(nlohmann::json& json, const scheduler_ue_metrics& metrics)
   json["dl_ri"] = metrics.dl_ri_stats.get_nof_observations() > 0 ? metrics.dl_ri_stats.get_mean() : 1;
   json["ul_ri"] = metrics.ul_ri_stats.get_nof_observations() > 0 ? metrics.ul_ri_stats.get_mean() : 1;
 
-  json["dl_mcs"]     = metrics.dl_mcs.value();
-  json["dl_brate"]   = metrics.dl_brate_kbps * 1e3;
-  json["dl_nof_ok"]  = metrics.dl_nof_ok;
-  json["dl_nof_nok"] = metrics.dl_nof_nok;
-  json["dl_bs"]      = metrics.dl_bs;
+  json["dl_mcs"]      = metrics.dl_mcs.value();
+  json["dl_nof_prbs"] = metrics.tot_pdsch_prbs_used;
+  json["dl_brate"]    = metrics.dl_brate_kbps * 1e3;
+  json["dl_nof_ok"]   = metrics.dl_nof_ok;
+  json["dl_nof_nok"]  = metrics.dl_nof_nok;
+  json["dl_bs"]       = metrics.dl_bs;
   if (!std::isnan(metrics.pusch_snr_db) && !iszero(metrics.pusch_snr_db)) {
     json["pusch_snr_db"] = std::clamp(metrics.pusch_snr_db, -99.9f, 99.9f);
   }
@@ -73,6 +74,7 @@ void to_json(nlohmann::json& json, const scheduler_ue_metrics& metrics)
   json["srs_ta_ns"] =
       (metrics.srs_ta_stats.get_nof_observations() > 0) ? std::optional{metrics.srs_ta_stats.get_mean() * 1e9} : 0.0f;
   json["ul_mcs"]                       = metrics.ul_mcs.value();
+  json["ul_nof_prbs"]                  = metrics.tot_pusch_prbs_used;
   json["ul_brate"]                     = metrics.ul_brate_kbps * 1e3;
   json["ul_nof_ok"]                    = metrics.ul_nof_ok;
   json["ul_nof_nok"]                   = metrics.ul_nof_nok;

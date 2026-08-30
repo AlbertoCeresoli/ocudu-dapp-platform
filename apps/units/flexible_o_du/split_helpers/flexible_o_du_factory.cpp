@@ -3,6 +3,16 @@
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 #include "flexible_o_du_factory.h"
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+#include "apps/services/dapp/dapp_metrics_json_fanout.h"
+#include "apps/services/dapp/dapp_service.h"
+#include "ocudu/dapp/abi/v1/memory.h"
+#include "ocudu/dapp/e3/management_service.h"
+#include "ocudu/phy/upper/channel_processors/pusch/factories.h"
+#include "ocudu/ran/band_helper.h"
+#include "ocudu/ran/bs_channel_bandwidth.h"
+#include "ocudu/ran/subcarrier_spacing.h"
+#endif
 #include "apps/helpers/e2/e2_metric_connector_manager.h"
 #include "apps/helpers/ntn/ntn_config_translators.h"
 #include "apps/services/worker_manager/worker_manager.h"
@@ -29,8 +39,57 @@
 #include "ocudu/ntn/ntn_configuration_manager_config.h"
 #include "fmt/format.h"
 #include <algorithm>
+#include <numeric>
 
 using namespace ocudu;
+
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+static app_services::dapp_service_config
+derive_dapp_service_config(app_services::dapp_service_config               config,
+                           span<const o_du_low_unit_config::du_low_config> low_cells,
+                           span<const odu::du_cell_config>                 high_cells,
+                           const upper_phy_execution_configuration&        execution,
+                           bool                                            pusch_acceleration_enabled)
+{
+  config.cells.clear();
+  config.cells.reserve(low_cells.size());
+  for (uint32_t cell_id = 0; cell_id != low_cells.size(); ++cell_id) {
+    const unsigned nof_slots_per_frame =
+        get_nof_slots_per_subframe(low_cells[cell_id].scs_common) * NOF_SUBFRAMES_PER_FRAME;
+    app_services::dapp_service_cell_config cell;
+    cell.cell_id                    = cell_id;
+    cell.nof_uplink_producer_shards = nof_slots_per_frame + 1;
+    cell.nof_ul_prbs =
+        static_cast<uint16_t>(high_cells[cell_id].ran.ul_cfg_common.init_ul_bwp.generic_params.crbs.length());
+    // The uplink carrier center is the RF placement reported on E3 subscription
+    // records; a single-cell RU window is centered on the cell, so the offset is zero.
+    cell.rf_center_frequency_hz =
+        static_cast<uint64_t>(band_helper::nr_arfcn_to_freq(high_cells[cell_id].ran.ul_carrier.arfcn_f_ref));
+    config.cells.push_back(cell);
+  }
+  config.nof_pusch_lanes = 2 * execution.pusch_executor.max_concurrency;
+  // One SRS estimator is created per uplink producer shard (nof_ul_rg plus the pool's
+  // default processor), not per executor lane: the upper PHY only inserts a pooling SRS
+  // factory when srs_executor.max_concurrency > 1, so at concurrency 1 the dApp
+  // decorator is asked for one estimator per shard and a concurrency-sized lane budget
+  // is exhausted after the first. Size the lanes by the shard count, and never below
+  // executor concurrency.
+  const uint32_t max_uplink_producer_shards =
+      std::accumulate(config.cells.begin(), config.cells.end(), 0U, [](uint32_t acc, const auto& cell) {
+        return std::max(acc, cell.nof_uplink_producer_shards);
+      });
+  config.nof_srs_lanes = std::max<uint32_t>(execution.srs_executor.max_concurrency, max_uplink_producer_shards);
+  config.nof_scheduler_lanes =
+      std::accumulate(high_cells.begin(), high_cells.end(), 0U, [](unsigned count, const odu::du_cell_config& cell) {
+        return count + cell.rrm_policy_members.size() + 2;
+      });
+  config.backend_mask = uint64_t{1} << OCUDU_DAPP_BACKEND_HOST_V1;
+  if (pusch_acceleration_enabled && is_pusch_demodulator_acceleration_available()) {
+    config.backend_mask |= uint64_t{1} << OCUDU_DAPP_BACKEND_CUDA_V1;
+  }
+  return config;
+}
+#endif
 
 static fapi::carrier_config generate_carrier_config_tlv(const odu::du_cell_config& du_cell)
 {
@@ -345,13 +404,38 @@ o_du_unit flexible_o_du_factory::create_flexible_o_du(const o_du_unit_dependenci
 
   o_du_low_unit_config odu_low_cfg =
       generate_o_du_low_config(du_lo, config.ru_cfg.rx_gain_dB, du_cells, du_hi.cells_cfg);
-  o_du_low_unit_dependencies odu_low_dependencies = {.rg_gateway = du_impl->get_upper_ru_dl_rg_adapter(),
-                                                     .rx_symbol_request_notifier =
-                                                         du_impl->get_upper_ru_ul_request_adapter(),
-                                                     .workers = dependencies.workers->get_du_low_executor_mapper(),
-                                                     .fapi_p5_executor = dependencies.workers->get_cmd_line_executor()};
-  o_du_low_unit_factory      odu_low_factory(du_lo.hal_config);
-  auto                       odu_lo_unit = odu_low_factory.create(odu_low_cfg, odu_low_dependencies);
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  std::unique_ptr<app_services::dapp_service> dapp_service;
+  if (config.dapp) {
+    auto dapp_config =
+        derive_dapp_service_config(*config.dapp,
+                                   odu_low_cfg.cells,
+                                   du_cells,
+                                   dependencies.workers->get_du_low_executor_mapper().get_upper_phy_execution_config(),
+                                   du_lo.expert_phy_cfg.pusch_acceleration_mode != "disabled");
+    dapp_config.ran_control = dependencies.dapp_ran_control;
+    auto created            = app_services::dapp_service::create(std::move(dapp_config));
+    report_fatal_error_if_not(created, "Unable to create dApp service: {}", created.detail);
+    dapp_service = std::move(created.service);
+  }
+#endif
+  o_du_low_unit_dependencies odu_low_dependencies = {
+      .rg_gateway                 = du_impl->get_upper_ru_dl_rg_adapter(),
+      .rx_symbol_request_notifier = du_impl->get_upper_ru_ul_request_adapter(),
+      .workers                    = dependencies.workers->get_du_low_executor_mapper(),
+      .fapi_p5_executor           = dependencies.workers->get_cmd_line_executor(),
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+      .dapp_hooks      = dapp_service ? dapp_service->upper_phy_hooks() : nullptr,
+      .phy_diagnostics = dapp_service ? dapp_service->phy_diagnostics() : nullptr
+#endif
+  };
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  if (dapp_service && dependencies.dapp_metrics_fanout != nullptr) {
+    dependencies.dapp_metrics_fanout->bind(dapp_service->metrics_json_sink());
+  }
+#endif
+  o_du_low_unit_factory odu_low_factory(du_lo.hal_config);
+  auto                  odu_lo_unit = odu_low_factory.create(odu_low_cfg, odu_low_dependencies);
 
   std::for_each(odu_lo_unit.metrics.begin(), odu_lo_unit.metrics.end(), [&](auto& e) {
     o_du.metrics.emplace_back(std::move(e));
@@ -369,6 +453,11 @@ o_du_unit flexible_o_du_factory::create_flexible_o_du(const o_du_unit_dependenci
                                                           *dependencies.metrics_notifier,
                                                           dependencies.remote_metrics_gateway,
                                                           {}};
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  if (dapp_service) {
+    odu_hi_unit_dependencies.o_du_hi_dependencies.du_hi.dapp_hooks = dapp_service->scheduler_hooks();
+  }
+#endif
 
   // Adjust the dependencies.
   for (unsigned i = 0, e = du_cells.size(); i != e; ++i) {
@@ -443,6 +532,58 @@ o_du_unit flexible_o_du_factory::create_flexible_o_du(const o_du_unit_dependenci
 
   ocudu_assert(ru, "Invalid Radio Unit");
 
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  // Describe the served cells and hand the RU gain controller to the E3 RAN
+  // control authority so cell info and gain actions are answerable over E3.
+  if (dependencies.dapp_ran_control) {
+    std::vector<dapp::e3::cell_descriptor> descriptors;
+    for (unsigned cell_index = 0; cell_index != du_cells.size() && cell_index != du_hi.cells_cfg.size(); ++cell_index) {
+      const auto&               unit = du_hi.cells_cfg[cell_index].cell;
+      const auto&               du   = du_cells[cell_index];
+      dapp::e3::cell_descriptor cell;
+      cell.cell_id          = static_cast<uint16_t>(cell_index);
+      cell.pci              = static_cast<uint16_t>(unit.pci);
+      cell.plmn             = unit.plmn;
+      cell.tac              = static_cast<uint32_t>(unit.tac);
+      cell.nr_cell_identity = du.nr_cgi.nci.value();
+      cell.band             = nr_band_to_uint(du.ran.dl_carrier.band);
+      cell.dl_arfcn         = du.ran.dl_carrier.arfcn_f_ref.value();
+      cell.ul_arfcn         = du.ran.ul_carrier.arfcn_f_ref.value();
+      cell.dl_center_hz     = static_cast<uint64_t>(band_helper::nr_arfcn_to_freq(du.ran.dl_carrier.arfcn_f_ref));
+      cell.ul_center_hz     = static_cast<uint64_t>(band_helper::nr_arfcn_to_freq(du.ran.ul_carrier.arfcn_f_ref));
+      cell.bandwidth_mhz    = static_cast<uint16_t>(bs_channel_bandwidth_to_MHz(du.ran.dl_carrier.carrier_bw));
+      cell.nof_prbs         = static_cast<uint16_t>(du.ran.ul_cfg_common.init_ul_bwp.generic_params.crbs.length());
+      cell.scs_khz          = static_cast<uint16_t>(scs_to_khz(unit.common_scs));
+      cell.nof_tx_antennas  = static_cast<uint8_t>(unit.nof_antennas_dl);
+      cell.nof_rx_antennas  = static_cast<uint8_t>(unit.nof_antennas_ul);
+      cell.barred           = du.cell_barred;
+      if (du.ran.tdd_cfg) {
+        const auto& pattern = du.ran.tdd_cfg->pattern1;
+        cell.tdd            = dapp::e3::cell_tdd_pattern{static_cast<uint16_t>(pattern.dl_ul_tx_period_nof_slots),
+                                              static_cast<uint8_t>(pattern.nof_dl_slots),
+                                              static_cast<uint8_t>(pattern.nof_dl_symbols),
+                                              static_cast<uint8_t>(pattern.nof_ul_slots),
+                                              static_cast<uint8_t>(pattern.nof_ul_symbols)};
+      }
+      if (du.ran.ul_cfg_common.init_ul_bwp.rach_cfg_common) {
+        const auto& rach = *du.ran.ul_cfg_common.init_ul_bwp.rach_cfg_common;
+        cell.prach       = dapp::e3::cell_prach_config{rach.rach_cfg_generic.prach_config_index,
+                                                 rach.prach_root_seq_index,
+                                                 rach.rach_cfg_generic.zero_correlation_zone_config,
+                                                 rach.total_nof_ra_preambles,
+                                                 rach.rach_cfg_generic.msg1_frequency_start};
+      }
+      cell.rx_gain_db = config.ru_cfg.rx_gain_dB;
+      if (config.ru_cfg.srate_MHz) {
+        cell.sample_rate_hz = static_cast<uint64_t>(*config.ru_cfg.srate_MHz * 1e6);
+      }
+      descriptors.push_back(std::move(cell));
+    }
+    dependencies.dapp_ran_control->set_cells(std::move(descriptors));
+    dependencies.dapp_ran_control->attach_ru_gain_controller(ru->get_controller().get_gain_controller());
+  }
+#endif
+
   // Add RU metrics subcommands.
   for (auto& subcmd : ru_metrics_subcommands) {
     o_du.commands.cmdline.metrics_subcommands.emplace_back(std::move(subcmd));
@@ -484,6 +625,11 @@ o_du_unit flexible_o_du_factory::create_flexible_o_du(const o_du_unit_dependenci
   }
 
   // Configure the RU and DU in the dynamic DU.
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  if (dapp_service) {
+    du_impl->add_dapp_service(std::move(dapp_service));
+  }
+#endif
   du_impl->add_ru(std::move(ru));
   du_impl->add_du(std::move(odu_instance));
 

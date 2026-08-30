@@ -19,6 +19,8 @@
 
 namespace ocudu {
 
+class scheduler_dapp_hook_provider;
+
 scheduler_expert_config make_custom_scheduler_expert_config(bool enable_csi_rs_pdsch_multiplexing);
 
 /// Configuration of the scheduler test simulator.
@@ -31,7 +33,8 @@ struct scheduler_test_sim_config {
   /// Whether to automatically respond to PUSCH grants with CRC indications.
   bool auto_crc = false;
   /// Cell-Specific K-offset for NTN cells expressed in slots for a subcarrier spacing of 15 kHz, i.e., milliseconds.
-  std::chrono::milliseconds ntn_cs_koffset{0};
+  std::chrono::milliseconds                     ntn_cs_koffset{0};
+  std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks;
 };
 
 /// Helper class to help setup a scheduler unit test.
@@ -41,9 +44,10 @@ public:
   explicit scheduler_test_simulator(unsigned           tx_rx_delay_                     = 4,
                                     subcarrier_spacing max_scs                          = subcarrier_spacing::kHz15,
                                     bool               enable_csi_rs_pdsch_multiplexing = true);
-  explicit scheduler_test_simulator(const scheduler_expert_config& sched_cfg_,
-                                    unsigned                       tx_rx_delay_ = 4,
-                                    subcarrier_spacing             max_scs      = subcarrier_spacing::kHz15);
+  explicit scheduler_test_simulator(const scheduler_expert_config&                sched_cfg_,
+                                    unsigned                                      tx_rx_delay_ = 4,
+                                    subcarrier_spacing                            max_scs = subcarrier_spacing::kHz15,
+                                    std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks = {});
   explicit scheduler_test_simulator(const scheduler_test_sim_config& cfg);
   ~scheduler_test_simulator();
 

@@ -17,6 +17,7 @@
 #include "ocudu/phy/upper/equalization/dynamic_ch_est_list.h"
 #include "ocudu/phy/upper/sequence_generators/pseudo_random_generator.h"
 #include "ocudu/ran/pusch/pusch_constants.h"
+#include <complex>
 
 namespace ocudu {
 
@@ -55,6 +56,15 @@ public:
                   const resource_grid_reader&         grid,
                   const dmrs_pusch_estimator_results& est_results,
                   const configuration&                config) override;
+
+  void enable_symbol_capture() override { capture_symbols_enabled = true; }
+  void disable_symbol_capture() override { capture_symbols_enabled = false; }
+  span<const std::complex<float>> get_captured_symbols() const override
+  {
+    static_assert(sizeof(cf_t) == sizeof(std::complex<float>), "cf_t must be compatible with std::complex<float>.");
+    const auto* data = reinterpret_cast<const std::complex<float>*>(captured_symbols.data());
+    return span<const std::complex<float>>(data, captured_count);
+  }
 
 private:
   /// Data type for representing an RE mask within an OFDM symbol.
@@ -124,6 +134,11 @@ private:
 
   /// Enables post equalization SINR calculation.
   bool compute_post_eq_sinr;
+
+  /// Diagnostic capture of equalized symbols (host-side).
+  bool              capture_symbols_enabled = false;
+  std::vector<cf_t> captured_symbols;
+  unsigned          captured_count = 0;
 };
 
 } // namespace ocudu

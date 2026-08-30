@@ -22,6 +22,9 @@
 
 namespace ocudu {
 
+class upper_phy_dapp_hook_provider;
+class phy_diagnostic_sink;
+
 class task_executor;
 class upper_phy_rg_gateway;
 class upper_phy_rx_symbol_request_notifier;
@@ -38,6 +41,10 @@ struct uplink_processor_config {
   unsigned nof_rb;
   /// PUSCH allocation maximum number of layers.
   unsigned max_nof_layers;
+  /// DU-local cell identifier propagated to dApp observations and inline invocations.
+  uint32_t cell_id = 0;
+  /// Producer shard identifier within the cell.
+  uint32_t producer_shard = 0;
 };
 
 /// Uplink processor factory.
@@ -259,7 +266,7 @@ struct upper_phy_dependencies {
   upper_phy_rg_gateway* rg_gateway;
   /// Received symbol request notifier.
   upper_phy_rx_symbol_request_notifier* rx_symbol_request_notifier;
-  /// DU-local cell index used for per-cell executor affinity (e.g. PDSCH fair lanes).
+  /// DU-local cell index (per-cell executor affinity, dApp observations).
   uint32_t cell_id = 0;
 };
 
@@ -397,6 +404,12 @@ struct upper_phy_factory_configuration {
   /// Defaults to 0. Validated at runtime against the number of visible NVIDIA CUDA devices.
   int nvcuda_device_id = 0;
 
+  /// \brief ZMQ PUB endpoint for real-time upper-PHY diagnostics (empty disables).
+  ///
+  /// Example: "tcp://127.0.0.1:5555". Streams OCDG FlatBuffers for PUSCH symbols,
+  /// CRC and available channel estimates for diagnostic consumers.
+  std::string zmq_diag_endpoint;
+
   /// Number of receive antenna ports.
   unsigned nof_rx_ports;
   /// Number of RBs for uplink.
@@ -423,6 +436,12 @@ struct upper_phy_factory_dependencies {
   ///
   /// if the optional is not set, a software PUSCH decoder factory will be used.
   std::optional<std::shared_ptr<hal::hw_accelerator_pusch_dec_factory>> hw_decoder_factory;
+  /// Optional runtime dApp hook provider. An empty provider preserves the conventional factory graph exactly.
+  std::shared_ptr<upper_phy_dapp_hook_provider> dapp_hooks;
+  /// \brief Optional transport-neutral diagnostics sink for PUSCH/SRS capture events.
+  ///
+  /// When set it takes precedence over \ref upper_phy_factory_configuration::zmq_diag_endpoint.
+  std::shared_ptr<phy_diagnostic_sink> diagnostics;
 };
 
 /// Creates and returns an upper PHY factory.

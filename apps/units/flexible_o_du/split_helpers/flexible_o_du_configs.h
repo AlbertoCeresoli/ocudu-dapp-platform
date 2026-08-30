@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "apps/services/dapp/dapp_service.h"
 #include "apps/units/flexible_o_du/o_du_high/o_du_high_unit_config.h"
 #include "apps/units/flexible_o_du/o_du_low/du_low_config.h"
 #include "ocudu/ran/cyclic_prefix.h"
@@ -26,6 +27,8 @@ struct flexible_o_du_unit_config {
     app_helpers::metrics_config config;
     bool                        enable_ru_metrics;
     float                       rx_gain_dB;
+    /// Radio sampling rate in MHz; present only for radios that expose one.
+    std::optional<double> srate_MHz;
   };
 
   /// O-RAN DU high configuration.
@@ -34,6 +37,8 @@ struct flexible_o_du_unit_config {
   const du_low_unit_config& du_low_cfg;
   /// RU configuration.
   ru_config ru_cfg;
+  /// Optional dApp runtime and embedded E3 service. Hook topology fields are derived by the DU factory.
+  std::optional<app_services::dapp_service_config> dapp;
 };
 
 /// Radio Unit dependencies of the flexible O-RAN DU.

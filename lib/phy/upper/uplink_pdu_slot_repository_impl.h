@@ -24,8 +24,14 @@ public:
   /// Creates an uplink PDU slot repository.
   uplink_pdu_slot_repository_impl(resource_grid&                 grid_,
                                   std::atomic<unsigned>&         grid_ref_counter_,
-                                  uplink_processor_fsm_notifier& fsm_) :
-    grid(grid_), grid_ref_counter(grid_ref_counter_), fsm_notifier(fsm_)
+                                  uplink_processor_fsm_notifier& fsm_,
+                                  uint32_t                       cell_id_,
+                                  uint32_t                       producer_shard_) :
+    cell_id(cell_id_),
+    producer_shard(producer_shard_),
+    grid(grid_),
+    grid_ref_counter(grid_ref_counter_),
+    fsm_notifier(fsm_)
   {
   }
 
@@ -63,7 +69,9 @@ public:
     unsigned end_symbol_index = pdu.pdu.start_symbol_index + pdu.pdu.nof_symbols - 1;
     ocudu_assert(end_symbol_index < MAX_NSYMB_PER_SLOT, "Invalid end symbol index {}.", end_symbol_index);
 
-    pusch_repository[end_symbol_index].push_back(pdu);
+    pusch_pdu attributed_pdu   = pdu;
+    attributed_pdu.pdu.cell_id = cell_id;
+    pusch_repository[end_symbol_index].push_back(std::move(attributed_pdu));
     fsm_notifier.increment_pending_pdu_count();
   }
 
@@ -123,7 +131,10 @@ public:
     unsigned end_symbol_index =
         pdu.config.resource.start_symbol.value() + static_cast<unsigned>(pdu.config.resource.nof_symbols) - 1;
     ocudu_assert(end_symbol_index < MAX_NSYMB_PER_SLOT, "Invalid end symbol index {}.", end_symbol_index);
-    srs_repository[end_symbol_index].push_back(pdu);
+    srs_pdu attributed_pdu               = pdu;
+    attributed_pdu.config.cell_id        = cell_id;
+    attributed_pdu.config.producer_shard = producer_shard;
+    srs_repository[end_symbol_index].push_back(std::move(attributed_pdu));
     fsm_notifier.increment_pending_pdu_count();
   }
 
@@ -185,6 +196,10 @@ public:
   }
 
 private:
+  /// DU-local cell identifier.
+  const uint32_t cell_id;
+  /// Producer shard identifier within the cell.
+  const uint32_t producer_shard;
   // See the shared_resource_grid::pool_interface interface for documentation.
   resource_grid& get() override { return grid; }
 

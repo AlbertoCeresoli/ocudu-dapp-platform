@@ -9,12 +9,14 @@
 #include "ocudu/mac/mac_pdu_handler.h"
 #include "ocudu/pcap/mac_pcap.h"
 #include "ocudu/scheduler/config/scheduler_expert_config.h"
+#include <memory>
 
 namespace ocudu {
 
 class timer_manager;
 class mac_metrics_notifier;
 class mac_clock_controller;
+class scheduler_dapp_hook_provider;
 
 /// \brief Implementation-specific parameters used to tune MAC operation.
 struct mac_expert_config {
@@ -53,7 +55,8 @@ struct mac_config {
   mac_clock_controller&     timers;
   metrics_config            metrics;
   // Parameters passed to MAC scheduler.
-  scheduler_expert_config sched_cfg;
+  scheduler_expert_config                       sched_cfg;
+  std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks;
 };
 
 } // namespace ocudu

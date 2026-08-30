@@ -20,21 +20,23 @@
 namespace ocudu {
 
 class timer_manager;
+class scheduler_dapp_hook_provider;
 
 class mac_cell_processor final : public mac_cell_slot_handler, public mac_cell_controller
 {
 public:
-  mac_cell_processor(const mac_cell_creation_request& cell_cfg_req,
-                     mac_scheduler_cell_info_handler& sched,
-                     mac_slot_time_handler&           sfn_time_mapper_,
-                     du_rnti_table&                   rnti_table,
-                     mac_cell_result_notifier&        phy_notifier,
-                     task_executor&                   cell_exec,
-                     task_executor&                   slot_exec,
-                     task_executor&                   ctrl_exec,
-                     mac_pcap&                        pcap,
-                     timer_manager&                   timers,
-                     mac_cell_config_dependencies     dependencies);
+  mac_cell_processor(const mac_cell_creation_request&              cell_cfg_req,
+                     mac_scheduler_cell_info_handler&              sched,
+                     mac_slot_time_handler&                        sfn_time_mapper_,
+                     du_rnti_table&                                rnti_table,
+                     mac_cell_result_notifier&                     phy_notifier,
+                     task_executor&                                cell_exec,
+                     task_executor&                                slot_exec,
+                     task_executor&                                ctrl_exec,
+                     mac_pcap&                                     pcap,
+                     timer_manager&                                timers,
+                     mac_cell_config_dependencies                  dependencies,
+                     std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks = {});
 
   /// Starts configured cell.
   async_task<void> start() override;
@@ -83,13 +85,14 @@ private:
   void write_tx_pdu_pcap(slot_point sl_tx, const sched_result& sl_res, const mac_dl_data_result& dl_res);
 
   // Dependencies.
-  ocudulog::basic_logger&         logger;
-  const mac_cell_creation_request cell_cfg;
-  task_executor&                  cell_exec;
-  task_executor&                  slot_exec;
-  task_executor&                  ctrl_exec;
-  mac_cell_result_notifier&       phy_cell;
-  timer_manager&                  timers;
+  ocudulog::basic_logger&                       logger;
+  const mac_cell_creation_request               cell_cfg;
+  task_executor&                                cell_exec;
+  task_executor&                                slot_exec;
+  task_executor&                                ctrl_exec;
+  mac_cell_result_notifier&                     phy_cell;
+  std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks;
+  timer_manager&                                timers;
 
   // Mapper of upper-layer bearers to MAC logical channels in the DL direction.
   mac_dl_ue_repository ue_mng;

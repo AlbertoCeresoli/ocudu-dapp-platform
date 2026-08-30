@@ -452,7 +452,20 @@ unsigned intra_slice_scheduler::schedule_dl_newtx_candidates(dl_ran_slice_candid
                                                              scheduler_policy&       dl_policy,
                                                              unsigned                max_ue_grants_to_alloc)
 {
-  // Prepare candidate list.
+  // Publish free-for-newTx PRB snapshot (post-retx) before Class-B ranking/packing.
+  {
+    std::vector<uint8_t> free_prbs(used_dl_vrbs.size(), uint8_t{1});
+    for (unsigned prb = 0; prb != used_dl_vrbs.size(); ++prb) {
+      if (used_dl_vrbs.test(prb)) {
+        free_prbs[prb] = 0;
+      }
+    }
+    const uint16_t remaining =
+        static_cast<uint16_t>(std::min<unsigned>(slice.remaining_rbs(), free_prbs.size()));
+    dl_policy.set_newtx_free_prb_snapshot(pdsch_slot, free_prbs, remaining);
+  }
+
+  // Prepare candidate list (runs conventional + Class-B policy).
   prepare_newtx_dl_candidates(slice, dl_policy);
   if (newtx_candidates.empty()) {
     return 0;
@@ -481,8 +494,14 @@ unsigned intra_slice_scheduler::schedule_dl_newtx_candidates(dl_ran_slice_candid
     }
 
     // Create DL grant builder.
-    auto result =
-        ue_alloc.allocate_dl_grant(ue_newtx_dl_grant_request{*ue_candidate.ue, pdsch_slot, ue_candidate.pending_bytes});
+    ue_newtx_dl_grant_request dl_req{*ue_candidate.ue, pdsch_slot, ue_candidate.pending_bytes};
+    dl_req.dapp_mcs        = ue_candidate.dapp_mcs;
+    dl_req.dapp_max_mcs    = ue_candidate.dapp_max_mcs;
+    dl_req.dapp_prb_limits = ue_candidate.dapp_prb_limits;
+    dl_req.dapp_prb_assign = ue_candidate.dapp_prb_assign;
+    dl_req.dapp_prb_pref   = ue_candidate.dapp_prb_pref;
+    dl_req.dapp_layers     = ue_candidate.dapp_layers;
+    auto result            = ue_alloc.allocate_dl_grant(dl_req);
 
     if (result.has_value()) {
       // Allocation was successful. Move grant builder to list of pending newTx grants.
@@ -579,9 +598,13 @@ unsigned intra_slice_scheduler::schedule_dl_newtx_candidates(dl_ran_slice_candid
   const unsigned alloc_count = pending_dl_newtxs.size();
   pending_dl_newtxs.clear();
 
-  // Update policy with final allocation results.
-  const auto& pdschs = cell_alloc[pdsch_slot].result.dl.ue_grants;
-  dl_policy.save_dl_newtx_grants(span<const dl_msg_alloc>(pdschs.end() - alloc_count, pdschs.end()));
+  // Update policy with final allocation results. Never walk off the grant vector:
+  // cancelled newTxs (empty VRBs) may have been erased, so take min(staged, present).
+  const auto&    pdschs = cell_alloc[pdsch_slot].result.dl.ue_grants;
+  const unsigned take   = std::min<unsigned>(alloc_count, pdschs.size());
+  if (take != 0) {
+    dl_policy.save_dl_newtx_grants(span<const dl_msg_alloc>(pdschs.end() - take, pdschs.end()));
+  }
 
   return alloc_count;
 }
@@ -590,15 +613,40 @@ unsigned intra_slice_scheduler::schedule_ul_newtx_candidates(ul_ran_slice_candid
                                                              scheduler_policy&       ul_policy,
                                                              unsigned                max_ue_grants_to_alloc)
 {
-  // Prepare candidate list.
+  // Publish free-for-newTx PRB snapshot (post-retx) before Class-B ranking/packing.
+  {
+    std::vector<uint8_t> free_prbs(used_ul_vrbs.size(), uint8_t{1});
+    for (unsigned prb = 0; prb != used_ul_vrbs.size(); ++prb) {
+      if (used_ul_vrbs.test(prb)) {
+        free_prbs[prb] = 0;
+      }
+    }
+    const uint16_t remaining =
+        static_cast<uint16_t>(std::min<unsigned>(slice.remaining_rbs(), free_prbs.size()));
+    ul_policy.set_newtx_free_prb_snapshot(pusch_slot, free_prbs, remaining);
+  }
+
+  // Prepare candidate list (runs conventional + Class-B policy).
   prepare_newtx_ul_candidates(slice, ul_policy);
   if (newtx_candidates.empty()) {
     return 0;
   }
 
+  // A policy mask constrains only this slice's new transmissions. Retransmissions have already been scheduled and the
+  // authoritative used-resource bitmap remains unchanged until an actual grant is committed.
+  vrb_bitmap newtx_used_ul_vrbs = used_ul_vrbs;
+  const auto avoided_prbs       = ul_policy.get_ul_newtx_avoid_prbs(pusch_slot);
+  if (avoided_prbs.size() == newtx_used_ul_vrbs.size()) {
+    for (uint32_t prb = 0; prb != avoided_prbs.size(); ++prb) {
+      if (avoided_prbs[prb] != 0) {
+        newtx_used_ul_vrbs.set(prb);
+      }
+    }
+  }
+
   // Recompute max number of UE grants that can be scheduled in this slot and the number of RBs per grant.
   auto [rbs_to_alloc, expected_rbs_per_grant] =
-      get_max_grants_and_rb_grant_size(newtx_candidates, cell_alloc, slice, used_ul_vrbs, max_ue_grants_to_alloc);
+      get_max_grants_and_rb_grant_size(newtx_candidates, cell_alloc, slice, newtx_used_ul_vrbs, max_ue_grants_to_alloc);
   if (expected_rbs_per_grant == 0) {
     return 0;
   }
@@ -609,8 +657,16 @@ unsigned intra_slice_scheduler::schedule_ul_newtx_candidates(ul_ran_slice_candid
     // Create UL grant builder.
     // NOTE: the symbols passed to the grant are the symbols that are available for PUSCH and for which the used VRBs
     // have been computed.
-    auto result = ue_alloc.allocate_ul_grant(ue_newtx_ul_grant_request{
-        *ue_candidate.ue, pusch_slot, ue_candidate.pending_bytes, ofdm_symbol_range{0, min_srs_symbol}});
+    ue_newtx_ul_grant_request ul_req{
+        *ue_candidate.ue, pusch_slot, ue_candidate.pending_bytes, ofdm_symbol_range{0, min_srs_symbol}};
+    ul_req.dapp_mcs        = ue_candidate.dapp_mcs;
+    ul_req.dapp_max_mcs    = ue_candidate.dapp_max_mcs;
+    ul_req.dapp_prb_limits = ue_candidate.dapp_prb_limits;
+    ul_req.dapp_prb_assign = ue_candidate.dapp_prb_assign;
+    ul_req.dapp_prb_pref   = ue_candidate.dapp_prb_pref;
+    ul_req.dapp_tpc        = ue_candidate.dapp_tpc;
+    ul_req.dapp_layers     = ue_candidate.dapp_layers;
+    auto result            = ue_alloc.allocate_ul_grant(ul_req);
 
     if (result.has_value()) {
       // Allocation was successful. Move grant builder to list of pending newTx grants.
@@ -658,7 +714,7 @@ unsigned intra_slice_scheduler::schedule_ul_newtx_candidates(ul_ran_slice_candid
     ocudu_assert(max_grant_size > 0, "Invalid grant size.");
 
     // Derive recommended parameters for the DL newTx grant.
-    vrb_interval alloc_vrbs = grant_builder.recommended_vrbs(used_ul_vrbs, max_grant_size);
+    vrb_interval alloc_vrbs = grant_builder.recommended_vrbs(newtx_used_ul_vrbs, max_grant_size);
     if (alloc_vrbs.empty()) {
       logger.error("ue={} c-rnti={}: Failed to allocate RBs for PUSCH grant at slot={}",
                    fmt::underlying(grant_builder.ue().ue_index()),
@@ -674,6 +730,7 @@ unsigned intra_slice_scheduler::schedule_ul_newtx_candidates(ul_ran_slice_candid
 
     // Fill used CRBs.
     unsigned nof_rbs_alloc = alloc_vrbs.length();
+    newtx_used_ul_vrbs.fill(alloc_vrbs.start(), alloc_vrbs.stop());
     used_ul_vrbs.fill(alloc_vrbs.start(), alloc_vrbs.stop());
 
     // Update slice state.
@@ -686,9 +743,13 @@ unsigned intra_slice_scheduler::schedule_ul_newtx_candidates(ul_ran_slice_candid
   unsigned alloc_count = pending_ul_newtxs.size();
   pending_ul_newtxs.clear();
 
-  // Update policy with allocation results.
-  const auto& puschs = cell_alloc[pusch_slot].result.ul.puschs;
-  ul_policy.save_ul_newtx_grants(span<const ul_sched_info>(puschs.end() - alloc_count, puschs.end()));
+  // Update policy with allocation results. Never walk off the grant vector:
+  // cancelled newTxs (empty VRBs) may have been erased, so take min(staged, present).
+  const auto&    puschs = cell_alloc[pusch_slot].result.ul.puschs;
+  const unsigned take   = std::min<unsigned>(alloc_count, puschs.size());
+  if (take != 0) {
+    ul_policy.save_ul_newtx_grants(span<const ul_sched_info>(puschs.end() - take, puschs.end()));
+  }
 
   return alloc_count;
 }

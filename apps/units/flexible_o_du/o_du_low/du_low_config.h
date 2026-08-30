@@ -76,6 +76,12 @@ struct du_low_unit_expert_upper_phy_config {
   bool enable_phy_tap = false;
   /// PHY tap plugin arguments.
   std::string phy_tap_arguments;
+  /// \brief ZMQ PUB endpoint for real-time upper-PHY diagnostics (empty disables).
+  ///
+  /// When set (e.g. "tcp://127.0.0.1:5555"), the PHY streams PUSCH equalized
+  /// symbols, CRC results, and SRS channel estimates as OCDG FlatBuffers on ZMQ.
+  /// Empty disables diagnostic publishing.
+  std::string zmq_diag_endpoint;
   /// \brief Acceleration mode for PUSCH.
   ///
   /// Use one of these options:

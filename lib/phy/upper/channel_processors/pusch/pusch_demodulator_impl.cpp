@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
+#include <cstring>
 // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
@@ -290,6 +291,10 @@ void pusch_demodulator_impl::demodulate(pusch_codeword_buffer&              code
   float    total_noise_var_accumulate = 0.0;
   float    total_evm_accumulate       = 0.0;
 
+  if (capture_symbols_enabled) {
+    captured_count = 0;
+  }
+
   // Process each OFDM symbol.
   for (unsigned i_symbol = config.start_symbol_index, i_symbol_end = config.start_symbol_index + config.nof_symbols;
        i_symbol != i_symbol_end;
@@ -342,6 +347,16 @@ void pusch_demodulator_impl::demodulate(pusch_codeword_buffer&              code
     const re_buffer_reader<cbf16_t>& ch_re = get_ch_data_re(grid, i_symbol, symbol_re_mask, config.rx_ports);
     equalizer->equalize(
         eq_re, eq_noise_vars, ch_re, ch_estimates, span<float>(noise_var_estimates).first(nof_rx_ports), 1.0F);
+
+    // Diagnostic constellation capture (data symbols only).
+    if (capture_symbols_enabled && !config.dmrs_symb_pos.test(i_symbol)) {
+      const std::size_t needed = captured_count + eq_re.size();
+      if (captured_symbols.size() < needed) {
+        captured_symbols.resize(needed);
+      }
+      std::memcpy(captured_symbols.data() + captured_count, eq_re.data(), eq_re.size() * sizeof(cf_t));
+      captured_count += eq_re.size();
+    }
 
     // Revert transform precoding for the entire OFDM symbol.
     if (config.enable_transform_precoding) {

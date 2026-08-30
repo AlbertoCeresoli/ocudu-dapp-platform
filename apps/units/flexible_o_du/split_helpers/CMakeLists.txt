@@ -23,3 +23,7 @@ target_link_libraries(ocudu_flexible_o_du_helpers
         ocudu_flexible_o_du_unit_metrics_helpers
         ocudu_ntn_lib
         ocudu_ntn_app_helpers)
+if (ENABLE_DAPP)
+  target_compile_definitions(ocudu_flexible_o_du_helpers PUBLIC OCUDU_FLEXIBLE_DU_DAPP=1)
+  target_link_libraries(ocudu_flexible_o_du_helpers ocudu_dapp_app_config ocudu_dapp_app_service)
+endif ()

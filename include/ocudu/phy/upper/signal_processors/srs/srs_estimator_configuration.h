@@ -15,6 +15,10 @@ namespace ocudu {
 
 /// Parameters required to receive the Sounding Reference Signals described in 3GPP TS38.211 Section 6.4.1.4.
 struct srs_estimator_configuration {
+  /// DU-local cell identifier used for runtime attribution.
+  uint32_t cell_id = 0;
+  /// Producer shard identifier within the cell.
+  uint32_t producer_shard = 0;
   /// Context information.
   std::optional<srs_context> context;
   /// Numerology, SFN and slot index.

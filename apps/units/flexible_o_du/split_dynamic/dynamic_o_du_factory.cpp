@@ -17,7 +17,8 @@ generate_ru_config(const std::variant<ru_sdr_unit_config, ru_ofh_unit_parsed_con
   if (const auto* ru = std::get_if<ru_sdr_unit_config>(&ru_cfg)) {
     return flexible_o_du_unit_config::ru_config{.config            = ru->metrics_cfg.metrics_cfg,
                                                 .enable_ru_metrics = ru->metrics_cfg.enable_ru_metrics,
-                                                .rx_gain_dB        = static_cast<float>(ru->rx_gain_dB)};
+                                                .rx_gain_dB        = static_cast<float>(ru->rx_gain_dB),
+                                                .srate_MHz         = ru->srate_MHz};
   }
 
   if (const auto* ru = std::get_if<ru_dummy_unit_config>(&ru_cfg)) {
@@ -38,7 +39,8 @@ generate_ru_config(const std::variant<ru_sdr_unit_config, ru_ofh_unit_parsed_con
 dynamic_o_du_factory::dynamic_o_du_factory(const dynamic_o_du_unit_config& config_) :
   flexible_o_du_factory(flexible_o_du_unit_config{.odu_high_cfg = config_.odu_high_cfg,
                                                   .du_low_cfg   = config_.du_low_cfg,
-                                                  .ru_cfg       = generate_ru_config(config_.ru_cfg)}),
+                                                  .ru_cfg       = generate_ru_config(config_.ru_cfg),
+                                                  .dapp         = config_.dapp}),
   unit_config(config_)
 {
 }

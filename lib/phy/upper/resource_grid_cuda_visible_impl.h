@@ -287,7 +287,9 @@ public:
   bool is_empty() const override
   {
     std::unique_lock<std::mutex> lock(grid_ready_mutex);
-    wait_for_active_device_mapping_locked(lock);
+    // On timeout the mapping is still active; the host-side mask is the best
+    // answer available either way.
+    (void)wait_for_active_device_mapping_locked(lock);
     return alloc_mask.is_empty();
   }
 
@@ -658,13 +660,21 @@ private:
     return true;
   }
 
-  void wait_for_active_device_mapping_locked(std::unique_lock<std::mutex>& lock) const
+  /// Bounded like wait_for_device_read_holds_locked: an unbounded spin here can
+  /// stall the UL-PHY thread behind a wedged device producer, which is worse
+  /// than failing the access for one slot.
+  bool wait_for_active_device_mapping_locked(std::unique_lock<std::mutex>& lock) const
   {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
     while (device_mapping_active) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
       lock.unlock();
       sched_yield();
       lock.lock();
     }
+    return true;
   }
 
   bool prepare_device_mapping(void* stream)
@@ -673,7 +683,9 @@ private:
     if (managed_data == nullptr) {
       return false;
     }
-    wait_for_active_device_mapping_locked(lock);
+    if (!wait_for_active_device_mapping_locked(lock)) {
+      return false;
+    }
     if (!wait_for_device_mapping_locked(stream)) {
       return false;
     }
@@ -706,7 +718,9 @@ private:
     if (managed_data == nullptr) {
       return false;
     }
-    wait_for_active_device_mapping_locked(lock);
+    if (!wait_for_active_device_mapping_locked(lock)) {
+      return false;
+    }
     if (!wait_for_device_mapping_locked(stream)) {
       return false;
     }
@@ -780,7 +794,9 @@ private:
 
   bool pull_pages_home_locked(std::unique_lock<std::mutex>& lock) const
   {
-    wait_for_active_device_mapping_locked(lock);
+    if (!wait_for_active_device_mapping_locked(lock)) {
+      return false;
+    }
     if (!wait_for_device_read_holds_locked(lock)) {
       return false;
     }
@@ -1025,7 +1041,9 @@ private:
     }
 
     std::unique_lock<std::mutex> lock(grid_ready_mutex);
-    wait_for_active_device_mapping_locked(lock);
+    if (!wait_for_active_device_mapping_locked(lock)) {
+      return false;
+    }
     // A reader between prepare_device_access and its fence record has no event
     // yet; wait the hold out first so the fence lands in pending events and
     // the memset below orders after it instead of zeroing under the read.
@@ -1069,7 +1087,6 @@ private:
   mutable bool                  host_shadow_valid{false};
   mutable bool                  host_pinned_valid{false};
   mutable unsigned              host_pinned_index{~0u};
-  mutable unsigned              host_shadow_from_index{~0u};
   mutable std::vector<cbf16_t>  host_shadow;
 
   static constexpr unsigned owned_snapshot_ring = 3;
@@ -1444,10 +1461,17 @@ private:
   /// home first. Queried per device so one binary stays correct on all four.
   bool host_reads_device_memory_directly{false};
 
+  /// Bounded: cudaErrorNotReady after 5 ms means "still pending, give up". Every
+  /// caller treats a non-success status as a failed access for this slot, which
+  /// is preferable to spinning the calling (possibly UL-PHY) thread unboundedly.
   static cudaError_t cuda_event_synchronize_yielding(cudaEvent_t event)
   {
+    const auto  deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
     cudaError_t status;
     while ((status = cudaEventQuery(event)) == cudaErrorNotReady) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return cudaErrorNotReady;
+      }
       sched_yield();
     }
     return status;

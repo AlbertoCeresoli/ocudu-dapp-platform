@@ -5,12 +5,15 @@
 
 #include "pusch_demodulator_gpu_impl.h"
 #include "../../channel_coding/ldpc/cuda/cuda_rt_utils.h"
+#include "../../dapp/pusch_resident_dapp_cuda.h"
 #include "../../phy_acceleration_runtime_options.h"
 #include "cuda/pusch_sch_llr_compactor.h"
 #include "pusch_acceleration_runtime_options.h"
 #include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_codeword_buffer.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_demodulator_notifier.h"
+#include "ocudu/phy/upper/dapp/pusch_dapp_demodulator.h"
+#include "ocudu/phy/upper/dapp/pusch_resident_dapp.h"
 #include "ocudu/ran/dmrs/dmrs.h"
 #include "ocudu/ran/resource_block.h"
 #include "ocudu/ran/sch/sch_dmrs_power.h"
@@ -175,6 +178,53 @@ inline void sanitize_stats_in_place(pusch_demodulator_notifier::demodulation_sta
       stats.epre_dB = v;
     }
   }
+}
+
+/// \brief Post-EQ SINR from equalized noise variances (scheduler-facing CSI).
+///
+/// When a Class-A equalizer dApp runs inline, the host skips the conventional
+/// E2E SINR D2H and the resident CE stub leaves CSI empty. Derive SINR from the
+/// same post-EQ noise tensor used by soft demap: SINR_dB = -10 log10(mean σ²),
+/// i.e. SINR under an assumed unit signal power. Reference Class-A estimators
+/// publish physical post-equalization disturbance in that normalization, so no
+/// calibration is required by default.
+///
+/// A positive default used by the older self-fit-residual estimator is unsafe
+/// with the physical-noise contract: closed-loop PUSCH power control interprets
+/// the inflated SINR as excess link margin and repeatedly commands the UE down.
+/// Keep an explicit override for legacy/vendor modules with a documented noise
+/// convention, but never apply an empirical offset to every Class-A module.
+inline bool mean_post_eq_sinr_db_from_noise(span<const float> noise, float& sinr_db)
+{
+  static const float host_convention_cal_db = []() {
+    if (const char* env = std::getenv("OCUDU_DAPP_UL_SINR_CAL_DB")) {
+      char*       end   = nullptr;
+      const float value = std::strtof(env, &end);
+      if (end != env && std::isfinite(value) && value >= -20.0f && value <= 20.0f) {
+        return value;
+      }
+    }
+    return 0.0f;
+  }();
+
+  // Class-A modules report an erasure (DC subcarrier, singular channel) as a huge post-equalization noise so the
+  // demapper yields zero LLRs. Such REs carry no information about the link and must not enter the SINR that drives
+  // link adaptation and power control: one erased RE per symbol would otherwise pull a 20 dB link to -10 dB.
+  constexpr float erasure_noise_threshold = 1.0e5f;
+  double          sum                     = 0.0;
+  size_t          count                   = 0;
+  for (float var : noise) {
+    if (std::isfinite(var) && var > 0.0f && var < erasure_noise_threshold) {
+      sum += static_cast<double>(var);
+      ++count;
+    }
+  }
+  if (count == 0) {
+    return false;
+  }
+  const float mean = static_cast<float>(sum / static_cast<double>(count));
+  sinr_db          = -convert_power_to_dB(mean) + host_convention_cal_db;
+  return std::isfinite(sinr_db);
 }
 
 inline pusch_demodulator_notifier::demodulation_stats build_e2e_final_stats(float gpu_sinr_db,
@@ -869,6 +919,10 @@ pusch_demodulator_gpu_impl::pusch_demodulator_gpu_impl(std::unique_ptr<channel_e
     d2h_event_ = nullptr;
   }
 
+  // Pre-allocate constellation diagnostic staging (pinned host + device tap + events).
+  // Must not allocate on the first rate-limited capture during Msg3/RACH.
+  ensure_eq_diag_resources();
+
   // Initialize CUDA memory pool for async allocations.
   cudaDeviceGetMemPool(&mem_pool_, device_id_);
   if (mem_pool_) {
@@ -1127,8 +1181,287 @@ pusch_demodulator_gpu_impl::pusch_demodulator_gpu_impl(std::unique_ptr<channel_e
   }
 }
 
+void pusch_demodulator_gpu_impl::ensure_eq_diag_resources()
+{
+  // Host pinned + completion event are required for every capture path (NeuralEq D2H and E2E tap).
+  // Device tap buffers are only needed for conventional E2E set_eq_output — allocate best-effort.
+  const std::size_t capacity = MAX_CAPTURE_EQ_SYMBOLS;
+  const std::size_t eq_bytes = capacity * sizeof(std::complex<float>);
+  const std::size_t nv_bytes = capacity * sizeof(float);
+
+  if (h_eq_diag_pinned_ == nullptr) {
+    if (cudaMallocHost(reinterpret_cast<void**>(&h_eq_diag_pinned_), eq_bytes) != cudaSuccess) {
+      h_eq_diag_pinned_ = nullptr;
+      static_cast<void>(cudaGetLastError());
+      eq_diag_capacity_ = 0;
+      return;
+    }
+  }
+  if (eq_diag_ready_event_ == nullptr) {
+    if (cudaEventCreateWithFlags(&eq_diag_ready_event_, cudaEventDisableTiming) != cudaSuccess) {
+      eq_diag_ready_event_ = nullptr;
+      static_cast<void>(cudaGetLastError());
+    }
+  }
+  if (eq_diag_event_ == nullptr) {
+    if (cudaEventCreateWithFlags(&eq_diag_event_, cudaEventDisableTiming) != cudaSuccess) {
+      eq_diag_event_ = nullptr;
+      static_cast<void>(cudaGetLastError());
+    }
+  }
+  // E2E conventional tap buffers (optional for NeuralEq path).
+  if (d_eq_diag_ == nullptr) {
+    if (cudaMalloc(&d_eq_diag_, eq_bytes) != cudaSuccess) {
+      d_eq_diag_ = nullptr;
+      static_cast<void>(cudaGetLastError());
+    }
+  }
+  if (d_eq_noise_diag_ == nullptr) {
+    if (cudaMalloc(&d_eq_noise_diag_, nv_bytes) != cudaSuccess) {
+      d_eq_noise_diag_ = nullptr;
+      static_cast<void>(cudaGetLastError());
+    }
+  }
+  // Capacity is usable as soon as host staging exists.
+  if (h_eq_diag_pinned_ != nullptr) {
+    eq_diag_capacity_ = capacity;
+  }
+}
+
+void pusch_demodulator_gpu_impl::configure_e2e_eq_tap(bool enable)
+{
+  if (e2e_handle_ == nullptr) {
+    return;
+  }
+  if (enable) {
+    ensure_eq_diag_resources();
+    if (d_eq_diag_ == nullptr || d_eq_noise_diag_ == nullptr) {
+      return;
+    }
+    pusch_e2e_set_eq_output(e2e_handle_, static_cast<float2*>(d_eq_diag_), static_cast<float*>(d_eq_noise_diag_));
+    eq_diag_tap_on_ = true;
+  } else if (eq_diag_tap_on_) {
+    pusch_e2e_set_eq_output(e2e_handle_, nullptr, nullptr);
+    eq_diag_tap_on_ = false;
+  }
+}
+
+void pusch_demodulator_gpu_impl::enable_symbol_capture()
+{
+  capture_symbols_enabled_ = true;
+  capture_requested_slot_  = true;
+  eq_diag_queued_          = false;
+  eq_diag_host_valid_      = false;
+  eq_diag_count_           = 0;
+  last_e2e_eq_count_       = 0;
+  last_capture_src_        = nullptr;
+  last_capture_n_          = 0;
+  captured_eq_host_.clear();
+  ocudulog::fetch_basic_logger("PHY").debug(
+      "constellation capture enable pinned={} cap={}", h_eq_diag_pinned_ != nullptr, eq_diag_capacity_);
+}
+
+void pusch_demodulator_gpu_impl::disable_symbol_capture()
+{
+  capture_symbols_enabled_ = false;
+}
+
+bool pusch_demodulator_gpu_impl::force_eq_diag_host_copy()
+{
+  // Prefer the device source recorded at queue time, else NeuralEq d_symbols_, else E2E tap.
+  const void* src = last_capture_src_;
+  std::size_t n   = last_capture_n_;
+  if (src == nullptr || n == 0) {
+    if (last_nof_eq_re_ > 0 && d_symbols_ != nullptr) {
+      src = d_symbols_;
+      n   = last_nof_eq_re_;
+    } else if (last_e2e_eq_count_ > 0 && d_eq_diag_ != nullptr) {
+      src = d_eq_diag_;
+      n   = last_e2e_eq_count_;
+    }
+  }
+  if (src == nullptr || n == 0) {
+    return false;
+  }
+  ensure_eq_diag_resources();
+  n = std::min(n, eq_diag_capacity_ != 0 ? eq_diag_capacity_ : n);
+  if (n == 0) {
+    return false;
+  }
+  captured_eq_host_.resize(n);
+  // Blocking D2H — only called from decoder pre-join after LDPC has already waited on stream_.
+  if (cudaMemcpy(captured_eq_host_.data(), src, n * sizeof(std::complex<float>), cudaMemcpyDeviceToHost) !=
+      cudaSuccess) {
+    static_cast<void>(cudaGetLastError());
+    captured_eq_host_.clear();
+    eq_diag_host_valid_ = false;
+    eq_diag_count_      = 0;
+    return false;
+  }
+  eq_diag_count_      = n;
+  eq_diag_host_valid_ = true;
+  eq_diag_queued_     = true;
+  // Also mirror into pinned buffer for any legacy readers.
+  if (h_eq_diag_pinned_ != nullptr && eq_diag_capacity_ >= n) {
+    std::memcpy(h_eq_diag_pinned_, captured_eq_host_.data(), n * sizeof(std::complex<float>));
+  }
+  return true;
+}
+
+void pusch_demodulator_gpu_impl::queue_eq_symbol_d2h(const void* src,
+                                                     std::size_t nof_eq_symbols,
+                                                     cudaEvent_t ready_event)
+{
+  // Fully off the slot-critical CPU path: only enqueue GPU work.
+  // Sibling stream waits for source-ready, then D2H in parallel with soft-demod/LDPC.
+  if ((!capture_symbols_enabled_ && !capture_requested_slot_) || src == nullptr || nof_eq_symbols == 0) {
+    static std::atomic<unsigned> skip_logs{0};
+    if (skip_logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+      ocudulog::fetch_basic_logger("PHY").debug("constellation queue SKIP enabled={} req={} src={} n={} this={}",
+                                                capture_symbols_enabled_,
+                                                capture_requested_slot_,
+                                                src != nullptr,
+                                                nof_eq_symbols,
+                                                static_cast<const void*>(this));
+    }
+    return;
+  }
+  ensure_eq_diag_resources();
+  // Always record the device source so pre-join can force a blocking D2H even if async fails.
+  const std::size_t n_cap = eq_diag_capacity_ != 0 ? eq_diag_capacity_ : MAX_CAPTURE_EQ_SYMBOLS;
+  const std::size_t n     = std::min(nof_eq_symbols, n_cap);
+  last_capture_src_       = src;
+  last_capture_n_         = n;
+  static std::atomic<unsigned> queue_logs{0};
+  if (queue_logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+    ocudulog::fetch_basic_logger("PHY").debug("constellation queue OK n={} src={} pinned={} this={}",
+                                              n,
+                                              src != nullptr,
+                                              h_eq_diag_pinned_ != nullptr,
+                                              static_cast<const void*>(this));
+  }
+  if (h_eq_diag_pinned_ == nullptr || eq_diag_capacity_ == 0) {
+    return;
+  }
+  const std::size_t bytes    = n * sizeof(std::complex<float>);
+  cudaStream_t      download = d2h_stream_ != nullptr ? d2h_stream_ : stream_;
+  if (d2h_stream_ != nullptr) {
+    if (ready_event != nullptr) {
+      cudaStreamWaitEvent(download, ready_event, 0);
+    } else if (eq_diag_ready_event_ != nullptr) {
+      cudaEventRecord(eq_diag_ready_event_, stream_);
+      cudaStreamWaitEvent(download, eq_diag_ready_event_, 0);
+    }
+  }
+  if (cudaMemcpyAsync(h_eq_diag_pinned_, src, bytes, cudaMemcpyDeviceToHost, download) == cudaSuccess) {
+    if (eq_diag_event_ != nullptr) {
+      cudaEventRecord(eq_diag_event_, download);
+    }
+    eq_diag_count_      = n;
+    eq_diag_queued_     = true;
+    eq_diag_host_valid_ = false; // valid only after event/stream sync or force copy
+  } else {
+    static_cast<void>(cudaGetLastError());
+    eq_diag_queued_     = false;
+    eq_diag_count_      = 0;
+    eq_diag_host_valid_ = false;
+  }
+}
+
+span<const std::complex<float>> pusch_demodulator_gpu_impl::get_captured_symbols() const
+{
+  static_assert(sizeof(cf_t) == sizeof(std::complex<float>), "cf_t must be compatible with std::complex<float>.");
+  // Preferred: stable host snapshot filled by wait_captured_symbols().
+  if (!captured_eq_host_.empty()) {
+    return span<const std::complex<float>>(captured_eq_host_.data(), captured_eq_host_.size());
+  }
+  // Host already validated (after wait_captured_symbols or sync fallback).
+  if (eq_diag_host_valid_ && h_eq_diag_pinned_ && eq_diag_count_ != 0) {
+    return span<const std::complex<float>>(h_eq_diag_pinned_, eq_diag_count_);
+  }
+  // Async path: only return when D2H has finished — never stall the main demod stream.
+  if (eq_diag_queued_ && eq_diag_event_ && h_eq_diag_pinned_ && eq_diag_count_ != 0) {
+    if (cudaEventQuery(eq_diag_event_) == cudaSuccess) {
+      return span<const std::complex<float>>(h_eq_diag_pinned_, eq_diag_count_);
+    }
+    // Not ready yet (caller on slot-critical path) — empty is OK; pre-join will wait+retry.
+    return {};
+  }
+  // CPU-equalization path already has host-side accumulated symbols (no D2H).
+  if (accumulated_count_ != 0 && !accumulated_symbols_.empty()) {
+    return span<const std::complex<float>>(reinterpret_cast<const std::complex<float>*>(accumulated_symbols_.data()),
+                                           accumulated_count_);
+  }
+  return {};
+}
+
+void pusch_demodulator_gpu_impl::wait_captured_symbols()
+{
+  // Off slot-critical path (decoder pre-join). Prefer async D2H completion, then force a
+  // blocking copy from the device EQ buffer for this slot (NeuralEq d_symbols_ or E2E tap).
+  if (!capture_requested_slot_ && !eq_diag_queued_ && last_capture_src_ == nullptr && last_nof_eq_re_ == 0 &&
+      last_e2e_eq_count_ == 0 && captured_eq_host_.empty()) {
+    return;
+  }
+
+  // 1) Drain async D2H if it was queued.
+  if (eq_diag_queued_ && eq_diag_event_ != nullptr) {
+    if (cudaEventSynchronize(eq_diag_event_) == cudaSuccess && h_eq_diag_pinned_ != nullptr && eq_diag_count_ != 0) {
+      captured_eq_host_.assign(h_eq_diag_pinned_, h_eq_diag_pinned_ + eq_diag_count_);
+      eq_diag_host_valid_     = true;
+      capture_requested_slot_ = false;
+      return;
+    }
+    static_cast<void>(cudaGetLastError());
+  }
+  if (eq_diag_queued_ && d2h_stream_ != nullptr && h_eq_diag_pinned_ != nullptr && eq_diag_count_ != 0) {
+    cudaStreamSynchronize(d2h_stream_);
+    captured_eq_host_.assign(h_eq_diag_pinned_, h_eq_diag_pinned_ + eq_diag_count_);
+    eq_diag_host_valid_     = true;
+    capture_requested_slot_ = false;
+    return;
+  }
+
+  // 2) Force blocking D2H from device EQ (always available after LDPC has waited on stream_).
+  if (force_eq_diag_host_copy()) {
+    capture_requested_slot_ = false;
+    return;
+  }
+
+  // 3) CPU EQ path.
+  if (accumulated_count_ != 0 && !accumulated_symbols_.empty()) {
+    captured_eq_host_.resize(accumulated_count_);
+    std::memcpy(
+        captured_eq_host_.data(), accumulated_symbols_.data(), accumulated_count_ * sizeof(std::complex<float>));
+    eq_diag_count_          = accumulated_count_;
+    eq_diag_host_valid_     = true;
+    capture_requested_slot_ = false;
+    return;
+  }
+
+  capture_requested_slot_ = false;
+  // Rate-limited so we can see empty captures without spamming every slot.
+  ocudulog::fetch_basic_logger("PHY").debug(
+      "constellation capture empty after wait: queued={} count={} last_nof_eq={} last_e2e={} dapp_inline={}",
+      eq_diag_queued_,
+      eq_diag_count_,
+      last_nof_eq_re_,
+      last_e2e_eq_count_,
+      last_dapp_inline_);
+}
+
 pusch_demodulator_gpu_impl::~pusch_demodulator_gpu_impl()
 {
+  if (stream_ != nullptr) {
+    cudaStreamSynchronizeYielding(stream_);
+  }
+  if (resident_dapp_) {
+    // The hook slot can retain this adapter beyond the demodulator lifetime. Do not leave it
+    // holding a completion token for an event owned and destroyed below.
+    resident_dapp_->on_completion(nullptr);
+  }
+  resident_dapp_.reset();
+
   // Free device memory.
   if (d_symbols_)
     cudaFree(d_symbols_);
@@ -1194,6 +1527,26 @@ pusch_demodulator_gpu_impl::~pusch_demodulator_gpu_impl()
 
   if (h_llrs_half_pinned_)
     cudaFreeHost(h_llrs_half_pinned_);
+  if (h_eq_diag_pinned_) {
+    cudaFreeHost(h_eq_diag_pinned_);
+    h_eq_diag_pinned_ = nullptr;
+  }
+  if (d_eq_diag_) {
+    cudaFree(d_eq_diag_);
+    d_eq_diag_ = nullptr;
+  }
+  if (d_eq_noise_diag_) {
+    cudaFree(d_eq_noise_diag_);
+    d_eq_noise_diag_ = nullptr;
+  }
+  if (eq_diag_ready_event_) {
+    cudaEventDestroy(eq_diag_ready_event_);
+    eq_diag_ready_event_ = nullptr;
+  }
+  if (eq_diag_event_) {
+    cudaEventDestroy(eq_diag_event_);
+    eq_diag_event_ = nullptr;
+  }
   if (d2h_stream_)
     cudaStreamDestroy(d2h_stream_);
   if (d2h_event_)
@@ -1313,8 +1666,11 @@ void pusch_demodulator_gpu_impl::demodulate(pusch_codeword_buffer&              
 
   // Reset GPU LLR state from previous demodulation.
   gpu_llrs_valid_                    = false;
-  last_device_grid_used_ = false;
+  last_device_grid_used_             = false;
   last_owned_device_grid_used_       = false;
+  last_dapp_inline_                  = false;
+  last_dapp_post_eq_noise_valid_     = false;
+  last_nof_eq_re_                    = 0;
   gpu_uci_llrs_valid_                = false;
   gpu_uci_decoded_valid_             = false;
   gpu_harq_ack_decoded_              = false;
@@ -1382,9 +1738,7 @@ void pusch_demodulator_gpu_impl::demodulate(pusch_codeword_buffer&              
 
   if (can_use_gpu_eq) {
     int dmrs_type_val = (config.dmrs_type == dmrs_config_type::type1) ? 1 : 2;
-    if (re_indices_cache_.matches(static_cast<unsigned>(config.rb_mask.count()),
-                                  static_cast<unsigned>(config.rb_mask.find_lowest()),
-                                  static_cast<unsigned>(config.rb_mask.find_highest()),
+    if (re_indices_cache_.matches(config.rb_mask,
                                   config.dmrs_symb_pos.to_uint64(),
                                   config.start_symbol_index,
                                   config.nof_symbols,
@@ -1560,9 +1914,7 @@ void pusch_demodulator_gpu_impl::demodulate(pusch_codeword_buffer&              
   // Update RE indices cache after building new indices (on cache miss).
   if (can_use_gpu_eq && !re_indices_cached) {
     int dmrs_type_val = (config.dmrs_type == dmrs_config_type::type1) ? 1 : 2;
-    re_indices_cache_.update(static_cast<unsigned>(config.rb_mask.count()),
-                             static_cast<unsigned>(config.rb_mask.find_lowest()),
-                             static_cast<unsigned>(config.rb_mask.find_highest()),
+    re_indices_cache_.update(config.rb_mask,
                              config.dmrs_symb_pos.to_uint64(),
                              config.start_symbol_index,
                              config.nof_symbols,
@@ -2200,9 +2552,8 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   // Get host staging pointer for geometry metadata when the RE-index cache misses.
   char* h_staging            = static_cast<char*>(h_unified_staging_[buf_idx]);
   int*  h_indices_staging    = reinterpret_cast<int*>(h_staging + unified_indices_offset_);
-  bool  re_indices_on_device = d_re_indices_cache_[buf_idx].matches(static_cast<unsigned>(config.rb_mask.count()),
-                                                                   static_cast<unsigned>(config.rb_mask.find_lowest()),
-                                                                   static_cast<unsigned>(config.rb_mask.find_highest()),
+  bool  re_indices_on_device = d_re_indices_offsets_[buf_idx] == unified_indices_offset_ &&
+                              d_re_indices_cache_[buf_idx].matches(config.rb_mask,
                                                                    config.dmrs_symb_pos.to_uint64(),
                                                                    config.start_symbol_index,
                                                                    config.nof_symbols,
@@ -2515,9 +2866,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   // DMA metadata. RE indices are geometry-only and cached per device buffer.
   if (!re_indices_on_device) {
     cudaMemcpyAsync(d_re_indices_, h_indices_staging, indices_bytes, cudaMemcpyHostToDevice, upload_stream);
-    d_re_indices_cache_[buf_idx].update(static_cast<unsigned>(config.rb_mask.count()),
-                                        static_cast<unsigned>(config.rb_mask.find_lowest()),
-                                        static_cast<unsigned>(config.rb_mask.find_highest()),
+    d_re_indices_cache_[buf_idx].update(config.rb_mask,
                                         config.dmrs_symb_pos.to_uint64(),
                                         config.start_symbol_index,
                                         config.nof_symbols,
@@ -2525,6 +2874,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
                                         config.nof_cdm_groups_without_data,
                                         nof_subcarriers,
                                         raw_accumulated_re_);
+    d_re_indices_offsets_[buf_idx] = unified_indices_offset_;
   }
 
   // Record profiling: H2D end
@@ -2552,11 +2902,153 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
     cudaEventRecord(prof_kernel_start_, stream_);
   }
 
-  // Run E2E kernel. The optimized single-layer and MIMO paths both emit FP16
-  // device LLRs so GPU-resident LDPC decode can consume them directly.
-  // Use triple-buffered LLR output for this iteration (buf_idx).
-  const bool dapp_inline_used = config.enable_transform_precoding;
-  if (config.enable_transform_precoding) {
+  // Give a resident full-receiver dApp first authority over the prepared grid, RE indices,
+  // inherited stream and caller-owned FP16 output. A returned failure leaves any already
+  // enqueued work ordered before the conventional overwrite on this same stream.
+  bool dapp_inline_used         = false;
+  bool dapp_post_eq_noise_valid = false;
+  auto demodulate_equalized     = [&]() {
+    // PUSCH data scrambling (TS 38.211 §6.3.1.1): c_init = n_RNTI·2^15 + q·2^14 + n_ID.
+    // Slot index is NOT part of data scrambling (only DMRS). Passing n_s into
+    // scrambler_configure() injects (n_s&0x1F)<<4 into c_init and yields ~100% UL CRC
+    // even when the Class-A equalizer symbols are correct — which is exactly the OTA
+    // "DAPP-EQ ok but all NOK" failure mode. Match the working GPU E2E path (n_s=0).
+    nr_scrambling_config_t scr_cfg{};
+    scr_cfg.n_RNTI = static_cast<uint16_t>(config.rnti);
+    scr_cfg.n_ID   = config.n_id;
+    scr_cfg.q      = 0;
+    scr_cfg.n_s    = 0;
+    status         = scrambler_configure(scr_handle_, &scr_cfg);
+    if (status == NR_LDPC_SUCCESS) {
+      status = scrambler_generate_sequence(scr_handle_, static_cast<int>(num_llrs), stream_);
+    }
+    if (status != NR_LDPC_SUCCESS) {
+      return false;
+    }
+    const int demod_status = modulator_soft_demod_descramble_half(mod_handle_,
+                                                                  static_cast<cuFloatComplex*>(d_symbols_),
+                                                                  static_cast<float*>(d_noise_vars_),
+                                                                  scrambler_get_sequence_ptr(scr_handle_),
+                                                                  d_llrs_half_[buf_idx],
+                                                                  static_cast<int>(nof_re * nof_tx_layers),
+                                                                  mod_order,
+                                                                  stream_);
+    status                 = demod_status == 0 ? NR_LDPC_SUCCESS : NR_LDPC_ERROR_CUDA_FAILED;
+    return demod_status == 0;
+  };
+  if (resident_dapp_) {
+    const pusch_resident_dapp_buffers buffers{.grid_cbf16           = d_grid_cbf16_,
+                                              .data_re_indices      = reinterpret_cast<const uint32_t*>(d_re_indices_),
+                                              .equalized_cf32       = d_symbols_,
+                                              .post_eq_noise_f32    = d_noise_vars_,
+                                              .llrs_f16             = d_llrs_half_[buf_idx],
+                                              .nof_grid_ports       = nof_rx_ports,
+                                              .nof_grid_symbols     = nof_symbols,
+                                              .nof_grid_subcarriers = nof_subcarriers,
+                                              .nof_data_re          = static_cast<uint32_t>(nof_re),
+                                              .device_ordinal       = 0,
+                                              .completion_slot      = static_cast<uint32_t>(buf_idx),
+                                              .execution_stream     = reinterpret_cast<uintptr_t>(stream_)};
+    const pusch_resident_dapp_mode    resident_mode = resident_dapp_->mode();
+    if (resident_mode == pusch_resident_dapp_mode::channel_estimator) {
+      const auto invoked = resident_dapp_->invoke_channel_estimator(buffers, config);
+      if (invoked.status == OCUDU_DAPP_OK_V1 && !invoked.invoke_fallback) {
+        if (config.nof_tx_layers <= 2) {
+          const bool eq_ok =
+              launch_pusch_resident_ce_equalizer(static_cast<const uint32_t*>(d_grid_cbf16_),
+                                                 static_cast<const float2*>(resident_dapp_->channel_estimates_cf32()),
+                                                 resident_dapp_->channel_noise_f32(),
+                                                 reinterpret_cast<const uint32_t*>(d_re_indices_),
+                                                 static_cast<float2*>(d_symbols_),
+                                                 static_cast<float*>(d_noise_vars_),
+                                                 nof_rx_ports,
+                                                 nof_tx_layers,
+                                                 nof_symbols,
+                                                 nof_subcarriers,
+                                                 static_cast<uint32_t>(nof_re),
+                                                 stream_);
+          if (eq_ok) {
+            // Stash EQ availability even if soft-demod later fails — pre-join force-D2H needs this.
+            last_nof_eq_re_   = static_cast<std::size_t>(nof_re) * static_cast<std::size_t>(nof_tx_layers);
+            last_capture_src_ = d_symbols_;
+            last_capture_n_   = last_nof_eq_re_;
+            // Async constellation D2H in parallel with soft-demod (sibling stream).
+            queue_eq_symbol_d2h(d_symbols_, last_nof_eq_re_);
+          }
+          dapp_inline_used = eq_ok && demodulate_equalized();
+          // The first equalization's demapper variance has already been consumed
+          // by soft demodulation on this stream. If the CE supplied a distinct
+          // scheduler disturbance, recompute only the post-EQ reporting buffer
+          // after soft demodulation. This keeps MMSE/LLRs calibrated while making
+          // scheduler SINR include channel-estimation error, without a host copy.
+          if (dapp_inline_used) {
+            if (const float* scheduler_noise = resident_dapp_->channel_scheduler_noise_f32();
+                scheduler_noise != nullptr) {
+              dapp_inline_used = launch_pusch_resident_ce_scheduler_noise(
+                  static_cast<const float2*>(resident_dapp_->channel_estimates_cf32()),
+                  scheduler_noise,
+                  reinterpret_cast<const uint32_t*>(d_re_indices_),
+                  static_cast<float*>(d_noise_vars_),
+                  nof_rx_ports,
+                  nof_tx_layers,
+                  nof_symbols,
+                  nof_subcarriers,
+                  static_cast<uint32_t>(nof_re),
+                  stream_);
+            }
+          }
+          status                   = dapp_inline_used ? NR_LDPC_SUCCESS : NR_LDPC_ERROR_CUDA_FAILED;
+          dapp_post_eq_noise_valid = dapp_inline_used;
+        }
+      }
+    } else if (resident_mode == pusch_resident_dapp_mode::equalizer) {
+      const auto invoked = resident_dapp_->invoke_equalizer(buffers, config);
+      if (invoked.status == OCUDU_DAPP_OK_V1 && !invoked.invoke_fallback) {
+        // Stash EQ availability even if soft-demod later fails — pre-join force-D2H needs this.
+        last_nof_eq_re_   = static_cast<std::size_t>(nof_re) * static_cast<std::size_t>(nof_tx_layers);
+        last_capture_src_ = d_symbols_;
+        last_capture_n_   = last_nof_eq_re_;
+        // NeuralEq path: EQ already enqueued on stream_; async D2H overlaps soft-demod/LDPC.
+        queue_eq_symbol_d2h(d_symbols_, last_nof_eq_re_);
+        dapp_inline_used         = demodulate_equalized();
+        dapp_post_eq_noise_valid = dapp_inline_used;
+      }
+    } else if (resident_mode == pusch_resident_dapp_mode::receiver) {
+      const auto invoked = resident_dapp_->invoke_receiver(buffers, config);
+      if (invoked.status == OCUDU_DAPP_OK_V1 && !invoked.invoke_fallback) {
+        // Same PUSCH data c_init as demodulate_equalized / GPU E2E (n_s must be 0).
+        nr_scrambling_config_t scr_cfg{};
+        scr_cfg.n_RNTI = static_cast<uint16_t>(config.rnti);
+        scr_cfg.n_ID   = config.n_id;
+        scr_cfg.q      = 0;
+        scr_cfg.n_s    = 0;
+        status         = scrambler_configure(scr_handle_, &scr_cfg);
+        if (status == NR_LDPC_SUCCESS) {
+          status = scrambler_descramble_llr_half_inplace(
+              scr_handle_, d_llrs_half_[buf_idx], static_cast<int>(num_llrs), stream_);
+        }
+        dapp_inline_used         = status == NR_LDPC_SUCCESS;
+        dapp_post_eq_noise_valid = dapp_inline_used && resident_dapp_->receiver_post_eq_noise_valid();
+      }
+    }
+  }
+
+  if (resident_dapp_ && !resident_dapp_->on_inline_output_enqueued(static_cast<uint32_t>(buf_idx), dapp_inline_used)) {
+    dapp_inline_used = false;
+  }
+
+  // Conventional GPU E2E: optionally mirror equalized symbols for constellation (ai-ran set_eq_output tap).
+  // Zero cost when capture is off (NULL pointers). NeuralEq / dApp-inline path already queued D2H from d_symbols_.
+  const bool want_e2e_eq_tap = !dapp_inline_used && capture_symbols_enabled_;
+  if (want_e2e_eq_tap) {
+    configure_e2e_eq_tap(true);
+  } else {
+    configure_e2e_eq_tap(false);
+  }
+
+  // Run the conventional E2E kernel unless the dApp produced the complete pre-descrambling
+  // result and OCUDU successfully appended scrambling reversal.
+  if (!dapp_inline_used && config.enable_transform_precoding) {
     int dft_size         = static_cast<int>(config.rb_mask.count()) * NOF_SUBCARRIERS_PER_RB;
     int nof_data_symbols = (dft_size > 0) ? static_cast<int>(nof_re / static_cast<unsigned>(dft_size)) : 0;
 
@@ -2568,10 +3060,10 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
                                                          dft_size,
                                                          nof_data_symbols,
                                                          stream_);
-  } else if (config.nof_tx_layers == 1) {
+  } else if (!dapp_inline_used && config.nof_tx_layers == 1) {
     status = pusch_e2e_process_full_gpu_optimized(
         e2e_handle_, d_grid_cbf16_, d_llrs_half_[buf_idx], d_re_indices_, static_cast<int>(nof_re), stream_);
-  } else {
+  } else if (!dapp_inline_used) {
     status = pusch_e2e_process_full_gpu_optimized_mimo_half(
         e2e_handle_, d_grid_cbf16_, d_llrs_half_[buf_idx], d_re_indices_, static_cast<int>(nof_re), stream_);
   }
@@ -2586,8 +3078,11 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   us_eq              = us_since(t_eq0);
   const auto t_post0 = std::chrono::steady_clock::now();
 
-  if (status != NR_LDPC_SUCCESS) {
+  if (!dapp_inline_used && status != NR_LDPC_SUCCESS) {
     cudaStreamSynchronizeYielding(stream_);
+    if (resident_dapp_) {
+      resident_dapp_->on_completion(nullptr);
+    }
     cudaError_t cuda_status = cudaGetLastError();
     ocudulog::fetch_basic_logger("PHY").warning(
         "PUSCH GPU E2E kernel failed with status {} (CUDA: {}); falling back to CPU.",
@@ -2834,36 +3329,71 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   //
   // Resident no-UCI path (default on; OCUDU_PUSCH_SINR_SIDE_STREAM=0 disables): route the tiny SINR
   // readback copies to d2h_stream_ so the compute stream goes straight from the demod
-  // kernels to the decoder's kernels. A D2H between two kernels on the same stream costs
-  // a large dispatch boundary on GB10; the side stream overlaps the copies with decode.
+  // kernels to the decoder's kernels. Skip when Class-A dApp produced LLRs inline.
   static const bool sinr_side_stream = []() {
     const char* v = std::getenv("OCUDU_PUSCH_SINR_SIDE_STREAM");
     return (v == nullptr) || (v[0] != '0');
   }();
   const bool resident_skip_sync =
       gpu_resident_mode_ && !resident_host_uci_demux_enabled(config) && !compact_uci_on_device;
-  if (resident_skip_sync && sinr_side_stream && (d2h_stream_ != nullptr) && kernel_complete_[buf_idx]) {
-    cudaEventRecord(kernel_complete_[buf_idx], stream_);
-    cudaStreamWaitEvent(d2h_stream_, kernel_complete_[buf_idx], 0);
-    pusch_e2e_sinr_async_launch(e2e_handle_, d2h_stream_);
-    last_sinr_on_side_stream_ = true;
-  } else {
-    pusch_e2e_sinr_async_launch(e2e_handle_, stream_);
-
-    // PHASE 2.2: Record kernel completion event for async D2H coordination.
-    if (kernel_complete_[buf_idx]) {
+  last_sinr_on_side_stream_ = false;
+  if (!dapp_inline_used) {
+    if (resident_skip_sync && sinr_side_stream && (d2h_stream_ != nullptr) && kernel_complete_[buf_idx]) {
       cudaEventRecord(kernel_complete_[buf_idx], stream_);
+      cudaStreamWaitEvent(d2h_stream_, kernel_complete_[buf_idx], 0);
+      pusch_e2e_sinr_async_launch(e2e_handle_, d2h_stream_);
+      last_sinr_on_side_stream_ = true;
+    } else {
+      pusch_e2e_sinr_async_launch(e2e_handle_, stream_);
     }
-    last_sinr_on_side_stream_ = false;
+  }
+
+  // PHASE 2.2: Record kernel completion event for async D2H / dApp coordination.
+  // Side-stream SINR path already recorded kernel_complete_ above.
+  if (kernel_complete_[buf_idx]) {
+    bool event_ok = last_sinr_on_side_stream_;
+    if (!event_ok) {
+      if (cudaEventRecord(kernel_complete_[buf_idx], stream_) != cudaSuccess) {
+        static_cast<void>(cudaGetLastError());
+        cudaStreamSynchronizeYielding(stream_);
+        event_ok = false;
+      } else {
+        event_ok = true;
+      }
+    }
+    if (resident_dapp_) {
+      resident_dapp_->on_completion(event_ok ? static_cast<void*>(kernel_complete_[buf_idx]) : nullptr);
+    }
+  } else if (resident_dapp_) {
+    cudaStreamSynchronizeYielding(stream_);
+    resident_dapp_->on_completion(nullptr);
+  }
+
+  // Conventional E2E constellation D2H: wait on kernel_complete, copy d_eq_diag_ on sibling stream
+  // (overlaps LDPC on main stream). Skip if NeuralEq already queued D2H from d_symbols_.
+  if (want_e2e_eq_tap && d_eq_diag_ != nullptr) {
+    const std::size_t nof_eq = static_cast<std::size_t>(nof_re) * static_cast<std::size_t>(std::max(1U, nof_tx_layers));
+    last_e2e_eq_count_       = nof_eq;
+    if (!eq_diag_queued_) {
+      queue_eq_symbol_d2h(d_eq_diag_, nof_eq, kernel_complete_[buf_idx]);
+    }
   }
 
   // Store which buffer was just written for decoder to read from.
-  last_buf_           = buf_idx;
-  last_resident_llrs_ = compact_sch_llrs ? d_sch_llrs_half_[buf_idx] : d_llrs_half_[buf_idx];
-  last_num_llrs_      = compact_sch_llrs ? resident_compaction.nof_ul_sch_bits : num_llrs;
-  last_n_id_          = config.n_id;
-  last_rnti_          = static_cast<uint16_t>(config.rnti);
-  gpu_llrs_valid_     = true;
+  last_buf_                      = buf_idx;
+  last_resident_llrs_            = compact_sch_llrs ? d_sch_llrs_half_[buf_idx] : d_llrs_half_[buf_idx];
+  last_num_llrs_                 = compact_sch_llrs ? resident_compaction.nof_ul_sch_bits : num_llrs;
+  last_n_id_                     = config.n_id;
+  last_rnti_                     = static_cast<uint16_t>(config.rnti);
+  gpu_llrs_valid_                = true;
+  last_dapp_inline_              = dapp_inline_used;
+  last_dapp_post_eq_noise_valid_ = dapp_inline_used && dapp_post_eq_noise_valid;
+  // Preserve last_nof_eq_re_ if EQ was already stashed above (NeuralEq / CE-EQ). Only overwrite
+  // when dApp-inline succeeded so deferred SINR still has a size; do NOT zero it when soft-demod
+  // falls back — constellation force-D2H still needs the EQ buffer size.
+  if (dapp_inline_used) {
+    last_nof_eq_re_ = static_cast<std::size_t>(nof_re) * static_cast<std::size_t>(nof_tx_layers);
+  }
 
   // GPU-resident mode without scheduler-visible UCI: SKIP sync and SINR readback here. The decoder will sync with the
   // GPU via cudaStreamSynchronize, after which SINR can be read from pinned memory via report_deferred_sinr().
@@ -2916,17 +3446,40 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
     }
 
     // Read SINR/EPRE/RSRP/TA from pinned memory (async D2H already complete after event sync).
-    float gpu_sinr_db = pusch_e2e_sinr_get_result(e2e_handle_);
-    float gpu_epre_db = pusch_e2e_epre_get_result(e2e_handle_);
-    float gpu_rsrp_db = pusch_e2e_rsrp_get_result(e2e_handle_);
-    float gpu_ta_s    = pusch_e2e_ta_get_result(e2e_handle_);
-    float gpu_cfo_hz  = pusch_e2e_cfo_get_result(e2e_handle_);
-    float gpu_evm     = pusch_e2e_evm_get_result(e2e_handle_);
+    // Class-A dApp inline: derive post-EQ SINR from d_noise_vars_ (E2E SINR path skipped).
+    if (dapp_inline_used) {
+      pusch_demodulator_notifier::demodulation_stats stats;
+      float                                          sinr_db = 0.0f;
+      if (last_dapp_post_eq_noise_valid_ && d_noise_vars_ != nullptr && last_nof_eq_re_ != 0) {
+        if (dapp_post_eq_noise_host_.size() < last_nof_eq_re_) {
+          dapp_post_eq_noise_host_.resize(last_nof_eq_re_);
+        }
+        if (cudaMemcpy(dapp_post_eq_noise_host_.data(),
+                       d_noise_vars_,
+                       last_nof_eq_re_ * sizeof(float),
+                       cudaMemcpyDeviceToHost) == cudaSuccess &&
+            mean_post_eq_sinr_db_from_noise(span<const float>(dapp_post_eq_noise_host_.data(), last_nof_eq_re_),
+                                            sinr_db)) {
+          stats.sinr_dB.emplace(sinr_db);
+        } else {
+          static_cast<void>(cudaGetLastError());
+        }
+      }
+      sanitize_stats_in_place(stats, static_cast<uint16_t>(config.rnti));
+      notifier.on_end_stats(stats);
+    } else {
+      float gpu_sinr_db = pusch_e2e_sinr_get_result(e2e_handle_);
+      float gpu_epre_db = pusch_e2e_epre_get_result(e2e_handle_);
+      float gpu_rsrp_db = pusch_e2e_rsrp_get_result(e2e_handle_);
+      float gpu_ta_s    = pusch_e2e_ta_get_result(e2e_handle_);
+      float gpu_cfo_hz  = pusch_e2e_cfo_get_result(e2e_handle_);
+      float gpu_evm     = pusch_e2e_evm_get_result(e2e_handle_);
 
-    pusch_demodulator_notifier::demodulation_stats stats =
-        build_e2e_final_stats(gpu_sinr_db, gpu_epre_db, gpu_rsrp_db, gpu_ta_s, gpu_cfo_hz, gpu_evm);
-    sanitize_stats_in_place(stats, static_cast<uint16_t>(config.rnti));
-    notifier.on_end_stats(stats);
+      pusch_demodulator_notifier::demodulation_stats stats =
+          build_e2e_final_stats(gpu_sinr_db, gpu_epre_db, gpu_rsrp_db, gpu_ta_s, gpu_cfo_hz, gpu_evm);
+      sanitize_stats_in_place(stats, static_cast<uint16_t>(config.rnti));
+      notifier.on_end_stats(stats);
+    }
   }
 
   if (compact_uci_on_device) {
@@ -3278,6 +3831,31 @@ void pusch_demodulator_gpu_impl::finalize_resident_uci()
 
 float pusch_demodulator_gpu_impl::report_deferred_sinr(pusch_demodulator_notifier& notifier)
 {
+  // Class-A equalizer dApp inline: E2E SINR D2H was skipped; after decoder
+  // stream sync, derive CSI from post-EQ noise for CRC / scheduler feedback.
+  if (last_dapp_inline_) {
+    pusch_demodulator_notifier::demodulation_stats stats;
+    float                                          sinr_db = 0.0f;
+    if (last_dapp_post_eq_noise_valid_ && d_noise_vars_ != nullptr && last_nof_eq_re_ != 0) {
+      if (dapp_post_eq_noise_host_.size() < last_nof_eq_re_) {
+        dapp_post_eq_noise_host_.resize(last_nof_eq_re_);
+      }
+      // Decoder pre-join already synchronized the demod stream.
+      if (cudaMemcpy(dapp_post_eq_noise_host_.data(),
+                     d_noise_vars_,
+                     last_nof_eq_re_ * sizeof(float),
+                     cudaMemcpyDeviceToHost) == cudaSuccess &&
+          mean_post_eq_sinr_db_from_noise(span<const float>(dapp_post_eq_noise_host_.data(), last_nof_eq_re_),
+                                          sinr_db)) {
+        stats.sinr_dB.emplace(sinr_db);
+      } else {
+        static_cast<void>(cudaGetLastError());
+      }
+    }
+    sanitize_stats_in_place(stats, last_rnti_);
+    notifier.on_end_stats(stats);
+    return 0.0F;
+  }
   // Read SINR from pinned memory. The async D2H was launched before kernel_complete_
   // event was recorded. After the decoder's cudaStreamSynchronize, the E2E kernel
   // (and its SINR D2H) are guaranteed complete.
@@ -3320,4 +3898,11 @@ float pusch_demodulator_gpu_impl::report_deferred_sinr(pusch_demodulator_notifie
   notifier.on_end_stats(stats);
 
   return 0.0F;
+}
+
+void pusch_demodulator_gpu_impl::report_deferred_dapp_completion()
+{
+  if (resident_dapp_ != nullptr && last_buf_ >= 0) {
+    resident_dapp_->observe_inline_completion(static_cast<uint32_t>(last_buf_));
+  }
 }

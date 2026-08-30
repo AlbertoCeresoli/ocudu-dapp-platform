@@ -27,6 +27,8 @@ static odu::du_low_dependencies generate_du_low_dependencies(const o_du_low_unit
 
   upper_phy_factory_dependencies& upper_phy_common_deps = out_deps.upper_phy_common_deps;
   upper_phy_common_deps.executors                       = dependencies.workers.get_upper_phy_execution_config();
+  upper_phy_common_deps.dapp_hooks                      = dependencies.dapp_hooks;
+  upper_phy_common_deps.diagnostics                     = dependencies.phy_diagnostics;
 
   if (hal_dependencies.hw_encoder_factory) {
     upper_phy_common_deps.hw_encoder_factory = hal_dependencies.hw_encoder_factory;

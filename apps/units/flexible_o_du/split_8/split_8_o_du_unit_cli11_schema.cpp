@@ -7,6 +7,9 @@
 #include "apps/units/flexible_o_du/o_du_low/du_low_config_cli11_schema.h"
 #include "apps/units/flexible_o_du/split_8/helpers/ru_sdr_config_cli11_schema.h"
 #include "split_8_o_du_unit_config.h"
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+#include "apps/services/dapp/dapp_config_cli11_schema.h"
+#endif
 
 using namespace ocudu;
 
@@ -15,6 +18,9 @@ void ocudu::configure_cli11_with_split_8_o_du_unit_config_schema(CLI::App& app, 
   configure_cli11_with_o_du_high_config_schema(app, parsed_cfg.odu_high_cfg);
   configure_cli11_with_du_low_config_schema(app, parsed_cfg.du_low_cfg);
   configure_cli11_with_ru_sdr_config_schema(app, parsed_cfg.ru_cfg);
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  app_services::configure_cli11_with_dapp_service_config_schema(app, parsed_cfg.dapp);
+#endif
 }
 
 void ocudu::autoderive_split_8_o_du_parameters_after_parsing(CLI::App& app, split_8_o_du_unit_config& parsed_cfg)
@@ -29,4 +35,7 @@ void ocudu::autoderive_split_8_o_du_parameters_after_parsing(CLI::App& app, spli
   nr_band     band = cell.band ? cell.band.value() : band_helper::get_band_from_dl_arfcn(cell.dl_f_ref_arfcn);
 
   autoderive_du_low_parameters_after_parsing(app, parsed_cfg.du_low_cfg, band_helper::get_duplex_mode(band));
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  app_services::autoderive_dapp_service_config_after_parsing(app, parsed_cfg.dapp);
+#endif
 }

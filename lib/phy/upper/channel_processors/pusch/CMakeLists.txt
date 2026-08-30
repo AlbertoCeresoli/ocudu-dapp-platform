@@ -9,13 +9,21 @@ set(PUSCH_DEMOD_SOURCES
 
 # Add GPU demodulator if CUDA is available
 if(CUDA_ACCEL_FOUND)
-    list(APPEND PUSCH_DEMOD_SOURCES pusch_demodulator_gpu_impl.cpp)
+    list(APPEND PUSCH_DEMOD_SOURCES
+        pusch_demodulator_gpu_impl.cpp
+        ../../dapp/pusch_resident_dapp_cuda.cu)
 endif()
 
 add_library(ocudu_pusch_demodulator STATIC ${PUSCH_DEMOD_SOURCES})
 
 # Link CUDA for GPU demodulator
 if(CUDA_ACCEL_FOUND)
+    set_target_properties(ocudu_pusch_demodulator PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+    if(CMAKE_CUDA_ARCHITECTURES)
+        set_target_properties(ocudu_pusch_demodulator PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+        set_target_properties(ocudu_pusch_demodulator PROPERTIES CUDA_ARCHITECTURES native)
+    endif()
     target_include_directories(ocudu_pusch_demodulator PRIVATE
         ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc)
     target_link_libraries(ocudu_pusch_demodulator PRIVATE ocudu_ldpc_cuda)

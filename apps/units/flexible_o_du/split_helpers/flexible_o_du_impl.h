@@ -14,6 +14,11 @@
 namespace ocudu {
 
 class radio_unit;
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+namespace app_services {
+class dapp_service;
+}
+#endif
 
 /// \brief Flexible O-RAN DU implementation.
 ///
@@ -22,6 +27,7 @@ class flexible_o_du_impl : public odu::du, public du_operation_controller
 {
 public:
   flexible_o_du_impl(unsigned nof_cells_, flexible_o_du_metrics_notifier* notifier);
+  ~flexible_o_du_impl() override;
 
   // See interface for documentation.
   du_operation_controller& get_operation_controller() override { return *this; }
@@ -37,6 +43,11 @@ public:
 
   /// Adds the given DU to this flexible O-RAN DU.
   void add_du(std::unique_ptr<odu::o_du> active_du);
+
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  /// Transfers ownership of the process-wide dApp service.
+  void add_dapp_service(std::unique_ptr<app_services::dapp_service> active_service);
+#endif
 
   /// Returns the O-DU metrics notifier of this flexible O-DU implementation.
   odu::o_du_metrics_notifier& get_o_du_metrics_notifier() { return odu_metrics_handler; }
@@ -54,10 +65,13 @@ private:
   upper_phy_ru_timing_adapter      ru_timing_adapt;
   upper_phy_ru_error_adapter       ru_error_adapt;
   flexible_o_du_metrics_aggregator odu_metrics_handler;
-  std::unique_ptr<odu::o_du>       du;
-  std::unique_ptr<radio_unit>      ru;
-  upper_phy_ru_dl_rg_adapter       ru_dl_rg_adapt;
-  upper_phy_ru_ul_request_adapter  ru_ul_request_adapt;
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  std::unique_ptr<app_services::dapp_service> dapp;
+#endif
+  std::unique_ptr<odu::o_du>      du;
+  std::unique_ptr<radio_unit>     ru;
+  upper_phy_ru_dl_rg_adapter      ru_dl_rg_adapt;
+  upper_phy_ru_ul_request_adapter ru_ul_request_adapt;
 };
 
 } // namespace ocudu

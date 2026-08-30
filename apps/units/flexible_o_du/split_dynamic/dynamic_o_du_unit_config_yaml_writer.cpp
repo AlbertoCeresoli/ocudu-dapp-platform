@@ -9,6 +9,9 @@
 #include "apps/units/flexible_o_du/split_7_2/helpers/ru_ofh_config_yaml_writer.h"
 #include "apps/units/flexible_o_du/split_8/helpers/ru_sdr_config_yaml_writer.h"
 #include "dynamic_o_du_unit_config.h"
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+#include "apps/services/dapp/dapp_config_yaml_writer.h"
+#endif
 
 using namespace ocudu;
 
@@ -61,4 +64,7 @@ void ocudu::fill_dynamic_o_du_unit_config_in_yaml_schema(YAML::Node& node, const
   } else if (std::holds_alternative<ru_sdr_unit_config>(config.ru_cfg)) {
     fill_ru_sdr_config_in_yaml_schema(node, std::get<ru_sdr_unit_config>(config.ru_cfg));
   }
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  app_services::fill_dapp_service_config_in_yaml_schema(node, config.dapp);
+#endif
 }

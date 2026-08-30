@@ -379,6 +379,22 @@ TEST_P(ResourceGridFixture, MaskBitsetContiguous)
   }
 }
 
+// The resident dApp hooks and the CUDA-visible grid rely on the reader exposing one
+// contiguous buffer whose per-(port, symbol) views are laid out at predictable offsets.
+TEST_P(ResourceGridFixture, ContiguousView)
+{
+  span<const cbf16_t> view = grid->get_reader().get_contiguous_view();
+  ASSERT_EQ(view.size(), static_cast<std::size_t>(nof_ports) * nof_symbols * nof_subc);
+
+  for (unsigned port = 0; port != nof_ports; ++port) {
+    for (unsigned symbol = 0; symbol != nof_symbols; ++symbol) {
+      const std::size_t expected_offset = (static_cast<std::size_t>(port) * nof_symbols + symbol) * nof_subc;
+      ASSERT_EQ(grid->get_reader().get_view(port, symbol).data(), view.data() + expected_offset)
+          << "Unexpected noncontiguous resource-grid symbol view.";
+    }
+  }
+}
+
 // Parameterised tests for all parameter combinations.
 INSTANTIATE_TEST_SUITE_P(AllConfigurations,
                          ResourceGridFixture,

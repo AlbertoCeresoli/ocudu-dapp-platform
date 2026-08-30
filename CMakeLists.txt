@@ -73,6 +73,11 @@ option(ENABLE_LIBNUMA        "Enable LibNUMA"                               OFF)
 option(ENABLE_EXPORT         "Enable PIC and export libraries"              OFF)
 option(ENABLE_TRX_DRIVER     "Enable Amarisoft TRX driver library"          OFF)
 option(ENABLE_PLUGINS        "Compile plugins in the plugin folder"         ON)
+# ON by default on this branch: it exists to carry the E3/dApp work, and a build
+# without it silently produces a gNB the dApp launcher refuses to start.
+option(ENABLE_DAPP           "Enable the stable OCUDU dApp SDK and runtime"  ON)
+option(ENABLE_E3             "Enable the embedded E3 dApp management agent" ON)
+option(ENABLE_E3_ASN1_CODEC  "Generate the E3 dApp management APER codec"    ON)
 option(DISABLE_MBEDTLS       "Disable MBEDTLS library and related apps"     OFF)
 option(DISABLE_SCTP          "Disable SCTP library and related apps"        OFF)
 option(BUILD_TESTING         "Compile tests"                                ON)
@@ -87,6 +92,31 @@ endif(BUILD_TESTING)
 
 # NVIDIA CUDA acceleration with in-tree CUDA kernels.
 option(ENABLE_CUDA "Enable NVIDIA CUDA acceleration with in-tree CUDA kernels" OFF)
+
+if(ENABLE_E3 AND NOT ENABLE_DAPP)
+    message(FATAL_ERROR "ENABLE_E3 requires ENABLE_DAPP")
+endif()
+if(ENABLE_E3_ASN1_CODEC AND NOT ENABLE_E3)
+    set(ENABLE_E3_ASN1_CODEC OFF)
+endif()
+
+# dApp feature availability shared by apps/, lib/, and tests/. Evaluated here
+# because apps/ is configured before lib/ and must not depend on cache state
+# left behind by an earlier configure run.
+if(ENABLE_DAPP)
+  find_program(FLATC_EXECUTABLE flatc)
+  find_path(FLATBUFFERS_INCLUDE_DIR flatbuffers/verifier.h)
+  if(FLATC_EXECUTABLE AND FLATBUFFERS_INCLUDE_DIR)
+    set(OCUDU_DAPP_CLASS_C_METADATA ON)
+  else()
+    set(OCUDU_DAPP_CLASS_C_METADATA OFF)
+  endif()
+  if(ENABLE_E3 AND ENABLE_E3_ASN1_CODEC AND OCUDU_DAPP_CLASS_C_METADATA)
+    set(OCUDU_DAPP_E3DP_CARRIER ON)
+  else()
+    set(OCUDU_DAPP_E3DP_CARRIER OFF)
+  endif()
+endif()
 
 if(ENABLE_CUDA)
     include(CheckLanguage)
@@ -720,6 +750,109 @@ if (ENABLE_PLUGINS)
         endif()
     endforeach()
 endif ()
+
+########################################################################
+# Install the stable dApp authoring SDK
+########################################################################
+if(ENABLE_DAPP)
+  include(CMakePackageConfigHelpers)
+  include(GNUInstallDirs)
+  set(OCUDU_DAPP_SDK_VERSION 1)
+  set(OCUDU_DAPP_SDK_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/OCUDUDAppSDK)
+  set(OCUDU_DAPP_SCHEMA_DIR ${CMAKE_INSTALL_DATADIR}/ocudu/dapp/schema)
+  set(OCUDU_DAPP_E3_MANAGEMENT_AVAILABLE OFF)
+
+  install(TARGETS ocudu_dapp_sdk
+    EXPORT OCUDUDAppSDKTargets
+    COMPONENT dapp_sdk)
+  install(DIRECTORY
+    ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/abi
+    ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/process
+    ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/use_cases
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ocudu/dapp
+    COMPONENT dapp_sdk
+    FILES_MATCHING PATTERN "*.h")
+  install(FILES ${PROJECT_SOURCE_DIR}/schemas/dapp/class-c-publication-v1.fbs
+    ${PROJECT_SOURCE_DIR}/schemas/dapp/package-signature-v1.schema.json
+    ${PROJECT_SOURCE_DIR}/schemas/dapp/package-trust-policy-v1.schema.json
+    ${PROJECT_SOURCE_DIR}/schemas/dapp/package-manifest-v1.schema.json
+    ${PROJECT_SOURCE_DIR}/schemas/dapp/package-spdx-sbom-profile-v1.schema.json
+    ${PROJECT_SOURCE_DIR}/schemas/dapp/release-provisioning-report-v1.schema.json
+    DESTINATION ${OCUDU_DAPP_SCHEMA_DIR}
+    COMPONENT dapp_sdk)
+
+  if(ENABLE_E3 AND ENABLE_E3_ASN1_CODEC)
+    set(OCUDU_DAPP_E3_MANAGEMENT_AVAILABLE ON)
+    install(TARGETS
+      ocudu_dapp_management
+      ocudu_dapp_e3sm_asn1
+      ocudu_dapp_e3_codec
+      ocudu_dapp_e3_client
+      ocudu_dapp_e3ap_codec
+      EXPORT OCUDUDAppSDKTargets
+      ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      COMPONENT dapp_sdk)
+    install(FILES
+      ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/artifact_digest.h
+      DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ocudu/dapp
+      COMPONENT dapp_sdk)
+    install(DIRECTORY
+      ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/management
+      DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ocudu/dapp
+      COMPONENT dapp_sdk
+      FILES_MATCHING PATTERN "*.h")
+    install(FILES
+      ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/aper_codec.h
+      ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/e3ap_codec.h
+      ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/e3ap_protocol.h
+      ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/local_client.h
+      ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/management_protocol.h
+      ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/portable_data_types.h
+      ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/result.h
+      ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/telemetry_types.h
+      DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ocudu/dapp/e3
+      COMPONENT dapp_sdk)
+    install(FILES
+      ${PROJECT_SOURCE_DIR}/schemas/e3/e3sm-ocudu-dapp-mgmt-v1.asn1
+      ${PROJECT_SOURCE_DIR}/schemas/e3/e3ap-ocudu-v1.asn1
+      ${PROJECT_SOURCE_DIR}/schemas/e3/e3sm-ocudu-telemetry-v1.asn1
+      ${PROJECT_SOURCE_DIR}/schemas/e3/e3sm-ocudu-dapp-mgmt-carrier-v1.asn1
+      ${PROJECT_SOURCE_DIR}/schemas/dapp/e3-data-profile-v1.fbs
+      DESTINATION ${OCUDU_DAPP_SCHEMA_DIR}
+      COMPONENT dapp_sdk)
+    # Python E3 client: independent dApps import it from
+    # <prefix>/share/ocudu/dapp/python and find the schemas one level up.
+    install(DIRECTORY ${PROJECT_SOURCE_DIR}/python/ocudu_e3
+      DESTINATION ${CMAKE_INSTALL_DATADIR}/ocudu/dapp/python
+      COMPONENT dapp_sdk
+      FILES_MATCHING PATTERN "*.py")
+    install(FILES ${PROJECT_SOURCE_DIR}/python/README.md
+      DESTINATION ${CMAKE_INSTALL_DATADIR}/ocudu/dapp/python
+      RENAME README-ocudu_e3.md
+      COMPONENT dapp_sdk)
+  endif()
+
+  configure_package_config_file(
+    ${PROJECT_SOURCE_DIR}/cmake/modules/OCUDUDAppSDKConfig.cmake.in
+    ${PROJECT_BINARY_DIR}/OCUDUDAppSDKConfig.cmake
+    INSTALL_DESTINATION ${OCUDU_DAPP_SDK_CMAKE_DIR}
+    NO_SET_AND_CHECK_MACRO
+    NO_CHECK_REQUIRED_COMPONENTS_MACRO)
+  write_basic_package_version_file(
+    ${PROJECT_BINARY_DIR}/OCUDUDAppSDKConfigVersion.cmake
+    VERSION ${OCUDU_DAPP_SDK_VERSION}
+    COMPATIBILITY SameMajorVersion)
+  install(EXPORT OCUDUDAppSDKTargets
+    FILE OCUDUDAppSDKTargets.cmake
+    NAMESPACE OCUDU::
+    DESTINATION ${OCUDU_DAPP_SDK_CMAKE_DIR}
+    COMPONENT dapp_sdk)
+  install(FILES
+    ${PROJECT_BINARY_DIR}/OCUDUDAppSDKConfig.cmake
+    ${PROJECT_BINARY_DIR}/OCUDUDAppSDKConfigVersion.cmake
+    DESTINATION ${OCUDU_DAPP_SDK_CMAKE_DIR}
+    COMPONENT dapp_sdk)
+endif()
 
 ########################################################################
 # Export (selected) libraries

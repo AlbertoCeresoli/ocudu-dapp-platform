@@ -18,6 +18,9 @@ public:
   /// Constructs from values.
   explicit srs_context(unsigned sector_id_, rnti_t rnti_) : sector_id(sector_id_), rnti(rnti_) {}
 
+  /// Gets the UE RNTI. Used to attribute an SRS observation to a UE (multi-UE ISAC).
+  rnti_t get_rnti() const { return rnti; }
+
 private:
   friend struct fmt::formatter<srs_context>;
   unsigned sector_id = 0;

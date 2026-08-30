@@ -7,8 +7,13 @@
 
 using namespace ocudu;
 
-ue_scheduler_impl::ue_scheduler_impl(const scheduler_ue_expert_config& expert_cfg_) :
-  expert_cfg(expert_cfg_), logger(ocudulog::fetch_basic_logger("SCHED")), ue_db(expert_cfg), event_mng(ue_db)
+ue_scheduler_impl::ue_scheduler_impl(const scheduler_ue_expert_config&             expert_cfg_,
+                                     std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks_) :
+  expert_cfg(expert_cfg_),
+  dapp_hooks(std::move(dapp_hooks_)),
+  logger(ocudulog::fetch_basic_logger("SCHED")),
+  ue_db(expert_cfg),
+  event_mng(ue_db)
 {
 }
 
@@ -184,7 +189,7 @@ ue_scheduler_impl::cell_context::cell_context(ue_scheduler_impl&                
                  parent.ue_db,
                  *params.ra_ue_repo,
                  *params.cell_metrics),
-  slice_sched(params.cell_res_alloc->cfg, parent.ue_db),
+  slice_sched(params.cell_res_alloc->cfg, parent.ue_db, parent.dapp_hooks),
   intra_slice_sched(parent.expert_cfg,
                     parent.ue_db,
                     *params.pdcch_sched,

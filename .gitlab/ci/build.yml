@@ -576,6 +576,108 @@ cuda pdsch issue 1 regression:
       - ${CUDA_PDSCH_BUILD_DIR}/Testing/Temporary/LastTest.log
     expire_in: 5 days
 
+# Keep the dApp/E3 lifecycle and process-security boundary green in clean GCC,
+# Clang, and sanitizer trees. The SDK repository owns its full reference-suite
+# matrix; these jobs protect the host side of that interface.
+dapp host cpu matrix:
+  extends: .build_and_unit_template
+  stage: build and unit tests
+  rules:
+    - if: $ON_MR
+      changes:
+        paths:
+          - .gitlab/ci/build.yml
+          - apps/services/dapp/**/*
+          - include/ocudu/dapp/**/*
+          - lib/dapp/**/*
+          - lib/phy/upper/dapp/**/*
+          - schemas/dapp/**/*
+          - schemas/e3/**/*
+          - tests/unittests/dapp/**/*
+          - tests/unittests/phy/upper/dapp_data_router_test.cpp
+    - if: $CI_PIPELINE_SCHEDULE_DESCRIPTION =~ /Nightly/
+  variables:
+    OS: ubuntu-24.04
+    OCUDU_BUILD_DIR: build-dapp-host-ci
+  parallel:
+    matrix:
+      - COMPILER: gcc
+        CMAKE_BUILD_TYPE: Release
+        DAPP_SANITIZER_ARGS: ""
+      - COMPILER: clang
+        CMAKE_BUILD_TYPE: Debug
+        DAPP_SANITIZER_ARGS: "-DENABLE_ASAN=ON -DENABLE_UBSAN=ON"
+  script:
+    - >-
+      builder.sh -b "${OCUDU_BUILD_DIR}" -c "${COMPILER}"
+      -m "-j${CPU_JOBS} dapp_runtime_test dapp_hook_provider_test"
+      -r
+      -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+      -DENABLE_DAPP=ON
+      -DENABLE_E3=ON
+      -DENABLE_E3_ASN1_CODEC=ON
+      -DENABLE_UHD=OFF
+      ${DAPP_SANITIZER_ARGS}
+      .
+    - >-
+      ctest --test-dir "${OCUDU_BUILD_DIR}" --output-on-failure
+      --output-junit dapp-host.xml -j1
+      -R '^(dapp_class_c_process_supervisor\.|dapp_config\.|dapp_data_router\.)'
+  artifacts:
+    when: always
+    reports:
+      junit: ${OCUDU_BUILD_DIR}/dapp-host.xml
+    paths:
+      - ${OCUDU_BUILD_DIR}/dapp-host.xml
+      - ${OCUDU_BUILD_DIR}/Testing/Temporary/LastTest.log
+    expire_in: 14 days
+
+dapp host cuda matrix:
+  stage: extended
+  tags:
+    - ${OCUDU_CUDA_RUNNER_TAG}
+  rules:
+    - if: '$OCUDU_CUDA_RUNNER_TAG && $OCUDU_CUDA_ARCHITECTURES && $ON_MR'
+      changes:
+        paths:
+          - .gitlab/ci/build.yml
+          - apps/services/dapp/**/*
+          - include/ocudu/dapp/**/*
+          - lib/dapp/**/*
+          - lib/phy/upper/channel_processors/pusch/**/*
+          - tests/unittests/dapp/**/*
+          - tests/unittests/phy/upper/channel_processors/pusch/**/*
+    - if: '$OCUDU_CUDA_RUNNER_TAG && $OCUDU_CUDA_ARCHITECTURES && $CI_PIPELINE_SCHEDULE_DESCRIPTION =~ /CUDA/'
+  variables:
+    DAPP_CUDA_BUILD_DIR: build-dapp-cuda-ci
+  script:
+    - nvidia-smi
+    - nvcc --version
+    - >-
+      cmake -S . -B "${DAPP_CUDA_BUILD_DIR}"
+      -DCMAKE_BUILD_TYPE=Release
+      -DENABLE_DAPP=ON
+      -DENABLE_E3=ON
+      -DENABLE_E3_ASN1_CODEC=ON
+      -DENABLE_CUDA=ON
+      -DCMAKE_CUDA_ARCHITECTURES="${OCUDU_CUDA_ARCHITECTURES}"
+      -DBUILD_TESTING=ON
+    - >-
+      cmake --build "${DAPP_CUDA_BUILD_DIR}" -j"$(nproc)"
+      --target dapp_runtime_test pusch_resident_dapp_adapter_test
+    - >-
+      ctest --test-dir "${DAPP_CUDA_BUILD_DIR}" --output-on-failure
+      --output-junit dapp-cuda.xml -j1
+      -R '^(dapp_class_c_process_supervisor\.|dapp_config\.|pusch_resident_dapp_adapter\.)'
+  artifacts:
+    when: always
+    reports:
+      junit: ${DAPP_CUDA_BUILD_DIR}/dapp-cuda.xml
+    paths:
+      - ${DAPP_CUDA_BUILD_DIR}/dapp-cuda.xml
+      - ${DAPP_CUDA_BUILD_DIR}/Testing/Temporary/LastTest.log
+    expire_in: 14 days
+
 # Packaging
 
 package:

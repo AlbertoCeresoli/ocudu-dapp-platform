@@ -118,6 +118,16 @@ std::optional<dl_harq_process_handle> ue_cell::handle_dl_ack_info(slot_point    
                                                      h_dl->get_grant_params().mcs,
                                                      h_dl->get_grant_params().mcs_table,
                                                      h_dl->get_grant_params().olla_mcs);
+
+    // One-shot snapshot for the Class-B scheduler (package-local DL OLLA).
+    // First transmissions only, same rationale as the UL CRC snapshot: a
+    // retx ACK is post-combining and biased toward success.
+    if (h_dl->nof_retxs() == 0) {
+      dapp_dl_ack_.seq      = dapp_dl_ack_.seq + 1u == 0u ? 1u : dapp_dl_ack_.seq + 1u;
+      dapp_dl_ack_.crc_ok   = ack_value == mac_harq_ack_report_status::ack;
+      dapp_dl_ack_.used_mcs = static_cast<uint8_t>(h_dl->get_grant_params().mcs.value());
+      dapp_dl_bler_.push(ack_value != mac_harq_ack_report_status::ack);
+    }
   }
 
   return h_dl;
@@ -152,6 +162,18 @@ expected<units::bytes> ue_cell::handle_crc_pdu(slot_point pusch_slot, const ul_c
                                                      h_ul->get_grant_params().mcs_table,
                                                      h_ul->get_grant_params().olla_mcs,
                                                      crc_pdu.ul_sinr_dB);
+
+    // One-shot snapshot for the Class-B scheduler (package-local OLLA / TPC).
+    // First transmissions only: a retx CRC is post-soft-combining and biased
+    // toward ACK, so feeding it to the package regulates the combined-CRC
+    // ratio instead of first-tx BLER and parks the loop several times above
+    // its target.
+    if (h_ul->nof_retxs() == 0) {
+      dapp_ul_crc_.seq      = dapp_ul_crc_.seq + 1u == 0u ? 1u : dapp_ul_crc_.seq + 1u;
+      dapp_ul_crc_.crc_ok   = crc_pdu.tb_crc_success;
+      dapp_ul_crc_.used_mcs = static_cast<uint8_t>(h_ul->get_grant_params().mcs.value());
+      dapp_ul_bler_.push(not crc_pdu.tb_crc_success);
+    }
 
     // Update PUSCH SNR reported from PHY.
     if (crc_pdu.ul_sinr_dB.has_value()) {

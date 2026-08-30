@@ -19,7 +19,8 @@ public:
     flexible_o_du_factory(
         {config_.odu_high_cfg,
          config_.du_low_cfg,
-         {config_.ru_cfg.config.metrics_cfg.metrics_cfg, config_.ru_cfg.config.metrics_cfg.enable_ru_metrics}}),
+         {config_.ru_cfg.config.metrics_cfg.metrics_cfg, config_.ru_cfg.config.metrics_cfg.enable_ru_metrics},
+         config_.dapp}),
     unit_config(config_)
   {
   }

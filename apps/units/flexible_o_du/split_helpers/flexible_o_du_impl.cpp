@@ -3,6 +3,9 @@
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 #include "flexible_o_du_impl.h"
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+#include "apps/services/dapp/dapp_service.h"
+#endif
 #include "ocudu/du/du_low/du_low.h"
 #include "ocudu/du/du_low/o_du_low.h"
 #include "ocudu/du/o_du.h"
@@ -21,6 +24,8 @@ flexible_o_du_impl::flexible_o_du_impl(unsigned nof_cells_, flexible_o_du_metric
 {
 }
 
+flexible_o_du_impl::~flexible_o_du_impl() = default;
+
 void flexible_o_du_impl::start()
 {
   du->get_operation_controller().start();
@@ -31,6 +36,11 @@ void flexible_o_du_impl::stop()
 {
   ru->get_controller().get_operation_controller().stop();
   du->get_operation_controller().stop();
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  if (dapp) {
+    dapp->stop();
+  }
+#endif
 }
 
 void flexible_o_du_impl::add_ru(std::unique_ptr<radio_unit> active_ru)
@@ -62,3 +72,11 @@ void flexible_o_du_impl::add_du(std::unique_ptr<odu::o_du> active_du)
     ru_error_adapt.map_handler(i, upper.get_error_handler());
   }
 }
+
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+void flexible_o_du_impl::add_dapp_service(std::unique_ptr<app_services::dapp_service> active_service)
+{
+  dapp = std::move(active_service);
+  ocudu_assert(dapp, "Cannot set an invalid dApp service");
+}
+#endif

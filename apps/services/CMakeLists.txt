@@ -10,6 +10,9 @@ add_subdirectory(app_execution_metrics)
 add_subdirectory(app_resource_usage)
 add_subdirectory(buffer_pool)
 add_subdirectory(cmdline)
+if (ENABLE_DAPP)
+  add_subdirectory(dapp)
+endif ()
 add_subdirectory(metrics)
 add_subdirectory(remote_control)
 add_subdirectory(worker_manager)
@@ -23,3 +26,6 @@ target_link_libraries(ocudu_app_services INTERFACE
         ocudu_remote_control_app_service
         ocudu_resource_usage_app_service
         ocudu_worker_manager_app_service)
+if (ENABLE_DAPP)
+  target_link_libraries(ocudu_app_services INTERFACE ocudu_dapp_app_service)
+endif ()

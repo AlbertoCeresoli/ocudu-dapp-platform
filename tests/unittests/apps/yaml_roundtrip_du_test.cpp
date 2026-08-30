@@ -76,4 +76,20 @@ TEST(du_default_config_test, roundtrip)
   assert_roundtrip(YAML::Dump(a), &load_and_emit, "du defaults");
 }
 
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+TEST(du_dapp_config_test, roundtrip)
+{
+  std::string config = read_file(CONFIGS + "/du_rf_b200_tdd_n78_20mhz.yml");
+  config += "\ndapp:\n  catalog_root: ";
+  config += CONFIGS;
+  config += "\n"
+            "  native_preflight_helper: /bin/true\n"
+            "  max_transactions: 2048\n"
+            "  max_queued_jobs: 32\n"
+            "  max_retained_jobs: 256\n"
+            "  max_scheduler_ul_prbs_avoided: 17\n";
+  assert_roundtrip(config, &load_and_emit, "du dApp configuration");
+}
+#endif
+
 } // namespace

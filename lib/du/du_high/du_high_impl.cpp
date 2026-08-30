@@ -82,7 +82,8 @@ du_high_impl::du_high_impl(const du_high_configuration& config_, const du_high_d
                                                          cfg.metrics.enable_sched_ue,
                                                          cfg.metrics.max_nof_sched_ue_events,
                                                          adapters->mac_ev_notifier},
-                              cfg.ran.sched_cfg});
+                              cfg.ran.sched_cfg,
+                              dependencies.dapp_hooks});
 
   if (test_mode_ctrl != nullptr) {
     // In test mode, an adapting layer is placed in between MAC and other components.

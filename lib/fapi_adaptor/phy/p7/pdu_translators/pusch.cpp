@@ -91,6 +91,8 @@ void ocudu::fapi_adaptor::convert_pusch_fapi_to_phy(uplink_pdu_slot_repository::
   proc_pdu.mcs_descr.modulation       = fapi_pdu.qam_mod_order;
   proc_pdu.mcs_descr.target_code_rate = fapi_pdu.target_code_rate;
   proc_pdu.n_id                       = fapi_pdu.nid_pusch;
+  proc_pdu.mcs_index                  = fapi_pdu.mcs_index;
+  proc_pdu.mcs_table                  = fapi_pdu.mcs_table;
   proc_pdu.nof_tx_layers              = fapi_pdu.num_layers;
   // This value is defined in field DL DMRS symbol position in SCF-222 v4.0 Section 3.4.3.2, in table PUSCH PDU, DMRS
   // subsection.

@@ -69,9 +69,11 @@ uplink_processor_impl::uplink_processor_impl(std::unique_ptr<prach_detector>  pr
                                              rx_buffer_pool&                  rm_buffer_pool_,
                                              upper_phy_rx_results_notifier&   notifier_,
                                              unsigned                         max_nof_prb,
-                                             unsigned                         max_nof_layers) :
+                                             unsigned                         max_nof_layers,
+                                             uint32_t                         cell_id,
+                                             uint32_t                         producer_shard) :
   grid_ref_counter(get_grid_ref_counter()),
-  pdu_repository(*grid_, grid_ref_counter, state_machine),
+  pdu_repository(*grid_, grid_ref_counter, state_machine, cell_id, producer_shard),
   prach(std::move(prach_)),
   pusch_proc(std::move(pusch_proc_)),
   pucch_proc(std::move(pucch_proc_)),
@@ -218,8 +220,8 @@ void uplink_processor_impl::process_symbol_pdus(unsigned end_symbol_index)
   span<const uplink_pdu_slot_repository::srs_pdu> srs_pdus = pdu_repository.get_srs_pdus(end_symbol_index);
 
   // PUSCH first so the GPU reader claims the live grid before any host
-  // snapshot / PUCCH home. Spectrum tap must run AFTER PUSCH: staging the
-  // Class-C snapshot homes the live VA (CPU copy + H2D). Doing that before
+  // snapshot / PUCCH home. Spectrum tap must run AFTER PUSCH: the tap stages the
+  // Class-C snapshot, which homes the live VA (CPU copy + H2D). Doing that before
   // PUSCH GPU-loads live is Xid 31 @ 0x140000.
   for (const auto& pdu : pusch_pdus) {
     process_pusch(pdu);
@@ -230,7 +232,6 @@ void uplink_processor_impl::process_symbol_pdus(unsigned end_symbol_index)
     for (const auto& pucch_f1 : pucch_f1_pdus) {
       pucch_f1_common_configs.push_back(pucch_f1.config.common_config);
     }
-    (void)grid->get_reader().stage_owned_snapshot_from_host();
     ul_tap->handle_ul_symbol(grid->get_writer(),
                              grid->get_reader(),
                              current_slot,

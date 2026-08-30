@@ -19,6 +19,7 @@ public:
                const pdu_t&                     pdu) override
   {
     processed_method_been_called = true;
+    last_cell_id                 = pdu.cell_id;
 
     // Notify completion of PUSCH UCI.
     if ((pdu.uci.nof_harq_ack != 0) || (pdu.uci.nof_csi_part1 != 0)) {
@@ -29,10 +30,12 @@ public:
     notifier.on_sch({});
   }
 
-  bool has_process_method_been_called() const { return processed_method_been_called; }
+  bool     has_process_method_been_called() const { return processed_method_been_called; }
+  uint32_t get_last_cell_id() const { return last_cell_id; }
 
 private:
-  bool processed_method_been_called = false;
+  bool     processed_method_been_called = false;
+  uint32_t last_cell_id{};
 };
 
 } // namespace ocudu

@@ -3,6 +3,7 @@
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 #include "ru_ofh_rx_symbol_handler_impl.h"
+#include "../channel_emulator_hook.h"
 #include "ocudu/phy/support/shared_resource_grid.h"
 
 using namespace ocudu;
@@ -16,11 +17,22 @@ void ru_ofh_rx_symbol_handler_impl::on_new_uplink_symbol(const ofh::uplane_rx_sy
   ru_context.slot      = context.slot;
   ru_context.symbol_id = context.symbol;
 
+  // Optional GPU channel emulation on the received symbols (same hook as
+  // the split-8 SDR RU; O-FH U-plane IQ is already frequency domain). The
+  // per-symbol delta path applies here: keep ul_slot_batch=0 -- symbols
+  // arrive from the O-RU one at a time. No-op unless configured.
+  if (is_valid) {
+    channel_emulator_hook::get().apply_uplink(grid, context.slot, context.symbol);
+  }
+
   notifier.on_new_uplink_symbol(ru_context, grid, is_valid);
 }
 
 void ru_ofh_rx_symbol_handler_impl::on_new_prach_window_data(const prach_buffer_context& context,
                                                              shared_prach_buffer         buffer)
 {
+  // Optional GPU channel emulation on the PRACH occasions. No-op unless
+  // configured.
+  channel_emulator_hook::get().apply_prach(*buffer, context);
   notifier.on_new_prach_window_data(context, std::move(buffer));
 }

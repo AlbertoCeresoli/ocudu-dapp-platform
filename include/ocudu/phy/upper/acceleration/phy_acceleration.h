@@ -39,6 +39,24 @@ struct resident_softbit_buffer {
   int buffer_index = -1;
 };
 
+/// Opaque accelerator-event tokens for opt-in resident dApp stage diagnostics.
+///
+/// The tokens are valid only for the associated fixed completion slot and only until that slot is reused. Generic
+/// upper-PHY code must not interpret them; diagnostic tools for the active accelerator backend may do so after the
+/// stream completion token has been synchronized.
+struct resident_dapp_diagnostic_timing {
+  /// Event recorded immediately before the independently built dApp module is invoked.
+  void* module_begin_token = nullptr;
+  /// Event recorded after the dApp module has enqueued its work.
+  void* module_end_token = nullptr;
+  /// Event recorded after the module and required OCUDU continuation have been enqueued.
+  void* inline_end_token = nullptr;
+  /// Fixed completion slot to which the tokens belong.
+  unsigned completion_slot = 0;
+  /// True when all tokens describe the same successful inline invocation.
+  bool valid = false;
+};
+
 /// Compact UCI results produced alongside a resident PUSCH SCH codeword.
 struct resident_uci_buffer {
   /// HARQ-ACK LLRs staged for host-side decoding or metric reporting.

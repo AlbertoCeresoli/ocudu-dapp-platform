@@ -10,6 +10,7 @@
 #include "pusch_processor_validator_impl.h"
 #include "ocudu/instrumentation/traces/du_traces.h"
 #include "ocudu/ocudulog/ocudulog.h"
+#include "ocudu/phy/support/resource_grid_reader.h"
 #include "ocudu/phy/upper/channel_coding/ldpc/ldpc.h"
 #include "ocudu/phy/upper/channel_processors/pusch/formatters.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_codeword_buffer.h"
@@ -21,6 +22,7 @@
 #include "ocudu/ran/uci/uci_part2_size_calculator.h"
 #include "ocudu/support/error_handling.h"
 #include "ocudu/support/tracing/scoped_trace.h"
+#include <atomic>
 #include <chrono>
 
 using namespace ocudu;
@@ -38,6 +40,70 @@ using namespace ocudu;
 }
 
 namespace {
+
+/// Upper bound on captured equalized symbols per grant (273 PRB x 12 x 13 symbols x 4 layers fits).
+constexpr std::size_t MAX_PUB_SYMBOLS = 262144;
+
+/// Snapshot of the grant parameters telemetry consumers need to regenerate the
+/// DM-RS, descramble, de-multiplex UCI and LDPC-decode the grant offline.
+template <typename RbMask>
+pusch_grant_diagnostic make_pusch_grant_diagnostic(const pusch_processor::pdu_t& pdu,
+                                                   std::size_t                   tbs_bytes,
+                                                   const RbMask&                 rb_mask,
+                                                   bool                          enable_transform_precoding,
+                                                   unsigned                      n_rs_id,
+                                                   unsigned                      scrambling_id,
+                                                   bool                          n_scid,
+                                                   unsigned                      nof_cdm_groups_without_data,
+                                                   dmrs_config_type              dmrs_type)
+{
+  pusch_grant_diagnostic grant;
+  grant.harq_id             = static_cast<uint8_t>(pdu.harq_id == INVALID_HARQ_ID ? 0 : pdu.harq_id);
+  grant.n_id                = static_cast<uint16_t>(pdu.n_id);
+  grant.tbs_bytes           = static_cast<uint32_t>(tbs_bytes);
+  grant.rv                  = pdu.codeword ? static_cast<uint8_t>(pdu.codeword->rv) : 0;
+  grant.new_data            = pdu.codeword ? pdu.codeword->new_data : true;
+  grant.ldpc_base_graph     = (pdu.codeword && pdu.codeword->ldpc_base_graph == ldpc_base_graph_type::BG2) ? 2 : 1;
+  grant.tbs_lbrm_bytes      = static_cast<uint32_t>(pdu.tbs_lbrm.value());
+  grant.mcs_known           = pdu.mcs_index.has_value() && pdu.mcs_table.has_value();
+  grant.mcs_index           = pdu.mcs_index.value_or(0);
+  grant.mcs_table           = static_cast<uint8_t>(pdu.mcs_table.value_or(pusch_mcs_table::qam64));
+  grant.transform_precoding = enable_transform_precoding;
+  grant.n_rs_id             = static_cast<uint16_t>(n_rs_id);
+  grant.cyclic_prefix       = pdu.cp == cyclic_prefix::EXTENDED ? 1 : 0;
+  grant.start_symbol        = static_cast<uint8_t>(pdu.start_symbol_index);
+  grant.nof_symbols         = static_cast<uint8_t>(pdu.nof_symbols);
+  grant.dmrs_symbol_mask    = 0;
+  for (unsigned l = 0; l != pdu.dmrs_symbol_mask.size() && l < 16; ++l) {
+    if (pdu.dmrs_symbol_mask.test(l)) {
+      grant.dmrs_symbol_mask |= static_cast<uint16_t>(1U << l);
+    }
+  }
+  grant.dmrs_type                   = dmrs_type == dmrs_config_type::type2 ? 2 : 1;
+  grant.nof_cdm_groups_without_data = static_cast<uint8_t>(nof_cdm_groups_without_data);
+  grant.dmrs_scrambling_id          = static_cast<uint16_t>(scrambling_id);
+  grant.n_scid                      = n_scid;
+  grant.bwp_start_rb                = static_cast<uint16_t>(pdu.bwp_start_rb);
+  grant.bwp_size_rb                 = static_cast<uint16_t>(pdu.bwp_size_rb);
+  for (unsigned prb = 0; prb != rb_mask.size() && prb < 275; ++prb) {
+    if (rb_mask.test(prb)) {
+      grant.prb_mask[prb / 8] |= static_cast<uint8_t>(1U << (prb % 8));
+    }
+  }
+  grant.nof_rx_ports          = static_cast<uint8_t>(pdu.rx_ports.size());
+  grant.nof_layers            = static_cast<uint8_t>(pdu.nof_tx_layers);
+  grant.dc_present            = pdu.dc_position.has_value();
+  grant.dc_position           = static_cast<uint16_t>(pdu.dc_position.value_or(0));
+  grant.nof_harq_ack_bits     = static_cast<uint16_t>(pdu.uci.nof_harq_ack);
+  grant.nof_csi_part1_bits    = static_cast<uint16_t>(pdu.uci.nof_csi_part1);
+  grant.csi_part2_expected    = !pdu.uci.csi_part2_size.entries.empty();
+  grant.alpha_scaling         = pdu.uci.alpha_scaling;
+  grant.beta_offset_harq_ack  = pdu.uci.beta_offset_harq_ack;
+  grant.beta_offset_csi_part1 = pdu.uci.beta_offset_csi_part1;
+  grant.beta_offset_csi_part2 = pdu.uci.beta_offset_csi_part2;
+  return grant;
+}
+
 bool supports_resident_accelerated_pusch_demodulation(const pusch_processor::pdu_t& pdu)
 {
   unsigned nof_rx_ports = static_cast<unsigned>(pdu.rx_ports.size());
@@ -271,7 +337,8 @@ pusch_processor_impl::pusch_processor_impl(configuration& config) :
   dec_nof_iterations(config.dec_nof_iterations),
   dec_enable_early_stop(config.dec_enable_early_stop),
   ce_dims(config.ce_dims),
-  csi_sinr_calc_method(config.csi_sinr_calc_method)
+  csi_sinr_calc_method(config.csi_sinr_calc_method),
+  diag_sink(std::move(config.diag_sink))
 {
   ocudu_assert(dependencies_pool, "Invalid dependency pool.");
   ocudu_assert(decoder, "Invalid decoder.");
@@ -343,6 +410,47 @@ void pusch_processor_impl::process(span<uint8_t>                    data,
     n_rs_id                    = dmrs_config.n_rs_id;
   }
 
+  // Raw resource-grid capture (pre-equalization, DM-RS included) for subscribers
+  // re-running channel estimation offline. Reads the allocated REs of every
+  // receive port and symbol into a reusable buffer; rate limited per RNTI by
+  // the sink and skipped entirely when nobody subscribes.
+  if ((diag_sink != nullptr) && diag_sink->should_collect(phy_diagnostic_stream::pusch_grid, to_value(pdu.rnti))) {
+    bounded_bitset<MAX_NOF_SUBCARRIERS> re_mask(rb_mask.size() * NOF_SUBCARRIERS_PER_RB);
+    rb_mask.for_each(0, rb_mask.size(), [&re_mask](unsigned prb) {
+      re_mask.fill(prb * NOF_SUBCARRIERS_PER_RB, (prb + 1) * NOF_SUBCARRIERS_PER_RB);
+    });
+    const unsigned nof_prb       = rb_mask.count();
+    const unsigned nof_re_symbol = nof_prb * NOF_SUBCARRIERS_PER_RB;
+    grid_capture_buffer.resize(static_cast<std::size_t>(nof_re_symbol) * pdu.nof_symbols * pdu.rx_ports.size());
+    std::size_t offset = 0;
+    for (const uint8_t port : pdu.rx_ports) {
+      for (unsigned l = pdu.start_symbol_index, end = pdu.start_symbol_index + pdu.nof_symbols; l != end; ++l) {
+        span<cf_t> destination(grid_capture_buffer.data() + offset, nof_re_symbol);
+        grid.get(destination, port, l, 0, re_mask);
+        offset += nof_re_symbol;
+      }
+    }
+    pusch_grid_diagnostic event;
+    event.rnti              = to_value(pdu.rnti);
+    event.slot              = pdu.slot;
+    event.nof_prb           = static_cast<uint16_t>(nof_prb);
+    event.nof_rx_ports      = static_cast<uint8_t>(pdu.rx_ports.size());
+    event.start_symbol      = static_cast<uint8_t>(pdu.start_symbol_index);
+    event.nof_symbols       = static_cast<uint8_t>(pdu.nof_symbols);
+    event.grant             = make_pusch_grant_diagnostic(pdu,
+                                              data.size(),
+                                              rb_mask,
+                                              enable_transform_precoding,
+                                              n_rs_id,
+                                              scrambling_id,
+                                              n_scid,
+                                              nof_cdm_groups_without_data,
+                                              dmrs_type);
+    event.resource_elements = span<const std::complex<float>>(
+        reinterpret_cast<const std::complex<float>*>(grid_capture_buffer.data()), grid_capture_buffer.size());
+    diag_sink->on_pusch_grid(event);
+  }
+
   // Check if resident SCH processing is possible BEFORE running CPU channel estimation.
   // If so, bypass the CPU estimator entirely; the accelerator computes channel, noise and scheduler-visible metrics.
   {
@@ -399,7 +507,8 @@ void pusch_processor_impl::process(span<uint8_t>                    data,
 
   // Configure the channel estimator.
   dmrs_pusch_estimator::configuration ch_est_config;
-  ch_est_config.slot = pdu.slot;
+  ch_est_config.cell_id = pdu.cell_id;
+  ch_est_config.slot    = pdu.slot;
   if (enable_transform_precoding) {
     ch_est_config.sequence_config = dmrs_pusch_estimator::low_papr_sequence_configuration{.n_rs_id = n_rs_id};
   } else {
@@ -537,6 +646,14 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
   notifier_adaptor.new_transmission(notifier, csi_part1_feedback, csi);
   csi_part1_feedback.connect_notifier(notifier_adaptor);
 
+  // Forward CRC to the diagnostic sink on decode completion (rate-limited).
+  const uint16_t rnti_u16    = to_value(pdu.rnti);
+  const bool     publish_crc = (diag_sink != nullptr) && resident_plan.has_sch_data &&
+                           diag_sink->should_collect(phy_diagnostic_stream::pusch_crc, rnti_u16);
+  if (publish_crc) {
+    notifier_adaptor.set_crc_diag(diag_sink.get(), pdu.slot, rnti_u16);
+  }
+
   if (resident_plan.has_sch_data) {
     units::bits tbs            = units::bytes(data.size()).to_bits();
     unsigned    nof_codeblocks = compute_nof_codeblocks(tbs, pdu.codeword->ldpc_base_graph);
@@ -595,6 +712,7 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
   bool enable_transform_precoding = !std::holds_alternative<ocudu::pusch_processor::dmrs_configuration>(pdu.dmrs);
 
   pusch_demodulator::configuration demod_config;
+  demod_config.cell_id                     = pdu.cell_id;
   demod_config.rnti                        = pdu.rnti;
   demod_config.rb_mask                     = pdu.freq_alloc.get_crb_mask(pdu.bwp_start_rb, pdu.bwp_size_rb);
   demod_config.modulation                  = pdu.mcs_descr.modulation;
@@ -613,8 +731,10 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
     demod_config.dmrs_scrambling_id = pdu.n_id;
     demod_config.n_scid             = false;
   }
-  demod_config.nof_tx_layers              = pdu.nof_tx_layers;
-  demod_config.dc_position                = pdu.dc_position;
+  demod_config.nof_tx_layers = pdu.nof_tx_layers;
+  demod_config.dmrs_scaling  = convert_dB_to_amplitude(-get_sch_to_dmrs_ratio_dB(nof_cdm_groups_without_data));
+  demod_config.c_prefix      = pdu.cp;
+  demod_config.dc_position   = pdu.dc_position;
   demod_config.enable_transform_precoding = enable_transform_precoding;
   if (enable_transform_precoding) {
     const auto& dmrs_cfg = std::get<ocudu::pusch_processor::dmrs_transform_precoding_configuration>(pdu.dmrs);
@@ -665,11 +785,67 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
     demod_call_start      = setup_end;
   }
 
+  // Enable equalized-symbol capture for constellation publishing (best-effort on GPU paths).
+  // Skip very small grants (Msg3 / RACH often 3 PRB) so rate-limited capture never touches the
+  // attach path — constellation needs stable connected PUSCH anyway.
+  const bool publish_symbols = (diag_sink != nullptr) && (demod_config.rb_mask.count() >= 6) &&
+                               diag_sink->should_collect(phy_diagnostic_stream::pusch_symbols, rnti_u16);
+  if (publish_symbols) {
+    ocudulog::fetch_basic_logger("PHY").debug(
+        "constellation capture enabled rnti=0x{:04x} prb={}", rnti_u16, demod_config.rb_mask.count());
+    demodulator.enable_symbol_capture();
+  }
+
   // Run demodulation
   {
     auto demod_scope = make_scoped_trace(l1_ul_tracer, "L1.UL.PUSCH.demodulate");
     demodulator.demodulate(
         demodulator_buffer, notifier_adaptor.get_demodulator_notifier(), grid, est_results, demod_config);
+  }
+
+  // Stash metadata (+ any already-ready IQ). Do NOT wait/sync here — that stalls the slot path
+  // and breaks Msg3/RACH timing. Pre-join (after LDPC sync) fills IQ via wait_captured_symbols.
+  if (publish_symbols) {
+    demodulator.disable_symbol_capture();
+    span<const std::complex<float>> captured = demodulator.get_captured_symbols();
+    if (captured.size() > MAX_PUB_SYMBOLS) {
+      captured = captured.last(MAX_PUB_SYMBOLS);
+    }
+    unsigned nof_data_symbols = 0;
+    for (unsigned i = demod_config.start_symbol_index; i < demod_config.start_symbol_index + demod_config.nof_symbols;
+         ++i) {
+      if (!demod_config.dmrs_symb_pos.test(i)) {
+        ++nof_data_symbols;
+      }
+    }
+    // The demodulator captures the data REs of symbols without DM-RS. The
+    // capture is a complete codeword only when DM-RS symbols carry no data
+    // (all CDM groups reserved) and nothing was clipped by MAX_PUB_SYMBOLS.
+    const std::size_t expected_symbols = static_cast<std::size_t>(demod_config.rb_mask.count()) *
+                                         NOF_SUBCARRIERS_PER_RB * nof_data_symbols * demod_config.nof_tx_layers;
+    const bool dmrs_symbols_carry_data = (dmrs_type == dmrs_config_type::type1 && nof_cdm_groups_without_data < 2) ||
+                                         (dmrs_type == dmrs_config_type::type2 && nof_cdm_groups_without_data < 3);
+    // Completeness is judged at emission time: accelerated demodulators deliver the capture late.
+    notifier_adaptor.set_pusch_sym_diag(diag_sink.get(),
+                                        pdu.slot,
+                                        rnti_u16,
+                                        static_cast<uint16_t>(demod_config.rb_mask.count()),
+                                        static_cast<uint16_t>(nof_data_symbols),
+                                        static_cast<uint8_t>(demod_config.nof_tx_layers),
+                                        static_cast<uint8_t>(get_bits_per_symbol(demod_config.modulation)),
+                                        pdu.mcs_descr.get_normalised_target_code_rate(),
+                                        captured);
+    notifier_adaptor.set_pusch_sym_grant(make_pusch_grant_diagnostic(pdu,
+                                                                     data.size(),
+                                                                     demod_config.rb_mask,
+                                                                     enable_transform_precoding,
+                                                                     demod_config.n_rs_id.value_or(0U),
+                                                                     demod_config.dmrs_scrambling_id,
+                                                                     demod_config.n_scid,
+                                                                     nof_cdm_groups_without_data,
+                                                                     dmrs_type),
+                                         expected_symbols,
+                                         dmrs_symbols_carry_data);
   }
 
   float demod_call_us = 0.0f;
@@ -734,7 +910,9 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
                                       &resident_uci_notified,
                                       resident_stats_deferred,
                                       decoder_ptr = decoder.get(),
-                                      &sinr_readback_us]() {
+                                      &sinr_readback_us,
+                                      publish_symbols]() {
+        demodulator.report_deferred_dapp_completion();
         if (resident_stats_deferred) {
           if (collect_accelerator_timing) {
             auto sinr_start = std::chrono::steady_clock::now();
@@ -750,6 +928,19 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
           demodulator.finalize_resident_uci();
           notify_resident_uci();
           resident_uci_notified = true;
+        }
+        // Late constellation IQ: async D2H on d2h_stream_ is done by now (decoder has
+        // already waited for LLR kernels). Off the slot-critical path — same as ai-ran.
+        if (publish_symbols) {
+          demodulator.wait_captured_symbols();
+          span<const std::complex<float>> eq      = demodulator.get_captured_symbols();
+          const bool                      clipped = eq.size() > MAX_PUB_SYMBOLS;
+          if (clipped) {
+            eq = eq.last(MAX_PUB_SYMBOLS);
+          }
+          if (!eq.empty()) {
+            notifier_adaptor.update_pusch_sym_diag_symbols(eq, clipped);
+          }
         }
       });
 

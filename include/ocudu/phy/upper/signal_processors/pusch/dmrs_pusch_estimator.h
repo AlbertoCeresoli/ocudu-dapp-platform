@@ -56,6 +56,8 @@ public:
 
   /// Parameters required to receive the demodulation reference signals described in 3GPP TS38.211 Section 6.4.1.1.
   struct configuration {
+    /// DU-local cell identifier used for dApp invocation attribution.
+    uint32_t cell_id = 0;
     /// Slot context for sequence initialization.
     slot_point slot;
     /// Sequence generator configuration.

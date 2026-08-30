@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "../channel_emulator_hook.h"
 #include "ocudu/phy/lower/lower_phy_rx_symbol_context.h"
 #include "ocudu/phy/lower/lower_phy_rx_symbol_notifier.h"
 #include "ocudu/ru/ru_uplink_plane.h"
@@ -23,6 +24,11 @@ public:
   void
   on_rx_symbol(const lower_phy_rx_symbol_context& context, const shared_resource_grid& grid, bool is_valid) override
   {
+    // Optional GPU channel emulation on the received symbols, before the
+    // upper PHY consumes them. No-op unless configured via environment.
+    if (is_valid) {
+      channel_emulator_hook::get().apply_uplink(grid, context.slot, context.nof_symbols);
+    }
     rx_symbol_handler.on_new_uplink_symbol(
         ru_uplink_rx_symbol_context{.slot = context.slot, .sector = context.sector, .symbol_id = context.nof_symbols},
         grid,
@@ -32,6 +38,9 @@ public:
   // See interface for documentation.
   void on_rx_prach_window(const prach_buffer_context& context, shared_prach_buffer buffer) override
   {
+    // Optional GPU channel emulation on the PRACH occasions, before the
+    // upper PHY detects. No-op unless configured via environment.
+    channel_emulator_hook::get().apply_prach(*buffer, context);
     rx_symbol_handler.on_new_prach_window_data(context, std::move(buffer));
   }
 

@@ -51,6 +51,7 @@ public:
 
     prach_spy = prach.get();
     pusch_spy = pusch_proc.get();
+    srs_spy   = srs.get();
     grid_spy  = grid.get();
     tap_spy   = tap.get();
 
@@ -69,7 +70,9 @@ public:
                                                            buffer_pool_spy,
                                                            results_notifier,
                                                            max_nof_prb,
-                                                           max_nof_layers);
+                                                           max_nof_layers,
+                                                           cell_id,
+                                                           producer_shard);
 
     buffer_pool_spy.clear();
   }
@@ -78,6 +81,8 @@ protected:
   static constexpr unsigned   max_nof_prb     = 15;
   static constexpr unsigned   max_nof_layers  = 1;
   static constexpr unsigned   max_nof_symbols = 14;
+  static constexpr uint32_t   cell_id         = 7;
+  static constexpr uint32_t   producer_shard  = 3;
   static constexpr slot_point slot            = {0, 9};
 
   const uplink_pdu_slot_repository::pusch_pdu pusch_pdu = {
@@ -126,8 +131,32 @@ protected:
                                                         .sr_opportunity       = true,
                                                         .ports                = {0}}};
 
+  const uplink_pdu_slot_repository::srs_pdu srs_pdu = {
+      .context = {.slot                                             = slot,
+                  .rnti                                             = to_rnti(0x4601),
+                  .is_normalized_channel_iq_matrix_report_requested = false,
+                  .is_positioning_report_requested                  = false},
+      .config  = {.context  = std::nullopt,
+                  .slot     = slot,
+                  .resource = {.nof_antenna_ports   = srs_resource_configuration::one_two_four_enum::one,
+                               .nof_symbols         = srs_nof_symbols::n1,
+                               .start_symbol        = 13,
+                               .configuration_index = 0,
+                               .sequence_id         = 0,
+                               .bandwidth_index     = 0,
+                               .comb_size           = tx_comb_size::n2,
+                               .comb_offset         = 0,
+                               .cyclic_shift        = 0,
+                               .freq_position       = 0,
+                               .freq_shift          = 0,
+                               .freq_hopping        = 0,
+                               .hopping             = srs_group_or_sequence_hopping::neither,
+                               .periodicity         = std::nullopt},
+                  .ports    = {0}}};
+
   prach_detector_spy*                     prach_spy = nullptr;
   pusch_processor_spy*                    pusch_spy = nullptr;
+  srs_estimator_dummy*                    srs_spy   = nullptr;
   manual_task_worker_always_enqueue_tasks pucch_executor;
   manual_task_worker_always_enqueue_tasks pusch_executor;
   manual_task_worker_always_enqueue_tasks srs_executor;
@@ -302,6 +331,7 @@ TEST_F(UplinkProcessorFixture, pusch_normal_workflow)
 
   // Check the processor has been called and the result notified.
   ASSERT_TRUE(pusch_spy->has_process_method_been_called());
+  EXPECT_EQ(pusch_spy->get_last_cell_id(), cell_id);
   ASSERT_TRUE(results_notifier.has_pusch_data_result_been_notified());
   ASSERT_TRUE(results_notifier.has_pusch_uci_result_been_notified());
 }
@@ -345,6 +375,24 @@ TEST_F(UplinkProcessorFixture, rx_symbol_bad_order)
   ASSERT_TRUE(pusch_spy->has_process_method_been_called());
   ASSERT_TRUE(results_notifier.has_pusch_data_result_been_notified());
   ASSERT_TRUE(results_notifier.has_pusch_uci_result_been_notified());
+}
+
+TEST_F(UplinkProcessorFixture, srs_workflow_preserves_cell_and_producer_identity)
+{
+  unique_uplink_pdu_slot_repository repository = ul_processor->get_pdu_slot_repository(slot);
+  repository->add_srs_pdu(srs_pdu);
+  shared_resource_grid grid = repository.release();
+
+  ul_processor->get_slot_processor(slot).handle_rx_symbol(max_nof_symbols - 1, true);
+  ASSERT_TRUE(srs_executor.has_pending_tasks());
+  ASSERT_FALSE(results_notifier.has_srs_result_been_notified());
+
+  srs_executor.run_pending_tasks();
+
+  ASSERT_TRUE(results_notifier.has_srs_result_been_notified());
+  ASSERT_TRUE(srs_spy->get_last_config().has_value());
+  EXPECT_EQ(srs_spy->get_last_config()->cell_id, cell_id);
+  EXPECT_EQ(srs_spy->get_last_config()->producer_shard, producer_shard);
 }
 
 TEST_F(UplinkProcessorFixture, pusch_wrong_slot)

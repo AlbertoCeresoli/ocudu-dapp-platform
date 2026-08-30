@@ -20,6 +20,7 @@
 #include "ocudu/phy/upper/channel_modulation/evm_calculator.h"
 #include "ocudu/phy/upper/channel_processors/pusch/factories.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_demodulator.h"
+#include "ocudu/phy/upper/dapp/pusch_resident_dapp.h"
 #include "ocudu/phy/upper/equalization/channel_equalizer.h"
 #include "ocudu/phy/upper/equalization/dynamic_ch_est_list.h"
 #include "ocudu/phy/upper/equalization/modular_ch_est_list.h"
@@ -94,6 +95,24 @@ public:
   // See interface for documentation.
   bool is_resident_mode_enabled() const override { return gpu_resident_mode_; }
 
+  /// Request host-side capture of equalized symbols for constellation diagnostics.
+  /// Capture is async (sibling D2H stream); rate-limited by the host diagnostic sink.
+  void enable_symbol_capture() override;
+  void disable_symbol_capture() override;
+  /// Non-blocking when D2H is not ready (returns empty). Prefer late fetch from
+  /// decoder pre-join callback, after kernels have finished — same pattern as ai-ran.
+  span<const std::complex<float>> get_captured_symbols() const override;
+  void                            wait_captured_symbols() override;
+
+  bool install_resident_dapp(std::shared_ptr<pusch_resident_dapp> dapp) override
+  {
+    if (!dapp || resident_dapp_) {
+      return false;
+    }
+    resident_dapp_ = std::move(dapp);
+    return true;
+  }
+
   // See interface for documentation.
   resident_softbit_buffer get_resident_softbits() const override
   {
@@ -161,6 +180,17 @@ public:
 
   /// \brief Report deferred SINR after decoder sync (no GPU sync needed).
   float report_deferred_sinr(pusch_demodulator_notifier& notifier) override;
+  void  report_deferred_dapp_completion() override;
+  void  enable_resident_dapp_diagnostic_timing(bool enabled) override
+  {
+    if (resident_dapp_) {
+      resident_dapp_->enable_diagnostic_timing(enabled);
+    }
+  }
+  resident_dapp_diagnostic_timing get_resident_dapp_diagnostic_timing(unsigned completion_slot) const override
+  {
+    return resident_dapp_ ? resident_dapp_->diagnostic_timing(completion_slot) : resident_dapp_diagnostic_timing{};
+  }
 
 private:
   /// Data type for representing an RE mask within an OFDM symbol.
@@ -249,6 +279,39 @@ private:
   std::vector<float> accumulated_noise_vars_;
   size_t             accumulated_count_ = 0;
 
+  /// Constellation diagnostic capture — async D2H of equalized symbols (ai-ran style).
+  /// Sources:
+  ///  * NeuralEq / Class-A EQ: D2H from `d_symbols_` after dApp EQ enqueue
+  ///  * Conventional GPU E2E: `pusch_e2e_set_eq_output` mirrors into `d_eq_diag_`, then D2H
+  ///  * CPU EQ path: host `accumulated_symbols_` (no D2H)
+  /// D2H runs on `d2h_stream_` in parallel with soft-demod/LDPC — never stalls the main stream.
+  bool                 capture_symbols_enabled_ = false;
+  bool                 capture_requested_slot_  = false; ///< sticky until wait/get for this slot
+  std::complex<float>* h_eq_diag_pinned_        = nullptr;
+  void*                d_eq_diag_               = nullptr; ///< device float2[n] for E2E tap / staging
+  void*                d_eq_noise_diag_         = nullptr; ///< required companion for set_eq_output
+  cudaEvent_t          eq_diag_ready_event_     = nullptr; ///< source ready on main stream
+  cudaEvent_t          eq_diag_event_           = nullptr; ///< D2H complete on d2h_stream_
+  std::size_t          eq_diag_capacity_        = 0;
+  std::size_t          eq_diag_count_           = 0;
+  std::size_t          last_e2e_eq_count_       = 0;       ///< conventional E2E eq tap size this slot
+  const void*          last_capture_src_        = nullptr; ///< device src of last queue_eq_symbol_d2h
+  std::size_t          last_capture_n_          = 0;       ///< symbol count for last_capture_src_
+  bool                 eq_diag_queued_          = false;
+  bool                 eq_diag_host_valid_      = false; ///< host buffer holds valid IQ (async or sync path)
+  bool                 eq_diag_tap_on_          = false; ///< E2E set_eq_output currently armed
+  /// Stable host-side IQ snapshot returned by get_captured_symbols() after wait.
+  std::vector<std::complex<float>> captured_eq_host_;
+  static constexpr std::size_t     MAX_CAPTURE_EQ_SYMBOLS = 8192;
+
+  void ensure_eq_diag_resources();
+  /// Queue async D2H of `nof_eq_symbols` complex floats from device `src` (e.g. d_symbols_
+  /// or d_eq_diag_). Waits on either `ready_event` (if non-null) or records ready on stream_.
+  void queue_eq_symbol_d2h(const void* src, std::size_t nof_eq_symbols, cudaEvent_t ready_event = nullptr);
+  void configure_e2e_eq_tap(bool enable);
+  /// Blocking D2H into captured_eq_host_ from best available device source (pre-join only).
+  bool force_eq_diag_host_copy();
+
   /// Host buffers for raw channel data (GPU equalization path).
   std::vector<cf_t> raw_ch_symbols_;   // [total_re * nof_rx_ports]
   std::vector<cf_t> raw_ch_estimates_; // [total_re * nof_rx_ports]
@@ -287,9 +350,7 @@ private:
 
   /// Device memory for full grid upload.
   void*  d_full_grid_      = nullptr; // fp32 grid after conversion
-  size_t d_full_grid_cap_  = 0;
   void*  d_full_estimates_ = nullptr; // fp32 estimates after conversion
-  size_t d_full_est_cap_   = 0;
   /// Pointers into unified buffer (computed as offsets, not separately allocated).
   void* d_grid_cbf16_ = nullptr; // cbf16 grid before conversion
   int*  d_re_indices_ = nullptr;
@@ -380,7 +441,16 @@ private:
   pusch_codeblock_decoder_cuda_batch* batch_decoder_ = nullptr;
 
   /// Flag indicating GPU-resident mode (skip D2H copy of LLRs).
-  bool gpu_resident_mode_ = false;
+  bool                                 gpu_resident_mode_ = false;
+  std::shared_ptr<pusch_resident_dapp> resident_dapp_;
+  bool                                 last_dapp_inline_ = false;
+  /// True only when the last inline dApp produced every post-EQ noise sample.
+  bool last_dapp_post_eq_noise_valid_ = false;
+  /// Number of post-EQ noise samples written for the last Class-A dApp inline equalize
+  /// (`nof_data_re * nof_tx_layers`). Used by deferred CSI so OLLA gets real UL SINR.
+  size_t last_nof_eq_re_ = 0;
+  /// Host scratch for D2H of post-EQ noise when exporting dApp-inline SINR after decoder sync.
+  std::vector<float> dapp_post_eq_noise_host_;
 
   /// Copy buffer for channel RE.
   modular_re_buffer_reader<cbf16_t, MAX_PORTS> ch_re_view;
@@ -634,47 +704,32 @@ private:
   /// The RE indices depend only on PRB allocation, DMRS pattern, and grid geometry — not on
   /// data content. Caching them saves ~5-15μs per slot by avoiding the per-symbol for_each loop.
   struct cached_re_indices_config {
-    unsigned rb_count                    = 0;
-    unsigned rb_lowest                   = 0;
-    unsigned rb_highest                  = 0;
-    uint64_t dmrs_symb_pos               = 0;
-    unsigned start_symbol                = 0;
-    unsigned nof_symbols                 = 0;
-    int      dmrs_config_type            = 0;
-    unsigned nof_cdm_groups_without_data = 0;
-    unsigned nof_subcarriers             = 0;
-    size_t   cached_total_re             = 0;
-    bool     valid                       = false;
+    crb_bitmap rb_mask;
+    uint64_t   dmrs_symb_pos               = 0;
+    unsigned   start_symbol                = 0;
+    unsigned   nof_symbols                 = 0;
+    int        dmrs_config_type            = 0;
+    unsigned   nof_cdm_groups_without_data = 0;
+    unsigned   nof_subcarriers             = 0;
+    size_t     cached_total_re             = 0;
+    bool       valid                       = false;
 
-    bool matches(unsigned rc,
-                 unsigned rl,
-                 unsigned rh,
-                 uint64_t dp,
-                 unsigned ss,
-                 unsigned ns,
-                 int      dt,
-                 unsigned cdm,
-                 unsigned subc) const
+    bool matches(const crb_bitmap& rb, uint64_t dp, unsigned ss, unsigned ns, int dt, unsigned cdm, unsigned subc) const
     {
-      return valid && rb_count == rc && rb_lowest == rl && rb_highest == rh && dmrs_symb_pos == dp &&
-             start_symbol == ss && nof_symbols == ns && dmrs_config_type == dt && nof_cdm_groups_without_data == cdm &&
-             nof_subcarriers == subc;
+      return valid && rb_mask == rb && dmrs_symb_pos == dp && start_symbol == ss && nof_symbols == ns &&
+             dmrs_config_type == dt && nof_cdm_groups_without_data == cdm && nof_subcarriers == subc;
     }
 
-    void update(unsigned rc,
-                unsigned rl,
-                unsigned rh,
-                uint64_t dp,
-                unsigned ss,
-                unsigned ns,
-                int      dt,
-                unsigned cdm,
-                unsigned subc,
-                size_t   total_re)
+    void update(const crb_bitmap& rb,
+                uint64_t          dp,
+                unsigned          ss,
+                unsigned          ns,
+                int               dt,
+                unsigned          cdm,
+                unsigned          subc,
+                size_t            total_re)
     {
-      rb_count                    = rc;
-      rb_lowest                   = rl;
-      rb_highest                  = rh;
+      rb_mask                     = rb;
       dmrs_symb_pos               = dp;
       start_symbol                = ss;
       nof_symbols                 = ns;
@@ -687,6 +742,8 @@ private:
   };
   cached_re_indices_config                          re_indices_cache_;
   std::array<cached_re_indices_config, NUM_BUFFERS> d_re_indices_cache_;
+  /// Byte offset at which each device-buffer cache stored its RE indices.
+  std::array<size_t, NUM_BUFFERS> d_re_indices_offsets_{};
 
   /// Cached compact SCH/UCI RE-index configuration.
   struct cached_compaction_re_indices_config {

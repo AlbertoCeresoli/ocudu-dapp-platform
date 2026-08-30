@@ -17,12 +17,13 @@ class mac_metrics_notifier;
 class mac_slot_time_handler;
 
 struct mac_dl_config {
-  mac_ue_executor_mapper&   ue_exec_mapper;
-  mac_cell_executor_mapper& cell_exec_mapper;
-  task_executor&            ctrl_exec;
-  mac_result_notifier&      phy_notifier;
-  mac_pcap&                 pcap;
-  timer_manager&            timers;
+  mac_ue_executor_mapper&                       ue_exec_mapper;
+  mac_cell_executor_mapper&                     cell_exec_mapper;
+  task_executor&                                ctrl_exec;
+  mac_result_notifier&                          phy_notifier;
+  mac_pcap&                                     pcap;
+  timer_manager&                                timers;
+  std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks;
 };
 
 class mac_dl_processor final : public mac_dl_configurator

@@ -7,10 +7,12 @@
 #include "../policy/scheduler_policy.h"
 #include "ran_slice_candidate.h"
 #include "ran_slice_instance.h"
+#include <memory>
 
 namespace ocudu {
 
 struct cell_resource_allocator;
+class scheduler_dapp_hook_provider;
 
 /// Inter-slice Scheduler.
 class inter_slice_scheduler
@@ -20,7 +22,9 @@ class inter_slice_scheduler
   static constexpr priority_type skip_prio = 0;
 
 public:
-  inter_slice_scheduler(const cell_configuration& cell_cfg_, ue_repository& ues_);
+  inter_slice_scheduler(const cell_configuration&                     cell_cfg_,
+                        ue_repository&                                ues_,
+                        std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks = {});
 
   /// Reset the state of the slices.
   void slot_indication(slot_point slot_tx, const cell_resource_allocator& res_grid);

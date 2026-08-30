@@ -12,6 +12,7 @@
 #include "ocudu/ran/cyclic_prefix.h"
 #include "ocudu/ran/dmrs/dmrs.h"
 #include "ocudu/ran/harq_id.h"
+#include "ocudu/ran/pusch/pusch_mcs.h"
 #include "ocudu/ran/rnti.h"
 #include "ocudu/ran/sch/ldpc_base_graph.h"
 #include "ocudu/ran/sch/sch_mcs.h"
@@ -103,6 +104,8 @@ public:
   struct pdu_t {
     /// HARQ identifier.
     harq_id_t harq_id = INVALID_HARQ_ID;
+    /// DU-local cell identifier used for runtime attribution.
+    uint32_t cell_id = 0;
     /// Indicates the slot and numerology.
     slot_point slot;
     /// Provides \f$n_{RNTI}\f$ from TS38.211 Section 6.3.1.1 Scrambling.
@@ -160,6 +163,11 @@ public:
     /// \f$c_{init} = n_{RNTI} \cdot 2^{16} + n_{RAPID} \cdot 2^{10} + n_{ID}\f$
     /// as specified in TS 38.211, Section 6.3.1.1.
     std::optional<unsigned> n_rapid;
+    /// MCS index and table as signalled by the scheduler. Informational only:
+    /// the PHY derives everything it needs from \c mcs_descr. Carried so
+    /// telemetry consumers can name the MCS without inferring it.
+    std::optional<uint8_t>         mcs_index;
+    std::optional<pusch_mcs_table> mcs_table;
   };
 
   /// \brief Channel size as seen by the PUSCH channel estimator.

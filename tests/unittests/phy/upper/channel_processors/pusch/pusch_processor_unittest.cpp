@@ -377,6 +377,7 @@ TEST_P(PuschProcessorFixture, PuschProcessorUnittest)
   const auto&                              dmrs_sequence_config =
       std::get<dmrs_pusch_estimator::pseudo_random_sequence_configuration>(estimator_entry.config.sequence_config);
   ASSERT_EQ(&rg_spy, estimator_entry.grid);
+  ASSERT_EQ(pdu.cell_id, estimator_entry.config.cell_id);
   ASSERT_EQ(pdu.slot, estimator_entry.config.slot);
   ASSERT_EQ(dmrs_config.dmrs, dmrs_sequence_config.type);
   ASSERT_EQ(dmrs_config.scrambling_id, dmrs_sequence_config.scrambling_id);
@@ -395,6 +396,7 @@ TEST_P(PuschProcessorFixture, PuschProcessorUnittest)
   ASSERT_EQ(1, demodulator_spy->get_entries().size());
   const pusch_demodulator_spy::entry_t& demodulator_entry = demodulator_spy->get_entries().front();
   ASSERT_EQ(&rg_spy, demodulator_entry.grid);
+  ASSERT_EQ(pdu.cell_id, demodulator_entry.config.cell_id);
   ASSERT_EQ(pdu.rnti, demodulator_entry.config.rnti);
   ASSERT_EQ(rb_mask, demodulator_entry.config.rb_mask);
   ASSERT_EQ(pdu.mcs_descr.modulation, demodulator_entry.config.modulation);
@@ -404,6 +406,11 @@ TEST_P(PuschProcessorFixture, PuschProcessorUnittest)
   ASSERT_EQ(dmrs_config.dmrs, demodulator_entry.config.dmrs_type);
   ASSERT_EQ(dmrs_config.nof_cdm_groups_without_data, demodulator_entry.config.nof_cdm_groups_without_data);
   ASSERT_EQ(pdu.n_id, demodulator_entry.config.n_id);
+  ASSERT_EQ(dmrs_config.scrambling_id, demodulator_entry.config.dmrs_scrambling_id);
+  ASSERT_EQ(dmrs_config.n_scid, demodulator_entry.config.n_scid);
+  ASSERT_EQ(convert_dB_to_amplitude(-get_sch_to_dmrs_ratio_dB(dmrs_config.nof_cdm_groups_without_data)),
+            demodulator_entry.config.dmrs_scaling);
+  ASSERT_EQ(pdu.cp, demodulator_entry.config.c_prefix);
   ASSERT_EQ(pdu.nof_tx_layers, demodulator_entry.config.nof_tx_layers);
   ASSERT_EQ(false, demodulator_entry.config.enable_transform_precoding);
   ASSERT_EQ(span<const uint8_t>(pdu.rx_ports), span<const uint8_t>(demodulator_entry.config.rx_ports));

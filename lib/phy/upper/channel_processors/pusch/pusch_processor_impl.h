@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include "pusch_processor_notifier_adaptor.h"
 #include "pusch_uci_decoder_wrapper.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_decoder.h"
@@ -11,6 +13,7 @@
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_processor.h"
 #include "ocudu/phy/upper/channel_processors/pusch/ulsch_demultiplex.h"
 #include "ocudu/phy/upper/channel_processors/uci/uci_decoder.h"
+#include "ocudu/phy/upper/diagnostics/phy_diagnostics.h"
 #include "ocudu/phy/upper/signal_processors/pusch/dmrs_pusch_estimator.h"
 #include "ocudu/phy/upper/unique_rx_buffer.h"
 #include "ocudu/ran/pusch/pusch_constants.h"
@@ -96,6 +99,8 @@ public:
     channel_state_information::sinr_type csi_sinr_calc_method;
     /// Channel size as seen by the PUSCH channel estimator.
     channel_size ce_dims;
+    /// Optional diagnostic sink shared with SRS and other emitters.
+    std::shared_ptr<phy_diagnostic_sink> diag_sink;
   };
 
   /// \brief Constructs a generic software PUSCH processor.
@@ -245,8 +250,12 @@ private:
   channel_size ce_dims;
   /// Selects the PUSCH SINR calculation method.
   channel_state_information::sinr_type csi_sinr_calc_method;
+  /// Optional upper-PHY diagnostic sink.
+  std::shared_ptr<phy_diagnostic_sink> diag_sink;
   /// Notifier adaptor.
   pusch_processor_notifier_adaptor notifier_adaptor;
+  /// Reusable buffer for raw resource-grid telemetry captures.
+  std::vector<cf_t> grid_capture_buffer;
 
   /// \brief Processes the data in a PUSCH transmission.
   /// \param[out]    data                         Received transport block.

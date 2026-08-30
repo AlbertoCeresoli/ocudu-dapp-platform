@@ -58,7 +58,70 @@ add_executable(upper_phy_rx_symbol_handler_test upper_phy_rx_symbol_handler_test
 target_link_libraries(upper_phy_rx_symbol_handler_test ocudu_upper_phy ocudu_phy_support ocudulog GTest::gtest GTest::gtest_main)
 gtest_discover_tests(upper_phy_rx_symbol_handler_test)
 
+if(ENABLE_DAPP)
+  add_executable(dapp_resource_grid_tensor_adapter_test dapp_resource_grid_tensor_adapter_test.cpp)
+  target_link_libraries(dapp_resource_grid_tensor_adapter_test
+          ocudu_phy_dapp_adapters
+          ocudu_dapp_runtime
+          ocudu_phy_support
+          ocudulog
+          GTest::gtest
+          GTest::gtest_main)
+  if(ENABLE_CUDA)
+    # The adapter enqueues cudaStreamWaitEvent on the owned-snapshot event, so
+    # the fixtures must supply real CUDA objects in accelerated builds.
+    target_link_libraries(dapp_resource_grid_tensor_adapter_test CUDA::cudart)
+    target_compile_definitions(dapp_resource_grid_tensor_adapter_test PRIVATE ENABLE_CUDA)
+  endif()
+  gtest_discover_tests(dapp_resource_grid_tensor_adapter_test)
+
+  add_executable(dapp_hook_provider_test
+          dapp_channel_estimator_test.cpp
+          dapp_demodulator_test.cpp
+          dapp_data_router_test.cpp
+          dapp_hook_provider_test.cpp
+          dapp_process_target_test.cpp)
+  if(ENABLE_E3)
+    target_sources(dapp_hook_provider_test PRIVATE dapp_portable_e3_target_test.cpp)
+  endif()
+  target_link_libraries(dapp_hook_provider_test
+          ocudu_phy_dapp_adapters
+          ocudu_phy_support
+          ocudu_srs_estimator
+          ocudu_support
+          ocudulog
+          GTest::gtest
+          GTest::gtest_main)
+  gtest_discover_tests(dapp_hook_provider_test PROPERTIES LABELS "tsan")
+endif()
+
 if(CUDA_ACCEL_FOUND)
+  add_executable(pusch_resident_dapp_adapter_test pusch_resident_dapp_adapter_test.cpp)
+  target_link_libraries(pusch_resident_dapp_adapter_test
+          ocudu_dapp_app_service
+          ocudu_phy_dapp_adapters
+          ocudu_channel_equalizer
+          ocudu_dft
+          ocudu_transform_precoding
+          ocudu_pusch_demodulator
+          ocudu_sequence_generators
+          CUDA::cudart
+          GTest::gtest
+          GTest::gtest_main)
+  target_compile_definitions(pusch_resident_dapp_adapter_test PRIVATE ENABLE_CUDA)
+  add_dependencies(pusch_resident_dapp_adapter_test ocudu-dapp-preflight)
+  target_compile_definitions(pusch_resident_dapp_adapter_test PRIVATE
+          OCUDU_DAPP_PREFLIGHT_HELPER="$<TARGET_FILE:ocudu-dapp-preflight>")
+  if(OCUDU_DAPP_REFERENCE_CUDA_DIR)
+    target_compile_definitions(pusch_resident_dapp_adapter_test PRIVATE
+            OCUDU_DAPP_REFERENCE_CUDA_DIR="${OCUDU_DAPP_REFERENCE_CUDA_DIR}")
+  endif()
+  if(OCUDU_DAPP_SCAFFOLD_CUDA_DIR)
+    target_compile_definitions(pusch_resident_dapp_adapter_test PRIVATE
+            OCUDU_DAPP_SCAFFOLD_CUDA_DIR="${OCUDU_DAPP_SCAFFOLD_CUDA_DIR}")
+  endif()
+  gtest_discover_tests(pusch_resident_dapp_adapter_test PROPERTIES RUN_SERIAL TRUE)
+
   add_executable(pdsch_grid_output_strategy_test pdsch_grid_output_strategy_test.cpp)
   target_include_directories(pdsch_grid_output_strategy_test PRIVATE
           ${PROJECT_SOURCE_DIR}/lib/phy/upper

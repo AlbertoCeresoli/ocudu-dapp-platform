@@ -3,6 +3,7 @@
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 #include "ru_ofh_downlink_plane_handler_proxy.h"
+#include "../channel_emulator_hook.h"
 #include "ocudu/ofh/transmitter/ofh_downlink_handler.h"
 #include "ocudu/phy/support/resource_grid_context.h"
 #include "ocudu/phy/support/shared_resource_grid.h"
@@ -14,6 +15,10 @@ void ru_downlink_plane_handler_proxy::handle_dl_data(const resource_grid_context
                                                      const shared_resource_grid&  grid)
 {
   ocudu_assert(context.sector < sectors.size(), "Invalid sector id '{}'", context.sector);
+
+  // Optional GPU channel emulation on the transmitted slot, before the O-FH
+  // transmitter compresses the grid. No-op unless configured.
+  channel_emulator_hook::get().apply_downlink(grid, context.slot);
 
   auto& sector = sectors[context.sector];
   sector->handle_dl_data(context, grid);

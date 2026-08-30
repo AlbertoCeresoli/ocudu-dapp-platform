@@ -1454,7 +1454,7 @@ static nr_ldpc_status_t pusch_e2e_process_full_gpu_impl(
             handle->d_eq_noise_var_sum,
             handle->d_eq_noise_var_count,
             nof_data_re, cfg.mod_order, grid_stride, symbol_stride, nof_re_per_symbol,
-            cfg.start_symbol, cfg.start_prb * 12, cfg.tx_scaling);
+            cfg.start_symbol, cfg.start_prb * 12, cfg.tx_scaling, false);
         if (_ls != NR_LDPC_SUCCESS) return _ls;
     }
 

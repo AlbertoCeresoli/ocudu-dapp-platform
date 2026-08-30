@@ -55,6 +55,11 @@ public:
 
   bool is_resident_mode_enabled() const override { return base->is_resident_mode_enabled(); }
 
+  bool install_resident_dapp(std::shared_ptr<pusch_resident_dapp> dapp) override
+  {
+    return base->install_resident_dapp(std::move(dapp));
+  }
+
   resident_softbit_buffer get_resident_softbits() const override { return base->get_resident_softbits(); }
 
   bool used_host_codeword_fallback() const override { return base->used_host_codeword_fallback(); }
@@ -71,6 +76,24 @@ public:
   {
     return base->report_deferred_sinr(demodulator_notifier);
   }
+
+  void report_deferred_dapp_completion() override { base->report_deferred_dapp_completion(); }
+
+  void enable_resident_dapp_diagnostic_timing(bool enabled) override
+  {
+    base->enable_resident_dapp_diagnostic_timing(enabled);
+  }
+
+  resident_dapp_diagnostic_timing get_resident_dapp_diagnostic_timing(unsigned completion_slot) const override
+  {
+    return base->get_resident_dapp_diagnostic_timing(completion_slot);
+  }
+
+  // Forward constellation capture (see dapp demodulator_decorator — base no-ops break PUSCH.SYM).
+  void enable_symbol_capture() override { base->enable_symbol_capture(); }
+  void disable_symbol_capture() override { base->disable_symbol_capture(); }
+  span<const std::complex<float>> get_captured_symbols() const override { return base->get_captured_symbols(); }
+  void wait_captured_symbols() override { base->wait_captured_symbols(); }
 
 private:
   // See pusch_codeword_buffer interface for documentation.

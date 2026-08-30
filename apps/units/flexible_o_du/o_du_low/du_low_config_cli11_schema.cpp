@@ -261,6 +261,11 @@ static void configure_cli11_expert_phy_args(CLI::App& app, du_low_unit_expert_up
              expert_phy_params.phy_tap_arguments,
              "PHY tap plugin argument string passed during construction.")
       ->capture_default_str();
+  add_option(app,
+             "--zmq_diag_endpoint",
+             expert_phy_params.zmq_diag_endpoint,
+             "ZMQ PUB bind endpoint for real-time PHY diagnostics (e.g. tcp://127.0.0.1:5555). Empty disables.")
+      ->capture_default_str();
 
   auto acceleration_mode_check = [](const std::string& value) -> std::string {
     if ((value == "auto") || (value == "enabled") || (value == "disabled")) {

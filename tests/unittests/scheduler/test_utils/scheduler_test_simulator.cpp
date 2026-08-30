@@ -18,9 +18,10 @@ scheduler_expert_config ocudu::make_custom_scheduler_expert_config(bool enable_c
   return exp_cfg;
 }
 
-scheduler_test_simulator::scheduler_test_simulator(const scheduler_expert_config& sched_cfg_,
-                                                   unsigned                       tx_rx_delay_,
-                                                   subcarrier_spacing             max_scs) :
+scheduler_test_simulator::scheduler_test_simulator(const scheduler_expert_config&                sched_cfg_,
+                                                   unsigned                                      tx_rx_delay_,
+                                                   subcarrier_spacing                            max_scs,
+                                                   std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks) :
   tx_rx_delay(tx_rx_delay_),
   logger([]() -> ocudulog::basic_logger& {
     ocudulog::init();
@@ -31,7 +32,7 @@ scheduler_test_simulator::scheduler_test_simulator(const scheduler_expert_config
   test_logger(ocudulog::fetch_basic_logger("TEST", true)),
   sched_cfg(sched_cfg_),
   cfg_mng(sched_cfg_),
-  sched(create_scheduler(scheduler_config{sched_cfg, notif})),
+  sched(create_scheduler(scheduler_config{sched_cfg, notif, std::move(dapp_hooks)})),
   next_slot(test_helper::generate_random_slot_point(max_scs))
 {
   test_logger.set_level(ocudulog::basic_levels::debug);
@@ -48,7 +49,7 @@ scheduler_test_simulator::scheduler_test_simulator(unsigned           tx_rx_dela
 }
 
 scheduler_test_simulator::scheduler_test_simulator(const scheduler_test_sim_config& cfg) :
-  scheduler_test_simulator(cfg.sched_cfg, cfg.tx_rx_delay, cfg.max_scs)
+  scheduler_test_simulator(cfg.sched_cfg, cfg.tx_rx_delay, cfg.max_scs, cfg.dapp_hooks)
 {
   auto_uci       = cfg.auto_uci;
   auto_crc       = cfg.auto_crc;

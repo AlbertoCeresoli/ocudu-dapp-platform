@@ -1,0 +1,20 @@
+{
+  "SPDX-FileCopyrightText": "Copyright (C) 2026 DeepSig Inc.",
+  "SPDX-License-Identifier": "BSD-3-Clause-Clear",
+  "schema": "ocudu.dapp.class-b-cpu-timing-policy.v1",
+  "platform_id": "gb10-development-uncontrolled",
+  "deadline_ns": 100000,
+  "repetitions": 1000,
+  "warmups": 100,
+  "maximum_p999_ns": 100000,
+  "maximum_deadline_miss_rate": 0,
+  "maximum_fallback_rate": 0,
+  "maximum_validation_rejection_rate": 0,
+  "required_scheduler_policy": "other",
+  "minimum_scheduler_priority": 0,
+  "required_cpu_affinity": "0-19",
+  "cpu_frequency_policy": "development-unlocked",
+  "release_controls_approved": false,
+  "controls_rationale": "Development measurement only; CPU scheduling and frequency controls are not approved for release admission.",
+  "operator_notes": "Replace with deployment-approved affinity, scheduling, and frequency controls for P0-R admission."
+}

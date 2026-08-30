@@ -40,3 +40,10 @@ add_library(ocudu_sched STATIC ${SOURCES}
         $<TARGET_OBJECTS:sched_ue_context>
         $<TARGET_OBJECTS:ue_sched>)
 target_link_libraries(ocudu_sched ocudu_ran sched_config sched_ue_context sched_support scheduler_logger)
+if (ENABLE_DAPP)
+  target_sources(ocudu_sched PRIVATE
+          dapp/quiet_reservation.cpp
+          dapp/scheduler_dapp_context.cpp
+          dapp/scheduler_dapp_policy.cpp)
+  target_link_libraries(ocudu_sched ocudu_dapp_runtime)
+endif ()

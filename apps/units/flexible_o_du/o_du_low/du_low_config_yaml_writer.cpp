@@ -76,6 +76,7 @@ static void fill_du_low_expert_section(YAML::Node node, const du_low_unit_expert
   node["allow_request_on_empty_uplink_slot"]       = config.allow_request_on_empty_uplink_slot;
   node["enable_phy_tap"]                           = config.enable_phy_tap;
   node["phy_tap_arguments"]                        = config.phy_tap_arguments;
+  node["zmq_diag_endpoint"]                        = config.zmq_diag_endpoint;
   node["pusch_acceleration_mode"]                  = config.pusch_acceleration_mode;
   node["ul_cuda_visible_grid_mode"]                = config.ul_cuda_visible_grid_mode;
   node["dl_cuda_visible_grid_mode"]                = config.dl_cuda_visible_grid_mode;

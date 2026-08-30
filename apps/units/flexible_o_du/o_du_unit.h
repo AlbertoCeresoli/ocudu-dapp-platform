@@ -18,7 +18,12 @@ namespace ocudu {
 namespace app_services {
 class metrics_notifier;
 class remote_server_metrics_gateway;
+class dapp_metrics_json_fanout;
 } // namespace app_services
+
+namespace dapp::e3 {
+class ran_control_handler;
+}
 
 namespace odu {
 class f1u_du_gateway;
@@ -57,7 +62,11 @@ struct o_du_unit_dependencies {
   e2_connection_client*                        e2_client_handler      = nullptr;
   app_services::metrics_notifier*              metrics_notifier       = nullptr;
   app_services::remote_server_metrics_gateway* remote_metrics_gateway = nullptr;
-  ocudulog::basic_logger*                      fapi_logger            = nullptr;
+  /// Optional tee bound to the dApp service so JSON metrics reach the E3 telemetry stream.
+  app_services::dapp_metrics_json_fanout* dapp_metrics_fanout = nullptr;
+  /// Optional gNB-wide E3 mutation authority (for example, RRC UE release).
+  std::shared_ptr<dapp::e3::ran_control_handler> dapp_ran_control;
+  ocudulog::basic_logger*                        fapi_logger = nullptr;
 };
 
 } // namespace ocudu

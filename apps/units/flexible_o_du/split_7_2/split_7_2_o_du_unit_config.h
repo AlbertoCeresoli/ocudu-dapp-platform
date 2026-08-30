@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "apps/services/dapp/dapp_service.h"
 #include "apps/units/flexible_o_du/o_du_high/o_du_high_unit_config.h"
 #include "apps/units/flexible_o_du/o_du_low/du_low_config.h"
 #include "apps/units/flexible_o_du/split_7_2/helpers/ru_ofh_config.h"
@@ -18,6 +19,8 @@ struct split_7_2_o_du_unit_config {
   du_low_unit_config du_low_cfg;
   /// Radio Unit configuration.
   ru_ofh_unit_parsed_config ru_cfg;
+  /// Optional in-process dApp runtime and embedded E3 endpoint.
+  std::optional<app_services::dapp_service_config> dapp;
 };
 
 } // namespace ocudu

@@ -102,6 +102,7 @@ static odu::du_low_config generate_du_low_config(const du_low_unit_config&      
       upper_phy_factory_config.phy_tap_tdd_pattern = cells[0].tdd_pattern;
     }
   }
+  upper_phy_factory_config.zmq_diag_endpoint = du_low.expert_phy_cfg.zmq_diag_endpoint;
 
   // The flexible PDSCH processor implementation will be used by default.
   const auto& upper_phy_threads_cfg = du_low.expert_execution_cfg.threads;

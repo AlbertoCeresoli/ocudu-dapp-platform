@@ -9,7 +9,10 @@
 using namespace ocudu;
 
 scheduler_impl::scheduler_impl(const scheduler_config& sched_cfg_) :
-  expert_params(sched_cfg_.expert_params), logger(ocudulog::fetch_basic_logger("SCHED")), cfg_mng(sched_cfg_)
+  expert_params(sched_cfg_.expert_params),
+  dapp_hooks(sched_cfg_.dapp_hooks),
+  logger(ocudulog::fetch_basic_logger("SCHED")),
+  cfg_mng(sched_cfg_)
 {
 }
 
@@ -23,7 +26,7 @@ bool scheduler_impl::handle_cell_configuration_request(const sched_cell_configur
   // Check if it is a new DU Cell Group.
   if (not groups.contains(msg.cell_group_index)) {
     // If it is a new group, create a new instance.
-    groups.emplace(msg.cell_group_index, std::make_unique<ue_scheduler_impl>(expert_params.ue));
+    groups.emplace(msg.cell_group_index, std::make_unique<ue_scheduler_impl>(expert_params.ue, dapp_hooks));
   }
 
   // Create a new cell scheduler instance.

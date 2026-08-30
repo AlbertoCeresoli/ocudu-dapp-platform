@@ -1,0 +1,101 @@
+// SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
+// SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+
+namespace ocudu.diagnostics;
+
+// FlatBuffers payloads for the ZMQ diagnostics transport.
+//
+// ZMQ topics still identify the diagnostic stream. Each topic carries one of
+// these tables as the FlatBuffers root object with file identifier "OCDG".
+// Complex vectors are encoded as interleaved float32 real/imag samples.
+
+table PuschSymbols {
+  version:ubyte = 1;
+  rnti:ushort;
+  sfn:ushort;
+  slot:ushort;
+  nof_prb:ushort;
+  nof_data_symbols:ushort;
+  nof_layers:ubyte;
+  mod_bits:ubyte;
+  sinr_db:float;
+  epre_db:float;
+  rsrp_db:float;
+  evm:float;
+  time_alignment_us:float;
+  cfo_hz:float;
+  target_code_rate:float;
+  equalized_cf32:[float];
+}
+
+table PuschCrc {
+  version:ubyte = 1;
+  rnti:ushort;
+  sfn:ushort;
+  slot:ushort;
+  crc_ok:bool;
+}
+
+table SrsChannel {
+  version:ubyte = 2;
+  comb_size:ubyte;
+  rnti:ushort;
+  sfn:ushort;
+  slot:ushort;
+  nof_subcarriers:ushort;
+  nof_rx_ports:ubyte;
+  nof_tx_ports:ubyte;
+  rx_port_index:ubyte;
+  tx_port_index:ubyte;
+  rsrp_db:float;
+  epre_db:float;
+  noise_variance:float;
+  time_alignment_ns:float;
+  h_coefficients_cf32:[float];
+  start_symbol:ubyte;
+  nof_symbols:ubyte;
+  mapping_initial_subcarrier:ushort;
+  comb_offset:ubyte;
+  cyclic_shift:ubyte;
+  sequence_id:ushort;
+  sequence_group:ushort;
+  sequence_number:ushort;
+  n_cs:ushort;
+  n_cs_max:ushort;
+  bandwidth_index:ubyte;
+  freq_position:ubyte;
+  freq_shift:ushort;
+  freq_hopping:ubyte;
+}
+
+table PuschDmrsChannel {
+  version:ubyte = 2;
+  rnti:ushort;
+  sfn:ushort;
+  slot:ushort;
+  start_prb:ushort;
+  nof_prb:ushort;
+  nof_subcarriers:ushort;
+  dmrs_symbol_index:ubyte;
+  start_symbol:ubyte;
+  nof_symbols:ubyte;
+  nof_rx_ports:ubyte;
+  nof_tx_layers:ubyte;
+  rx_port_index:ubyte;
+  tx_layer_index:ubyte;
+  dmrs_type:ubyte;
+  nof_cdm_groups_without_data:ubyte;
+  transform_precoding:bool;
+  scrambling_id:ushort;
+  n_scid:bool;
+  sinr_db:float;
+  epre_db:float;
+  rsrp_db:float;
+  noise_variance:float;
+  time_alignment_us:float;
+  cfo_hz:float;
+  target_code_rate:float;
+  h_estimates_cf32:[float];
+}
+
+file_identifier "OCDG";

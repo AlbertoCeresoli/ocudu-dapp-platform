@@ -14,8 +14,14 @@ class srs_estimator_dummy : public srs_estimator
 public:
   srs_estimator_result estimate(const resource_grid_reader& grid, const srs_estimator_configuration& config) override
   {
+    last_config = config;
     return srs_estimator_result();
   }
+
+  const std::optional<srs_estimator_configuration>& get_last_config() const { return last_config; }
+
+private:
+  std::optional<srs_estimator_configuration> last_config;
 };
 
 } // namespace ocudu

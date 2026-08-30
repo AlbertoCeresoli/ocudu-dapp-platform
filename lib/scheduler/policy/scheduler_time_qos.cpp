@@ -52,7 +52,14 @@ void ue_history_repository::save_dl_newtx_grants(span<const dl_msg_alloc> dl_gra
   span<float> dl_rate = ue_db.column<component::dl_avg>().to_span();
   std::fill(last_samples_buffer.begin(), last_samples_buffer.begin() + dl_rate.size(), 0.0f);
   for (const dl_msg_alloc& grant : dl_grants) {
-    unsigned offset = ue_db.get_offset(ue_row_ids[grant.context.ue_index]);
+    if (grant.pdsch_cfg.rnti == rnti_t::INVALID_RNTI) {
+      continue;
+    }
+    const du_ue_index_t ue_idx = grant.context.ue_index;
+    if (ue_idx >= ue_row_ids.size() || ue_row_ids[ue_idx] == invalid_row_id) {
+      continue;
+    }
+    unsigned offset = ue_db.get_offset(ue_row_ids[ue_idx]);
     for (const auto& cw : grant.pdsch_cfg.codewords) {
       last_samples_buffer[offset] += cw.tb_size_bytes.value();
     }
@@ -74,7 +81,14 @@ void ue_history_repository::save_ul_newtx_grants(span<const ul_sched_info> ul_gr
   span<float> ul_rate = ue_db.column<component::ul_avg>().to_span();
   std::fill(last_samples_buffer.begin(), last_samples_buffer.begin() + ul_rate.size(), 0.0f);
   for (const ul_sched_info& grant : ul_grants) {
-    unsigned offset = ue_db.get_offset(ue_row_ids[grant.context.ue_index]);
+    if (grant.pusch_cfg.rnti == rnti_t::INVALID_RNTI) {
+      continue;
+    }
+    const du_ue_index_t ue_idx = grant.context.ue_index;
+    if (ue_idx >= ue_row_ids.size() || ue_row_ids[ue_idx] == invalid_row_id) {
+      continue;
+    }
+    unsigned offset = ue_db.get_offset(ue_row_ids[ue_idx]);
     last_samples_buffer[offset] += grant.pusch_cfg.tb_size_bytes.value();
   }
   auto sample_it = last_samples_buffer.begin();

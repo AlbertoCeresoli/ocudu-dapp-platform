@@ -7,10 +7,14 @@
 #include "../policy/scheduler_policy_factory.h"
 #include "../ue_scheduling/ue_cell_grid_allocator.h"
 #include "ocudu/ocudulog/ocudulog.h"
+#include "ocudu/scheduler/config/pusch_td_resource_indices.h"
+#include "ocudu/scheduler/dapp/scheduler_dapp_policy.h"
 
 using namespace ocudu;
 
-inter_slice_scheduler::inter_slice_scheduler(const cell_configuration& cell_cfg_, ue_repository& ues_) :
+inter_slice_scheduler::inter_slice_scheduler(const cell_configuration&                     cell_cfg_,
+                                             ue_repository&                                ues_,
+                                             std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks) :
   cell_cfg(cell_cfg_), logger(ocudulog::fetch_basic_logger("SCHED")), ues(ues_)
 {
   // Create a number of slices equal to the number of configured RRM Policy members + 1 (default SRB slice) + 1 (default
@@ -24,6 +28,20 @@ inter_slice_scheduler::inter_slice_scheduler(const cell_configuration& cell_cfg_
   // NOTE: We assume nof. CRBs in a cell for both DL and UL are same.
   const unsigned cell_max_rbs = cell_cfg.params.dl_cfg_common.init_dl_bwp.generic_params.crbs.length();
 
+  auto create_policy = [&](const scheduler_policy_config& policy_config, ran_slice_id_t slice_id) {
+    auto policy = create_scheduler_strategy(policy_config, cell_cfg);
+    if (dapp_hooks) {
+      policy =
+          dapp_hooks->decorate_scheduler_policy(std::move(policy),
+                                                {static_cast<uint32_t>(cell_cfg.cell_index),
+                                                 slice_id.value(),
+                                                 cell_max_rbs,
+                                                 std::min<uint32_t>(cell_cfg.expert_cfg.ue.pre_policy_rr_ue_group_size,
+                                                                    OCUDU_DAPP_SCHEDULER_MAX_CANDIDATES_V1)});
+    }
+    return policy;
+  };
+
   // Create RAN slice instances.
   // > Default SRB slice.
   // NOTE: We set \c min_prb for default SRB slice to maximum nof. PRBs of a UE carrier to give maximum priority to this
@@ -33,13 +51,13 @@ inter_slice_scheduler::inter_slice_scheduler(const cell_configuration& cell_cfg_
       SRB_RAN_SLICE_ID,
       cell_cfg,
       slice_rrm_policy_config{.rbs = {cell_max_rbs, cell_max_rbs}, .priority = slice_rrm_policy_config::max_priority},
-      create_scheduler_strategy(cell_cfg.expert_cfg.ue.policy_cfg, cell_cfg),
+      create_policy(cell_cfg.expert_cfg.ue.policy_cfg, SRB_RAN_SLICE_ID),
       ues);
   // > Default DRB slice.
   slices.emplace_back(DEFAULT_DRB_RAN_SLICE_ID,
                       cell_cfg,
                       slice_rrm_policy_config{.rbs = {0, cell_max_rbs}},
-                      create_scheduler_strategy(cell_cfg.expert_cfg.ue.policy_cfg, cell_cfg),
+                      create_policy(cell_cfg.expert_cfg.ue.policy_cfg, DEFAULT_DRB_RAN_SLICE_ID),
                       ues);
   // NOTE: RAN slice IDs 0 and 1 are reserved for default SRB and default DRB slice respectively.
   ran_slice_id_t id_count{2};
@@ -52,8 +70,7 @@ inter_slice_scheduler::inter_slice_scheduler(const cell_configuration& cell_cfg_
                              std::min(rrm_adjusted.rbs.max(), cell_max_rbs)};
     rrm_adjusted.priority = std::min(rrm.priority, slice_rrm_policy_config::max_priority);
     // Create custom RAN slice based on the RRM policy.
-    slices.emplace_back(
-        id_count, cell_cfg, rrm_adjusted, create_scheduler_strategy(rrm.policy_sched_cfg, cell_cfg), ues);
+    slices.emplace_back(id_count, cell_cfg, rrm_adjusted, create_policy(rrm.policy_sched_cfg, id_count), ues);
     ++id_count;
   }
 }

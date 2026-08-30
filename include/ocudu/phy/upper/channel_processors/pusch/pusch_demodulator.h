@@ -17,12 +17,15 @@
 #include "ocudu/ran/rnti.h"
 #include "ocudu/ran/sch/modulation_scheme.h"
 #include "ocudu/ran/slot_point.h"
+#include <complex>
+#include <memory>
 
 namespace ocudu {
 
 class pusch_codeword_buffer;
 class pusch_demodulator_notifier;
 class resource_grid_reader;
+class pusch_resident_dapp;
 
 /// \brief PUSCH demodulator interface.
 ///
@@ -36,6 +39,8 @@ class pusch_demodulator
 public:
   /// Parameters defining the demodulation procedure of a PUSCH transmission.
   struct configuration {
+    /// DU-local cell identifier used for dApp invocation attribution.
+    uint32_t cell_id = 0;
     /// Radio Network Temporary Identifier, see parameter \f$n_{RNTI}\f$ in TS38.211 Section 6.3.1.1.
     rnti_t rnti;
     /// Allocation CRB list: the entries set to true are used for transmission.
@@ -59,6 +64,10 @@ public:
     unsigned dmrs_scrambling_id;
     /// DMRS sequence initialization, see parameter \f$n_{SCID}\f$ in TS38.211 Section 6.4.1.1.1.1. Values {0, 1}.
     bool n_scid;
+    /// DM-RS amplitude relative to PUSCH data symbols.
+    float dmrs_scaling = 1.0F;
+    /// Cyclic prefix used to derive the number of symbols per slot.
+    cyclic_prefix c_prefix = cyclic_prefix::NORMAL;
     /// Number of transmit layers.
     unsigned nof_tx_layers;
     /// \brief Direct current position.
@@ -126,6 +135,9 @@ public:
   /// \brief Checks if resident accelerator mode is currently enabled.
   virtual bool is_resident_mode_enabled() const { return false; }
 
+  /// Installs one pre-bound resident Class-A adapter during dependency construction.
+  virtual bool install_resident_dapp(std::shared_ptr<pusch_resident_dapp>) { return false; }
+
   /// \brief Gets resident softbit buffer information from the last demodulation.
   virtual resident_softbit_buffer get_resident_softbits() const { return {}; }
 
@@ -157,6 +169,32 @@ public:
   /// \param[in] notifier The demodulator notifier to report stats to.
   /// \return SINR readback time in microseconds.
   virtual float report_deferred_sinr(pusch_demodulator_notifier& notifier) { return 0; }
+
+  /// Reports the completed resident dApp boundary after accelerator synchronization.
+  virtual void report_deferred_dapp_completion() {}
+
+  /// Enables opt-in resident dApp stage diagnostics. This must be configured before concurrent processing starts.
+  virtual void enable_resident_dapp_diagnostic_timing(bool) {}
+
+  /// Returns opaque stage timing tokens for a fixed resident completion slot.
+  virtual resident_dapp_diagnostic_timing get_resident_dapp_diagnostic_timing(unsigned) const { return {}; }
+
+  /// \brief Enable equalized-symbol capture for the next demodulation (constellation diagnostics).
+  ///
+  /// GPU-resident paths may leave the buffer empty — diagnostics are best-effort.
+  virtual void enable_symbol_capture() {}
+
+  /// Disable equalized-symbol capture.
+  virtual void disable_symbol_capture() {}
+
+  /// Captured equalized symbols from the last demodulate() when capture was enabled.
+  /// Non-blocking: may return empty if async D2H is still in flight (call again after
+  /// \ref wait_captured_symbols from the decoder pre-join path).
+  virtual span<const std::complex<float>> get_captured_symbols() const { return {}; }
+
+  /// Wait for any in-flight constellation D2H to finish. Safe from decoder pre-join
+  /// (off the slot-critical path). Default is a no-op for CPU paths.
+  virtual void wait_captured_symbols() {}
 };
 
 } // namespace ocudu

@@ -9,10 +9,13 @@
 #include "ocudu/du/du_low/o_du_low_config.h"
 #include "ocudu/ran/tdd/tdd_ul_dl_config.h"
 #include <chrono>
+#include <memory>
 
 namespace ocudu {
 
 struct du_low_unit_config;
+class upper_phy_dapp_hook_provider;
+class phy_diagnostic_sink;
 
 /// O-RAN DU low unit configuration.
 struct o_du_low_unit_config {
@@ -39,10 +42,13 @@ struct o_du_low_unit_config {
 
 /// O-RAN DU low unit dependencies.
 struct o_du_low_unit_dependencies {
-  upper_phy_rg_gateway&                 rg_gateway;
-  upper_phy_rx_symbol_request_notifier& rx_symbol_request_notifier;
-  odu::du_low_executor_mapper&          workers;
-  task_executor&                        fapi_p5_executor;
+  upper_phy_rg_gateway&                         rg_gateway;
+  upper_phy_rx_symbol_request_notifier&         rx_symbol_request_notifier;
+  odu::du_low_executor_mapper&                  workers;
+  task_executor&                                fapi_p5_executor;
+  std::shared_ptr<upper_phy_dapp_hook_provider> dapp_hooks;
+  /// Optional upper-PHY diagnostic sink (E3 telemetry); overrides the ZMQ diagnostics endpoint.
+  std::shared_ptr<phy_diagnostic_sink> phy_diagnostics;
 };
 
 } // namespace ocudu

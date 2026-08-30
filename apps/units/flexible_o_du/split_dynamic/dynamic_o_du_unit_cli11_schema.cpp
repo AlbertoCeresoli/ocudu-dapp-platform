@@ -12,6 +12,9 @@
 #include "dynamic_o_du_unit_config.h"
 #include "ocudu/support/cli11_utils.h"
 #include "ocudu/support/config_parsers.h"
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+#include "apps/services/dapp/dapp_config_cli11_schema.h"
+#endif
 
 using namespace ocudu;
 
@@ -97,6 +100,9 @@ void ocudu::configure_cli11_with_dynamic_o_du_unit_config_schema(CLI::App& app, 
   // Expert execution section.
   CLI::App* expert_subcmd = add_subcommand(app, "expert_execution", "Expert execution configuration")->configurable();
   configure_cli11_expert_execution_args(*expert_subcmd, dummy_cfg);
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  app_services::configure_cli11_with_dapp_service_config_schema(app, parsed_cfg.dapp);
+#endif
 }
 
 static void manage_ru(CLI::App& app, dynamic_o_du_unit_config& parsed_cfg)
@@ -163,4 +169,7 @@ void ocudu::autoderive_dynamic_o_du_parameters_after_parsing(CLI::App& app, dyna
   const auto&   cell = parsed_cfg.odu_high_cfg.du_high_cfg.config.cells_cfg.front().cell;
   const nr_band band = cell.band ? cell.band.value() : band_helper::get_band_from_dl_arfcn(cell.dl_f_ref_arfcn);
   autoderive_du_low_parameters_after_parsing(app, parsed_cfg.du_low_cfg, band_helper::get_duplex_mode(band));
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  app_services::autoderive_dapp_service_config_after_parsing(app, parsed_cfg.dapp);
+#endif
 }

@@ -9,15 +9,19 @@ using namespace ocudu;
 
 mac_impl::mac_impl(const mac_config& params) :
   rnti_table(params.mac_cfg.initial_crnti),
-  mac_sched(std::make_unique<ocudu_scheduler_adapter>(
-      ocudu_mac_sched_config{params.mac_cfg, params.ctrl_exec, params.timers.get_timer_manager(), params.sched_cfg},
-      rnti_table)),
+  mac_sched(std::make_unique<ocudu_scheduler_adapter>(ocudu_mac_sched_config{params.mac_cfg,
+                                                                             params.ctrl_exec,
+                                                                             params.timers.get_timer_manager(),
+                                                                             params.sched_cfg,
+                                                                             params.dapp_hooks},
+                                                      rnti_table)),
   dl_unit(mac_dl_config{params.ue_exec_mapper,
                         params.cell_exec_mapper,
                         params.ctrl_exec,
                         params.phy_notifier,
                         params.pcap,
-                        params.timers.get_timer_manager()},
+                        params.timers.get_timer_manager(),
+                        params.dapp_hooks},
           *mac_sched,
           rnti_table),
   ul_unit(mac_ul_config{params.ctrl_exec,

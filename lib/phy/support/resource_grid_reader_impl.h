@@ -65,6 +65,13 @@ public:
 
   span<const cbf16_t> get_contiguous_view() const override;
 
+  /// \brief Checks if a port is empty.
+  ///
+  /// Non-virtual fast path for the resident dApp hooks. Upstream replaced the
+  /// atomic empty-port bitmap this used to read with the allocation info, which
+  /// exposes the same query directly.
+  bool is_port_empty(unsigned i_port) const { return alloc_mask.is_port_empty(i_port); }
+
 private:
   const storage_type&                  data;
   const resource_grid_allocation_info& alloc_mask;

@@ -80,6 +80,67 @@ struct run_spec {
   unsigned cw_offset;
 };
 
+std::vector<uint32_t> generate_gold_sequence_reference(uint32_t c_init, unsigned nof_bits)
+{
+  static constexpr unsigned nc = 1600;
+  std::vector<uint8_t>      x1(nc + nof_bits + 31, 0);
+  std::vector<uint8_t>      x2(nc + nof_bits + 31, 0);
+  x1[0] = 1;
+  for (unsigned bit = 0; bit != 31; ++bit) {
+    x2[bit] = (c_init >> bit) & 1U;
+  }
+  for (unsigned n = 0; n != nc + nof_bits; ++n) {
+    x1[n + 31] = x1[n + 3] ^ x1[n];
+    x2[n + 31] = x2[n + 3] ^ x2[n + 2] ^ x2[n + 1] ^ x2[n];
+  }
+
+  std::vector<uint32_t> result((nof_bits + 31U) / 32U, 0);
+  for (unsigned bit = 0; bit != nof_bits; ++bit) {
+    result[bit / 32U] |= static_cast<uint32_t>(x1[nc + bit] ^ x2[nc + bit]) << (31U - (bit % 32U));
+  }
+  return result;
+}
+
+bool check_gold_sequence(uint32_t c_init, unsigned nof_bits)
+{
+  cudaStream_t stream = nullptr;
+  if (!check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "gold cudaStreamCreateWithFlags")) {
+    return false;
+  }
+  scrambler_handle_t scrambler = nullptr;
+  bool               ok        = check_status(scrambler_create(&scrambler), "gold scrambler_create") &&
+            check_status(scrambler_configure_c_init(scrambler, c_init), "gold scrambler_configure_c_init") &&
+            check_status(scrambler_generate_sequence(scrambler, static_cast<int>(nof_bits), stream),
+                         "gold scrambler_generate_sequence") &&
+            check_cuda(cudaStreamSynchronize(stream), "gold cudaStreamSynchronize");
+
+  const auto            expected = generate_gold_sequence_reference(c_init, nof_bits);
+  std::vector<uint32_t> actual(expected.size());
+  if (ok) {
+    ok = check_cuda(cudaMemcpy(actual.data(),
+                               scrambler_get_sequence_ptr(scrambler),
+                               actual.size() * sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost),
+                    "gold copy sequence");
+  }
+  if (ok && actual != expected) {
+    const auto mismatch = std::mismatch(actual.begin(), actual.end(), expected.begin());
+    const auto index    = static_cast<size_t>(mismatch.first - actual.begin());
+    std::fprintf(stderr,
+                 "Gold sequence mismatch c_init=0x%08x word=%zu actual=0x%08x expected=0x%08x\n",
+                 c_init,
+                 index,
+                 actual[index],
+                 expected[index]);
+    ok = false;
+  }
+  if (scrambler != nullptr) {
+    scrambler_destroy(scrambler);
+  }
+  cudaStreamDestroy(stream);
+  return ok;
+}
+
 bool configure_rate_dematcher(rate_matcher_handle_t handle, unsigned q_m, unsigned e, unsigned filler_bits)
 {
   static constexpr int bg = 1;
@@ -282,6 +343,9 @@ bool run_case(unsigned q_m, unsigned scramble_offset)
 int main()
 {
   bool ok = true;
+  for (const uint32_t c_init : {0U, 1U, 17U, (0x4601U << 15U) + 17U, 0x7fffffffU}) {
+    ok = check_gold_sequence(c_init, 4096U) && ok;
+  }
   for (unsigned q_m : {1U, 2U, 4U, 6U, 8U}) {
     for (unsigned scramble_offset : {0U, 1U, 31U, 32U, 47U}) {
       ok = run_case(q_m, scramble_offset) && ok;

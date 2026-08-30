@@ -11,4 +11,4 @@ set(SOURCES
 
 add_library(ocudu_remote_control_app_service STATIC ${SOURCES})
 target_include_directories(ocudu_remote_control_app_service PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(ocudu_remote_control_app_service PRIVATE uSockets)
+target_link_libraries(ocudu_remote_control_app_service PRIVATE uSockets ${CMAKE_DL_LIBS})

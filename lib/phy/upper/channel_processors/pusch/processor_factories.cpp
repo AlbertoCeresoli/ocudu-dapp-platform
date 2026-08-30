@@ -11,6 +11,8 @@
 #include "pusch_processor_pool.h"
 #include "pusch_processor_validator_impl.h"
 #include "ulsch_demultiplex_impl.h"
+#include "ocudu/phy/upper/channel_processors/pusch/factories.h"
+#include "ocudu/phy/upper/diagnostics/phy_diagnostics.h"
 #include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/phy/upper/channel_processors/pusch/factories.h"
 #include <algorithm>
@@ -332,7 +334,8 @@ public:
     ch_estimate_dimensions(config.ch_estimate_dimensions),
     dec_nof_iterations(config.dec_nof_iterations),
     dec_enable_early_stop(config.dec_enable_early_stop),
-    csi_sinr_calc_method(config.csi_sinr_calc_method)
+    csi_sinr_calc_method(config.csi_sinr_calc_method),
+    diag_sink(config.diag_sink)
   {
     ocudu_assert(estimator_factory, "Invalid channel estimation factory.");
     ocudu_assert(demodulator_factory, "Invalid demodulation factory.");
@@ -367,6 +370,7 @@ public:
     config.dec_enable_early_stop = dec_enable_early_stop;
     config.csi_sinr_calc_method  = csi_sinr_calc_method;
     config.ce_dims               = ch_estimate_dimensions;
+    config.diag_sink             = diag_sink;
     return std::make_unique<pusch_processor_impl>(config);
   }
 
@@ -386,6 +390,7 @@ private:
   unsigned                                                                 dec_nof_iterations;
   bool                                                                     dec_enable_early_stop;
   channel_state_information::sinr_type                                     csi_sinr_calc_method;
+  std::shared_ptr<phy_diagnostic_sink>                                     diag_sink;
 };
 
 class pusch_processor_pool_factory : public pusch_processor_factory

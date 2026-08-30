@@ -42,7 +42,7 @@ ocudu_scheduler_adapter::ocudu_scheduler_adapter(const ocudu_mac_sched_config& p
   timers(params.timers),
   logger(ocudulog::fetch_basic_logger("MAC")),
   notifier(*this),
-  sched_impl(create_scheduler(scheduler_config{params.sched_cfg, notifier})),
+  sched_impl(create_scheduler(scheduler_config{params.sched_cfg, notifier, params.dapp_hooks})),
   rach_handler(*sched_impl, rnti_mng, logger),
   pos_handler(create_positioning_handler(*sched_impl, params.ctrl_exec, params.timers, logger))
 {

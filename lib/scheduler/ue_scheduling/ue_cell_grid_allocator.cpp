@@ -149,6 +149,26 @@ ue_cell_grid_allocator::allocate_dl_grant(const ue_newtx_dl_grant_request& reque
     // (e.g. a special slot), the grant is deferred to a later slot rather than downgraded to a single transmission.
     return make_unexpected(dl_alloc_failure_cause::other);
   }
+  if (request.dapp_mcs.has_value()) {
+    sch_mcs_index mcs = *request.dapp_mcs;
+    if (request.dapp_max_mcs.has_value() && mcs > *request.dapp_max_mcs) {
+      mcs = *request.dapp_max_mcs;
+    }
+    sched_ctxt->recommended_mcs = mcs;
+  }
+  if (request.dapp_layers.has_value() && *request.dapp_layers >= 1) {
+    sched_ctxt->recommended_ri = *request.dapp_layers;
+  }
+  if (request.dapp_prb_limits.has_value()) {
+    // expected_nof_rbs is a soft target; clamp to dApp max.
+    sched_ctxt->expected_nof_rbs =
+        std::min(sched_ctxt->expected_nof_rbs, request.dapp_prb_limits->stop() > 0
+                                                   ? request.dapp_prb_limits->stop() - 1
+                                                   : sched_ctxt->expected_nof_rbs);
+    if (request.dapp_prb_limits->start() > 0) {
+      sched_ctxt->expected_nof_rbs = std::max(sched_ctxt->expected_nof_rbs, request.dapp_prb_limits->start());
+    }
+  }
 
   // Build the repetition bundle when a repetition row was selected. A qualifying UE is never downgraded to a single
   // transmission; if the bundle cannot start in this slot, the allocation is deferred.
@@ -165,6 +185,8 @@ ue_cell_grid_allocator::allocate_dl_grant(const ue_newtx_dl_grant_request& reque
   if (not result.has_value()) {
     return make_unexpected(result.error());
   }
+  result->dapp_prb_assign = request.dapp_prb_assign;
+  result->dapp_prb_pref   = request.dapp_prb_pref;
 
   // Add DL grant to list of pending grants and create a newTx DL grant builder.
   dl_grants.push_back(*result);
@@ -636,14 +658,33 @@ ue_cell_grid_allocator::allocate_ul_grant(const ue_newtx_ul_grant_request& reque
     // No valid parameters were found for this UE.
     return make_unexpected(alloc_status::skip_ue);
   }
+  if (request.dapp_mcs.has_value()) {
+    sch_mcs_index mcs = *request.dapp_mcs;
+    if (request.dapp_max_mcs.has_value() && mcs > *request.dapp_max_mcs) {
+      mcs = *request.dapp_max_mcs;
+    }
+    sched_ctxt->recommended_mcs = mcs;
+  }
+  if (request.dapp_prb_limits.has_value()) {
+    sched_ctxt->nof_rb_lims.intersect(*request.dapp_prb_limits);
+    if (sched_ctxt->nof_rb_lims.empty()) {
+      return make_unexpected(alloc_status::skip_ue);
+    }
+    sched_ctxt->expected_nof_rbs =
+        std::min(sched_ctxt->expected_nof_rbs, std::max(1u, sched_ctxt->nof_rb_lims.stop() - 1));
+    sched_ctxt->expected_nof_rbs = std::max(sched_ctxt->expected_nof_rbs, sched_ctxt->nof_rb_lims.start());
+  }
 
   // Set up a UL grant.
   auto result = setup_ul_grant_builder(request.user, *sched_ctxt, std::nullopt);
   if (not result.has_value()) {
     return make_unexpected(result.error());
   }
+  result->dapp_prb_assign = request.dapp_prb_assign;
+  result->dapp_prb_pref   = request.dapp_prb_pref;
+  result->dapp_tpc        = request.dapp_tpc;
 
-  // Add UL grant to list of pending grants and create a newTx DL grant builder.
+  // Add UL grant to list of pending grants and create a newTx UL grant builder.
   ul_grants.push_back(*result);
   return ul_newtx_grant_builder{*this, static_cast<unsigned>(ul_grants.size()) - 1};
 }
@@ -764,7 +805,15 @@ ue_cell_grid_allocator::setup_ul_grant_builder(const slice_ue&                  
 
 void ue_cell_grid_allocator::set_pusch_params(ul_grant_info& grant, const vrb_interval& vrbs) const
 {
-  ocudu_assert(not vrbs.empty(), "Invalid set of PUSCH VRBs");
+  if (vrbs.empty()) {
+    // Stage-2 could not place RBs (Class-B hard assign collided with retx/avoid). Cancel the
+    // already-reserved PDCCH/PUSCH/HARQ instead of asserting — the builder destructor requires
+    // set_pusch_params() to have been called.
+    grant.pdcch->ctx.rnti       = rnti_t::INVALID_RNTI;
+    grant.pusch->pusch_cfg.rnti = rnti_t::INVALID_RNTI;
+    grant.h_ul.reset();
+    return;
+  }
 
   ue&      u     = ues[grant.user->ue_index()];
   ue_cell& ue_cc = *u.find_cell(cell_alloc.cell_index());
@@ -790,14 +839,6 @@ void ue_cell_grid_allocator::set_pusch_params(ul_grant_info& grant, const vrb_in
   cell_slot_resource_allocator& pdcch_alloc = cell_alloc[0];
   const unsigned                final_k2    = pusch_td_cfg.k2 + cell_cfg.ntn_cs_koffset;
   cell_slot_resource_allocator& pusch_alloc = cell_alloc[final_k2];
-
-  if (vrbs.empty()) {
-    // RBs could not be allocated. Cancel associated grants.
-    grant.pdcch->ctx.rnti       = rnti_t::INVALID_RNTI;
-    grant.pusch->pusch_cfg.rnti = rnti_t::INVALID_RNTI;
-    grant.h_ul.reset();
-    return;
-  }
 
   // Compute exact MCS and TBS for this transmission.
   expected<sch_mcs_tbs, compute_ul_mcs_tbs_error> mcs_tbs_info;
@@ -880,7 +921,9 @@ void ue_cell_grid_allocator::set_pusch_params(ul_grant_info& grant, const vrb_in
 
   // Compute TPC command before computing the nof_prbs adaptation based on PHR; this is because, when the TPC gets
   // computed, the channel state manager will update close-loop power control adjustment.
-  const uint8_t tpc_command = ue_cc.get_pusch_power_controller().compute_tpc_command(
+  const uint8_t tpc_command = grant.dapp_tpc.has_value()
+                                  ? *grant.dapp_tpc
+                                  : ue_cc.get_pusch_power_controller().compute_tpc_command(
       pdcch_alloc.slot + pusch_td_cfg.k2 + cell_cfg.ntn_cs_koffset);
 
   // Check if is possible to allocate an aperiodic SRS.

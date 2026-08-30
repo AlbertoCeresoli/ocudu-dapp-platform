@@ -7,6 +7,7 @@
 #include "apps/services/remote_control/remote_control_appconfig.h"
 #include "nlohmann/json.hpp"
 #include "ocudu/ocudulog/ocudulog.h"
+#include "ocudu/support/diagnostic_plugin.h"
 #include "ocudu/support/synchronization/stop_event.h"
 #include "ocudu/support/synchronization/sync_event.h"
 #ifndef __clang__
@@ -21,6 +22,10 @@
 #include "ocudu/adt/scope_exit.h"
 #include "ocudu/support/executors/unique_thread.h"
 #include <csignal>
+#include <cstdlib>
+#include <cstdint>
+#include <dlfcn.h>
+#include <limits>
 #include <utility>
 
 using namespace ocudu;
@@ -87,6 +92,8 @@ class remote_server_impl : public remote_server,
   std::set<socket_type*>                                           metrics_subscribers;
   socket_type*                                                     current_cmd_client = nullptr;
   stop_event_source                                                stop_control;
+  void*                                                            diagnostic_plugin_library = nullptr;
+  ocudu_diagnostic_plugin_publish_metrics_json_fn                  diagnostic_plugin_publish_metrics = nullptr;
 
   /// Metrics subscription command.
   class metrics_subscribe_command : public remote_command
@@ -155,11 +162,35 @@ public:
         auto& cmd       = commands[std::string(unsub_cmd->get_name())];
         cmd             = std::move(unsub_cmd);
       }
+
+      if (const char* path = std::getenv("OCUDU_DIAGNOSTIC_PLUGIN_LIB"); path != nullptr && path[0] != '\0') {
+        diagnostic_plugin_library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (diagnostic_plugin_library == nullptr) {
+          ocudulog::fetch_basic_logger("ALL").warning(
+              "Diagnostic plugin dlopen({}) failed: {}", path, dlerror());
+        } else {
+          diagnostic_plugin_publish_metrics = reinterpret_cast<ocudu_diagnostic_plugin_publish_metrics_json_fn>(
+              dlsym(diagnostic_plugin_library, "ocudu_diagnostic_plugin_publish_metrics_json"));
+          if (diagnostic_plugin_publish_metrics == nullptr) {
+            ocudulog::fetch_basic_logger("ALL").warning(
+                "Diagnostic plugin {} does not expose ocudu_diagnostic_plugin_publish_metrics_json", path);
+            dlclose(diagnostic_plugin_library);
+            diagnostic_plugin_library = nullptr;
+          }
+        }
+      }
     }
   }
 
   // See interface for documentation.
-  ~remote_server_impl() override { stop(); }
+  ~remote_server_impl() override
+  {
+    stop();
+    if (diagnostic_plugin_library != nullptr) {
+      dlclose(diagnostic_plugin_library);
+      diagnostic_plugin_library = nullptr;
+    }
+  }
 
   // See interface for documentation.
   remote_server_operation_controller& get_operation_controller() override { return *this; }
@@ -240,6 +271,10 @@ public:
     auto token = stop_control.get_token();
     if (OCUDU_UNLIKELY(token.is_stop_requested())) {
       return;
+    }
+
+    if (diagnostic_plugin_publish_metrics != nullptr && metrics.size() <= std::numeric_limits<uint32_t>::max()) {
+      diagnostic_plugin_publish_metrics(metrics.data(), static_cast<uint32_t>(metrics.size()));
     }
 
     // Send the given metrics to all registered metrics subscribers.

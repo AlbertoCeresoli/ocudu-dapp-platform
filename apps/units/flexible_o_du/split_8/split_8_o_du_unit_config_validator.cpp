@@ -8,6 +8,9 @@
 #include "apps/units/flexible_o_du/split_8/helpers/ru_sdr_config_validator.h"
 #include "ocudu/ran/prach/prach_configuration.h"
 #include "ocudu/ran/prach/prach_preamble_information.h"
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+#include "apps/services/dapp/dapp_config_validator.h"
+#endif
 
 using namespace ocudu;
 
@@ -80,6 +83,12 @@ bool ocudu::validate_split_8_o_du_unit_config(const split_8_o_du_unit_config& co
   if (!validate_du_low_config(config.du_low_cfg, du_low_dependencies)) {
     return false;
   }
+
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  if (config.dapp && !app_services::validate_dapp_service_config(*config.dapp)) {
+    return false;
+  }
+#endif
 
   auto ru_sdr_dependencies = get_ru_sdr_validation_dependencies(config.odu_high_cfg.du_high_cfg.config);
   return validate_ru_sdr_config(config.ru_cfg, ru_sdr_dependencies);

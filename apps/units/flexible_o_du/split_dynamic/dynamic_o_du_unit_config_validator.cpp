@@ -8,6 +8,9 @@
 #include "apps/units/flexible_o_du/split_7_2/helpers/ru_ofh_config_validator.h"
 #include "apps/units/flexible_o_du/split_8/helpers/ru_sdr_config_validator.h"
 #include "ocudu/ran/prach/prach_configuration.h"
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+#include "apps/services/dapp/dapp_config_validator.h"
+#endif
 
 using namespace ocudu;
 
@@ -96,6 +99,12 @@ bool ocudu::validate_dynamic_o_du_unit_config(const dynamic_o_du_unit_config& co
   if (!validate_du_low_config(config.du_low_cfg, du_low_dependencies)) {
     return false;
   }
+
+#ifdef OCUDU_FLEXIBLE_DU_DAPP
+  if (config.dapp && !app_services::validate_dapp_service_config(*config.dapp)) {
+    return false;
+  }
+#endif
 
   if (auto* ru_ofh = std::get_if<ru_ofh_unit_parsed_config>(&config.ru_cfg)) {
     auto ru_ofh_dependencies = get_ru_ofh_validation_dependencies(config.odu_high_cfg.du_high_cfg.config);

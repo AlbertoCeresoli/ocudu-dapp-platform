@@ -10,7 +10,8 @@ using namespace ocudu;
 split8_du_factory::split8_du_factory(const split_8_o_du_unit_config& config_) :
   flexible_o_du_factory({config_.odu_high_cfg,
                          config_.du_low_cfg,
-                         {config_.ru_cfg.metrics_cfg.metrics_cfg, config_.ru_cfg.metrics_cfg.enable_ru_metrics}}),
+                         {config_.ru_cfg.metrics_cfg.metrics_cfg, config_.ru_cfg.metrics_cfg.enable_ru_metrics},
+                         config_.dapp}),
   unit_config(config_)
 {
 }

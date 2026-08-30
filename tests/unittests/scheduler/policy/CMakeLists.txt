@@ -12,3 +12,19 @@ target_link_libraries(scheduler_policy_test
         gtest
         ocudu_gtest_main)
 gtest_discover_tests(scheduler_policy_test)
+
+if (ENABLE_DAPP)
+  add_executable(scheduler_dapp_policy_test
+          quiet_reservation_test.cpp
+          scheduler_dapp_context_test.cpp
+          scheduler_dapp_policy_test.cpp)
+  target_link_libraries(scheduler_dapp_policy_test
+          ocudu_sched
+          scheduler_test_suite
+          scheduler_test_utils
+          sched_test_doubles
+          ocudulog
+          gtest
+          ocudu_gtest_main)
+  gtest_discover_tests(scheduler_dapp_policy_test PROPERTIES LABELS "tsan")
+endif ()

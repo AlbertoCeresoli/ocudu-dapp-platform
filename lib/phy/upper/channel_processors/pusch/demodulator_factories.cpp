@@ -11,6 +11,8 @@
 
 #ifdef ENABLE_CUDA
 #include "pusch_demodulator_gpu_impl.h"
+#include <atomic>
+#include <cstdio>
 #include <cuda_runtime.h>
 #endif
 
@@ -128,6 +130,11 @@ public:
 
   bool is_resident_mode_enabled() const override { return accelerated_demodulator->is_resident_mode_enabled(); }
 
+  bool install_resident_dapp(std::shared_ptr<pusch_resident_dapp> dapp) override
+  {
+    return accelerated_demodulator->install_resident_dapp(std::move(dapp));
+  }
+
   resident_softbit_buffer get_resident_softbits() const override
   {
     return accelerated_demodulator->get_resident_softbits();
@@ -150,6 +157,43 @@ public:
   float report_deferred_sinr(pusch_demodulator_notifier& notifier) override
   {
     return accelerated_demodulator->report_deferred_sinr(notifier);
+  }
+
+  void report_deferred_dapp_completion() override { accelerated_demodulator->report_deferred_dapp_completion(); }
+
+  void enable_resident_dapp_diagnostic_timing(bool enabled) override
+  {
+    accelerated_demodulator->enable_resident_dapp_diagnostic_timing(enabled);
+  }
+
+  resident_dapp_diagnostic_timing get_resident_dapp_diagnostic_timing(unsigned completion_slot) const override
+  {
+    return accelerated_demodulator->get_resident_dapp_diagnostic_timing(completion_slot);
+  }
+
+  // Forward constellation capture to both paths (NeuralEq GPU is the active one OTA).
+  void enable_symbol_capture() override
+  {
+    accelerated_demodulator->enable_symbol_capture();
+    sw_demodulator->enable_symbol_capture();
+  }
+  void disable_symbol_capture() override
+  {
+    accelerated_demodulator->disable_symbol_capture();
+    sw_demodulator->disable_symbol_capture();
+  }
+  span<const std::complex<float>> get_captured_symbols() const override
+  {
+    auto eq = accelerated_demodulator->get_captured_symbols();
+    if (!eq.empty()) {
+      return eq;
+    }
+    return sw_demodulator->get_captured_symbols();
+  }
+  void wait_captured_symbols() override
+  {
+    accelerated_demodulator->wait_captured_symbols();
+    sw_demodulator->wait_captured_symbols();
   }
 
 private:

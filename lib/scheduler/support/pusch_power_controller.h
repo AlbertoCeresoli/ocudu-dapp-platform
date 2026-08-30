@@ -38,6 +38,27 @@ public:
   /// Compute the TPC command for the PUSCH with the objective set to reach the target SINR.
   uint8_t compute_tpc_command(slot_point pusch_slot);
 
+  /// Latest Type-1 PH (dB), lower edge of the reported interval. Empty if no PHR yet.
+  std::optional<float> latest_ph_db() const
+  {
+    if (not latest_phr.has_value()) {
+      return std::nullopt;
+    }
+    return static_cast<float>(latest_phr->phr.ph.start());
+  }
+
+  /// Latest grant-size-normalized PH (dB): raw PH plus 10log10(N_PRB) of the
+  /// PUSCH that carried the PHR (the headroom a 1-PRB grant would have).
+  /// Comparable across PHRs measured on different grant sizes; raw PH is not.
+  /// Empty when no PHR or no power-control derived data is available.
+  std::optional<float> latest_ph_normalized_db() const
+  {
+    if (not latest_phr.has_value() or not latest_phr->phr_data_for_pw_ctrl.has_value()) {
+      return std::nullopt;
+    }
+    return latest_phr->phr_data_for_pw_ctrl->ph_normalized_pw_dB;
+  }
+
 private:
   /// This variable defines how many PUSCH PRB allocations needs to be stored in the internal ring-buffer; it is the
   /// maximum expected delay (in slots) between the for which slot the PUSCH is scheduled and the slot at which the PHR

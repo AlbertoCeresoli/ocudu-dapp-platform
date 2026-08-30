@@ -4645,7 +4645,8 @@ __global__ void kernel_pusch_e2e_with_estimates(
     int est_stride,            /* nof_re_per_symbol for estimates */
     int start_symbol,          /* allocation start symbol */
     int start_subcarrier,      /* allocation start subcarrier (start_prb * 12) */
-    float tx_scaling)
+    float tx_scaling,
+    bool estimates_match_grid)
 {
     int re_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (re_idx >= nof_re) return;
@@ -4675,7 +4676,7 @@ __global__ void kernel_pusch_e2e_with_estimates(
     cuFloatComplex y[8], h[8];
 
     /* Validate estimate indexing bounds */
-    if (re_in_symbol < 0 || re_in_symbol >= est_stride || symbol_rel < 0) {
+    if (!estimates_match_grid && (re_in_symbol < 0 || re_in_symbol >= est_stride || symbol_rel < 0)) {
         /* Out of bounds - use identity channel to prevent crash */
         #pragma unroll
         for (int p = 0; p < NOF_PORTS; p++) {
@@ -4690,7 +4691,8 @@ __global__ void kernel_pusch_e2e_with_estimates(
 
             /* Load estimate from GPU-computed buffer */
             /* Estimate layout: [symbol_rel, port, re_in_symbol] */
-            int est_idx = symbol_rel * (NOF_PORTS * est_stride) + p * est_stride + re_in_symbol;
+            int est_idx = estimates_match_grid ? p * grid_stride + src_re
+                                               : symbol_rel * (NOF_PORTS * est_stride) + p * est_stride + re_in_symbol;
             h[p] = d_estimates[est_idx];
         }
     }
@@ -5503,9 +5505,9 @@ void launch_kernel_time_interpolate(dim3 grid, dim3 block, size_t shmem, cudaStr
 }
 
 nr_ldpc_status_t launch_kernel_pusch_e2e_with_estimates(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream,
-    int nof_rx_ports, int equalizer_algorithm, const unsigned int* __restrict__ d_grid_cbf16, const cuFloatComplex* __restrict__ d_estimates, const int* __restrict__ re_indices, const float* __restrict__ noise_vars, __half* __restrict__ llrs_half, const unsigned int* __restrict__ scramble_seq, float* __restrict__ d_eq_noise_var_sum, unsigned int* __restrict__ d_eq_noise_var_count, int nof_re, int mod_order, int grid_stride, int symbol_stride, int est_stride, int start_symbol, int start_subcarrier, float tx_scaling) {
+    int nof_rx_ports, int equalizer_algorithm, const unsigned int* __restrict__ d_grid_cbf16, const cuFloatComplex* __restrict__ d_estimates, const int* __restrict__ re_indices, const float* __restrict__ noise_vars, __half* __restrict__ llrs_half, const unsigned int* __restrict__ scramble_seq, float* __restrict__ d_eq_noise_var_sum, unsigned int* __restrict__ d_eq_noise_var_count, int nof_re, int mod_order, int grid_stride, int symbol_stride, int est_stride, int start_symbol, int start_subcarrier, float tx_scaling, bool estimates_match_grid) {
     #define LX_kernel_pusch_e2e_with_estimates(PORTS, ALG) \
-        kernel_pusch_e2e_with_estimates<PORTS, ALG><<<grid, block, shmem, stream>>>(d_grid_cbf16, d_estimates, re_indices, noise_vars, llrs_half, scramble_seq, d_eq_noise_var_sum, d_eq_noise_var_count, nof_re, mod_order, grid_stride, symbol_stride, est_stride, start_symbol, start_subcarrier, tx_scaling)
+        kernel_pusch_e2e_with_estimates<PORTS, ALG><<<grid, block, shmem, stream>>>(d_grid_cbf16, d_estimates, re_indices, noise_vars, llrs_half, scramble_seq, d_eq_noise_var_sum, d_eq_noise_var_count, nof_re, mod_order, grid_stride, symbol_stride, est_stride, start_symbol, start_subcarrier, tx_scaling, estimates_match_grid)
     #define DA_kernel_pusch_e2e_with_estimates(PORTS) \
         switch (equalizer_algorithm) { \
             case EQUALIZER_ZF: LX_kernel_pusch_e2e_with_estimates(PORTS, EQUALIZER_ZF); break; \

@@ -10,6 +10,11 @@
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_decoder_result.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_demodulator_notifier.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_processor_result_notifier.h"
+#include "ocudu/phy/upper/diagnostics/phy_diagnostics.h"
+#include "ocudu/ran/slot_point.h"
+#include <complex>
+#include <limits>
+#include <vector>
 
 namespace ocudu {
 
@@ -78,6 +83,60 @@ public:
     uci_payload.harq_ack.clear();
     uci_payload.csi_part1.clear();
     uci_payload.csi_part2.clear();
+  }
+
+  /// Configures CRC diagnostic forwarding for the next transmission. The sink is non-owning.
+  void set_crc_diag(phy_diagnostic_sink* sink, slot_point slot, uint16_t rnti)
+  {
+    crc_sink_ = sink;
+    crc_slot_ = slot;
+    crc_rnti_ = rnti;
+  }
+
+  /// Configures PUSCH equalized-symbol + KPI diagnostic forwarding (publish from on_sch_data).
+  void set_pusch_sym_diag(phy_diagnostic_sink*            sink,
+                          slot_point                      slot,
+                          uint16_t                        rnti,
+                          uint16_t                        nof_prb,
+                          uint16_t                        nof_data_symbols,
+                          uint8_t                         nof_layers,
+                          uint8_t                         mod_bits,
+                          float                           target_code_rate,
+                          span<const std::complex<float>> symbols)
+  {
+    sym_sink_             = sink;
+    sym_slot_             = slot;
+    sym_rnti_             = rnti;
+    sym_nof_prb_          = nof_prb;
+    sym_nof_data_symbols_ = nof_data_symbols;
+    sym_nof_layers_       = nof_layers;
+    sym_mod_bits_         = mod_bits;
+    sym_target_code_rate_ = target_code_rate;
+    sym_buffer_.assign(symbols.begin(), symbols.end());
+    sym_grant_valid_ = false;
+    sym_truncated_   = false;
+  }
+
+  /// Attaches the grant parameters to the pending PUSCH symbol diagnostic. Completeness is judged
+  /// when the event is emitted (accelerated paths deliver the symbols late through
+  /// update_pusch_sym_diag_symbols): the capture must hold exactly \c expected_symbols and DM-RS
+  /// symbols must carry no data for it to be a whole codeword.
+  void set_pusch_sym_grant(const pusch_grant_diagnostic& grant, std::size_t expected_symbols, bool incomplete)
+  {
+    sym_grant_            = grant;
+    sym_grant_valid_      = true;
+    sym_expected_symbols_ = expected_symbols;
+    sym_truncated_        = incomplete;
+  }
+
+  /// Late-stage symbol update for async D2H (GPU paths).
+  void update_pusch_sym_diag_symbols(span<const std::complex<float>> symbols, bool clipped = false)
+  {
+    if (sym_sink_ == nullptr) {
+      return;
+    }
+    sym_buffer_.assign(symbols.begin(), symbols.end());
+    sym_truncated_ = sym_truncated_ || clipped;
   }
 
   /// Gets the PUSCH demodulator notifier.
@@ -251,10 +310,49 @@ private:
 
   void on_sch_data(const pusch_decoder_result& result) override
   {
+    // MAC first — diagnostics never delay CRC/TB delivery.
     pusch_processor_result_data result_data;
     result_data.data = result;
     result_data.csi  = uci_payload.csi;
     notifier->on_sch(result_data);
+
+    if (crc_sink_ != nullptr) {
+      crc_sink_->on_pusch_crc({.rnti = crc_rnti_, .slot = crc_slot_, .crc_ok = result.tb_crc_ok});
+      crc_sink_ = nullptr;
+    }
+    if (sym_sink_ != nullptr) {
+      const channel_state_information& csi_now = uci_payload.csi;
+      const auto                       sinr    = csi_now.get_sinr_dB();
+      const auto                       epre    = csi_now.get_epre_dB();
+      const auto                       rsrp    = csi_now.get_rsrp_dB();
+      const auto                       evm_opt = csi_now.get_total_evm();
+      const auto                       ta_opt  = csi_now.get_time_alignment();
+      const auto                       cfo_opt = csi_now.get_cfo_Hz();
+      const float                      nanv    = std::numeric_limits<float>::quiet_NaN();
+      const float ta_us = ta_opt.has_value() ? static_cast<float>(ta_opt.value().to_seconds() * 1e6) : nanv;
+      sym_sink_->on_pusch_symbols(
+          {.rnti              = sym_rnti_,
+           .slot              = sym_slot_,
+           .nof_prb           = sym_nof_prb_,
+           .nof_data_symbols  = sym_nof_data_symbols_,
+           .nof_layers        = sym_nof_layers_,
+           .mod_bits          = sym_mod_bits_,
+           .sinr_dB           = sinr.value_or(nanv),
+           .epre_dB           = epre.value_or(nanv),
+           .rsrp_dB           = rsrp.value_or(nanv),
+           .evm               = evm_opt.value_or(nanv),
+           .time_alignment_us = ta_us,
+           .cfo_Hz            = cfo_opt.value_or(nanv),
+           .target_code_rate  = sym_target_code_rate_,
+           .equalized_symbols = span<const std::complex<float>>(sym_buffer_.data(), sym_buffer_.size()),
+           .grant_valid       = sym_grant_valid_,
+           .grant             = sym_grant_,
+           .crc_known         = true,
+           .crc_ok            = result.tb_crc_ok,
+           .symbols_truncated = sym_truncated_ || (sym_grant_valid_ && sym_buffer_.size() != sym_expected_symbols_)});
+      sym_sink_ = nullptr;
+      sym_buffer_.clear();
+    }
   }
 
   // See detail::pusch_processor_notifier_callback for documentation.
@@ -341,6 +439,26 @@ private:
   csi_part1_notifier_impl csi_part_1_notifier;
   /// CSI Part 2 notifier.
   csi_part2_notifier_impl csi_part_2_notifier;
+
+  /// Optional CRC diagnostic sink (non-owning, reset after each transmission).
+  phy_diagnostic_sink* crc_sink_ = nullptr;
+  slot_point           crc_slot_;
+  uint16_t             crc_rnti_ = 0;
+
+  /// Optional PUSCH symbol/KPI diagnostic sink.
+  phy_diagnostic_sink*             sym_sink_ = nullptr;
+  slot_point                       sym_slot_;
+  uint16_t                         sym_rnti_             = 0;
+  uint16_t                         sym_nof_prb_          = 0;
+  uint16_t                         sym_nof_data_symbols_ = 0;
+  uint8_t                          sym_nof_layers_       = 0;
+  uint8_t                          sym_mod_bits_         = 0;
+  float                            sym_target_code_rate_ = 0.0f;
+  std::vector<std::complex<float>> sym_buffer_;
+  pusch_grant_diagnostic           sym_grant_{};
+  bool                             sym_grant_valid_      = false;
+  bool                             sym_truncated_        = false;
+  std::size_t                      sym_expected_symbols_ = 0;
 };
 
 } // namespace ocudu

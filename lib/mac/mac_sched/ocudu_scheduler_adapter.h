@@ -15,8 +15,11 @@
 #include "ocudu/ran/slot_point_extended.h"
 #include "ocudu/scheduler/mac_scheduler.h"
 #include "ocudu/support/async/manual_event.h"
+#include <memory>
 
 namespace ocudu {
+
+class scheduler_dapp_hook_provider;
 
 struct ocudu_mac_sched_config {
   const mac_expert_config& mac_cfg;
@@ -25,7 +28,8 @@ struct ocudu_mac_sched_config {
   /// APP Timers.
   timer_manager& timers;
   // Parameters passed to MAC scheduler.
-  const scheduler_expert_config& sched_cfg;
+  const scheduler_expert_config&                sched_cfg;
+  std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks;
 };
 
 /// \brief This class adapts OCUDU scheduler interface to operate with OCUDU MAC.

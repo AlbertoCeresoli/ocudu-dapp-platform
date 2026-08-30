@@ -21,7 +21,7 @@ std::unique_ptr<du_low> ocudu::odu::make_du_low(const du_low_config& config, du_
 
   std::vector<std::unique_ptr<upper_phy>> upper;
   for (unsigned i_cell = 0; i_cell != nof_cells; ++i_cell) {
-    // Propagate the DU-low cell index so upper PHY can bind per-cell executors (e.g. PDSCH fair lanes).
+    // DU-low cell index: per-cell executor affinity and dApp/management identity.
     deps.cells[i_cell].upper_phy_deps.cell_id = i_cell;
     upper.push_back(upper_phy_factory->create(config.cells[i_cell].upper_phy_cfg, deps.cells[i_cell].upper_phy_deps));
   }

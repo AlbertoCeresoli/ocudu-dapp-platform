@@ -49,7 +49,6 @@ private:
   srs_estimator_handle_t handle         = nullptr;
   std::mutex             estimator_mutex;
 
-  const resource_grid_reader*                    staged_grid_source = nullptr;
   std::unique_ptr<pusch_device_grid_reader_cuda> staged_grid_reader;
 
   bool                            gpu_configured = false;

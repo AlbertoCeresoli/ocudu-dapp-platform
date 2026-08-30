@@ -6,13 +6,17 @@
 
 #include "ocudu/scheduler/config/scheduler_expert_config.h"
 #include "ocudu/scheduler/scheduler_configurator.h"
+#include <memory>
 
 namespace ocudu {
 
+class scheduler_dapp_hook_provider;
+
 /// \brief Configuration used to create a scheduler instance.
 struct scheduler_config {
-  const scheduler_expert_config& expert_params;
-  sched_configuration_notifier&  config_notifier;
+  const scheduler_expert_config&                expert_params;
+  sched_configuration_notifier&                 config_notifier;
+  std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks;
 };
 
 } // namespace ocudu

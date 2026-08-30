@@ -124,6 +124,9 @@ public:
   virtual void                                 on_new_processor_pool_scope() {}
 };
 
+// Forward declaration — full definition in diagnostics/phy_diagnostics.h
+class phy_diagnostic_sink;
+
 struct pusch_processor_factory_sw_configuration {
   std::shared_ptr<dmrs_pusch_estimator_factory> estimator_factory;
   std::shared_ptr<pusch_demodulator_factory>    demodulator_factory;
@@ -135,6 +138,8 @@ struct pusch_processor_factory_sw_configuration {
   bool                                          dec_enable_early_stop = true;
   unsigned                                      max_nof_concurrent_threads;
   channel_state_information::sinr_type csi_sinr_calc_method = channel_state_information::sinr_type::channel_estimator;
+  /// Optional shared diagnostic sink (ZMQ OCDG). Null disables publishing.
+  std::shared_ptr<phy_diagnostic_sink> diag_sink;
 };
 
 std::shared_ptr<pusch_processor_factory>

@@ -64,7 +64,8 @@ public:
   void handle_positioning_measurement_stop(const positioning_measurement_stop_request& req) override;
 
 private:
-  const scheduler_expert_config expert_params;
+  const scheduler_expert_config                 expert_params;
+  std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks;
 
   ocudulog::basic_logger& logger;
 

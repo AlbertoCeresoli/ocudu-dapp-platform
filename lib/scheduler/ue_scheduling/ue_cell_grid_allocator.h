@@ -10,7 +10,11 @@
 #include "../uci_scheduling/uci_allocator.h"
 #include "../ue_context/ue_repository.h"
 #include "grant_params_selector.h"
+#include "ocudu/adt/interval.h"
 #include "ocudu/adt/noop_functor.h"
+#include "ocudu/ran/resource_allocation/rb_interval.h"
+#include "ocudu/ran/sch/sch_mcs.h"
+#include <optional>
 
 namespace ocudu {
 
@@ -25,7 +29,14 @@ struct ue_newtx_dl_grant_request {
   /// Pending newTx bytes to allocate.
   units::bytes pending_bytes;
   /// Whether interleaving VRB-to-PRB mapping is enabled.
-  bool interleaving_enabled;
+  bool interleaving_enabled = false;
+  /// Optional Class-B overrides.
+  std::optional<sch_mcs_index>      dapp_mcs;
+  std::optional<sch_mcs_index>      dapp_max_mcs;
+  std::optional<interval<unsigned>> dapp_prb_limits;
+  std::optional<vrb_interval>       dapp_prb_assign;
+  std::optional<vrb_interval>       dapp_prb_pref;
+  std::optional<uint8_t>            dapp_layers;
 };
 
 /// Request for a reTx DL grant allocation.
@@ -54,6 +65,14 @@ struct ue_newtx_ul_grant_request {
   units::bytes pending_bytes;
   /// Symbols that can be used for PUSCH allocation.
   ofdm_symbol_range allowed_symbols;
+  /// Optional Class-B overrides.
+  std::optional<sch_mcs_index>      dapp_mcs;
+  std::optional<sch_mcs_index>      dapp_max_mcs;
+  std::optional<interval<unsigned>> dapp_prb_limits;
+  std::optional<vrb_interval>       dapp_prb_assign;
+  std::optional<vrb_interval>       dapp_prb_pref;
+  std::optional<uint8_t>            dapp_tpc;
+  std::optional<uint8_t>            dapp_layers;
 };
 
 /// Request for a reTx UL grant allocation.
@@ -113,6 +132,8 @@ class ue_cell_grid_allocator
     dl_msg_alloc*                     pdsch;
     uci_allocation                    uci_alloc;
     std::optional<dl_repetition_info> reps;
+    std::optional<vrb_interval>       dapp_prb_assign;
+    std::optional<vrb_interval>       dapp_prb_pref;
   };
 
   // Information relative to a pending UL grant for this slot.
@@ -122,6 +143,9 @@ class ue_cell_grid_allocator
     ul_harq_process_handle         h_ul;
     pdcch_ul_information*          pdcch;
     ul_sched_info*                 pusch;
+    std::optional<vrb_interval>    dapp_prb_assign;
+    std::optional<vrb_interval>    dapp_prb_pref;
+    std::optional<uint8_t>         dapp_tpc;
   };
 
 public:
@@ -159,6 +183,22 @@ public:
     vrb_interval recommended_vrbs(const vrb_bitmap& used_vrbs, unsigned max_nof_rbs = MAX_NOF_PRBS) const
     {
       const dl_grant_info& grant = grant_info();
+      if (grant.dapp_prb_assign.has_value()) {
+        const auto& a = *grant.dapp_prb_assign;
+        if (a.length() > 0 && a.stop() <= used_vrbs.size() &&
+            used_vrbs.find_lowest(a.start(), a.stop(), true) < 0) {
+          return a;
+        }
+        // Assigned run is not free (retx / avoid / overlap). Fall back so a PDCCH
+        // already reserved in stage 1 is not cancelled.
+      }
+      if (grant.dapp_prb_pref.has_value()) {
+        const auto& p = *grant.dapp_prb_pref;
+        if (p.length() > 0 && p.stop() <= used_vrbs.size() && p.length() <= max_nof_rbs &&
+            used_vrbs.find_lowest(p.start(), p.stop(), true) < 0) {
+          return p;
+        }
+      }
       return compute_newtx_dl_vrbs(grant.cfg, used_vrbs, max_nof_rbs);
     }
 
@@ -196,6 +236,22 @@ public:
     vrb_interval recommended_vrbs(const vrb_bitmap& used_vrbs, unsigned max_nof_rbs = MAX_NOF_PRBS) const
     {
       const ul_grant_info& grant = grant_info();
+      if (grant.dapp_prb_assign.has_value()) {
+        const auto& a = *grant.dapp_prb_assign;
+        if (a.length() > 0 && a.stop() <= used_vrbs.size() &&
+            used_vrbs.find_lowest(a.start(), a.stop(), true) < 0) {
+          return a;
+        }
+        // Assigned run is not free (retx / avoid / overlap). Fall back so a PDCCH
+        // already reserved in stage 1 is not cancelled.
+      }
+      if (grant.dapp_prb_pref.has_value()) {
+        const auto& p = *grant.dapp_prb_pref;
+        if (p.length() > 0 && p.stop() <= used_vrbs.size() && p.length() <= max_nof_rbs &&
+            used_vrbs.find_lowest(p.start(), p.stop(), true) < 0) {
+          return p;
+        }
+      }
       return compute_newtx_ul_vrbs(grant.cfg, used_vrbs, max_nof_rbs);
     }
 

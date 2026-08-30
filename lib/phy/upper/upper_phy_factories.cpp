@@ -23,10 +23,16 @@
 #include "ocudu/phy/upper/channel_processors/pucch/factories.h"
 #include "ocudu/phy/upper/channel_processors/pusch/factories.h"
 #include "ocudu/phy/upper/channel_processors/ssb/factories.h"
+#include "ocudu/phy/upper/dapp/upper_phy_dapp_hook_provider.h"
 #include "ocudu/phy/upper/signal_processors/nzp_csi_rs/factories.h"
 #include "ocudu/phy/upper/signal_processors/prs/factories.h"
 #include "ocudu/phy/upper/signal_processors/srs/srs_estimator_factory.h"
 #include "ocudu/support/error_handling.h"
+#include "ocudu/ocudulog/ocudulog.h"
+#include "diagnostics/diagnostic_plugin_sink.h"
+#include "diagnostics/srs_diagnostic_decorator.h"
+#include "diagnostics/zmq_diag_publisher.h"
+#include "ocudu/phy/upper/diagnostics/phy_diagnostics.h"
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
@@ -97,7 +103,8 @@ create_ul_processor_pool(uplink_processor_factory&              factory,
                          rx_buffer_pool&                        rm_buffer_pool,
                          upper_phy_rx_results_notifier&         rx_results_notifier,
                          const upper_phy_factory_configuration& factory_config,
-                         const upper_phy_configuration&         config);
+                         const upper_phy_configuration&         config,
+                         uint32_t                               cell_id);
 
 static std::vector<std::unique_ptr<prach_buffer>>
 create_prach_buffers(const upper_phy_configuration& config, bool enable_accelerated_prach_buffer, int nvcuda_device_id);
@@ -113,6 +120,7 @@ public:
                                 std::shared_ptr<srs_estimator_factory>           srs_factory_,
                                 std::shared_ptr<resource_grid_factory>           grid_factory_,
                                 std::shared_ptr<phy_tap_factory>                 tap_factory_,
+                                std::shared_ptr<upper_phy_dapp_hook_provider>    dapp_hooks_,
                                 uplink_processor_impl::task_executor_collection& task_executors_) :
     pucch_factory(std::move(pucch_factory_)),
     pusch_factory(std::move(pusch_factory_)),
@@ -120,7 +128,8 @@ public:
     srs_factory(std::move(srs_factory_)),
     grid_factory(std::move(grid_factory_)),
     task_executors(task_executors_),
-    tap_factory(std::move(tap_factory_))
+    tap_factory(std::move(tap_factory_)),
+    dapp_hooks(std::move(dapp_hooks_))
   {
     report_fatal_error_if_not(prach_factory, "Invalid PRACH factory.");
     report_fatal_error_if_not(pusch_factory, "Invalid PUSCH factory.");
@@ -146,12 +155,7 @@ public:
         grid_factory->create(config.nof_rx_ports, MAX_NSYMB_PER_SLOT, config.nof_rb * NOF_SUBCARRIERS_PER_RB);
     report_fatal_error_if_not(grid, "Invalid uplink resource grid.");
 
-    // If a TAP factory is provided, create the PHY TAP and pass it to the uplink processor.
-    std::unique_ptr<phy_tap> ul_tap;
-    if (tap_factory) {
-      ul_tap = tap_factory->create();
-      report_fatal_error_if_not(ul_tap, "Invalid PHY TAP.");
-    }
+    std::unique_ptr<phy_tap> ul_tap = create_tap(config);
 
     return std::make_unique<uplink_processor_impl>(std::move(prach),
                                                    std::move(pusch_proc),
@@ -163,7 +167,9 @@ public:
                                                    config.rm_buffer_pool,
                                                    config.notifier,
                                                    config.nof_rb,
-                                                   config.max_nof_layers);
+                                                   config.max_nof_layers,
+                                                   config.cell_id,
+                                                   config.producer_shard);
   }
 
   std::unique_ptr<uplink_processor>
@@ -185,12 +191,7 @@ public:
         grid_factory->create(config.nof_rx_ports, MAX_NSYMB_PER_SLOT, config.nof_rb * NOF_SUBCARRIERS_PER_RB);
     report_fatal_error_if_not(grid, "Invalid uplink resource grid.");
 
-    // If a TAP factory is provided, create the PHY TAP and pass it to the uplink processor.
-    std::unique_ptr<phy_tap> ul_tap;
-    if (tap_factory) {
-      ul_tap = tap_factory->create();
-      report_fatal_error_if_not(ul_tap, "Invalid PHY TAP.");
-    }
+    std::unique_ptr<phy_tap> ul_tap = create_tap(config);
     return std::make_unique<uplink_processor_impl>(std::move(prach),
                                                    std::move(pusch_proc),
                                                    std::move(pucch_proc),
@@ -201,7 +202,9 @@ public:
                                                    config.rm_buffer_pool,
                                                    config.notifier,
                                                    config.nof_rb,
-                                                   config.max_nof_layers);
+                                                   config.max_nof_layers,
+                                                   config.cell_id,
+                                                   config.producer_shard);
   }
 
   std::unique_ptr<uplink_pdu_validator> create_pdu_validator() override
@@ -213,6 +216,20 @@ public:
   }
 
 private:
+  std::unique_ptr<phy_tap> create_tap(const uplink_processor_config& config)
+  {
+    std::unique_ptr<phy_tap> tap;
+    if (tap_factory) {
+      tap = tap_factory->create();
+      report_fatal_error_if_not(tap, "Invalid PHY TAP.");
+    }
+    if (dapp_hooks) {
+      tap = dapp_hooks->wrap_phy_tap({config.cell_id, config.producer_shard}, std::move(tap));
+      report_fatal_error_if_not(tap, "Invalid dApp PHY tap wrapper.");
+    }
+    return tap;
+  }
+
   std::shared_ptr<pucch_processor_factory>        pucch_factory;
   std::shared_ptr<pusch_processor_factory>        pusch_factory;
   std::shared_ptr<prach_detector_factory>         prach_factory;
@@ -220,6 +237,7 @@ private:
   std::shared_ptr<resource_grid_factory>          grid_factory;
   uplink_processor_impl::task_executor_collection task_executors;
   std::shared_ptr<phy_tap_factory>                tap_factory;
+  std::shared_ptr<upper_phy_dapp_hook_provider>   dapp_hooks;
 };
 
 /// \brief Factory to create single executor downlink processors.
@@ -542,7 +560,8 @@ public:
                                                             phy_config.rx_buf_pool->get_pool(),
                                                             *phy_config.rx_results_notifier,
                                                             factory_config,
-                                                            config);
+                                                            config,
+                                                            deps.cell_id);
     report_fatal_error_if_not(phy_config.ul_processor_pool, "Invalid uplink processor pool.");
 
     const std::string resolved_prach_acceleration_mode =
@@ -654,6 +673,32 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
                             pusch_constants::MAX_NOF_LAYERS,
                             config.pusch_max_nof_layers);
 
+  std::shared_ptr<phy_diagnostic_sink> diag_sink = dependencies.diagnostics;
+  if (diag_sink) {
+    ocudulog::fetch_basic_logger("PHY").info("Using the E3 telemetry sink for upper-PHY diagnostics");
+  } else if (!config.zmq_diag_endpoint.empty()) {
+    diag_sink = create_diagnostic_plugin_sink(config.zmq_diag_endpoint);
+    if (diag_sink) {
+      ocudulog::fetch_basic_logger("PHY").info(
+          "Using diagnostic plugin for endpoint {}", config.zmq_diag_endpoint);
+    } else {
+#ifdef ENABLE_ZEROMQ
+      auto candidate = std::make_shared<zmq_diag_publisher>(config.zmq_diag_endpoint);
+      if (candidate->is_enabled()) {
+        diag_sink = std::move(candidate);
+        ocudulog::fetch_basic_logger("PHY").info(
+            "Diagnostic plugin unavailable; in-tree ZMQ publisher bound to {}", config.zmq_diag_endpoint);
+      } else {
+        ocudulog::fetch_basic_logger("PHY").warning("Failed to bind ZMQ diagnostic publisher to {}",
+                                                    config.zmq_diag_endpoint);
+      }
+#else
+      ocudulog::fetch_basic_logger("PHY").warning(
+          "Diagnostic plugin unavailable and ZeroMQ fallback is disabled for endpoint {}", config.zmq_diag_endpoint);
+#endif
+    }
+  }
+
   channel_equalizer_algorithm_type pusch_equalizer_algorithm_type = channel_equalizer_algorithm_type::zf;
   if (config.pusch_channel_equalizer_algorithm == "mmse") {
     pusch_equalizer_algorithm_type = channel_equalizer_algorithm_type::mmse;
@@ -730,6 +775,14 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
   std::shared_ptr<srs_estimator_factory> srs_factory = create_srs_estimator_generic_factory(
       sequence_factory, ta_est_factory, config.ul_bw_rb, resolved_srs_acceleration_mode, config.nvcuda_device_id);
   report_fatal_error_if_not(srs_factory, "Invalid SRS estimator factory.");
+  if (dependencies.dapp_hooks) {
+    srs_factory = dependencies.dapp_hooks->decorate_srs_estimator(std::move(srs_factory),
+                                                                  dependencies.executors.srs_executor.max_concurrency);
+    report_fatal_error_if_not(srs_factory, "Invalid dApp-decorated SRS estimator factory.");
+  }
+  if (dependencies.diagnostics) {
+    srs_factory = create_srs_diagnostic_decorator_factory(std::move(srs_factory), dependencies.diagnostics);
+  }
   if (use_srs_acceleration) {
     ocudulog::fetch_basic_logger("PHY").info("Using accelerated SRS estimator");
   }
@@ -771,7 +824,6 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
         std::move(pusch_ch_estimator_factory), metric_notifier->get_pusch_port_channel_estimator_notifier());
     report_error_if_not(pusch_ch_estimator_factory, "Invalid port channel estimator factory.");
   }
-
   std::shared_ptr<low_papr_sequence_generator_factory> low_papr_sequence_gen_factory =
       create_low_papr_sequence_generator_sw_factory();
   report_error_if_not(low_papr_sequence_gen_factory, "Invalid low-PAPR sequence generator factory.");
@@ -836,7 +888,6 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
         std::move(pusch_precoding_factory), metric_notifier->get_pusch_transform_precoder_notifier());
     report_fatal_error_if_not(pusch_precoding_factory, "Failed to create transform precoder factory.");
   }
-
   // Create DM-RS based PUSCH channel estimator factory.
   std::shared_ptr<dmrs_pusch_estimator_factory> pusch_channel_estimator_factory =
       create_dmrs_pusch_estimator_factory_sw(prg_factory,
@@ -854,6 +905,17 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
     pusch_channel_estimator_factory = create_pusch_channel_estimator_metric_decorator_factory(
         std::move(pusch_channel_estimator_factory), metric_notifier->get_pusch_channel_estimator_notifier());
     report_fatal_error_if_not(pusch_channel_estimator_factory, "Failed to create factory.");
+  }
+  if (dependencies.dapp_hooks) {
+    const unsigned dapp_pusch_lanes = 2 * dependencies.executors.pusch_executor.max_concurrency;
+    pusch_channel_estimator_factory =
+        dependencies.dapp_hooks->decorate_pusch_channel_estimator(std::move(pusch_channel_estimator_factory),
+                                                                  {.nof_lanes        = dapp_pusch_lanes,
+                                                                   .max_nof_prb      = config.ul_bw_rb,
+                                                                   .max_nof_rx_ports = config.nof_rx_ports,
+                                                                   .max_nof_layers   = config.pusch_max_nof_layers});
+    report_fatal_error_if_not(pusch_channel_estimator_factory,
+                              "Invalid dApp-decorated PUSCH channel estimator factory.");
   }
 
   // Determine acceleration mode early so we can enable the resident decoder if appropriate.
@@ -989,6 +1051,16 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
         std::move(pusch_demod_factory), metric_notifier->get_pusch_demodulator_notifier());
     report_fatal_error_if_not(uci_dec_factory, "Invalid PUSCH demodulator.");
   }
+  if (dependencies.dapp_hooks) {
+    const unsigned dapp_pusch_lanes = 2 * dependencies.executors.pusch_executor.max_concurrency;
+    pusch_demod_factory =
+        dependencies.dapp_hooks->decorate_pusch_demodulator(std::move(pusch_demod_factory),
+                                                            {.nof_lanes        = dapp_pusch_lanes,
+                                                             .max_nof_prb      = config.ul_bw_rb,
+                                                             .max_nof_rx_ports = config.nof_rx_ports,
+                                                             .max_nof_layers   = config.pusch_max_nof_layers});
+    report_fatal_error_if_not(pusch_demod_factory, "Invalid dApp-decorated PUSCH demodulator factory.");
+  }
 
   // Add the remaining PUSCH processor configuration values.
   pusch_config.estimator_factory          = pusch_channel_estimator_factory;
@@ -999,6 +1071,7 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
   pusch_config.dec_enable_early_stop      = config.ldpc_decoder_early_stop;
   pusch_config.csi_sinr_calc_method       = config.pusch_sinr_calc_method;
   pusch_config.max_nof_concurrent_threads = dependencies.executors.pusch_executor.max_concurrency;
+  pusch_config.diag_sink                  = diag_sink;
 
   // Size channel-estimate scratch storage for the configured uplink carrier and advertised PUSCH layer limit.
   pusch_config.ch_estimate_dimensions.nof_symbols        = MAX_NSYMB_PER_SLOT;
@@ -1107,6 +1180,7 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
                                                       std::move(srs_factory),
                                                       ul_rg_factory,
                                                       std::move(tap_factory),
+                                                      dependencies.dapp_hooks,
                                                       ul_task_executors);
   report_fatal_error_if_not(factory, "Invalid Uplink processor factory.");
 
@@ -1118,9 +1192,11 @@ create_ul_processor_pool(uplink_processor_factory&              factory,
                          rx_buffer_pool&                        rm_buffer_pool,
                          upper_phy_rx_results_notifier&         rx_results_notifier,
                          const upper_phy_factory_configuration& factory_config,
-                         const upper_phy_configuration&         config)
+                         const upper_phy_configuration&         config,
+                         uint32_t                               cell_id)
 {
   uplink_processor_pool_config config_pool;
+  uint32_t                     producer_shard = 0;
 
   // Fetch and configure logger.
   ocudulog::basic_logger& logger = ocudulog::fetch_basic_logger("PHY", true);
@@ -1141,9 +1217,11 @@ create_ul_processor_pool(uplink_processor_factory&              factory,
                                               .rm_buffer_pool = rm_buffer_pool,
                                               .nof_rx_ports   = config.nof_rx_ports,
                                               .nof_rb         = config.ul_bw_rb,
-                                              .max_nof_layers = config.pusch_max_nof_layers};
+                                              .max_nof_layers = config.pusch_max_nof_layers,
+                                              .cell_id        = cell_id};
 
     for (unsigned count = 0; count != config.nof_ul_rg; ++count) {
+      ul_proc_config.producer_shard = producer_shard++;
       // Create an uplink processor.
       std::unique_ptr<uplink_processor> ul_proc;
       if (factory_config.log_level != ocudulog::basic_levels::none) {
@@ -1157,6 +1235,7 @@ create_ul_processor_pool(uplink_processor_factory&              factory,
     }
 
     config_pool.ul_processors.push_back(std::move(info));
+    ul_proc_config.producer_shard = producer_shard++;
     if (factory_config.log_level != ocudulog::basic_levels::none) {
       config_pool.default_processor = factory.create(ul_proc_config, logger, factory_config.enable_logging_broadcast);
     } else {

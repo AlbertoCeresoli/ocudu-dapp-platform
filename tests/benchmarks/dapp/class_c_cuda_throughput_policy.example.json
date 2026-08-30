@@ -1,0 +1,23 @@
+{
+  "SPDX-FileCopyrightText": "Copyright (C) 2026 DeepSig Inc.",
+  "SPDX-License-Identifier": "BSD-3-Clause-Clear",
+  "schema": "ocudu.dapp.class-c-cuda-throughput-policy.v1",
+  "platform_id": "development-gb10",
+  "channel_bandwidth_mhz": 100,
+  "common_scs_khz": 30,
+  "time_scaling": 1,
+  "srs_period_ms": 20,
+  "duration_seconds": 30,
+  "restart_cycles_before_measurement": 3,
+  "minimum_spectrum_tensor_bytes": 183456,
+  "minimum_srs_tensor_bytes": 1024,
+  "minimum_spectrum_publications_per_second": 100,
+  "minimum_srs_publications_per_second": 10,
+  "minimum_spectrum_export_gbps": 0.10,
+  "minimum_srs_export_gbps": 0.00008,
+  "maximum_backpressure_drop_rate": 0.0,
+  "maximum_export_slot_high_watermark_ratio": 1.0,
+  "release_controls_approved": false,
+  "controls_rationale": "Development-only thresholds; replace with operator-approved deployment controls and capacity targets.",
+  "operator_notes": "A failed development report is expected until controls and thresholds are approved."
+}

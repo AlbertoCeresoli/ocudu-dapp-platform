@@ -37,7 +37,8 @@ mac_cell_controller& mac_dl_processor::add_cell(const mac_cell_creation_request&
                                            cfg.ctrl_exec,
                                            cfg.pcap,
                                            cfg.timers,
-                                           std::move(dependencies));
+                                           std::move(dependencies),
+                                           cfg.dapp_hooks);
 
   return *cells[cell_cfg_req.cell_index];
 }

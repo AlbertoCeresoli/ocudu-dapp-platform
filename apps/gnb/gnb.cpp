@@ -12,6 +12,7 @@
 #include "apps/services/buffer_pool/buffer_pool_manager.h"
 #include "apps/services/cmdline/cmdline_command_dispatcher.h"
 #include "apps/services/cmdline/stdout_metrics_command.h"
+#include "apps/services/dapp/dapp_metrics_json_fanout.h"
 #include "apps/services/metrics/metrics_manager.h"
 #include "apps/services/metrics/metrics_notifier_proxy.h"
 #include "apps/services/remote_control/remote_server.h"
@@ -32,6 +33,7 @@
 #include "gnb_appconfig_yaml_writer.h"
 #include "ocudu/adt/scope_exit.h"
 #include "ocudu/cu_cp/cu_cp_operation_controller.h"
+#include "ocudu/dapp/e3/management_service.h"
 #include "ocudu/du/du_high/du_high_clock_controller.h"
 #include "ocudu/du/du_operation_controller.h"
 #include "ocudu/e1ap/gateways/e1_local_connector_factory.h"
@@ -41,9 +43,12 @@
 #include "ocudu/gtpu/gtpu_teid_pool_factory.h"
 #include "ocudu/instrumentation/traces/scheduler_event_tracer.h"
 #include "ocudu/ngap/gateways/n2_connection_client_factory.h"
+#include "ocudu/ran/plmn_identity.h"
+#include "ocudu/ru/ru_controller.h"
 #include "ocudu/support/backtrace.h"
 #include "ocudu/support/config_parsers.h"
 #include "ocudu/support/cpu_features.h"
+#include "ocudu/support/executors/task_executor.h"
 #include "ocudu/support/io/io_broker_factory.h"
 #include "ocudu/support/signal_handling.h"
 #include "ocudu/support/signal_observer.h"
@@ -53,6 +58,7 @@
 #include "ocudu/xnap/gateways/xnc_network_gateway_factory.h"
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #ifdef DPDK_FOUND
 #include "ocudu/hal/dpdk/dpdk_eal_factory.h"
 #endif
@@ -76,6 +82,117 @@ static std::string config_file;
 static std::atomic<bool> is_app_running = {true};
 /// Maximum number of configuration files allowed to be concatenated in the command line.
 static constexpr unsigned MAX_CONFIG_FILES = 10;
+
+namespace {
+
+/// E3 mutations enter on the SCTP server thread. Always defer the CU-CP call
+/// onto its sequential control executor so E3 cannot violate CU-CP affinity or
+/// block on a radio procedure.
+class cu_cp_e3_ran_control final : public dapp::e3::ran_control_handler
+{
+public:
+  cu_cp_e3_ran_control(ocucp::cu_cp_command_handler& commands_, task_executor& executor_) :
+    commands(commands_), executor(executor_)
+  {
+  }
+
+  bool request_ue_release(uint16_t serving_pci, uint16_t rnti) noexcept override
+  {
+    auto* handler = &commands.get_ue_release_command_handler();
+    return executor.defer([handler, serving_pci, rnti]() {
+      handler->trigger_release(static_cast<pci_t>(serving_pci), static_cast<rnti_t>(rnti), std::nullopt);
+    });
+  }
+
+  bool request_handover(uint16_t serving_pci, uint16_t rnti, uint16_t target_pci) noexcept override
+  {
+    // The target's PLMN/TAC come from our own cell table when the target is one
+    // of our cells, otherwise from the serving cell (same PLMN/TAC neighbour).
+    std::optional<dapp::e3::cell_descriptor> target;
+    std::optional<dapp::e3::cell_descriptor> source;
+    {
+      std::lock_guard lock(mutex);
+      for (const auto& cell : cell_table) {
+        if (cell.pci == target_pci) {
+          target = cell;
+        }
+        if (cell.pci == serving_pci) {
+          source = cell;
+        }
+      }
+    }
+    const auto& reference = target ? *target : (source ? *source : dapp::e3::cell_descriptor{});
+    auto        plmn      = plmn_identity::parse(reference.plmn.empty() ? "00101" : reference.plmn);
+    if (!plmn.has_value()) {
+      return false;
+    }
+    auto*       handler = &commands.get_mobility_command_handler();
+    const tac_t tac     = static_cast<tac_t>(reference.tac);
+    const auto  plmn_id = plmn.value();
+    return executor.defer([handler, serving_pci, rnti, target_pci, plmn_id, tac]() {
+      handler->trigger_handover(
+          static_cast<pci_t>(serving_pci), static_cast<rnti_t>(rnti), static_cast<pci_t>(target_pci), plmn_id, tac);
+    });
+  }
+
+  bool set_tx_gain(uint8_t port_id, double gain_db) noexcept override
+  {
+    std::lock_guard lock(mutex);
+    if (gain_controller == nullptr || !gain_controller->set_tx_gain(port_id, gain_db)) {
+      return false;
+    }
+    for (auto& cell : cell_table) {
+      cell.tx_gain_db = gain_db;
+    }
+    return true;
+  }
+
+  bool set_rx_gain(uint8_t port_id, double gain_db) noexcept override
+  {
+    std::lock_guard lock(mutex);
+    if (gain_controller == nullptr || !gain_controller->set_rx_gain(port_id, gain_db)) {
+      return false;
+    }
+    for (auto& cell : cell_table) {
+      cell.rx_gain_db = gain_db;
+    }
+    return true;
+  }
+
+  std::vector<dapp::e3::cell_descriptor> cells() const noexcept override
+  {
+    std::lock_guard lock(mutex);
+    return cell_table;
+  }
+
+  dapp::e3::ran_control_capabilities capabilities() const noexcept override
+  {
+    std::lock_guard lock(mutex);
+    return {true, true, gain_controller != nullptr, gain_controller != nullptr};
+  }
+
+  /// Called by the O-DU factory once the radio unit and cell configuration exist.
+  void attach_ru_gain_controller(ru_gain_controller* controller) noexcept override
+  {
+    std::lock_guard lock(mutex);
+    gain_controller = controller;
+  }
+
+  void set_cells(std::vector<dapp::e3::cell_descriptor> cells_) noexcept override
+  {
+    std::lock_guard lock(mutex);
+    cell_table = std::move(cells_);
+  }
+
+private:
+  ocucp::cu_cp_command_handler&          commands;
+  task_executor&                         executor;
+  mutable std::mutex                     mutex;
+  ru_gain_controller*                    gain_controller = nullptr;
+  std::vector<dapp::e3::cell_descriptor> cell_table;
+};
+
+} // namespace
 
 static void populate_cli11_generic_args(CLI::App& app)
 {
@@ -110,8 +227,11 @@ static void app_error_report_handler()
 
 static void initialize_log(const std::string& filename)
 {
+  // Warning/error logs drive the live supervisor and OTA A/B safety gates. Keep
+  // file logging synchronous so an RLF or fatal event is observable immediately
+  // instead of only after the stdio buffer happens to fill.
   ocudulog::sink* log_sink =
-      (filename == "stdout") ? ocudulog::create_stdout_sink() : ocudulog::create_file_sink(filename);
+      (filename == "stdout") ? ocudulog::create_stdout_sink() : &ocudulog::fetch_file_sink(filename, 0, true, true);
   if (log_sink == nullptr) {
     report_error("Could not create application main log sink.\n");
   }
@@ -284,7 +404,7 @@ int main(int argc, char** argv)
 
   if (gnb_cfg.metrics_cfg.rusage_config.metrics_consumers_cfg.enable_json_metrics &&
       !gnb_cfg.remote_control_config.enabled) {
-    fmt::println("NOTE: No JSON metrics will be generated as the remote server is disabled");
+    fmt::println("NOTE: JSON metrics reach only the dApp E3 telemetry stream because the remote server is disabled");
   }
 
   // Check the modified configuration.
@@ -369,8 +489,11 @@ int main(int argc, char** argv)
 
   std::unique_ptr<app_services::remote_server> remote_control_server =
       app_services::create_remote_server(gnb_cfg.remote_control_config);
-  app_services::remote_server_metrics_gateway* remote_server_gateway =
-      remote_control_server ? remote_control_server->get_metrics_gateway() : nullptr;
+  // Every JSON metrics report is teed to the remote WebSocket gateway (when
+  // enabled) and to the dApp E3 telemetry stream once the DU binds its service.
+  app_services::dapp_metrics_json_fanout metrics_json_fanout(
+      remote_control_server ? remote_control_server->get_metrics_gateway() : nullptr);
+  app_services::remote_server_metrics_gateway* remote_server_gateway = &metrics_json_fanout;
 
   // Instantiate executor metrics service.
   app_services::executor_metrics_service_and_metrics exec_metrics_service = build_executor_metrics_service(
@@ -540,6 +663,8 @@ int main(int argc, char** argv)
     metrics_configs.push_back(std::move(metric));
   }
   // Create O-DU dependencies.
+  auto dapp_ran_control = std::make_shared<cu_cp_e3_ran_control>(o_cucp_obj.get_cu_cp().get_command_handler(),
+                                                                 workers.get_cu_cp_executor_mapper().ctrl_executor());
   o_du_unit_dependencies odu_dependencies;
   odu_dependencies.workers                = &workers;
   odu_dependencies.f1c_client_handler     = f1c_gw.get();
@@ -551,6 +676,8 @@ int main(int argc, char** argv)
   odu_dependencies.e2_client_handler      = e2_gw_du.get();
   odu_dependencies.metrics_notifier       = &metrics_notifier_forwarder;
   odu_dependencies.remote_metrics_gateway = remote_server_gateway;
+  odu_dependencies.dapp_metrics_fanout    = &metrics_json_fanout;
+  odu_dependencies.dapp_ran_control       = dapp_ran_control;
   odu_dependencies.fapi_logger            = &ocudulog::fetch_basic_logger("FAPI");
 
   // Create O-DU.
