@@ -1,0 +1,110 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+//
+// E3 data-profile messages, version 1. One schema describes every message
+// on the carrier: requests, responses, and publication chunks. Messages are
+// exchanged as size-prefixed FlatBuffers with file identifier "E3DP". The
+// per-publication Class-C metadata (class-c-publication-v1.fbs, "OCC3")
+// rides opaquely inside PublicationChunk.metadata, unchanged from the other
+// carriers.
+
+namespace Ocudu.Dapp.E3Data.V1;
+
+struct Id128 {
+  low:uint64;
+  high:uint64;
+}
+
+enum DataSubscriptionAction : ubyte { Create = 0, Remove = 1, List = 2 }
+
+enum DataDropPolicy : ubyte { DropNewest = 0, DropOldest = 1, CoalesceLatest = 2 }
+
+/// A client treats any nonzero code as failure.
+enum ResultCode : ubyte {
+  Ok = 0,
+  NotFound = 1,
+  Conflict = 2,
+  InvalidRequest = 3,
+  Incompatible = 4,
+  ResourceExhausted = 5,
+}
+
+/// Field bounds mirror the service model: sample_every_n 1..65535,
+/// maximum_chunk_bytes 1024..65536, lease_us 1..60000000, cell_id 0..65535.
+/// Receivers validate; senders must not rely on clamping. Queueing depth is
+/// a server-side matter and is not negotiated on the wire.
+table DataSubscriptionControl {
+  action:DataSubscriptionAction = Create;
+  subscription_id:Id128;
+  interface_id:uint32;
+  cell_id:uint32 = null;
+  sample_every_n:uint32 = 1;
+  maximum_chunk_bytes:uint32 = 65536;
+  lease_us:uint64 = 1000000;
+  drop_policy:DataDropPolicy = DropNewest;
+}
+
+table DataPoll {
+  subscription_id:Id128 (required);
+  maximum_chunks:uint32 = 8;
+}
+
+table SubscriptionRecord {
+  request:DataSubscriptionControl (required);
+  lease_expiry_ns:uint64;
+  queued_chunks:uint64;
+  published_objects:uint64;
+  published_tensor_bytes:uint64;
+  dropped_objects:uint64;
+  busy_drops:uint64;
+  sampled_objects:uint64;
+  active:bool;
+  /// Absolute center frequency of the measurement window in hertz, and the
+  /// signed offset of the cell's center relative to it. Fixed for the life
+  /// of a subscription and delivered with every record; zero when the
+  /// server has no RF configuration.
+  rf_center_frequency_hz:uint64 = 0;
+  cell_frequency_offset_hz:int64 = 0;
+}
+
+table PublicationChunk {
+  subscription_id:Id128;
+  cell_id:uint32;
+  publication_sequence:uint64;
+  route_epoch:uint64;
+  chunk_index:uint32;
+  chunk_count:uint32;
+  tensor_size:uint64;
+  dropped_objects:uint64;
+  /// Class-C publication envelope ("OCC3"); present on chunk 0 of each object.
+  metadata:[ubyte];
+  /// Tensor bytes for this chunk, aligned for in-place consumption.
+  tensor:[ubyte] (force_align: 16);
+}
+
+table DataSubscriptionResult {
+  subscriptions:[SubscriptionRecord];
+}
+
+table DataPublicationResult {
+  chunks:[PublicationChunk];
+  subscription:SubscriptionRecord;
+}
+
+union ResponsePayload { DataSubscriptionResult, DataPublicationResult }
+
+table Response {
+  code:ResultCode = InvalidRequest;
+  error_text:string;
+  payload:ResponsePayload;
+}
+
+union MessageBody { DataSubscriptionControl, DataPoll, Response }
+
+table Message {
+  transaction_id:Id128 (required);
+  body:MessageBody (required);
+}
+
+root_type Message;
+file_identifier "E3DP";

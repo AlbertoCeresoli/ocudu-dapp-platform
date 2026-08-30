@@ -1,0 +1,180 @@
+{
+  "SPDX-FileCopyrightText": "Copyright (C) 2026 DeepSig Inc.",
+  "SPDX-License-Identifier": "BSD-3-Clause-Clear",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ocudu:dapp:release-provisioning-report:v1",
+  "title": "OCUDU dApp release provisioning report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "SPDX-FileCopyrightText",
+    "SPDX-License-Identifier",
+    "schema",
+    "status",
+    "published_utc",
+    "platform",
+    "installation",
+    "catalog",
+    "keys",
+    "phases",
+    "limitations"
+  ],
+  "properties": {
+    "SPDX-FileCopyrightText": {"type": "string", "minLength": 1},
+    "SPDX-License-Identifier": {"const": "BSD-3-Clause-Clear"},
+    "schema": {"const": "ocudu.dapp.release-provisioning-report.v1"},
+    "status": {"const": "passed"},
+    "published_utc": {"type": "string", "format": "date-time"},
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system", "architecture", "kernel_release"],
+      "properties": {
+        "system": {"type": "string", "minLength": 1},
+        "architecture": {"type": "string", "minLength": 1},
+        "kernel_release": {"type": "string", "minLength": 1}
+      }
+    },
+    "installation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "files"],
+      "properties": {
+        "component": {"const": "dapp_sdk"},
+        "files": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["relative_path", "sha256", "mode"],
+            "properties": {
+              "relative_path": {"type": "string", "minLength": 1},
+              "sha256": {"$ref": "#/$defs/hash"},
+              "mode": {"type": "string", "pattern": "^[0-7]{4}$"}
+            }
+          }
+        }
+      }
+    },
+    "catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package_count", "manifest_schema_version", "spdx_format", "packages"],
+      "properties": {
+        "package_count": {"type": "integer", "minimum": 1, "maximum": 256},
+        "manifest_schema_version": {"const": 1},
+        "spdx_format": {"const": "spdx-2.3-json"},
+        "packages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["package_id", "manifest", "manifest_sha256", "artifact_sha256", "sbom_sha256"],
+            "properties": {
+              "package_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              "manifest": {"type": "string", "minLength": 1},
+              "manifest_sha256": {"$ref": "#/$defs/hash"},
+              "artifact_sha256": {"$ref": "#/$defs/hash"},
+              "sbom_sha256": {"$ref": "#/$defs/hash"}
+            }
+          }
+        }
+      }
+    },
+    "keys": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "old_key_id", "new_key_id", "private_key_mode", "private_keys_retained"],
+      "properties": {
+        "algorithm": {"const": "ecdsa-p256-sha256"},
+        "old_key_id": {"$ref": "#/$defs/hash"},
+        "new_key_id": {"$ref": "#/$defs/hash"},
+        "private_key_mode": {"const": "0600"},
+        "private_keys_retained": {"const": false}
+      }
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "prefixItems": [
+        {"$ref": "#/$defs/initial_phase"},
+        {"$ref": "#/$defs/overlap_old_phase"},
+        {"$ref": "#/$defs/overlap_new_phase"},
+        {"$ref": "#/$defs/revocation_phase"},
+        {"$ref": "#/$defs/floor_phase"},
+        {"$ref": "#/$defs/rollback_phase"},
+        {"$ref": "#/$defs/live_phase"}
+      ],
+      "items": false
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 8,
+      "items": {"type": "string", "minLength": 1, "maxLength": 512}
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "status", "evidence"],
+      "properties": {
+        "name": {"type": "string"},
+        "status": {"const": "passed"},
+        "evidence": {"type": "string", "minLength": 1, "maxLength": 512}
+      }
+    },
+    "initial_phase": {
+      "allOf": [
+        {"$ref": "#/$defs/phase"},
+        {"properties": {"name": {"const": "initial_old_key_admission"}}}
+      ]
+    },
+    "overlap_old_phase": {
+      "allOf": [
+        {"$ref": "#/$defs/phase"},
+        {"properties": {"name": {"const": "overlap_old_catalog_admission"}}}
+      ]
+    },
+    "overlap_new_phase": {
+      "allOf": [
+        {"$ref": "#/$defs/phase"},
+        {"properties": {"name": {"const": "overlap_new_catalog_admission"}}}
+      ]
+    },
+    "revocation_phase": {
+      "allOf": [
+        {"$ref": "#/$defs/phase"},
+        {"properties": {"name": {"const": "old_key_revocation_rejection"}}}
+      ]
+    },
+    "floor_phase": {
+      "allOf": [
+        {"$ref": "#/$defs/phase"},
+        {"properties": {"name": {"const": "sequence_floor_rejection"}}}
+      ]
+    },
+    "rollback_phase": {
+      "allOf": [
+        {"$ref": "#/$defs/phase"},
+        {"properties": {"name": {"const": "policy_epoch_rollback_rejection"}}}
+      ]
+    },
+    "live_phase": {
+      "allOf": [
+        {"$ref": "#/$defs/phase"},
+        {"properties": {"name": {"const": "final_catalog_live_lifecycle"}}}
+      ]
+    }
+  }
+}

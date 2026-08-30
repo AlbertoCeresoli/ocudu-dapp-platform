@@ -1,0 +1,161 @@
+{
+  "SPDX-FileCopyrightText": "Copyright (C) 2026 DeepSig Inc.",
+  "SPDX-License-Identifier": "BSD-3-Clause-Clear",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ocudu:dapp:class-a-cuda-qualification-report:v1",
+  "title": "OCUDU Class-A CUDA qualification report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "SPDX-FileCopyrightText",
+    "SPDX-License-Identifier",
+    "schema",
+    "created_at",
+    "finished_at",
+    "status",
+    "policy",
+    "host_manifest",
+    "benchmark",
+    "protocol",
+    "runs",
+    "summary"
+  ],
+  "properties": {
+    "SPDX-FileCopyrightText": {"type": "string"},
+    "SPDX-License-Identifier": {"const": "BSD-3-Clause-Clear"},
+    "schema": {"const": "ocudu.class-a-cuda-qualification-report.v1"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["passed", "failed", "invalid"]},
+    "policy": {"type": "object"},
+    "host_manifest": {
+      "type": "object",
+      "required": ["python", "kernel", "operating_system", "cpu_model", "logical_cpus"],
+      "properties": {
+        "python": {"type": "string"},
+        "kernel": {"type": "string"},
+        "operating_system": {"type": "string"},
+        "cpu_model": {"type": "string"},
+        "logical_cpus": {"type": ["integer", "null"], "minimum": 1}
+      }
+    },
+    "benchmark": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string"},
+        "sha256": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trials", "lane_counts", "prbs", "layers", "modulation_orders", "symbols", "repetitions", "warmups_per_phase", "ce_deadline_us", "demodulator_deadline_us", "preflight_timeout_ms", "gpu_policy"],
+      "properties": {
+        "trials": {"type": "integer", "minimum": 3},
+        "lane_counts": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1, "maximum": 64}},
+        "prbs": {"const": [25, 106, 273]},
+        "layers": {"const": [1, 2]},
+        "modulation_orders": {"const": [2, 4, 6, 8]},
+        "symbols": {"const": 12},
+        "repetitions": {"const": 1000},
+        "warmups_per_phase": {"const": 100},
+        "ce_deadline_us": {"const": 100},
+        "demodulator_deadline_us": {"const": 150},
+        "preflight_timeout_ms": {"const": 500},
+        "gpu_policy": {"const": "exclusive"}
+      }
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "required": ["trial", "pusch_lanes", "started_at", "finished_at", "duration_seconds", "command", "exit_code", "log", "status", "reasons"],
+        "properties": {
+          "trial": {"type": "integer", "minimum": 1},
+          "pusch_lanes": {"type": "integer", "minimum": 1},
+          "started_at": {"type": "string", "format": "date-time"},
+          "finished_at": {"type": "string", "format": "date-time"},
+          "duration_seconds": {"type": "number", "minimum": 0},
+          "command": {"type": "string"},
+          "exit_code": {"type": "integer"},
+          "log": {"$ref": "#/$defs/artifact"},
+          "csv": {"$ref": "#/$defs/artifact"},
+          "status": {"enum": ["passed", "failed", "invalid"]},
+          "reasons": {"type": "array", "items": {"type": "string"}},
+          "environment": {"$ref": "#/$defs/environment"},
+          "summary": {"$ref": "#/$defs/run_summary"}
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected_runs", "passed_runs", "failed_runs", "invalid_runs", "resident_accepted_invocations", "pipeline_deadline_misses", "production_deadline_misses"],
+      "properties": {
+        "expected_runs": {"type": "integer", "minimum": 3},
+        "passed_runs": {"type": "integer", "minimum": 0},
+        "failed_runs": {"type": "integer", "minimum": 0},
+        "invalid_runs": {"type": "integer", "minimum": 0},
+        "resident_accepted_invocations": {"type": "integer", "minimum": 0},
+        "pipeline_deadline_misses": {"type": "integer", "minimum": 0},
+        "production_deadline_misses": {"type": "integer", "minimum": 0}
+      }
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string"},
+        "sha256": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "required": [
+        "gpu_monitor_available", "gpu_observation_healthy", "foreign_compute_processes", "foreign_compute_pids",
+        "gpu_policy", "host", "machine", "gpu", "scheduler_policy", "scheduler_priority", "cpu_affinity",
+        "pusch_stream_priority", "package_filter", "preflight_timeout_ms", "build_hash", "build_mode", "cuda_device",
+        "cuda_driver_version", "cuda_runtime_version", "gpu_pci_bus_id", "nvml_driver_version", "gpu_uuid",
+        "gpu_temperature_min_c", "gpu_temperature_max_c", "gpu_sm_clock_min_mhz", "gpu_sm_clock_max_mhz",
+        "gpu_memory_clock_min_mhz", "gpu_memory_clock_max_mhz", "gpu_power_min_mw", "gpu_power_max_mw",
+        "gpu_power_limit_mw", "gpu_persistence_mode", "gpu_compute_mode", "gpu_performance_state_best",
+        "gpu_performance_state_worst"
+      ],
+      "additionalProperties": {"type": "string"}
+    },
+    "run_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["measurement_rows", "device_pipeline_rows", "resident_accepted_invocations", "pipeline_deadline_misses", "production_deadline_misses", "worst_device_pipeline"],
+      "properties": {
+        "measurement_rows": {"type": "integer", "minimum": 1},
+        "device_pipeline_rows": {"type": "integer", "minimum": 1},
+        "resident_accepted_invocations": {"type": "integer", "minimum": 0},
+        "pipeline_deadline_misses": {"type": "integer", "minimum": 0},
+        "production_deadline_misses": {"type": "integer", "minimum": 0},
+        "worst_device_pipeline": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "prbs", "layers", "modulation_order", "p50_ns", "p90_ns", "p99_ns", "p999_ns", "max_ns"],
+          "properties": {
+            "path": {"type": "string"},
+            "prbs": {"type": "integer"},
+            "layers": {"type": "integer"},
+            "modulation_order": {"type": "integer"},
+            "p50_ns": {"type": "integer", "minimum": 0},
+            "p90_ns": {"type": "integer", "minimum": 0},
+            "p99_ns": {"type": "integer", "minimum": 0},
+            "p999_ns": {"type": "integer", "minimum": 0},
+            "max_ns": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    }
+  }
+}

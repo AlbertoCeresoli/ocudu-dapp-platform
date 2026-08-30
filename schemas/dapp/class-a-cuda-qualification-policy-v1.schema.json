@@ -1,0 +1,43 @@
+{
+  "SPDX-FileCopyrightText": "Copyright (C) 2026 DeepSig Inc.",
+  "SPDX-License-Identifier": "BSD-3-Clause-Clear",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ocudu:dapp:class-a-cuda-qualification-policy:v1",
+  "title": "OCUDU Class-A CUDA qualification policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "platform_id",
+    "scheduler_policy",
+    "minimum_scheduler_priority",
+    "cpu_affinity",
+    "pusch_stream_priority",
+    "gpu_clock_policy",
+    "gpu_power_policy",
+    "maximum_gpu_temperature_c",
+    "release_controls_approved"
+  ],
+  "properties": {
+    "SPDX-FileCopyrightText": {"type": "string"},
+    "SPDX-License-Identifier": {"const": "BSD-3-Clause-Clear"},
+    "$schema": {"type": "string"},
+    "schema": {"const": "ocudu.class-a-cuda-qualification-policy.v1"},
+    "platform_id": {"type": "string", "minLength": 1},
+    "scheduler_policy": {"enum": ["fifo", "round-robin", "batch", "idle", "other"]},
+    "minimum_scheduler_priority": {"type": "integer", "minimum": 0},
+    "cpu_affinity": {"type": "string", "minLength": 1},
+    "pusch_stream_priority": {"type": "string", "minLength": 1},
+    "gpu_clock_policy": {"type": "string", "minLength": 1},
+    "gpu_power_policy": {"type": "string", "minLength": 1},
+    "maximum_gpu_temperature_c": {"type": "integer", "minimum": 1, "maximum": 120},
+    "release_controls_approved": {"type": "boolean"},
+    "expected_machine": {"type": "string", "minLength": 1},
+    "expected_gpu": {"type": "string", "minLength": 1},
+    "required_gpu_persistence_mode": {"enum": ["enabled", "disabled", "unavailable"]},
+    "required_gpu_compute_mode": {"enum": ["default", "exclusive-thread", "exclusive-process", "prohibited", "unavailable"]},
+    "minimum_gpu_sm_clock_mhz": {"type": "integer", "minimum": 0},
+    "expected_gpu_power_limit_mw": {"type": "integer", "minimum": -1},
+    "operator_notes": {"type": "string"}
+  }
+}

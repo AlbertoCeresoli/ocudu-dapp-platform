@@ -1,0 +1,190 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+// Companion high-rate metadata schema for Class-C local data planes.
+// Tensor bytes remain external; this envelope describes an authorized object.
+
+namespace Ocudu.Dapp.ClassC.V1;
+
+enum PublicationKind : ubyte {
+  Spectrum = 0,
+  SrsIsac = 1,
+  UlResourcePlan = 2,
+  InterferenceMap = 3,
+  QuietPeriodIntent = 4,
+  QuietPeriodReservation = 5
+}
+
+enum GridMaskGranularity : ubyte { None = 0, Prb = 1, SymbolPrb = 2, ResourceElement = 3 }
+enum UlUseCategory : ubyte {
+  Unknown = 0, PlannedEmpty = 1, Pusch = 2, Pucch = 3, Srs = 4,
+  PrachOrCommon = 5, ReferenceSignal = 6, ReservedQuiet = 7
+}
+enum QuietnessLevel : ubyte { NoNewPusch = 0, NoPusch = 1, NoScheduledUeUl = 2, RfSilenceRequested = 3 }
+enum ReservationStatus : ubyte { Accepted = 0, Clamped = 1, Rejected = 2, Cancelled = 3, Expired = 4 }
+enum MemoryDomain : ubyte {
+  Host = 0, HostPinned = 1, AcceleratorDevice = 2,
+  ManagedCoherent = 3, PosixShared = 4, AcceleratorIpcExport = 5
+}
+enum ElementType : ubyte {
+  Int8 = 0, Uint8 = 1, Int16 = 2, Uint16 = 3, Int32 = 4, Fp16 = 5,
+  Bf16 = 6, Fp32 = 7, ComplexInt16 = 8, ComplexBf16 = 9,
+  ComplexFp16 = 10, ComplexFp32 = 11
+}
+
+struct Id128 { low : ulong; high : ulong; }
+struct RadioTime { sfn : ushort; slot : ushort; numerology : ubyte; symbol_mask : ushort; }
+
+table ObservationContext {
+  radio_time : RadioTime;
+  cell_id : uint;
+  ran_node_id : Id128;
+  clock_domain_id : string (required);
+  observation_time_ns : ulong;
+  ue_token : Id128;
+  reference_frequency_hz : ulong;
+  calibration_generation : ulong;
+}
+
+table TensorDescriptor {
+  object_id : Id128;
+  allocation_generation : ulong;
+  domain : MemoryDomain;
+  backend_id : uint;
+  element_type : ElementType;
+  layout_id : string (required);
+  layout_version_major : ushort;
+  layout_version_minor : ushort;
+  byte_offset : ulong;
+  byte_length : ulong;
+  dimensions : [ulong];
+  byte_strides : [ulong];
+  device_ordinal : ushort = 65535;
+  capability_id : Id128;
+  lease_id : Id128;
+  lease_expiry_ns : ulong;
+  read_only : bool = true;
+}
+
+table SpectrumMetadata {
+  bandwidth_hz : ulong;
+  rx_ports : ushort;
+  symbols : ubyte;
+  subcarriers : uint;
+  scale : float = 1.0;
+  completeness_mask : [ubyte];
+  first_sample_time_ns : ulong;
+  grid_ready_time_ns : ulong;
+  occupancy_annotations : [ubyte];
+  plan_generation : ulong;
+  occupancy_granularity : GridMaskGranularity = None;
+  occupancy_complete : bool = false;
+}
+
+table SrsIsacMetadata {
+  srs_resource_id : ushort;
+  srs_config_id : ushort;
+  rx_ports : ushort;
+  tx_ports : ushort;
+  comb_size : ubyte;
+  comb_offset : ubyte;
+  first_subcarrier : uint;
+  subcarrier_spacing_hz : uint;
+  frequency_points : uint;
+  noise_variance : float;
+  rsrp : float;
+  epre : float;
+  timing_advance_ns : int;
+  cfo_hz : int;
+  calibration_id : Id128;
+  estimate_ready_time_ns : ulong;
+}
+
+table UlAllocationSpan {
+  symbol_start : ubyte;
+  symbol_count : ubyte;
+  prb_start : ushort;
+  prb_count : ushort;
+  use_category : UlUseCategory;
+  dmrs_symbol_mask : ushort;
+  allocation_id : uint;
+}
+
+table UlResourcePlanMetadata {
+  plan_generation : ulong;
+  committed_time_ns : ulong;
+  first_prb : ushort;
+  prb_count : ushort;
+  mask_granularity : GridMaskGranularity = None;
+  spans : [UlAllocationSpan];
+  complete : bool = true;
+}
+
+table InterferenceMapMetadata {
+  source_grid_sequence : ulong;
+  source_plan_generation : ulong;
+  produced_time_ns : ulong;
+  valid_from : RadioTime;
+  valid_for_slots : ushort;
+  first_prb : ushort;
+  prb_count : ushort;
+  mask_granularity : GridMaskGranularity = Prb;
+  confidence_scale : float = 1.0;
+  detection_threshold : float;
+  hysteresis : float;
+  plan_matched : bool;
+}
+
+table QuietPeriodIntentMetadata {
+  request_id : Id128;
+  earliest_start : RadioTime;
+  latest_start : RadioTime;
+  duration_slots : ushort;
+  repeat_period_slots : ushort;
+  repeat_count : ushort = 1;
+  first_prb : ushort;
+  prb_count : ushort;
+  requested_level : QuietnessLevel = NoPusch;
+  confidence : float;
+  expiry_time_ns : ulong;
+  budget_class : ushort;
+}
+
+table QuietPeriodReservationMetadata {
+  request_id : Id128;
+  reservation_id : Id128;
+  reservation_generation : ulong;
+  status : ReservationStatus;
+  start : RadioTime;
+  duration_slots : ushort;
+  repeat_period_slots : ushort;
+  repeat_count : ushort = 1;
+  first_prb : ushort;
+  prb_count : ushort;
+  achieved_level : QuietnessLevel = NoPusch;
+  expiry_time_ns : ulong;
+  reason_code : ushort;
+}
+
+union PublicationMetadata {
+  SpectrumMetadata,
+  SrsIsacMetadata,
+  UlResourcePlanMetadata,
+  InterferenceMapMetadata,
+  QuietPeriodIntentMetadata,
+  QuietPeriodReservationMetadata
+}
+
+table PublicationEnvelope {
+  schema_id : string (required);
+  schema_version_major : ushort;
+  schema_version_minor : ushort;
+  publication_kind : PublicationKind;
+  publication_sequence : ulong;
+  producer_instance : Id128;
+  context : ObservationContext (required);
+  tensor : TensorDescriptor;
+  metadata : PublicationMetadata;
+}
+
+root_type PublicationEnvelope;
+file_identifier "OCC3";

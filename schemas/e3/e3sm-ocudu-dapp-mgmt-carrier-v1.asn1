@@ -1,0 +1,26 @@
+-- SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+-- SPDX-License-Identifier: BSD-3-Clause-Clear
+--
+-- E3AP-OCUDU-V1 capability advertisement for the OCUDU dApp management
+-- service model (E3SM-OCUDU-DAPP-MGMT-V1).
+--
+-- RAN function identifier: 11 ("OCUDU dApp Management Service Model").
+-- Control identifier 1: E3-DAppControlAction.actionData is one APER
+--   ManagementRequest; the E3-ControlResponse.controlOutcome is the matching
+--   APER ManagementResponse. Both may be fragmented at the E3AP layer.
+-- The service model defines no telemetry identifiers.
+
+OCUDU-DAPP-MGMT-CARRIER-SM DEFINITIONS AUTOMATIC TAGS ::= BEGIN
+
+maxMgmtBytes INTEGER ::= 2097152
+
+Mgmt-RanFunctionData ::= SEQUENCE {
+  name         OCTET STRING (SIZE (1..32)),
+  version      INTEGER (0..65535),
+  description  OCTET STRING (SIZE (1..128)),
+  schemaModule OCTET STRING (SIZE (1..64)),
+  maximumBytes INTEGER (1..maxMgmtBytes),
+  ...
+}
+
+END

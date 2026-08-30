@@ -1,0 +1,103 @@
+{
+  "SPDX-FileCopyrightText": "Copyright (C) 2026 DeepSig Inc.",
+  "SPDX-License-Identifier": "BSD-3-Clause-Clear",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ocudu:dapp:failure-gallery-report:v1",
+  "title": "OCUDU dApp failure-gallery report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "SPDX-FileCopyrightText",
+    "SPDX-License-Identifier",
+    "schema",
+    "status",
+    "published_monotonic_ns",
+    "du",
+    "catalog",
+    "scenarios",
+    "health",
+    "teardown",
+    "limitations"
+  ],
+  "properties": {
+    "SPDX-FileCopyrightText": {"type": "string"},
+    "SPDX-License-Identifier": {"const": "BSD-3-Clause-Clear"},
+    "schema": {"const": "ocudu.dapp.failure-gallery-report.v1"},
+    "status": {"const": "passed"},
+    "published_monotonic_ns": {"type": "integer", "minimum": 1},
+    "du": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pid", "path", "sha256"],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1},
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "manifests"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "manifests": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/hash"},
+          "required": [
+            "failure_channel_estimator_exception_cpu.manifest.json",
+            "failure_channel_estimator_invalid_cpu.manifest.json",
+            "failure_channel_estimator_deadline_cpu.manifest.json",
+            "failure_spectrumd_invalid_cpu.manifest.json"
+          ],
+          "minProperties": 4,
+          "maxProperties": 4
+        }
+      }
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status", "instance_id", "evidence"],
+        "properties": {
+          "name": {
+            "enum": [
+              "authority_conflict",
+              "native_exception",
+              "native_invalid_output",
+              "native_deadline_fallback",
+              "process_heartbeat_recovery",
+              "process_exit_recovery",
+              "process_invalid_output"
+            ]
+          },
+          "status": {"const": "passed"},
+          "instance_id": {"type": "string", "minLength": 1},
+          "evidence": {"type": "object"}
+        }
+      }
+    },
+    "health": {"type": "object"},
+    "teardown": {
+      "type": "object",
+      "required": ["terminal_jobs", "unloaded_instances", "live_instances"],
+      "properties": {
+        "terminal_jobs": {"type": "integer", "minimum": 1},
+        "unloaded_instances": {"type": "integer", "minimum": 7},
+        "live_instances": {"const": 0}
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

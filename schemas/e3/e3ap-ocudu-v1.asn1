@@ -1,0 +1,228 @@
+-- SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+-- SPDX-License-Identifier: BSD-3-Clause-Clear
+
+E3AP-OCUDU-V1 DEFINITIONS AUTOMATIC TAGS ::= BEGIN
+
+-- E3 application protocol used by out-of-process dApps and observers that
+-- reach the embedded OCUDU E3 agent over SCTP.
+--
+-- The procedure set and field names mirror E3AP 1.0.0 as implemented by the
+-- Northeastern University libe3 project (setup, subscription, indication,
+-- dApp control action, dApp report, xApp control action, release, message
+-- ack) so that dApp logic ports between the stacks. The module is not
+-- byte-compatible with libe3: every SEQUENCE is extensible, identifier ranges
+-- are wide enough for production deployments, payloads are bounded at
+-- 16 MiB with explicit fragmentation, and a control response carries a
+-- service-model outcome instead of a bare acknowledgement.
+--
+-- Service-model bodies are opaque APER OCTET STRINGs selected by
+-- ranFunctionIdentifier. Registered RAN functions:
+--   10  OCUDU-TELEMETRY-SM           (indications: Telemetry-IndicationData,
+--                                     subscriptionData: Telemetry-SubscriptionData)
+--   11  E3SM-OCUDU-DAPP-MGMT-V1      (actionData: ManagementRequest,
+--                                     controlOutcome: ManagementResponse)
+--
+-- Transport: one E3-PDU per SCTP message on a one-to-one style association.
+-- SCTP stream 0 carries procedures; stream 1 carries indications. Payload
+-- protocol identifier 0x00E3A001 is a project-private value. Payloads larger
+-- than one fragment are split into ordered fragments of at most
+-- maxE3FragmentBytes; receivers reassemble fragments that share the same
+-- PDU id (control) or subscriptionId + sequence (indication) in fragmentIndex
+-- order and verify the reassembled length against payloadBytes before
+-- decoding. Linux SCTP cannot deliver a single message larger than the socket
+-- send buffer, so senders MUST fragment rather than rely on the transport.
+
+maxE3Name          INTEGER ::= 64
+maxE3Version       INTEGER ::= 32
+maxE3Text          INTEGER ::= 512
+maxE3RanFunctions  INTEGER ::= 64
+maxE3Identifiers   INTEGER ::= 256
+-- Largest reassembled opaque service-model payload (16 MiB).
+maxE3PayloadBytes  INTEGER ::= 16777216
+-- Largest payload fragment carried by one PDU (64 KiB).
+maxE3FragmentBytes INTEGER ::= 65536
+-- Largest RAN-function capability blob in one setup response.
+maxE3FunctionData  INTEGER ::= 262144
+
+E3-DAppID ::= INTEGER (1..65535)
+E3-MessageID ::= INTEGER (1..4294967295)
+E3-RanFunctionID ::= INTEGER (1..65535)
+E3-TelemetryID ::= INTEGER (1..65535)
+E3-ControlID ::= INTEGER (1..65535)
+E3-SubscriptionID ::= INTEGER (1..65535)
+-- Bounded UTF-8 text carried as OCTET STRING: PER does not make SIZE constraints
+-- on UTF8String visible, and encoders disagree on that corner; OCTET STRING keeps
+-- every implementation byte-identical. Receivers MUST reject malformed UTF-8.
+E3-Version ::= OCTET STRING (SIZE (1..maxE3Version))
+E3-Name ::= OCTET STRING (SIZE (1..maxE3Name))
+E3-Text ::= OCTET STRING (SIZE (0..maxE3Text))
+E3-Identifier ::= OCTET STRING (SIZE (16))
+E3-Unsigned64 ::= OCTET STRING (SIZE (8))
+E3-PayloadFragment ::= OCTET STRING (SIZE (1..maxE3FragmentBytes))
+E3-ResponseCode ::= ENUMERATED { positive(0), negative(1), ... }
+
+E3-Cause ::= ENUMERATED {
+  unspecified(0), protocolError(1), setupRequired(2), setupAlreadyComplete(3),
+  unsupportedProtocolVersion(4), unsupportedRanFunction(5), unsupportedIdentifier(6),
+  invalidRequest(7), notFound(8), duplicate(9), resourceExhausted(10),
+  authorizationRejected(11), payloadTooLarge(12), transportOverrun(13),
+  shuttingDown(14), ...
+}
+
+E3-IdentifierList ::= SEQUENCE (SIZE (0..maxE3Identifiers)) OF INTEGER (1..65535)
+
+E3-RanFunctionDefinition ::= SEQUENCE {
+  ranFunctionIdentifier   E3-RanFunctionID,
+  telemetryIdentifierList E3-IdentifierList,
+  controlIdentifierList   E3-IdentifierList,
+  ranFunctionData         OCTET STRING (SIZE (1..maxE3FunctionData)),
+  ...,
+  ranFunctionName         E3-Name OPTIONAL,
+  ranFunctionVersion      E3-Version OPTIONAL
+}
+
+E3-SetupRequest ::= SEQUENCE {
+  e3apProtocolVersion E3-Version,
+  dAppName            E3-Name,
+  dAppVersion         E3-Version,
+  vendor              E3-Name,
+  ...,
+  dAppInstance        E3-Identifier OPTIONAL
+}
+
+E3-SetupResponse ::= SEQUENCE {
+  requestId           E3-MessageID,
+  responseCode        E3-ResponseCode,
+  ranIdentifier       E3-Name,
+  e3apProtocolVersion E3-Version OPTIONAL,
+  dAppIdentifier      E3-DAppID OPTIONAL,
+  ranFunctionList     SEQUENCE (SIZE (0..maxE3RanFunctions)) OF E3-RanFunctionDefinition OPTIONAL,
+  ...,
+  cause               E3-Cause OPTIONAL,
+  detail              E3-Text OPTIONAL,
+  ranInstance         E3-Identifier OPTIONAL,
+  maximumPayloadBytes INTEGER (1..maxE3PayloadBytes) OPTIONAL,
+  maximumFragmentBytes INTEGER (1..maxE3FragmentBytes) OPTIONAL
+}
+
+E3-SubscriptionRequest ::= SEQUENCE {
+  dAppIdentifier          E3-DAppID,
+  ranFunctionIdentifier   E3-RanFunctionID,
+  telemetryIdentifierList E3-IdentifierList,
+  controlIdentifierList   E3-IdentifierList,
+  subscriptionTime        INTEGER (0..86400) OPTIONAL,
+  periodicity             INTEGER (0..60000) OPTIONAL,
+  ...,
+  -- Service-model subscription parameters (E2-style action definition).
+  subscriptionData        OCTET STRING (SIZE (1..maxE3FunctionData)) OPTIONAL
+}
+
+E3-SubscriptionDelete ::= SEQUENCE {
+  dAppIdentifier E3-DAppID,
+  subscriptionId E3-SubscriptionID,
+  ...
+}
+
+E3-SubscriptionResponse ::= SEQUENCE {
+  requestId               E3-MessageID,
+  dAppIdentifier          E3-DAppID,
+  responseCode            E3-ResponseCode,
+  subscriptionId          E3-SubscriptionID OPTIONAL,
+  telemetryIdentifierList E3-IdentifierList OPTIONAL,
+  controlIdentifierList   E3-IdentifierList OPTIONAL,
+  ...,
+  cause                   E3-Cause OPTIONAL,
+  detail                  E3-Text OPTIONAL
+}
+
+E3-IndicationMessage ::= SEQUENCE {
+  dAppIdentifier        E3-DAppID,
+  ranFunctionIdentifier E3-RanFunctionID,
+  protocolData          E3-PayloadFragment,
+  ...,
+  subscriptionId        E3-SubscriptionID OPTIONAL,
+  telemetryIdentifier   E3-TelemetryID OPTIONAL,
+  sequence              E3-Unsigned64 OPTIONAL,
+  fragmentIndex         INTEGER (0..65535) DEFAULT 0,
+  fragmentCount         INTEGER (1..65536) DEFAULT 1,
+  payloadBytes          INTEGER (1..maxE3PayloadBytes) OPTIONAL
+}
+
+E3-DAppControlAction ::= SEQUENCE {
+  dAppIdentifier        E3-DAppID,
+  ranFunctionIdentifier E3-RanFunctionID,
+  controlIdentifier     E3-ControlID,
+  actionData            E3-PayloadFragment,
+  ...,
+  fragmentIndex         INTEGER (0..65535) DEFAULT 0,
+  fragmentCount         INTEGER (1..65536) DEFAULT 1,
+  payloadBytes          INTEGER (1..maxE3PayloadBytes) OPTIONAL
+}
+
+-- Outcome of a dApp control action carrying a service-model response body.
+-- libe3 answers control actions with E3-MessageAck only; OCUDU sends the ack
+-- when the request is accepted for processing and this message when the
+-- service model produces a result.
+E3-ControlResponse ::= SEQUENCE {
+  requestId             E3-MessageID,
+  dAppIdentifier        E3-DAppID,
+  ranFunctionIdentifier E3-RanFunctionID,
+  controlIdentifier     E3-ControlID,
+  responseCode          E3-ResponseCode,
+  cause                 E3-Cause OPTIONAL,
+  detail                E3-Text OPTIONAL,
+  controlOutcome        E3-PayloadFragment OPTIONAL,
+  fragmentIndex         INTEGER (0..65535) DEFAULT 0,
+  fragmentCount         INTEGER (1..65536) DEFAULT 1,
+  payloadBytes          INTEGER (0..maxE3PayloadBytes) DEFAULT 0,
+  ...
+}
+
+E3-DAppReport ::= SEQUENCE {
+  dAppIdentifier        E3-DAppID,
+  ranFunctionIdentifier E3-RanFunctionID,
+  reportData            E3-PayloadFragment,
+  ...
+}
+
+E3-XAppControlAction ::= SEQUENCE {
+  dAppIdentifier        E3-DAppID,
+  ranFunctionIdentifier E3-RanFunctionID,
+  xAppControlData       E3-PayloadFragment,
+  ...
+}
+
+E3-ReleaseMessage ::= SEQUENCE {
+  dAppIdentifier E3-DAppID,
+  ...
+}
+
+E3-MessageAck ::= SEQUENCE {
+  requestId    E3-MessageID,
+  responseCode E3-ResponseCode,
+  ...,
+  cause        E3-Cause OPTIONAL,
+  detail       E3-Text OPTIONAL
+}
+
+E3-PDU ::= SEQUENCE {
+  id  E3-MessageID,
+  msg CHOICE {
+    setupRequest         E3-SetupRequest,
+    setupResponse        E3-SetupResponse,
+    subscriptionRequest  E3-SubscriptionRequest,
+    subscriptionDelete   E3-SubscriptionDelete,
+    subscriptionResponse E3-SubscriptionResponse,
+    indicationMessage    E3-IndicationMessage,
+    dAppControlAction    E3-DAppControlAction,
+    dAppReport           E3-DAppReport,
+    xAppControlAction    E3-XAppControlAction,
+    releaseMessage       E3-ReleaseMessage,
+    messageAck           E3-MessageAck,
+    controlResponse      E3-ControlResponse,
+    ...
+  },
+  ...
+}
+
+END

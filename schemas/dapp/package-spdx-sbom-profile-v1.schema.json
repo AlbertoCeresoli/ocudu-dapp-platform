@@ -1,0 +1,83 @@
+{
+  "SPDX-FileCopyrightText": "Copyright (C) 2026 DeepSig Inc.",
+  "SPDX-License-Identifier": "BSD-3-Clause-Clear",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ocudu:dapp:package-spdx-sbom-profile:v1",
+  "title": "OCUDU dApp SPDX 2.3 JSON package-binding profile",
+  "type": "object",
+  "required": [
+    "spdxVersion", "dataLicense", "SPDXID", "name", "documentNamespace", "creationInfo",
+    "packages", "files", "relationships"
+  ],
+  "properties": {
+    "spdxVersion": {"const": "SPDX-2.3"},
+    "dataLicense": {"const": "CC0-1.0"},
+    "SPDXID": {"const": "SPDXRef-DOCUMENT"},
+    "name": {"type": "string", "minLength": 1, "maxLength": 256},
+    "documentNamespace": {"type": "string", "format": "uri", "maxLength": 512},
+    "creationInfo": {
+      "type": "object",
+      "required": ["created", "creators"],
+      "properties": {
+        "created": {"type": "string", "format": "date-time", "maxLength": 64},
+        "creators": {
+          "type": "array", "minItems": 1, "maxItems": 16,
+          "items": {"type": "string", "minLength": 1, "maxLength": 256}
+        }
+      }
+    },
+    "packages": {
+      "type": "array", "minItems": 1, "maxItems": 4096,
+      "contains": {
+        "type": "object",
+        "required": ["SPDXID", "name", "versionInfo", "supplier", "filesAnalyzed", "hasFiles"],
+        "properties": {
+          "SPDXID": {"const": "SPDXRef-Package"},
+          "name": {"type": "string", "minLength": 1, "maxLength": 128},
+          "versionInfo": {"type": "string", "minLength": 1, "maxLength": 32},
+          "supplier": {"type": "string", "pattern": "^Organization: .+", "maxLength": 142},
+          "filesAnalyzed": {"const": true},
+          "hasFiles": {"type": "array", "contains": {"const": "SPDXRef-Artifact"}}
+        }
+      },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "files": {
+      "type": "array", "minItems": 1, "maxItems": 4096,
+      "contains": {
+        "type": "object",
+        "required": ["SPDXID", "fileName", "checksums"],
+        "properties": {
+          "SPDXID": {"const": "SPDXRef-Artifact"},
+          "fileName": {"type": "string", "pattern": "^\\./.+"},
+          "checksums": {
+            "type": "array", "minItems": 1, "maxItems": 8,
+            "contains": {
+              "type": "object",
+              "required": ["algorithm", "checksumValue"],
+              "properties": {
+                "algorithm": {"const": "SHA256"},
+                "checksumValue": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              }
+            }
+          }
+        }
+      },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "relationships": {
+      "type": "array", "maxItems": 4096,
+      "contains": {
+        "type": "object",
+        "required": ["spdxElementId", "relationshipType", "relatedSpdxElement"],
+        "properties": {
+          "spdxElementId": {"const": "SPDXRef-DOCUMENT"},
+          "relationshipType": {"const": "DESCRIBES"},
+          "relatedSpdxElement": {"const": "SPDXRef-Package"}
+        }
+      }
+    }
+  }
+}

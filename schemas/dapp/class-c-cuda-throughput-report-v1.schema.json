@@ -1,0 +1,236 @@
+{
+  "SPDX-FileCopyrightText": "Copyright (C) 2026 DeepSig Inc.",
+  "SPDX-License-Identifier": "BSD-3-Clause-Clear",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ocudu:dapp:class-c-cuda-throughput-report:v1",
+  "title": "OCUDU Class-C CUDA process throughput report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "SPDX-FileCopyrightText",
+    "SPDX-License-Identifier",
+    "schema",
+    "created_at",
+    "finished_at",
+    "status",
+    "policy_artifact",
+    "policy",
+    "host_manifest",
+    "gpu_inventory",
+    "tooling",
+    "load",
+    "protocol",
+    "routes",
+    "summary"
+  ],
+  "properties": {
+    "SPDX-FileCopyrightText": {"type": "string"},
+    "SPDX-License-Identifier": {"const": "BSD-3-Clause-Clear"},
+    "schema": {"const": "ocudu.dapp.class-c-cuda-throughput-report.v1"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["passed", "failed", "invalid"]},
+    "policy_artifact": {"$ref": "#/$defs/path_artifact"},
+    "policy": {"type": "object"},
+    "host_manifest": {"type": "object"},
+    "gpu_inventory": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+    "tooling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runner", "contention_protocol", "report_schema", "policy_schema"],
+      "properties": {
+        "runner": {"$ref": "#/$defs/path_artifact"},
+        "contention_protocol": {"$ref": "#/$defs/path_artifact"},
+        "report_schema": {"$ref": "#/$defs/path_artifact"},
+        "policy_schema": {"$ref": "#/$defs/path_artifact"}
+      }
+    },
+    "load": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "odu",
+        "driver",
+        "client",
+        "e3_schema",
+        "preflight_helper",
+        "nvidia_smi",
+        "packages",
+        "command",
+        "status",
+        "reasons",
+        "baseline_gpu_client_pids",
+        "log"
+      ],
+      "properties": {
+        "odu": {"$ref": "#/$defs/path_artifact"},
+        "driver": {"$ref": "#/$defs/path_artifact"},
+        "client": {"$ref": "#/$defs/path_artifact"},
+        "e3_schema": {"$ref": "#/$defs/path_artifact"},
+        "preflight_helper": {"$ref": "#/$defs/path_artifact"},
+        "nvidia_smi": {"$ref": "#/$defs/path_artifact"},
+        "packages": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/package"}},
+        "command": {"type": "string"},
+        "status": {"enum": ["running", "passed", "invalid"]},
+        "reasons": {"type": "array", "items": {"type": "string"}},
+        "baseline_gpu_client_pids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "ready": {"$ref": "#/$defs/artifact"},
+        "result": {"$ref": "#/$defs/artifact"},
+        "expected_gpu_client_pids": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "observed_gpu_client_pids_before": {
+          "type": "array",
+          "minItems": 3,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "observed_gpu_client_pids_after": {
+          "type": "array",
+          "minItems": 3,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "exit_code": {"type": "integer"},
+        "log": {"$ref": "#/$defs/artifact"}
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["observed_duration_ns", "load_profile", "restart_cycles_before_measurement"],
+      "properties": {
+        "observed_duration_ns": {"type": "integer", "minimum": 0},
+        "load_profile": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["channel_bandwidth_mhz", "common_scs_khz", "time_scaling", "srs_period_ms"],
+          "properties": {
+            "channel_bandwidth_mhz": {"const": 100},
+            "common_scs_khz": {"const": 30},
+            "time_scaling": {"const": 1},
+            "srs_period_ms": {"type": "integer"}
+          }
+        },
+        "restart_cycles_before_measurement": {"type": "integer", "minimum": 1}
+      }
+    },
+    "routes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "spectrum": {"$ref": "#/$defs/route_summary"},
+        "srs_isac": {"$ref": "#/$defs/route_summary"}
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_export_bytes", "aggregate_export_gbps", "reasons"],
+      "properties": {
+        "total_export_bytes": {"type": "integer", "minimum": 0},
+        "aggregate_export_gbps": {"type": "number", "minimum": 0},
+        "reasons": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {"path": {"type": "string"}, "sha256": {"$ref": "#/$defs/hash"}}
+    },
+    "path_artifact": {"$ref": "#/$defs/artifact"},
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest", "package_id", "global_name", "artifact"],
+      "properties": {
+        "manifest": {"$ref": "#/$defs/path_artifact"},
+        "package_id": {"type": "string"},
+        "global_name": {"type": "string"},
+        "artifact": {"$ref": "#/$defs/path_artifact"}
+      }
+    },
+    "counters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "publications",
+        "payload_bytes",
+        "backpressure_drops",
+        "invalid_drops",
+        "encode_failures",
+        "notification_failures",
+        "concurrent_drops",
+        "snapshot_count",
+        "snapshot_bytes",
+        "lease_count",
+        "export_count",
+        "export_bytes",
+        "e3_payload_count",
+        "e3_payload_bytes",
+        "export_slot_reservation_failures",
+        "results"
+      ],
+      "properties": {
+        "publications": {"type": "integer", "minimum": 0},
+        "payload_bytes": {"type": "integer", "minimum": 0},
+        "backpressure_drops": {"type": "integer", "minimum": 0},
+        "invalid_drops": {"type": "integer", "minimum": 0},
+        "encode_failures": {"type": "integer", "minimum": 0},
+        "notification_failures": {"type": "integer", "minimum": 0},
+        "concurrent_drops": {"type": "integer", "minimum": 0},
+        "snapshot_count": {"type": "integer", "minimum": 0},
+        "snapshot_bytes": {"type": "integer", "minimum": 0},
+        "lease_count": {"type": "integer", "minimum": 0},
+        "export_count": {"type": "integer", "minimum": 0},
+        "export_bytes": {"type": "integer", "minimum": 0},
+        "e3_payload_count": {"type": "integer", "minimum": 0},
+        "e3_payload_bytes": {"type": "integer", "minimum": 0},
+        "export_slot_reservation_failures": {"type": "integer", "minimum": 0},
+        "results": {"type": "integer", "minimum": 0}
+      }
+    },
+    "route_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "counter_deltas",
+        "tensor_bytes_per_export",
+        "publications_per_second",
+        "export_bytes_per_second",
+        "export_gbps",
+        "backpressure_drop_rate",
+        "export_slots_capacity",
+        "export_slots_in_use_final",
+        "export_slots_high_watermark",
+        "export_slot_high_watermark_ratio",
+        "reasons"
+      ],
+      "properties": {
+        "counter_deltas": {"$ref": "#/$defs/counters"},
+        "tensor_bytes_per_export": {"type": "integer", "minimum": 1},
+        "publications_per_second": {"type": "number", "minimum": 0},
+        "export_bytes_per_second": {"type": "number", "minimum": 0},
+        "export_gbps": {"type": "number", "minimum": 0},
+        "backpressure_drop_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "export_slots_capacity": {"type": "integer", "minimum": 2},
+        "export_slots_in_use_final": {"type": "integer", "minimum": 0},
+        "export_slots_high_watermark": {"type": "integer", "minimum": 1},
+        "export_slot_high_watermark_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+        "reasons": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "SPDX-FileCopyrightText": "Copyright (C) 2026 DeepSig Inc.",
+  "SPDX-License-Identifier": "BSD-3-Clause-Clear",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ocudu:dapp:package-manifest:v1",
+  "title": "OCUDU dApp package manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "package_id", "global_name", "vendor", "version", "artifact", "sha256",
+    "placements", "backends", "interfaces"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "package_id": {"$ref": "#/$defs/package_id"},
+    "global_name": {"type": "string", "minLength": 1, "maxLength": 128},
+    "vendor": {"type": "string", "minLength": 1, "maxLength": 128},
+    "version": {"type": "string", "minLength": 1, "maxLength": 32},
+    "artifact": {"$ref": "#/$defs/relative_path"},
+    "sha256": {"$ref": "#/$defs/hash"},
+    "placements": {
+      "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true,
+      "items": {"enum": ["in_process", "out_of_process"]}
+    },
+    "backends": {
+      "type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": true,
+      "items": {"enum": ["cpu", "cuda", "other_accelerator"]}
+    },
+    "interfaces": {
+      "type": "array", "minItems": 1, "maxItems": 64,
+      "items": {"$ref": "#/$defs/interface"}
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sbom", "format", "sha256"],
+      "properties": {
+        "sbom": {"$ref": "#/$defs/relative_path"},
+        "format": {"const": "spdx-2.3-json"},
+        "sha256": {"$ref": "#/$defs/hash"}
+      }
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "package_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "relative_path": {
+      "type": "string", "minLength": 1, "maxLength": 4096,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//).+$"
+    },
+    "pusch_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_prb", "max_rx_ports", "max_layers", "modulation_mask", "dmrs_type_mask"],
+      "properties": {
+        "max_prb": {"type": "integer", "minimum": 1, "maximum": 275},
+        "max_rx_ports": {"type": "integer", "minimum": 1, "maximum": 64},
+        "max_layers": {"type": "integer", "minimum": 1, "maximum": 4},
+        "modulation_mask": {"type": "integer", "minimum": 1, "maximum": 15},
+        "dmrs_type_mask": {"type": "integer", "minimum": 1, "maximum": 3},
+        "flags": {"type": "integer", "minimum": 0, "maximum": 3}
+      }
+    },
+    "interface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["interface_id", "major", "minor", "class", "placements", "threading"],
+      "properties": {
+        "interface_id": {"type": "integer", "minimum": 1, "maximum": 4294967295},
+        "major": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "minor": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "class": {"enum": ["A", "B", "C"]},
+        "placements": {
+          "type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true,
+          "items": {"enum": ["in_process", "out_of_process"]}
+        },
+        "threading": {"enum": ["per_worker", "reentrant_shared", "serialized"]},
+        "binding": {"enum": ["required", "optional"]},
+        "capabilities": {"type": "integer", "minimum": 0},
+        "pusch_profile": {"$ref": "#/$defs/pusch_profile"}
+      }
+    }
+  }
+}

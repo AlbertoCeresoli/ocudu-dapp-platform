@@ -1,0 +1,244 @@
+{
+  "SPDX-FileCopyrightText": "Copyright (C) 2026 DeepSig Inc.",
+  "SPDX-License-Identifier": "BSD-3-Clause-Clear",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ocudu:dapp:cuda-loaded-l1-soak-report:v1",
+  "title": "OCUDU CUDA dApp loaded-L1 soak report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "SPDX-FileCopyrightText",
+    "SPDX-License-Identifier",
+    "schema",
+    "created_at",
+    "finished_at",
+    "status",
+    "host_manifest",
+    "gpu_inventory",
+    "tooling",
+    "load",
+    "protocol",
+    "summary"
+  ],
+  "properties": {
+    "SPDX-FileCopyrightText": {"type": "string"},
+    "SPDX-License-Identifier": {"const": "BSD-3-Clause-Clear"},
+    "schema": {"const": "ocudu.dapp.cuda-loaded-l1-soak-report.v1"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["passed", "failed", "invalid"]},
+    "host_manifest": {
+      "type": "object",
+      "required": ["python", "kernel", "operating_system", "cpu_model", "logical_cpus"],
+      "properties": {
+        "python": {"type": "string"},
+        "kernel": {"type": "string"},
+        "operating_system": {"type": "string"},
+        "cpu_model": {"type": "string"},
+        "logical_cpus": {"type": ["integer", "null"], "minimum": 1}
+      }
+    },
+    "gpu_inventory": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "name", "uuid", "pci_bus_id", "driver_version"],
+        "properties": {
+          "index": {"type": "string"},
+          "name": {"type": "string"},
+          "uuid": {"type": "string"},
+          "pci_bus_id": {"type": "string"},
+          "driver_version": {"type": "string"}
+        }
+      }
+    },
+    "tooling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runner", "contention_protocol", "qualification_protocol"],
+      "properties": {
+        "runner": {"$ref": "#/$defs/path_artifact"},
+        "contention_protocol": {"$ref": "#/$defs/path_artifact"},
+        "qualification_protocol": {"$ref": "#/$defs/path_artifact"}
+      }
+    },
+    "load": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "odu",
+        "driver",
+        "client",
+        "e3_schema",
+        "preflight_helper",
+        "nvidia_smi",
+        "packages",
+        "command",
+        "status",
+        "reasons",
+        "log"
+      ],
+      "properties": {
+        "odu": {"$ref": "#/$defs/path_artifact"},
+        "driver": {"$ref": "#/$defs/path_artifact"},
+        "client": {"$ref": "#/$defs/path_artifact"},
+        "e3_schema": {"$ref": "#/$defs/path_artifact"},
+        "preflight_helper": {"$ref": "#/$defs/path_artifact"},
+        "nvidia_smi": {"$ref": "#/$defs/path_artifact"},
+        "packages": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 4,
+          "items": {"$ref": "#/$defs/package"}
+        },
+        "command": {"type": "string"},
+        "status": {"enum": ["running", "passed", "invalid"]},
+        "reasons": {"type": "array", "items": {"type": "string"}},
+        "ready": {"$ref": "#/$defs/artifact"},
+        "result": {"$ref": "#/$defs/artifact"},
+        "process_pids": {
+          "type": "object",
+          "additionalProperties": false,
+          "oneOf": [
+            {"required": ["du", "worker"]},
+            {"required": ["du", "spectrum_worker", "srs_worker"]}
+          ],
+          "properties": {
+            "du": {"type": "integer", "minimum": 1},
+            "worker": {"type": "integer", "minimum": 1},
+            "spectrum_worker": {"type": "integer", "minimum": 1},
+            "srs_worker": {"type": "integer", "minimum": 1}
+          }
+        },
+        "exit_code": {"type": "integer"},
+        "log": {"$ref": "#/$defs/artifact"}
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "duration_seconds",
+        "sample_interval_seconds",
+        "restart_cycles_before_soak",
+        "release_bounds_approved",
+        "bounds_rationale",
+        "maximum_du_rss_growth_bytes",
+        "maximum_worker_rss_growth_bytes",
+        "maximum_du_gpu_memory_growth_bytes",
+        "maximum_worker_gpu_memory_growth_bytes",
+        "maximum_fd_growth",
+        "maximum_thread_growth"
+      ],
+      "properties": {
+        "duration_seconds": {"type": "integer", "minimum": 1, "maximum": 604800},
+        "sample_interval_seconds": {"type": "integer", "minimum": 1, "maximum": 60},
+        "restart_cycles_before_soak": {"type": "integer", "minimum": 1, "maximum": 100},
+        "release_bounds_approved": {"type": "boolean"},
+        "bounds_rationale": {"type": "string", "minLength": 1},
+        "maximum_du_rss_growth_bytes": {"type": "integer", "minimum": 0},
+        "maximum_worker_rss_growth_bytes": {"type": "integer", "minimum": 0},
+        "maximum_du_gpu_memory_growth_bytes": {"type": "integer", "minimum": 0},
+        "maximum_worker_gpu_memory_growth_bytes": {"type": "integer", "minimum": 0},
+        "maximum_fd_growth": {"type": "integer", "minimum": 0},
+        "maximum_thread_growth": {"type": "integer", "minimum": 0}
+      }
+    },
+    "samples": {"$ref": "#/$defs/artifact"},
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sample_count", "observed_duration_ns", "processes", "reasons"],
+      "properties": {
+        "sample_count": {"type": "integer", "minimum": 0},
+        "observed_duration_ns": {"type": "integer", "minimum": 0},
+        "processes": {
+          "type": "object",
+          "properties": {
+            "du": {"$ref": "#/$defs/process_summary"},
+            "worker": {"$ref": "#/$defs/process_summary"},
+            "spectrum_worker": {"$ref": "#/$defs/process_summary"},
+            "srs_worker": {"$ref": "#/$defs/process_summary"}
+          },
+          "additionalProperties": false
+        },
+        "reasons": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string"},
+        "sha256": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "path_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string"},
+        "sha256": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest", "package_id", "global_name", "artifact"],
+      "properties": {
+        "manifest": {"$ref": "#/$defs/path_artifact"},
+        "package_id": {"type": "string"},
+        "global_name": {"type": "string"},
+        "artifact": {"$ref": "#/$defs/path_artifact"}
+      }
+    },
+    "resource_values": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rss_bytes", "gpu_memory_bytes", "threads", "file_descriptors"],
+      "properties": {
+        "rss_bytes": {"type": "integer", "minimum": 0},
+        "gpu_memory_bytes": {"type": "integer", "minimum": 0},
+        "threads": {"type": "integer", "minimum": 0},
+        "file_descriptors": {"type": "integer", "minimum": 0}
+      }
+    },
+    "resource_bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rss_bytes", "gpu_memory_bytes", "threads", "file_descriptors"],
+      "properties": {
+        "rss_bytes": {"type": "integer", "minimum": 0},
+        "gpu_memory_bytes": {"type": "integer", "minimum": 0},
+        "threads": {"type": "integer", "minimum": 0},
+        "file_descriptors": {"type": "integer", "minimum": 0}
+      }
+    },
+    "process_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pid", "initial", "final", "peak", "peak_growth", "bounds", "gpu_uuids"],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1},
+        "initial": {"$ref": "#/$defs/resource_values"},
+        "final": {"$ref": "#/$defs/resource_values"},
+        "peak": {"$ref": "#/$defs/resource_values"},
+        "peak_growth": {"$ref": "#/$defs/resource_values"},
+        "bounds": {"$ref": "#/$defs/resource_bounds"},
+        "gpu_uuids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string"}
+        }
+      }
+    }
+  }
+}

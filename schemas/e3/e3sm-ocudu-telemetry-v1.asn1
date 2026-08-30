@@ -1,0 +1,278 @@
+-- SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+-- SPDX-License-Identifier: BSD-3-Clause-Clear
+--
+-- OCUDU Telemetry Service Model for E3AP-OCUDU-V1.
+--
+-- Usage with the E3 protocol:
+--   Telemetry-RanFunctionData  is encoded into E3-RanFunctionDefinition.ranFunctionData
+--   Telemetry-SubscriptionData is encoded into E3-SubscriptionRequest.subscriptionData
+--   Telemetry-IndicationData   is the reassembled E3-IndicationMessage payload
+--
+-- RAN function identifier: 10 ("OCUDU Telemetry Service Model").
+-- Telemetry identifiers (E3-SubscriptionRequest.telemetryIdentifierList):
+--   1 pusch.symbols        per-UE PUSCH link quality with equalized data symbols
+--   2 pusch.crc            PUSCH transport-block CRC outcome
+--   3 srs.channel          SRS channel estimate per UE and port pair
+--   4 pusch.dmrs_channel   PUSCH DM-RS channel estimate per UE, port and layer
+--   5 gnb.metrics_json     periodic gNB JSON metrics report, relayed verbatim
+--   6 classc.spectrum      host snapshot of the Class-C Spectrum publication (0x00010001)
+--   7 classc.srs_isac      host snapshot of the Class-C SRS-ISAC publication (0x00010002)
+--   8 pusch.grid           raw pre-equalization PUSCH resource grid with grant parameters (0x00020006)
+-- The service model defines no control identifiers.
+--
+-- E3-SubscriptionRequest.periodicity, when nonzero, is the per-RNTI minimum
+-- publication interval in milliseconds for every telemetry in the request;
+-- Telemetry-SubscriptionConfig.minimumIntervalMs overrides it per telemetry.
+--
+-- Complex sample vectors are little-endian IEEE-754 binary32 pairs (re, im)
+-- carried as OCTET STRING so that the PER encoding stays compact. Non-finite
+-- scalar measurements are omitted rather than encoded.
+
+OCUDU-TELEMETRY-SM DEFINITIONS AUTOMATIC TAGS ::= BEGIN
+
+maxTelemetryObjectBytes   INTEGER ::= 16777216
+maxTelemetryText          INTEGER ::= 128
+maxTelemetryStreams       INTEGER ::= 64
+maxTelemetryRntiFilter    INTEGER ::= 32
+
+TelemetryUnsigned64 ::= OCTET STRING (SIZE (8))
+TelemetryId ::= INTEGER (1..65535)
+Rnti ::= INTEGER (0..65535)
+Cf32Samples ::= OCTET STRING (SIZE (0..maxTelemetryObjectBytes))
+
+Telemetry-DropPolicy ::= ENUMERATED { dropNewest(0), dropOldest(1), coalesceLatest(2), ... }
+
+Telemetry-StreamDescriptor ::= SEQUENCE {
+  telemetryId        TelemetryId,
+  name               OCTET STRING (SIZE (1..maxTelemetryText)),
+  description        OCTET STRING (SIZE (0..maxTelemetryText)),
+  classCPortable     BOOLEAN,
+  interfaceId        INTEGER (1..4294967295),
+  minimumIntervalUs  TelemetryUnsigned64 OPTIONAL,
+  cellIds            SEQUENCE (SIZE (0..32)) OF INTEGER (0..65535) OPTIONAL,
+  ...,
+  -- Floor no subscriber can go below; absent when full rate may be requested.
+  hardFloorIntervalUs TelemetryUnsigned64 OPTIONAL
+}
+
+-- Capability advertisement returned in the E3 setup response.
+Telemetry-RanFunctionData ::= SEQUENCE {
+  name                 OCTET STRING (SIZE (1..32)),
+  version              INTEGER (0..65535),
+  description          OCTET STRING (SIZE (1..128)),
+  streams              SEQUENCE (SIZE (0..maxTelemetryStreams)) OF Telemetry-StreamDescriptor,
+  maximumObjectBytes   INTEGER (1..maxTelemetryObjectBytes),
+  maximumSubscriptions INTEGER (0..1024),
+  ...
+}
+
+RadioSlot ::= SEQUENCE {
+  sfn        INTEGER (0..1023),
+  slot       INTEGER (0..159),
+  numerology INTEGER (0..4),
+  ...
+}
+
+PuschSymbolsRecord ::= SEQUENCE {
+  rnti             Rnti,
+  radioSlot        RadioSlot,
+  nofPrb           INTEGER (0..275),
+  nofDataSymbols   INTEGER (0..14),
+  nofLayers        INTEGER (0..4),
+  modulationBits   INTEGER (0..8),
+  sinrDb           REAL OPTIONAL,
+  epreDb           REAL OPTIONAL,
+  rsrpDb           REAL OPTIONAL,
+  evm              REAL OPTIONAL,
+  timeAlignmentUs  REAL OPTIONAL,
+  cfoHz            REAL OPTIONAL,
+  targetCodeRate   REAL OPTIONAL,
+  equalizedSymbols Cf32Samples,
+  ...,
+  -- Grant parameters, the gNB's transport-block CRC verdict, and whether the
+  -- capture is an incomplete codeword (clipped, or DM-RS symbols carry data).
+  grant            PuschGrantParameters OPTIONAL,
+  crcOk            BOOLEAN OPTIONAL,
+  symbolsTruncated BOOLEAN OPTIONAL
+}
+
+-- Everything an offline receiver needs to regenerate the DM-RS, descramble,
+-- de-multiplex UCI, rate-dematch and LDPC-decode one PUSCH grant.
+PuschGrantParameters ::= SEQUENCE {
+  harqId                  INTEGER (0..15),
+  nId                     INTEGER (0..1023),
+  tbsBytes                INTEGER (0..16777215),
+  rvIndex                 INTEGER (0..3),
+  newData                 BOOLEAN,
+  ldpcBaseGraph           INTEGER (1..2),
+  tbsLbrmBytes            INTEGER (0..16777215),
+  mcsIndex                INTEGER (0..31) OPTIONAL,
+  mcsTable                INTEGER (0..2) OPTIONAL,   -- 0 qam64, 1 qam256, 2 qam64LowSe (TS 38.214 5.1.3.1)
+  transformPrecoding      BOOLEAN,
+  nRsId                   INTEGER (0..1023) OPTIONAL,
+  cyclicPrefix            INTEGER (0..1),            -- 0 normal, 1 extended
+  startSymbol             INTEGER (0..13),
+  nofSymbols              INTEGER (1..14),
+  dmrsSymbolMask          INTEGER (0..16383),        -- bit l set when symbol l carries DM-RS
+  dmrsType                INTEGER (1..2),
+  nofCdmGroupsWithoutData INTEGER (1..3),
+  dmrsScramblingId        INTEGER (0..65535),
+  nScid                   BOOLEAN,
+  bwpStartRb              INTEGER (0..274),
+  bwpSizeRb               INTEGER (1..275),
+  prbMask                 OCTET STRING (SIZE (35)),  -- CRB mask, 275 bits, LSB-first per byte
+  nofRxPorts              INTEGER (0..8),
+  nofLayers               INTEGER (0..4),
+  dcPosition              INTEGER (0..3299) OPTIONAL,
+  nofHarqAckBits          INTEGER (0..1706),
+  nofCsiPart1Bits         INTEGER (0..1706),
+  csiPart2Expected        BOOLEAN,
+  alphaScaling            REAL,
+  betaOffsetHarqAck       REAL,
+  betaOffsetCsiPart1      REAL,
+  betaOffsetCsiPart2      REAL,
+  ...
+}
+
+-- Raw pre-equalization resource elements of one PUSCH grant, DM-RS included:
+-- receive-port-major, then OFDM symbol, then subcarrier over the allocated
+-- PRBs (nofPrb * 12 per symbol).
+PuschGridRecord ::= SEQUENCE {
+  rnti             Rnti,
+  radioSlot        RadioSlot,
+  nofPrb           INTEGER (0..275),
+  nofRxPorts       INTEGER (0..8),
+  startSymbol      INTEGER (0..13),
+  nofSymbols       INTEGER (1..14),
+  grant            PuschGrantParameters,
+  resourceElements Cf32Samples,
+  ...
+}
+
+PuschCrcRecord ::= SEQUENCE {
+  rnti      Rnti,
+  radioSlot RadioSlot,
+  crcOk     BOOLEAN,
+  ...
+}
+
+SrsChannelRecord ::= SEQUENCE {
+  rnti                     Rnti,
+  radioSlot                RadioSlot,
+  nofSubcarriers           INTEGER (0..65535),
+  combSize                 INTEGER (0..255),
+  nofRxPorts               INTEGER (0..255),
+  nofTxPorts               INTEGER (0..255),
+  rxPortIndex              INTEGER (0..255),
+  txPortIndex              INTEGER (0..255),
+  startSymbol              INTEGER (0..13),
+  nofSymbols               INTEGER (0..14),
+  rsrpDb                   REAL OPTIONAL,
+  epreDb                   REAL OPTIONAL,
+  noiseVariance            REAL OPTIONAL,
+  timeAlignmentNs          REAL OPTIONAL,
+  mappingInitialSubcarrier INTEGER (0..65535) OPTIONAL,
+  combOffset               INTEGER (0..255) OPTIONAL,
+  cyclicShift              INTEGER (0..255) OPTIONAL,
+  sequenceId               INTEGER (0..65535) OPTIONAL,
+  sequenceGroup            INTEGER (0..65535) OPTIONAL,
+  sequenceNumber           INTEGER (0..65535) OPTIONAL,
+  cyclicShiftIndex         INTEGER (0..65535) OPTIONAL,
+  cyclicShiftMaximum       INTEGER (0..65535) OPTIONAL,
+  bandwidthIndex           INTEGER (0..255) OPTIONAL,
+  frequencyPosition        INTEGER (0..255) OPTIONAL,
+  frequencyShift           INTEGER (0..65535) OPTIONAL,
+  frequencyHopping         INTEGER (0..255) OPTIONAL,
+  coefficients             Cf32Samples,
+  ...
+}
+
+PuschDmrsChannelRecord ::= SEQUENCE {
+  rnti                     Rnti,
+  radioSlot                RadioSlot,
+  startPrb                 INTEGER (0..274),
+  nofPrb                   INTEGER (0..275),
+  nofSubcarriers           INTEGER (0..65535),
+  dmrsSymbolIndex          INTEGER (0..13),
+  startSymbol              INTEGER (0..13),
+  nofSymbols               INTEGER (0..14),
+  nofRxPorts               INTEGER (0..255),
+  nofTxLayers              INTEGER (0..255),
+  rxPortIndex              INTEGER (0..255),
+  txLayerIndex             INTEGER (0..255),
+  dmrsType                 INTEGER (1..2),
+  nofCdmGroupsWithoutData  INTEGER (0..3),
+  transformPrecoding       BOOLEAN,
+  scramblingId             INTEGER (0..65535),
+  nScid                    BOOLEAN,
+  sinrDb                   REAL OPTIONAL,
+  epreDb                   REAL OPTIONAL,
+  rsrpDb                   REAL OPTIONAL,
+  noiseVariance            REAL OPTIONAL,
+  timeAlignmentUs          REAL OPTIONAL,
+  cfoHz                    REAL OPTIONAL,
+  targetCodeRate           REAL OPTIONAL,
+  estimates                Cf32Samples,
+  ...
+}
+
+-- Byte-for-byte relay of one already-generated gNB JSON metrics report.
+GnbMetricsJsonRecord ::= SEQUENCE {
+  json OCTET STRING (SIZE (1..maxTelemetryObjectBytes)),
+  ...
+}
+
+-- Host snapshot of a bounded Class-C publication: the FlatBuffers metadata
+-- envelope (class-c-publication-v1, "OCC3") plus the complete tensor.
+ClassCPortableRecord ::= SEQUENCE {
+  interfaceId INTEGER (1..4294967295),
+  metadata    OCTET STRING (SIZE (0..65536)),
+  tensor      OCTET STRING (SIZE (1..maxTelemetryObjectBytes)),
+  ...
+}
+
+Telemetry-Object ::= CHOICE {
+  puschSymbols     PuschSymbolsRecord,
+  puschCrc         PuschCrcRecord,
+  srsChannel       SrsChannelRecord,
+  puschDmrsChannel PuschDmrsChannelRecord,
+  gnbMetricsJson   GnbMetricsJsonRecord,
+  classCPortable   ClassCPortableRecord,
+  -- Root alternative (not an extension addition): PER wraps additions in an
+  -- open type whose length is fragmented above 16 KiB, which several PER
+  -- decoders do not implement, and grid captures are routinely larger.
+  puschGrid        PuschGridRecord,
+  ...
+}
+
+-- One published object as reassembled from E3-IndicationMessage fragments.
+Telemetry-IndicationData ::= SEQUENCE {
+  telemetryId    TelemetryId,
+  cellId         INTEGER (0..65535),
+  sequence       TelemetryUnsigned64,
+  routeEpoch     TelemetryUnsigned64,
+  monotonicNs    TelemetryUnsigned64,
+  droppedObjects TelemetryUnsigned64,
+  object         Telemetry-Object,
+  ...
+}
+
+-- Per-telemetry filter, sampling, and drop policy carried in
+-- E3-SubscriptionRequest.subscriptionData. Telemetries listed in the request
+-- without a matching entry use the defaults below.
+Telemetry-SubscriptionConfig ::= SEQUENCE {
+  telemetryId       TelemetryId,
+  cellId            INTEGER (0..65535) OPTIONAL,
+  sampleEveryN      INTEGER (1..65535) DEFAULT 1,
+  dropPolicy        Telemetry-DropPolicy DEFAULT coalesceLatest,
+  minimumIntervalMs INTEGER (0..60000) OPTIONAL,
+  rntiFilter        SEQUENCE (SIZE (1..maxTelemetryRntiFilter)) OF Rnti OPTIONAL,
+  ...
+}
+
+Telemetry-SubscriptionData ::= SEQUENCE {
+  configs SEQUENCE (SIZE (0..maxTelemetryStreams)) OF Telemetry-SubscriptionConfig,
+  ...
+}
+
+END

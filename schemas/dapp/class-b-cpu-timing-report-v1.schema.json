@@ -1,0 +1,127 @@
+{
+  "SPDX-FileCopyrightText": "Copyright (C) 2026 DeepSig Inc.",
+  "SPDX-License-Identifier": "BSD-3-Clause-Clear",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ocudu:dapp:class-b-cpu-timing-report:v1",
+  "title": "OCUDU Class-B CPU timing report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "SPDX-FileCopyrightText",
+    "SPDX-License-Identifier",
+    "schema",
+    "created_at",
+    "finished_at",
+    "status",
+    "policy_artifact",
+    "policy",
+    "host_manifest",
+    "tooling",
+    "run",
+    "protocol",
+    "profiles",
+    "summary"
+  ],
+  "properties": {
+    "SPDX-FileCopyrightText": {"type": "string"},
+    "SPDX-License-Identifier": {"const": "BSD-3-Clause-Clear"},
+    "schema": {"const": "ocudu.dapp.class-b-cpu-timing-report.v1"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["passed", "failed", "invalid"]},
+    "policy_artifact": {"$ref": "#/$defs/artifact"},
+    "policy": {"type": "object"},
+    "host_manifest": {"type": "object"},
+    "tooling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runner", "benchmark", "policy_schema", "report_schema", "module_manifest", "module_artifact"],
+      "properties": {
+        "runner": {"$ref": "#/$defs/artifact"},
+        "benchmark": {"$ref": "#/$defs/artifact"},
+        "policy_schema": {"$ref": "#/$defs/artifact"},
+        "report_schema": {"$ref": "#/$defs/artifact"},
+        "module_manifest": {"$ref": "#/$defs/artifact"},
+        "module_artifact": {"$ref": "#/$defs/artifact"}
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "exit_code", "duration_seconds", "raw_csv", "log"],
+      "properties": {
+        "command": {"type": "string"},
+        "exit_code": {"type": "integer"},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "raw_csv": {"$ref": "#/$defs/artifact"},
+        "log": {"$ref": "#/$defs/artifact"}
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deadline_ns", "repetitions", "warmups", "expected_profiles", "expected_rows"],
+      "properties": {
+        "deadline_ns": {"const": 100000},
+        "repetitions": {"const": 1000},
+        "warmups": {"const": 100},
+        "expected_profiles": {"type": "array", "minItems": 9, "maxItems": 9, "uniqueItems": true, "items": {"type": "string"}},
+        "expected_rows": {"const": 9000}
+      }
+    },
+    "profiles": {"type": "array", "maxItems": 9, "items": {"$ref": "#/$defs/profile"}},
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rows", "deadline_misses", "fallbacks", "validation_rejections", "worst_total_p999_ns", "reasons"],
+      "properties": {
+        "rows": {"type": "integer", "minimum": 0, "maximum": 9000},
+        "deadline_misses": {"type": "integer", "minimum": 0},
+        "fallbacks": {"type": "integer", "minimum": 0},
+        "validation_rejections": {"type": "integer", "minimum": 0},
+        "worst_total_p999_ns": {"type": "integer", "minimum": 0},
+        "reasons": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {"path": {"type": "string"}, "sha256": {"$ref": "#/$defs/hash"}}
+    },
+    "percentiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min", "p50", "p90", "p99", "p999", "max"],
+      "properties": {
+        "min": {"type": "integer", "minimum": 0},
+        "p50": {"type": "integer", "minimum": 0},
+        "p90": {"type": "integer", "minimum": 0},
+        "p99": {"type": "integer", "minimum": 0},
+        "p999": {"type": "integer", "minimum": 0},
+        "max": {"type": "integer", "minimum": 0}
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "direction", "candidates", "prbs", "interference", "samples", "avoidance_outputs", "outcomes", "phases", "deadline_miss_rate", "reasons"],
+      "properties": {
+        "name": {"type": "string"},
+        "direction": {"enum": ["dl", "ul"]},
+        "candidates": {"type": "integer", "minimum": 1, "maximum": 64},
+        "prbs": {"enum": [51, 273]},
+        "interference": {"type": "boolean"},
+        "samples": {"const": 1000},
+        "avoidance_outputs": {"type": "integer", "minimum": 0},
+        "outcomes": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "phases": {"type": "object", "additionalProperties": {"$ref": "#/$defs/percentiles"}},
+        "deadline_miss_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "reasons": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "SPDX-FileCopyrightText": "Copyright (C) 2026 DeepSig Inc.",
+  "SPDX-License-Identifier": "BSD-3-Clause-Clear",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ocudu:dapp:package-signature:v1",
+  "title": "OCUDU dApp detached package signature v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "algorithm",
+    "key_id",
+    "package_sequence",
+    "manifest_sha256",
+    "signature"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "algorithm": {"const": "ecdsa-p256-sha256"},
+    "key_id": {"$ref": "#/$defs/hash"},
+    "package_sequence": {"type": "integer", "minimum": 1},
+    "manifest_sha256": {"$ref": "#/$defs/hash"},
+    "signature": {
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 144,
+      "pattern": "^[0-9a-f]+$"
+    }
+  },
+  "$defs": {
+    "hash": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}
