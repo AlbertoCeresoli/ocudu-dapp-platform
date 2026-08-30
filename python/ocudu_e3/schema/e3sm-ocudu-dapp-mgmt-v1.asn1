@@ -1,0 +1,565 @@
+-- SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+-- SPDX-License-Identifier: BSD-3-Clause-Clear
+
+E3SM-OCUDU-DAPP-MGMT-V1 DEFINITIONS AUTOMATIC TAGS ::= BEGIN
+
+-- Normative core profile for the embedded OCUDU E3 dApp agent. This is a
+-- project service-model definition, not a ratified O-RAN specification.
+-- Bounded portable Class-C payloads are included as a lower-rate fallback;
+-- high-rate tensor transport remains outside this management schema.
+
+maxName       INTEGER ::= 128
+maxVersion    INTEGER ::= 64
+maxText       INTEGER ::= 512
+maxItems      INTEGER ::= 1024
+maxValueBytes INTEGER ::= 1048576
+maxDataChunks INTEGER ::= 8
+maxDataChunkBytes INTEGER ::= 65536
+
+Identifier ::= OCTET STRING (SIZE (16))
+Hash256 ::= OCTET STRING (SIZE (32))
+-- Text fields use bounded UTF-8 octets. Implementations MUST reject malformed
+-- UTF-8. OCTET STRING avoids divergent constrained-UTF8String PER encodings.
+Name ::= OCTET STRING (SIZE (1..maxName))
+Version ::= OCTET STRING (SIZE (0..maxVersion))
+-- Fixed-width network-order integers avoid target-long and generator
+-- arithmetic differences while preserving the complete uint64/int64 domains.
+Unsigned64 ::= OCTET STRING (SIZE (8))
+Signed64 ::= OCTET STRING (SIZE (8)) -- two's-complement network order
+Counter ::= Unsigned64
+Generation ::= Counter
+TimestampNs ::= Counter
+
+DappClass ::= ENUMERATED {
+  residentInlineL1(0), deadlineBoundDecision(1), openLoopAnalytics(2), ...
+}
+Placement ::= ENUMERATED { inProcess(0), supervisedProcess(1), remoteProcess(2), ... }
+Backend ::= ENUMERATED { cpu(0), cuda(1), otherAccelerator(2), ... }
+BindingRequirement ::= ENUMERATED { required(0), optional(1), ... }
+BindingState ::= ENUMERATED { unbound(0), bound(1), unavailable(2), ... }
+PackageSignatureStatus ::= ENUMERATED { unsignedPackage(0), verified(1), ... }
+LifecycleState ::= ENUMERATED {
+  discovered(0), loaded(1), prepared(2), armed(3), shadow(4), active(5),
+  draining(6), inactive(7), unloaded(8), degraded(9),
+  quarantinedResident(10), error(11), ...
+}
+
+ResultCode ::= ENUMERATED {
+  success(0), dryRunSuccess(1), accepted(2), notFound(3), conflict(4),
+  invalidRequest(5), incompatible(6), verificationFailed(7), loadFailed(8),
+  lifecycleFailed(9), transactionMismatch(10), resourceExhausted(11), ...
+}
+
+TypedValue ::= CHOICE {
+  booleanValue BOOLEAN,
+  signedValue  Signed64,
+  unsignedValue Counter,
+  realValue    REAL,
+  stringValue  OCTET STRING (SIZE (0..4096)),
+  bytesValue   OCTET STRING (SIZE (0..maxValueBytes)),
+  ...
+}
+
+PuschProfile ::= SEQUENCE {
+  maxPrb          INTEGER (1..275),
+  maxRxPorts      INTEGER (1..64),
+  maxLayers       INTEGER (1..4),
+  modulationMask INTEGER (1..15),
+  dmrsTypeMask    INTEGER (1..3),
+  flags           INTEGER (0..4294967295),
+  ...
+}
+
+InterfaceRecord ::= SEQUENCE {
+  interfaceId      INTEGER (1..4294967295),
+  interfaceMajor   INTEGER (0..65535),
+  interfaceMinor   INTEGER (0..65535),
+  class            DappClass,
+  placementMask    BIT STRING (SIZE (8)),
+  threading        ENUMERATED { perWorker(0), reentrantShared(1), serialized(2), ... },
+  capabilityBits   BIT STRING (SIZE (64)),
+  puschProfile     PuschProfile OPTIONAL,
+  ...,
+  bindingRequirement BindingRequirement OPTIONAL,
+  bindingState       BindingState OPTIONAL
+}
+
+PackageRecord ::= SEQUENCE {
+  packageId       Identifier,
+  globalName      Name,
+  vendor          Name,
+  version         Version,
+  contentHash     Hash256,
+  placementMask   BIT STRING (SIZE (8)),
+  backends        SEQUENCE (SIZE (1..16)) OF Backend,
+  interfaces      SEQUENCE (SIZE (0..64)) OF InterfaceRecord OPTIONAL,
+  compatible      BOOLEAN,
+  incompatibility OCTET STRING (SIZE (0..maxText)) OPTIONAL,
+  ...,
+  signatureStatus PackageSignatureStatus OPTIONAL,
+  signingKeyId    Hash256 OPTIONAL,
+  signatureSequence Unsigned64 OPTIONAL,
+  trustPolicyEpoch Unsigned64 OPTIONAL,
+  manifestSchemaVersion INTEGER (1..65535) OPTIONAL,
+  sbomSha256 Hash256 OPTIONAL
+}
+
+InstanceRecord ::= SEQUENCE {
+  instanceId       Identifier,
+  packageId        Identifier,
+  globalName       Name,
+  vendor           Name,
+  version          Version,
+  placement        Placement,
+  backend          Backend,
+  state            LifecycleState,
+  generation       Generation,
+  managementCapabilities BIT STRING (SIZE (64)),
+  interfaces       SEQUENCE (SIZE (1..64)) OF InterfaceRecord,
+  lastIncidentId   Counter OPTIONAL,
+  lastError        OCTET STRING (SIZE (0..maxText)) OPTIONAL,
+  ...
+}
+
+InventoryQuery ::= SEQUENCE {
+  includePackages  BOOLEAN DEFAULT TRUE,
+  includeInstances BOOLEAN DEFAULT TRUE,
+  ...
+}
+
+-- Downstream E3 associations are observers/clients of this agent, not dApp
+-- lifecycle instances. Keeping them beside the LCM inventory lets operators
+-- see both namespaces without pretending an external subscriber was loaded by
+-- the embedded lifecycle manager.
+E3SubscriptionRecord ::= SEQUENCE {
+  subscriptionId      INTEGER (1..65535),
+  ranFunctionId       INTEGER (1..65535),
+  telemetryIdentifiers SEQUENCE (SIZE (0..64)) OF INTEGER (1..65535),
+  ...
+}
+E3ConnectionRecord ::= SEQUENCE {
+  associationId  Unsigned64,
+  openedNs       TimestampNs,
+  peerAddress    OCTET STRING (SIZE (1..maxName)),
+  setupComplete  BOOLEAN,
+  dappId         INTEGER (1..65535) OPTIONAL,
+  dappName       OCTET STRING (SIZE (0..maxName)) OPTIONAL,
+  subscriptions  SEQUENCE (SIZE (0..64)) OF E3SubscriptionRecord,
+  controlRequests Counter,
+  ...
+}
+
+InventoryResult ::= SEQUENCE {
+  generation Generation,
+  packages  SEQUENCE (SIZE (0..maxItems)) OF PackageRecord OPTIONAL,
+  instances SEQUENCE (SIZE (0..maxItems)) OF InstanceRecord OPTIONAL,
+  ...,
+  connections SEQUENCE (SIZE (0..64)) OF E3ConnectionRecord OPTIONAL
+}
+
+LifecycleAction ::= ENUMERATED {
+  load(0), prepare(1), arm(2), enterShadow(3), activate(4), deactivate(5),
+  retryQuiescence(6), unload(7), breakerProbe(8), ...
+}
+
+LifecycleControl ::= SEQUENCE {
+  action          LifecycleAction,
+  packageId       Identifier OPTIONAL,
+  placement       Placement OPTIONAL,
+  backend         Backend OPTIONAL,
+  timeoutUs       INTEGER (0..3600000000) DEFAULT 1000000,
+  ...
+}
+
+ConfigDescriptor ::= SEQUENCE {
+  key             Name,
+  description     OCTET STRING (SIZE (0..maxText)),
+  kind            ENUMERATED { boolean(0), signed(1), unsigned(2), real(3), string(4), bytes(5), ... },
+  flags           BIT STRING (SIZE (32)),
+  defaultValue    TypedValue OPTIONAL,
+  minimumValue    TypedValue OPTIONAL,
+  maximumValue    TypedValue OPTIONAL,
+  ...
+}
+
+ConfigEntry ::= SEQUENCE { key Name, value TypedValue, ... }
+ConfigQuery ::= SEQUENCE {
+  kind ENUMERATED { schema(0), effective(1), ... },
+  ...
+}
+ConfigSet ::= SEQUENCE {
+  expectedConfigGeneration Generation,
+  boundary ENUMERATED { immediate(0), invocation(1), slot(2), restart(3), ... },
+  entries SEQUENCE (SIZE (0..maxItems)) OF ConfigEntry,
+  ...
+}
+ConfigResult ::= SEQUENCE {
+  generation Generation OPTIONAL,
+  descriptors SEQUENCE (SIZE (0..maxItems)) OF ConfigDescriptor OPTIONAL,
+  entries SEQUENCE (SIZE (0..maxItems)) OF ConfigEntry OPTIONAL,
+  ...
+}
+
+ModelAction ::= ENUMERATED { stage(0), validate(1), warm(2), activate(3), rollback(4), retire(5), ... }
+ModelControl ::= SEQUENCE {
+  action          ModelAction,
+  modelId         Name,
+  modelVersion    Version OPTIONAL,
+  expectedModelGeneration Generation,
+  artifact        OCTET STRING (SIZE (0..maxValueBytes)) OPTIONAL,
+  ...
+}
+
+MetricDescriptor ::= SEQUENCE {
+  name            Name,
+  description     OCTET STRING (SIZE (0..maxText)),
+  unit            OCTET STRING (SIZE (0..64)),
+  kind            ENUMERATED { boolean(0), signed(1), unsigned(2), real(3), string(4), bytes(5), ... },
+  flags           BIT STRING (SIZE (32)),
+  ...
+}
+MetricSample ::= SEQUENCE { name Name, value TypedValue, timestampNs TimestampNs, ... }
+MetricQuery ::= SEQUENCE { kind ENUMERATED { schema(0), snapshot(1), ... }, ... }
+MetricResult ::= SEQUENCE {
+  descriptors SEQUENCE (SIZE (0..maxItems)) OF MetricDescriptor OPTIONAL,
+  samples SEQUENCE (SIZE (0..maxItems)) OF MetricSample OPTIONAL,
+  ...
+}
+
+IncidentCause ::= ENUMERATED {
+  returnedError(0), standardException(1), unknownException(2), invalidInput(3),
+  invalidOutput(4), deadlineMiss(5), deviceError(6), resourceExhausted(7),
+  processExit(8), heartbeatLoss(9), leaseExpired(10), quiescenceTimeout(11),
+  securityViolation(12), policyRejection(13), ...
+}
+IncidentAction ::= ENUMERATED {
+  observed(0), invocationFallback(1), breakerOpened(2), disabled(3),
+  modelRollback(4), quarantined(5), processRestarted(6), duRestartRequired(7), ...
+}
+IncidentRecord ::= SEQUENCE {
+  incidentId      Counter,
+  timestampNs     TimestampNs,
+  instanceId      Identifier,
+  packageId       Identifier,
+  appGeneration   Generation,
+  modelGeneration Generation OPTIONAL,
+  hookId          INTEGER (0..4294967295) OPTIONAL,
+  cellId          INTEGER (0..65535) OPTIONAL,
+  workerId        INTEGER (0..65535) OPTIONAL,
+  phase           ENUMERATED {
+    query(0), create(1), configure(2), prepare(3), warmup(4), invoke(5),
+    completion(6), report(7), stop(8), quiesce(9), unload(10), ...
+  },
+  cause           IncidentCause,
+  action          IncidentAction,
+  nativeStatus    INTEGER (-2147483648..2147483647),
+  recurrenceCount INTEGER (1..4294967295),
+  sanitizedMessage OCTET STRING (SIZE (0..maxText)) OPTIONAL,
+  invocationSequence Counter OPTIONAL,
+  exceptionTypeHash Counter OPTIONAL,
+  observedLatencyNs Counter OPTIONAL,
+  deadlineNs Counter OPTIONAL,
+  fallbackSucceeded BOOLEAN DEFAULT FALSE,
+  breakerOpen BOOLEAN DEFAULT FALSE,
+  ...
+}
+IncidentQuery ::= SEQUENCE {
+  action          ENUMERATED { list(0), clearThrough(1), ... } DEFAULT list,
+  instanceId      Identifier OPTIONAL,
+  cause           IncidentCause OPTIONAL,
+  afterIncidentId Counter OPTIONAL,
+  maximumRecords  INTEGER (1..maxItems) DEFAULT 100,
+  ...
+}
+IncidentResult ::= SEQUENCE {
+  incidents    SEQUENCE (SIZE (0..maxItems)) OF IncidentRecord,
+  clearedCount Counter OPTIONAL,
+  ...
+}
+
+HealthSummary ::= SEQUENCE {
+  total Counter,
+  standardExceptions Counter,
+  unknownExceptions Counter,
+  deadlineMisses Counter,
+  invalidInputs Counter,
+  invalidOutputs Counter,
+  deviceErrors Counter,
+  resourceExhaustions Counter,
+  quiescenceTimeouts Counter,
+  breakerOpened Counter,
+  fallbacks Counter,
+  quarantined Counter,
+  historyEvictions Counter,
+  sourceRingDrops Counter,
+  lastIncidentId Counter,
+  ...
+}
+
+JobState ::= ENUMERATED { accepted(0), running(1), waitingBoundary(2), succeeded(3), failed(4), cancelled(5), ... }
+OperationResult ::= SEQUENCE {
+  code ResultCode,
+  inventoryGeneration Generation OPTIONAL,
+  instanceGeneration Generation OPTIONAL,
+  resourceGeneration Generation OPTIONAL,
+  instanceId Identifier OPTIONAL,
+  state LifecycleState OPTIONAL,
+  detail OCTET STRING (SIZE (0..maxText)) OPTIONAL,
+  ...
+}
+JobRecord ::= SEQUENCE {
+  jobId Identifier,
+  transactionId Identifier,
+  state JobState,
+  progressPercent INTEGER (0..100),
+  submittedNs TimestampNs,
+  startedNs TimestampNs OPTIONAL,
+  completedNs TimestampNs OPTIONAL,
+  result OperationResult OPTIONAL,
+  detail OCTET STRING (SIZE (0..maxText)) OPTIONAL,
+  ...
+}
+JobQuery ::= SEQUENCE {
+  action ENUMERATED { get(0), list(1), cancel(2), ... },
+  jobId Identifier OPTIONAL,
+  ...
+}
+JobResult ::= SEQUENCE { jobs SEQUENCE (SIZE (0..maxItems)) OF JobRecord, ... }
+
+RadioTime ::= SEQUENCE {
+  sfn        INTEGER (0..1023),
+  slot       INTEGER (0..159),
+  numerology INTEGER (0..4),
+  ...
+}
+QuietReservationQuery ::= SEQUENCE {
+  cellId         INTEGER (0..65535) OPTIONAL,
+  maximumRecords INTEGER (1..maxItems) DEFAULT 100,
+  ...
+}
+QuietReservationRecord ::= SEQUENCE {
+  cellId                  INTEGER (0..65535),
+  requestId               Identifier,
+  reservationId           Identifier,
+  reservationGeneration   Generation,
+  sourceInstanceId        Identifier,
+  sourceGeneration        Generation,
+  sourceSequence          Counter,
+  start                   RadioTime,
+  durationSlots           INTEGER (1..65535),
+  repeatPeriodSlots       INTEGER (0..65535),
+  repeatCount             INTEGER (1..8),
+  firstPrb                INTEGER (0..65535),
+  nofPrbs                 INTEGER (1..65535),
+  achievedLevel           ENUMERATED {
+    noNewPusch(0), noPusch(1), noScheduledUeUl(2), rfSilenceRequest(3), ...
+  },
+  status                  ENUMERATED {
+    accepted(0), clamped(1), rejected(2), cancelled(3), expired(4), ...
+  },
+  reason                  ENUMERATED {
+    none(0), invalid(1), insufficientLead(2), outsideHorizon(3), budget(4),
+    conflict(5), capability(6), sourceRetired(7), expired(8), ...
+  },
+  budgetClass             INTEGER (0..65535),
+  confidenceQ16           INTEGER (0..65536),
+  expiryMonotonicNs       TimestampNs,
+  ...
+}
+QuietReservationResult ::= SEQUENCE {
+  reservations SEQUENCE (SIZE (0..maxItems)) OF QuietReservationRecord,
+  truncated    BOOLEAN DEFAULT FALSE,
+  ...
+}
+
+DataDropPolicy ::= ENUMERATED { dropNewest(0), dropOldest(1), coalesceLatest(2), ... }
+DataSubscriptionAction ::= ENUMERATED { create(0), remove(1), list(2), ... }
+DataSubscriptionControl ::= SEQUENCE {
+  action            DataSubscriptionAction,
+  subscriptionId    Identifier OPTIONAL,
+  interfaceId       INTEGER (1..4294967295) OPTIONAL,
+  cellId             INTEGER (0..65535) OPTIONAL,
+  sampleEveryN       INTEGER (1..65535) DEFAULT 1,
+  queueDepthChunks   INTEGER (1..1024) DEFAULT 64,
+  maximumChunkBytes  INTEGER (1024..maxDataChunkBytes) DEFAULT 65536,
+  leaseUs            INTEGER (1..60000000) DEFAULT 1000000,
+  dropPolicy         DataDropPolicy DEFAULT dropNewest,
+  ...
+}
+DataPollQuery ::= SEQUENCE {
+  subscriptionId Identifier,
+  maximumChunks  INTEGER (1..maxDataChunks) DEFAULT 8,
+  ...
+}
+DataSubscriptionRecord ::= SEQUENCE {
+  subscriptionId       Identifier,
+  interfaceId          INTEGER (1..4294967295),
+  cellId               INTEGER (0..65535) OPTIONAL,
+  sampleEveryN         INTEGER (1..65535),
+  queueDepthChunks     INTEGER (1..1024),
+  maximumChunkBytes    INTEGER (1024..maxDataChunkBytes),
+  leaseUs              INTEGER (1..60000000),
+  dropPolicy           DataDropPolicy,
+  leaseExpiryNs        TimestampNs,
+  queuedChunks         Counter,
+  publishedObjects     Counter,
+  publishedTensorBytes Counter,
+  droppedObjects       Counter,
+  busyDrops            Counter,
+  sampledObjects       Counter,
+  active               BOOLEAN,
+  ...,
+  -- Absolute center of the measurement window and the signed offset of the
+  -- cell center relative to it; absent when the deployment has no RF config.
+  rfCenterFrequencyHz    Unsigned64 OPTIONAL,
+  cellFrequencyOffsetHz  Signed64 OPTIONAL
+}
+DataSubscriptionResult ::= SEQUENCE {
+  subscriptions SEQUENCE (SIZE (0..32)) OF DataSubscriptionRecord,
+  ...
+}
+DataPublicationChunk ::= SEQUENCE {
+  subscriptionId      Identifier,
+  interfaceId         INTEGER (1..4294967295),
+  cellId              INTEGER (0..65535),
+  publicationSequence Counter,
+  routeEpoch          Generation,
+  chunkIndex          INTEGER (0..4294967295),
+  chunkCount          INTEGER (1..4294967295),
+  tensorSize          Counter,
+  droppedObjects      Counter,
+  metadata            OCTET STRING (SIZE (0..maxDataChunkBytes)) OPTIONAL,
+  tensorChunk         OCTET STRING (SIZE (1..maxDataChunkBytes)),
+  ...
+}
+DataPublicationResult ::= SEQUENCE {
+  chunks       SEQUENCE (SIZE (0..maxDataChunks)) OF DataPublicationChunk,
+  subscription DataSubscriptionRecord OPTIONAL,
+  ...
+}
+
+-- RAN-level mutations. releaseUeToIdle/handoverUe address a UE (servingPci +
+-- rnti; handover adds targetPci). setTxGain/setRxGain address a radio-unit port
+-- (portId + gainDb) and carry rnti 0. Every action is admitted by the host
+-- authority and deferred onto the owning component's control executor.
+RanControlAction ::= ENUMERATED { releaseUeToIdle(0), ..., handoverUe(1), setTxGain(2), setRxGain(3) }
+RanControl ::= SEQUENCE {
+  action     RanControlAction,
+  servingPci INTEGER (0..1007),
+  rnti       INTEGER (0..65535),
+  ...,
+  targetPci  INTEGER (0..1007) OPTIONAL,
+  portId     INTEGER (0..63) OPTIONAL,
+  gainDb     REAL OPTIONAL
+}
+
+-- Read-only description of the served cells plus which RAN controls the host
+-- can honour, so a client learns PCI, PLMN/TAC, band, carriers, bandwidth,
+-- numerology, antennas, TDD pattern, PRACH configuration and RU gains without
+-- parsing gNB configuration files.
+CellInfoQuery ::= SEQUENCE { ... }
+CellTddPattern ::= SEQUENCE {
+  periodSlots INTEGER (1..320),
+  dlSlots     INTEGER (0..320),
+  dlSymbols   INTEGER (0..13),
+  ulSlots     INTEGER (0..320),
+  ulSymbols   INTEGER (0..13),
+  ...
+}
+CellPrachConfig ::= SEQUENCE {
+  configIndex         INTEGER (0..255),
+  rootSequenceIndex   INTEGER (0..837),
+  zeroCorrelationZone INTEGER (0..15),
+  totalPreambles      INTEGER (0..64),
+  prbStart            INTEGER (0..274),
+  ...
+}
+CellDescriptor ::= SEQUENCE {
+  cellId         INTEGER (0..65535),
+  pci            INTEGER (0..1007),
+  plmn           OCTET STRING (SIZE (5..6)),
+  tac            INTEGER (0..16777215),
+  nrCellIdentity Unsigned64,
+  band           INTEGER (0..1023),
+  dlArfcn        INTEGER (0..3279165),
+  ulArfcn        INTEGER (0..3279165),
+  dlCenterHz     Unsigned64,
+  ulCenterHz     Unsigned64,
+  bandwidthMhz   INTEGER (0..400),
+  nofPrbs        INTEGER (0..275),
+  scsKhz         INTEGER (15..480),
+  nofTxAntennas  INTEGER (0..64),
+  nofRxAntennas  INTEGER (0..64),
+  barred         BOOLEAN,
+  tdd            CellTddPattern OPTIONAL,
+  prach          CellPrachConfig OPTIONAL,
+  txGainDb       REAL OPTIONAL,
+  rxGainDb       REAL OPTIONAL,
+  sampleRateHz   Unsigned64 OPTIONAL,
+  ...
+}
+RanControlCapabilities ::= SEQUENCE {
+  ueRelease BOOLEAN,
+  handover  BOOLEAN,
+  txGain    BOOLEAN,
+  rxGain    BOOLEAN,
+  ...
+}
+CellInfoResult ::= SEQUENCE {
+  cells        SEQUENCE (SIZE (0..32)) OF CellDescriptor,
+  capabilities RanControlCapabilities,
+  ...
+}
+
+RequestHeader ::= SEQUENCE {
+  transactionId Identifier,
+  instanceId Identifier OPTIONAL,
+  expectedInstanceGeneration Generation OPTIONAL,
+  expectedInventoryGeneration Generation OPTIONAL,
+  dryRun BOOLEAN DEFAULT FALSE,
+  ...
+}
+
+ManagementOperation ::= CHOICE {
+  inventory InventoryQuery,
+  lifecycle LifecycleControl,
+  configQuery ConfigQuery,
+  configSet ConfigSet,
+  model ModelControl,
+  metrics MetricQuery,
+  incidents IncidentQuery,
+  health NULL,
+  jobs JobQuery,
+  quietReservations QuietReservationQuery,
+  dataSubscriptions DataSubscriptionControl,
+  dataPoll DataPollQuery,
+  ...,
+  ranControl RanControl,
+  cellInfo CellInfoQuery
+}
+ManagementRequest ::= SEQUENCE { header RequestHeader, operation ManagementOperation, ... }
+
+ManagementPayload ::= CHOICE {
+  inventory InventoryResult,
+  config ConfigResult,
+  metrics MetricResult,
+  incidents IncidentResult,
+  health HealthSummary,
+  jobs JobResult,
+  quietReservations QuietReservationResult,
+  dataSubscriptions DataSubscriptionResult,
+  dataPublications DataPublicationResult,
+  ...,
+  cellInfo CellInfoResult
+}
+ManagementResponse ::= SEQUENCE {
+  transactionId Identifier,
+  code ResultCode,
+  jobId Identifier OPTIONAL,
+  result OperationResult OPTIONAL,
+  payload ManagementPayload OPTIONAL,
+  errorText OCTET STRING (SIZE (0..maxText)) OPTIONAL,
+  ...
+}
+
+END

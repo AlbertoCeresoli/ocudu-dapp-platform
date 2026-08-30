@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+#
+# pip packaging for the ocudu_e3 Python client.
+#
+# Known issue (deferred): the vendored FlatBuffers bindings live in
+# ocudu_e3/_classc_fbs/Ocudu/... and are put on sys.path by ocudu_e3/classc.py
+# at import time. The generic top-level package name "Ocudu" is not restructured
+# here; the bindings are shipped as package data inside ocudu_e3 so nothing is
+# installed at site-packages top level under that name.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ocudu-e3"
+dynamic = ["version"]
+description = "Python client for the OCUDU E3 interface (E3AP over SCTP, telemetry, dApp management)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "BSD-3-Clause-Clear" }
+authors = [{ name = "DeepSig Inc." }]
+dependencies = ["asn1tools"]
+
+[project.optional-dependencies]
+classc = ["flatbuffers", "numpy"]
+h5 = ["h5py", "numpy"]
+
+[project.scripts]
+ocudu-e3 = "ocudu_e3.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "ocudu_e3.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["ocudu_e3*"]
+
+[tool.setuptools.package-data]
+ocudu_e3 = [
+    "schema/*.asn1",
+    "schema/README.md",
+    "_classc_fbs/**/*.py",
+]
