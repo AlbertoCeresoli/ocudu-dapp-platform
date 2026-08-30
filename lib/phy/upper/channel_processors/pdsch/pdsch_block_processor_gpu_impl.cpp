@@ -220,7 +220,7 @@ bool pdsch_block_processor_gpu_impl::map_to_device_grid(span<const uint32_t> re_
     return false;
   }
 
-  const bool log_small     = transport_block.size() <= 16;
+  const bool log_small     = is_gpu_mapper_timing_enabled() && transport_block.size() <= 16;
   const auto t_map0        = std::chrono::steady_clock::now();
   size_t     offsets_bytes = re_offsets.size() * sizeof(uint32_t);
   if (offsets_bytes > d_mapper_re_offsets_capacity) {
