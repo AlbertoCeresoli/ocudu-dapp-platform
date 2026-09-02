@@ -11,6 +11,8 @@ style as other OCUDU architecture notes.
 
 ## Start here
 
+**Read the papers first?** The quickstart repository ships two preview papers: the [architecture and tutorial paper](https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-quickstart/-/blob/main/papers/ocudu_dapp_tutorial.pdf) and the [measured interface study](https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-quickstart/-/blob/main/papers/ocudu_dapp_interface_study.pdf).
+
 **New to the platform? Follow the step-by-step tutorials** — a guided path
 from an empty vendor repo to an LLM agent tuning a live cell. No radio needed:
 the sibling `ocudu-docker/` repo builds everything into a container and ships
