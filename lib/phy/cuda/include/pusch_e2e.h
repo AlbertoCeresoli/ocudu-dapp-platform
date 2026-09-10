@@ -269,6 +269,18 @@ void pusch_e2e_sinr_async_launch(pusch_e2e_handle_t handle, cudaStream_t stream)
  * copies may remain queued; drain the stream before reusing host storage. */
 nr_ldpc_status_t pusch_e2e_sinr_async_launch_checked(pusch_e2e_handle_t handle, cudaStream_t stream);
 
+/** Reduce external compact equalized symbols/noise into the existing fixed 16-byte
+ * SINR/EVM mailbox. No allocation, graph creation, copy, or synchronization.
+ * Either optional input may be null: its count is then zero (unavailable), never stale.
+ * Queue the normal checked readback afterwards and honor its completion fence.
+ * Symbol order is RE-major/layer-minor; count includes all layers. */
+nr_ldpc_status_t pusch_e2e_measure_external_eq(pusch_e2e_handle_t handle,
+                                               const float2*      symbols,
+                                               const float*       noise,
+                                               unsigned           count,
+                                               unsigned           modulation_bits,
+                                               cudaStream_t       stream);
+
 /** Independent post-EQ and pilot SINR sources. Read only after successful current
  * readback completion. Unavailable measurements return -INFINITY, without
  * cross-source fallback. The legacy getter retains its compatibility fallback. */

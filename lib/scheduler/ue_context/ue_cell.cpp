@@ -135,6 +135,7 @@ std::optional<dl_harq_process_handle> ue_cell::handle_dl_ack_info(slot_point    
 
 expected<units::bytes> ue_cell::handle_crc_pdu(slot_point pusch_slot, const ul_crc_pdu_indication& crc_pdu)
 {
+  last_ul_crc_metrics_.reset();
   // Find UL HARQ with matching PUSCH slot.
   std::optional<ul_harq_process_handle> h_ul = harqs.find_ul_harq_waiting_ack(pusch_slot);
   if (not h_ul.has_value() or h_ul->id() != crc_pdu.harq_id) {
@@ -151,24 +152,32 @@ expected<units::bytes> ue_cell::handle_crc_pdu(slot_point pusch_slot, const ul_c
   }
 
   // Update UL HARQ state.
+  const unsigned nof_retxs = h_ul->nof_retxs();
   auto tbs_ret = h_ul->ul_crc_info(crc_pdu.tb_crc_success);
 
   if (tbs_ret.has_value()) {
     // HARQ with matching ID and UCI slot was found.
 
     // Update link adaptation controller.
-    components.ue_mcs_calculator->handle_ul_crc_info(crc_pdu.tb_crc_success,
-                                                     h_ul->get_grant_params().mcs,
-                                                     h_ul->get_grant_params().mcs_table,
-                                                     h_ul->get_grant_params().olla_mcs,
-                                                     crc_pdu.ul_sinr_dB);
+    const bool  olla_eligible = components.ue_mcs_calculator->handle_ul_crc_info(crc_pdu.tb_crc_success,
+                                                                                h_ul->get_grant_params().mcs,
+                                                                                h_ul->get_grant_params().mcs_table,
+                                                                                h_ul->get_grant_params().olla_mcs,
+                                                                                crc_pdu.ul_sinr_dB);
+    const auto& la            = *components.ue_mcs_calculator;
+    last_ul_crc_metrics_      = ul_crc_link_adaptation_info{nof_retxs,
+                                                       la.is_ul_olla_enabled(),
+                                                       olla_eligible,
+                                                       la.ul_snr_offset_db(),
+                                                       la.ul_max_snr_offset_db(),
+                                                       la.ul_target_bler()};
 
     // One-shot snapshot for the Class-B scheduler (package-local OLLA / TPC).
     // First transmissions only: a retx CRC is post-soft-combining and biased
     // toward ACK, so feeding it to the package regulates the combined-CRC
     // ratio instead of first-tx BLER and parks the loop several times above
     // its target.
-    if (h_ul->nof_retxs() == 0) {
+    if (nof_retxs == 0) {
       dapp_ul_crc_.seq      = dapp_ul_crc_.seq + 1u == 0u ? 1u : dapp_ul_crc_.seq + 1u;
       dapp_ul_crc_.crc_ok   = crc_pdu.tb_crc_success;
       dapp_ul_crc_.used_mcs = static_cast<uint8_t>(h_ul->get_grant_params().mcs.value());

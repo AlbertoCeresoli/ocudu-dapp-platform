@@ -162,9 +162,10 @@ void cell_metrics_handler::handle_conres_ce_never_acked()
   data.nof_conres_ce_never_acked++;
 }
 
-void cell_metrics_handler::handle_crc_indication(slot_point                   sl_rx,
-                                                 const ul_crc_pdu_indication& crc_pdu,
-                                                 units::bytes                 tbs)
+void cell_metrics_handler::handle_crc_indication(slot_point                                 sl_rx,
+                                                 const ul_crc_pdu_indication&               crc_pdu,
+                                                 units::bytes                               tbs,
+                                                 std::optional<ul_crc_link_adaptation_info> feedback)
 {
   if (not enabled()) {
     return;
@@ -173,6 +174,19 @@ void cell_metrics_handler::handle_crc_indication(slot_point                   sl
     auto& u = ues[crc_pdu.ue_index];
     u.data.count_crc_acks += crc_pdu.tb_crc_success ? 1 : 0;
     ++u.data.count_crc_pdus;
+    if (feedback) {
+      u.last_ul_crc = feedback;
+      if (feedback->nof_retxs == 0) {
+        (crc_pdu.tb_crc_success ? u.data.ul_first_tx_ok : u.data.ul_first_tx_nok)++;
+      } else {
+        (crc_pdu.tb_crc_success ? u.data.ul_retx_ok : u.data.ul_retx_nok)++;
+      }
+      if (feedback->olla_eligible) {
+        (crc_pdu.tb_crc_success ? u.data.ul_olla_eligible_ok : u.data.ul_olla_eligible_nok)++;
+      } else {
+        ++u.data.ul_olla_skipped;
+      }
+    }
     if (crc_pdu.ul_sinr_dB.has_value()) {
       ++u.data.nof_pusch_snr_reports;
       u.data.sum_pusch_snrs += crc_pdu.ul_sinr_dB.value();
@@ -412,12 +426,14 @@ void cell_metrics_handler::handle_late_ul_harqs()
 void cell_metrics_handler::report_metrics()
 {
   auto next_report = notifier.get_builder();
+  ++report_sequence;
 
   const std::chrono::milliseconds report_period{data.nof_slots / last_slot_tx.nof_slots_per_subframe()};
   for (ue_metric_context& ue : ues) {
     // Compute statistics of the UE metrics and push the result to the report. This includes the final report of UEs
     // that were removed during this report period.
     next_report->ue_metrics.push_back(ue.compute_report(report_period, nof_slots_per_sf));
+    next_report->ue_metrics.back().report_sequence = report_sequence;
   }
   next_report->report_ue_metrics = report_ue_metrics;
   // Now that their final metrics have been reported, erase the UEs that were removed during this report period.
@@ -569,6 +585,11 @@ void cell_metrics_handler::handle_slot_result(slot_point_extended       sl_tx,
     }
     ue_metric_context& u = ues[it->second];
     u.data.ul_mcs += ul_grant.pusch_cfg.mcs_index.value();
+    const uint64_t prb_symbols = uint64_t{grant_prbs} * ul_grant.pusch_cfg.symbols.length();
+    u.data.ul_prb_symbols += prb_symbols;
+    if (ul_grant.context.nof_retxs != 0) {
+      u.data.ul_retx_prb_symbols += prb_symbols;
+    }
     u.last_ul_olla = ul_grant.context.olla_offset;
     if (u.oldest_unserved_sr_slot.valid()) {
       unsigned sr_to_pusch_delay = last_slot_tx.without_hyper_sfn() - u.oldest_unserved_sr_slot;
@@ -669,6 +690,18 @@ cell_metrics_handler::ue_metric_context::compute_report(std::chrono::millisecond
   ret.dl_nof_nok          = data.count_uci_harqs - data.count_uci_harq_acks;
   ret.ul_nof_ok           = data.count_crc_acks;
   ret.ul_nof_nok          = data.count_crc_pdus - data.count_crc_acks;
+  ret.ul_mac_delivered_bytes = data.sum_ul_tb_bytes;
+  ret.ul_prb_symbols         = data.ul_prb_symbols;
+  ret.ul_retx_prb_symbols    = data.ul_retx_prb_symbols;
+  ret.ul_first_tx_ok         = data.ul_first_tx_ok;
+  ret.ul_first_tx_nok        = data.ul_first_tx_nok;
+  ret.ul_retx_ok             = data.ul_retx_ok;
+  ret.ul_retx_nok            = data.ul_retx_nok;
+  ret.ul_olla_eligible_ok    = data.ul_olla_eligible_ok;
+  ret.ul_olla_eligible_nok   = data.ul_olla_eligible_nok;
+  ret.ul_olla_skipped        = data.ul_olla_skipped;
+  ret.ul_link_adaptation     = last_ul_crc;
+  ret.report_period          = metric_report_period;
   ret.pusch_snr_db        = data.nof_pusch_snr_reports > 0 ? data.sum_pusch_snrs / data.nof_pusch_snr_reports : 0;
   ret.pusch_rsrp_db       = data.nof_pusch_rsrp_reports > 0 ? data.sum_pusch_rsrp / data.nof_pusch_rsrp_reports
                                                             : -std::numeric_limits<float>::infinity();

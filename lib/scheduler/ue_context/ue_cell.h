@@ -14,6 +14,7 @@
 #include "ue_link_adaptation_controller.h"
 #include "ocudu/scheduler/config/scheduler_expert_config.h"
 #include "ocudu/scheduler/scheduler_feedback_handler.h"
+#include "ocudu/scheduler/scheduler_metrics.h"
 
 namespace ocudu {
 
@@ -201,6 +202,7 @@ public:
   };
 
   dapp_ul_crc_snapshot dapp_peek_ul_crc() const { return dapp_ul_crc_; }
+  std::optional<ul_crc_link_adaptation_info> last_ul_crc_metrics() const { return last_ul_crc_metrics_; }
   bool dapp_ul_crc_is_fresh() const { return dapp_ul_crc_.seq != 0 && dapp_ul_crc_.seq != dapp_ul_crc_consumed_seq_; }
   void dapp_mark_ul_crc_consumed(uint32_t seq) const
   {
@@ -274,6 +276,7 @@ private:
   /// Last UL CRC for Class-B OLLA / TPC. consumed_seq is mutable so the
   /// const get_cc() path can one-shot the outcome onto a single invoke.
   mutable dapp_ul_crc_snapshot dapp_ul_crc_{};
+  std::optional<ul_crc_link_adaptation_info> last_ul_crc_metrics_;
   mutable uint32_t             dapp_ul_crc_consumed_seq_ = 0;
   mutable dapp_ul_crc_snapshot dapp_dl_ack_{};
   mutable uint32_t             dapp_dl_ack_consumed_seq_ = 0;

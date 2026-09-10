@@ -4,6 +4,8 @@
 #include "../../../upper/channel_processors/pusch/pusch_metric_readback_completion.h"
 #include "../../src/pusch_e2e_internal.cuh"
 #include "pusch_e2e.h"
+#include "pusch_equalized_metrics.h"
+#include <vector>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -165,6 +167,9 @@ struct resources {
     bind_host(ctx, host, host_pilot);
     ctx.d_eq_noise_var_sum   = &device->noise;
     ctx.d_eq_noise_var_count = &device->count;
+    ctx.d_evm_error_sum = &device->evm_error;
+    ctx.d_evm_symbol_count = &device->evm_count;
+    ctx.configured = true;
     ctx.d_sinr_epre_result   = reinterpret_cast<float*>(device_pilot);
   }
   void run(accumulators value, pilot_metrics pilot, bool side_stream)
@@ -189,6 +194,68 @@ struct resources {
     std::this_thread::sleep_for(std::chrono::milliseconds{5});
   }
 };
+
+unsigned execute_external(bool managed)
+{
+  resources owner;
+  owner.create(managed);
+  constexpr unsigned capacity = 14U * 275U * 12U * 4U;
+  struct scratch {
+    float2* symbols{};
+    float* noise{};
+    ~scratch() { if (symbols) cudaFree(symbols); if (noise) cudaFree(noise); }
+  } device;
+  checked(cudaMalloc(&device.symbols, capacity * sizeof(float2)));
+  checked(cudaMalloc(&device.noise, capacity * sizeof(float)));
+  std::vector<float2> symbols(capacity);
+  std::vector<float> noise(capacity, 0.01F);
+  noise[0] = 1.0e6F; noise[1] = NAN; noise[2] = 0;
+  checked(cudaMemcpy(device.noise, noise.data(), capacity * sizeof(float), cudaMemcpyHostToDevice));
+  unsigned cases = 0;
+  for (unsigned bits : {2U, 4U, 6U, 8U}) {
+    for (unsigned i = 0; i < capacity; ++i) {
+      const float value = float(int(i % 33) - 16) * 0.1F;
+      symbols[i] = {value, value + 0.01F};
+    }
+    symbols[3] = {NAN, NAN};
+    checked(cudaMemcpy(device.symbols, symbols.data(), capacity * sizeof(float2), cudaMemcpyHostToDevice));
+    for (unsigned count : {0U, 1U, 7U, 612U, 7344U, capacity}) {
+      for (unsigned optional = 0; optional != 4; ++optional) {
+        const bool has_noise = optional & 1U, has_symbols = optional & 2U;
+        double sum_noise = 0, sum_error = 0;
+        unsigned nn = 0, ne = 0;
+        for (unsigned i = 0; i < count; ++i) {
+          if (has_noise && ocudu::detail::pusch_metric_noise_valid(noise[i])) { sum_noise += noise[i]; ++nn; }
+          if (has_symbols && std::isfinite(symbols[i].x) && std::isfinite(symbols[i].y)) {
+            sum_error += ocudu::detail::pusch_qam_error_power(symbols[i].x, symbols[i].y, bits); ++ne;
+          }
+        }
+        produce<<<1, 1, 0, owner.producer>>>(owner.device, owner.device_pilot, {999, 1, 999, 1}, {4, -11, -13, 0, 81});
+        require(pusch_e2e_measure_external_eq(&owner.ctx, has_symbols ? device.symbols : nullptr,
+                    has_noise ? device.noise : nullptr, count, bits, owner.producer) == NR_LDPC_SUCCESS,
+                "external GPU reduction");
+        checked(cudaEventRecord(owner.produced, owner.producer));
+        checked(cudaStreamWaitEvent(owner.readback, owner.produced, 0));
+        require(pusch_e2e_sinr_async_launch_checked(&owner.ctx, owner.readback) == NR_LDPC_SUCCESS, "external readback");
+        checked(cudaEventRecord(owner.completed, owner.readback));
+        require(ocudu::pusch_metric_readback_completed(true, true, true, owner.completed, owner.readback), "external fence");
+        require(owner.host->count == nn && owner.host->evm_count == ne, "optional/invalid/erasure counts");
+        require(std::abs(owner.host->noise - sum_noise) <= 1e-4 * std::max(1.0, sum_noise), "noise reduction parity");
+        require(std::abs(owner.host->evm_error - sum_error) <= 1e-4 * std::max(1.0, sum_error), "QAM EVM parity");
+        if (!nn) require(!std::isfinite(pusch_e2e_post_eq_sinr_get_result(&owner.ctx)), "no stale SINR");
+        if (!ne) require(std::isnan(pusch_e2e_evm_get_result(&owner.ctx)), "no stale EVM");
+        ++cases;
+      }
+    }
+  }
+  require(pusch_e2e_measure_external_eq(&owner.ctx, device.symbols, device.noise, capacity + 1, 2,
+                                      owner.producer) == NR_LDPC_ERROR_INVALID_CONFIG, "extent bound");
+  require(pusch_e2e_measure_external_eq(&owner.ctx, device.symbols, device.noise, 1, 3,
+                                      owner.producer) == NR_LDPC_ERROR_INVALID_CONFIG, "unsupported QAM");
+  std::printf("{\"kind\":\"external_eq\",\"managed\":%s,\"cases\":%u,\"status\":\"GPU_REDUCTION_PARITY_OK\"}\n",
+              managed ? "true" : "false", cases);
+  return cases;
+}
 
 unsigned execute(bool managed)
 {
@@ -226,6 +293,12 @@ unsigned execute(bool managed)
 int main(int argc, char** argv)
 {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--external-only") == 0) {
+      cold_checks();
+      execute_external(false);
+      execute_external(true);
+      return 0;
+    }
     require(argc == 1 || ((argc == 2 || argc == 4) && std::strcmp(argv[1], "--execute") == 0 &&
                           (argc == 2 || std::strcmp(argv[2], "--output") == 0)),
             "usage: [--execute [--output new-report.json]]");
@@ -239,6 +312,8 @@ int main(int argc, char** argv)
     if (argc >= 2) {
       const unsigned pinned  = execute(false);
       const unsigned managed = execute(true);
+      execute_external(false);
+      execute_external(true);
       if (report) {
         require(std::fprintf(report,
                              "{\"status\":\"ACTUAL_ASYNC_READBACK_OK\",\"pinned_cases\":%u,\"managed_cases\":%u,"

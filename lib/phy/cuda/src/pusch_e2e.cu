@@ -10,6 +10,7 @@
  */
 
 #include "pusch_e2e.h"
+#include "pusch_equalized_metrics.h"
 #include "scrambling.h"
 #include "ocudu_phy_cuda_mimo_math.cuh"
 #include <cuda_runtime.h>
@@ -377,39 +378,63 @@ __device__ __forceinline__ void sinr_accumulate_warp(
     warp_accumulate_sum_count(d_sum, d_count, valid_count ? eq_noise_var : 0.0f, valid_count);
 }
 
-__device__ __forceinline__ float nearest_qam_axis(float value, int max_abs_level, float scale)
-{
-    float clipped = fminf((float)max_abs_level, fmaxf((float)-max_abs_level, value / scale));
-    int idx = (int)floorf((clipped + (float)max_abs_level) * 0.5f + 0.5f);
-    idx = max(0, min(max_abs_level, idx));
-    return ((float)(-max_abs_level + 2 * idx)) * scale;
-}
-
 __device__ __forceinline__ float evm_error_power(cuFloatComplex eq, int mod_order)
 {
-    float ref_re;
-    float ref_im;
-    if (mod_order == 2) {
-        constexpr float scale = 0.7071067811865475f;
-        ref_re = (eq.x >= 0.0f) ? scale : -scale;
-        ref_im = (eq.y >= 0.0f) ? scale : -scale;
-    } else if (mod_order == 4) {
-        constexpr float scale = 0.31622776601683794f;
-        ref_re = nearest_qam_axis(eq.x, 3, scale);
-        ref_im = nearest_qam_axis(eq.y, 3, scale);
-    } else if (mod_order == 6) {
-        constexpr float scale = 0.1543033499620919f;
-        ref_re = nearest_qam_axis(eq.x, 7, scale);
-        ref_im = nearest_qam_axis(eq.y, 7, scale);
-    } else {
-        constexpr float scale = 0.07669649888473704f;
-        ref_re = nearest_qam_axis(eq.x, 15, scale);
-        ref_im = nearest_qam_axis(eq.y, 15, scale);
-    }
+    return ocudu::detail::pusch_qam_error_power(eq.x, eq.y, mod_order);
+}
 
-    float err_re = eq.x - ref_re;
-    float err_im = eq.y - ref_im;
-    return err_re * err_re + err_im * err_im;
+namespace {
+__global__ void external_eq_metrics(const float2* symbols, const float* noise, unsigned count,
+                                    unsigned bits, float* noise_sum, unsigned* noise_count,
+                                    float* error_sum, unsigned* symbol_count)
+{
+    // One fixed reduction block overwrites every output, including empty/invalid grants.
+    // No atomics, per-grant scratch allocation, or configuration-dependent CUDA graph.
+    __shared__ float ns[256], es[256];
+    __shared__ unsigned nc[256], ec[256];
+    const unsigned t = threadIdx.x;
+    float n = 0, e = 0;
+    unsigned nn = 0, ne = 0;
+    for (unsigned i = t; i < count; i += blockDim.x) {
+        if (noise && ocudu::detail::pusch_metric_noise_valid(noise[i])) {
+            n += noise[i];
+            ++nn;
+        }
+        // Match baseline EVM's finite-symbol rule; erasures are not silently
+        // removed from EVM, even though their noise sentinel is excluded from SINR.
+        if (symbols && isfinite(symbols[i].x) && isfinite(symbols[i].y)) {
+            e += ocudu::detail::pusch_qam_error_power(symbols[i].x, symbols[i].y, bits);
+            ++ne;
+        }
+    }
+    ns[t] = n; es[t] = e; nc[t] = nn; ec[t] = ne;
+    __syncthreads();
+    for (unsigned stride = 128; stride != 0; stride /= 2) {
+        if (t < stride) {
+            ns[t] += ns[t + stride]; es[t] += es[t + stride];
+            nc[t] += nc[t + stride]; ec[t] += ec[t + stride];
+        }
+        __syncthreads();
+    }
+    if (t == 0) {
+        *noise_sum = ns[0]; *noise_count = nc[0];
+        *error_sum = es[0]; *symbol_count = ec[0];
+    }
+}
+} // namespace
+
+nr_ldpc_status_t pusch_e2e_measure_external_eq(pusch_e2e_handle_t handle,
+                                             const float2* symbols, const float* noise,
+                                             unsigned count, unsigned bits, cudaStream_t stream)
+{
+    if (!handle || !handle->configured || !handle->d_eq_noise_var_sum || !handle->d_eq_noise_var_count ||
+        !handle->d_evm_error_sum || !handle->d_evm_symbol_count || count > 14U * 275U * 12U * 4U ||
+        (bits != 2 && bits != 4 && bits != 6 && bits != 8)) {
+        return NR_LDPC_ERROR_INVALID_CONFIG;
+    }
+    external_eq_metrics<<<1, 256, 0, stream>>>(symbols, noise, count, bits,
+        handle->d_eq_noise_var_sum, handle->d_eq_noise_var_count, handle->d_evm_error_sum, handle->d_evm_symbol_count);
+    return cudaGetLastError() == cudaSuccess ? NR_LDPC_SUCCESS : NR_LDPC_ERROR_CUDA_FAILED;
 }
 
 __device__ __forceinline__ void evm_accumulate(

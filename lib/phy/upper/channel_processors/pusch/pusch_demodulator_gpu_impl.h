@@ -446,13 +446,9 @@ private:
   bool                                 gpu_resident_mode_ = false;
   std::shared_ptr<pusch_resident_dapp> resident_dapp_;
   bool                                 last_dapp_inline_ = false;
-  /// True only when the last inline dApp produced every post-EQ noise sample.
-  bool last_dapp_post_eq_noise_valid_ = false;
   /// Number of post-EQ noise samples written for the last Class-A dApp inline equalize
   /// (`nof_data_re * nof_tx_layers`). Used by deferred CSI so OLLA gets real UL SINR.
   size_t last_nof_eq_re_ = 0;
-  /// Host scratch for D2H of post-EQ noise when exporting dApp-inline SINR after decoder sync.
-  std::vector<float> dapp_post_eq_noise_host_;
 
   /// Copy buffer for channel RE.
   modular_re_buffer_reader<cbf16_t, MAX_PORTS> ch_re_view;

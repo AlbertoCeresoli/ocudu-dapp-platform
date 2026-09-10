@@ -35,6 +35,9 @@ class cell_metrics_handler final : public sched_metrics_ue_configurator
       unsigned   count_uci_harqs                = 0;
       unsigned   count_crc_acks                 = 0;
       unsigned   count_crc_pdus                 = 0;
+      unsigned   ul_first_tx_ok = 0, ul_first_tx_nok = 0, ul_retx_ok = 0, ul_retx_nok = 0;
+      unsigned   ul_olla_eligible_ok = 0, ul_olla_eligible_nok = 0, ul_olla_skipped = 0;
+      uint64_t   ul_prb_symbols = 0, ul_retx_prb_symbols = 0;
       unsigned   count_pucch_harq_pdus          = 0;
       unsigned   count_pusch_harq_pdus          = 0;
       unsigned   count_sr                       = 0;
@@ -111,6 +114,7 @@ class cell_metrics_handler final : public sched_metrics_ue_configurator
     std::array<unsigned, MAX_NOF_RB_LCIDS> last_dl_bs{0};
     std::optional<float>                   last_dl_olla;
     std::optional<float>                   last_ul_olla;
+    std::optional<ul_crc_link_adaptation_info> last_ul_crc;
     non_persistent_data                    data;
 
     scheduler_ue_metrics compute_report(std::chrono::milliseconds metric_report_period, unsigned nof_slots_per_sf);
@@ -174,6 +178,7 @@ class cell_metrics_handler final : public sched_metrics_ue_configurator
   };
 
   scheduler_cell_metrics_notifier& notifier;
+  uint64_t                         report_sequence = 0;
   const cell_configuration&        cell_cfg;
 
   /// Whether per-UE metrics should be consumed/printed by report consumers.
@@ -224,7 +229,10 @@ public:
   void handle_conres_ce_never_acked();
 
   /// \brief Register CRC indication.
-  void handle_crc_indication(slot_point sl_rx, const ul_crc_pdu_indication& crc_pdu, units::bytes tbs);
+  void handle_crc_indication(slot_point                                 sl_rx,
+                             const ul_crc_pdu_indication&               crc_pdu,
+                             units::bytes                               tbs,
+                             std::optional<ul_crc_link_adaptation_info> feedback = std::nullopt);
 
   /// \brief Handle SRS indication.
   void handle_srs_indication(const srs_indication::srs_indication_pdu& srs_pdu, unsigned ri);

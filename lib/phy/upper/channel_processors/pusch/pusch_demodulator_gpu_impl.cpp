@@ -204,7 +204,7 @@ inline void sanitize_stats_in_place(pusch_demodulator_notifier::demodulation_sta
 /// the inflated SINR as excess link margin and repeatedly commands the UE down.
 /// Keep an explicit override for legacy/vendor modules with a documented noise
 /// convention, but never apply an empirical offset to every Class-A module.
-inline bool mean_post_eq_sinr_db_from_noise(span<const float> noise, float& sinr_db)
+inline float dapp_sinr_calibration_db()
 {
   static const float host_convention_cal_db = []() {
     if (const char* env = std::getenv("OCUDU_DAPP_UL_SINR_CAL_DB")) {
@@ -217,24 +217,22 @@ inline bool mean_post_eq_sinr_db_from_noise(span<const float> noise, float& sinr
     return 0.0f;
   }();
 
-  // Class-A modules report an erasure (DC subcarrier, singular channel) as a huge post-equalization noise so the
-  // demapper yields zero LLRs. Such REs carry no information about the link and must not enter the SINR that drives
-  // link adaptation and power control: one erased RE per symbol would otherwise pull a 20 dB link to -10 dB.
-  constexpr float erasure_noise_threshold = 1.0e5f;
-  double          sum                     = 0.0;
-  size_t          count                   = 0;
-  for (float var : noise) {
-    if (std::isfinite(var) && var > 0.0f && var < erasure_noise_threshold) {
-      sum += static_cast<double>(var);
-      ++count;
-    }
+  return host_convention_cal_db;
+}
+
+inline pusch_demodulator_notifier::demodulation_stats external_eq_stats(pusch_e2e_handle_t handle)
+{
+  pusch_demodulator_notifier::demodulation_stats stats;
+  const float                                    sinr = pusch_e2e_post_eq_sinr_get_result(handle);
+  const float                                    evm  = pusch_e2e_evm_get_result(handle);
+  if (std::isfinite(sinr)) {
+    stats.sinr_dB = sinr + dapp_sinr_calibration_db();
   }
-  if (count == 0) {
-    return false;
+  if (std::isfinite(evm)) {
+    stats.evm = evm;
   }
-  const float mean = static_cast<float>(sum / static_cast<double>(count));
-  sinr_db          = -convert_power_to_dB(mean) + host_convention_cal_db;
-  return std::isfinite(sinr_db);
+  // No pilot/TA/CFO reads here: the baseline estimator did not run for this grant.
+  return stats;
 }
 
 static unsigned pusch_gpu_e2e_timing_warn_us()
@@ -1641,7 +1639,6 @@ void pusch_demodulator_gpu_impl::demodulate(pusch_codeword_buffer&              
   last_device_grid_used_             = false;
   last_owned_device_grid_used_       = false;
   last_dapp_inline_                  = false;
-  last_dapp_post_eq_noise_valid_     = false;
   last_nof_eq_re_                    = 0;
   last_capture_src_                  = nullptr;
   last_capture_n_                    = 0;
@@ -2884,6 +2881,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   // enqueued work ordered before the conventional overwrite on this same stream.
   bool dapp_inline_used         = false;
   bool dapp_post_eq_noise_valid = false;
+  bool dapp_eq_symbols_valid    = false;
   auto demodulate_equalized     = [&]() {
     // PUSCH data scrambling (TS 38.211 §6.3.1.1): c_init = n_RNTI·2^15 + q·2^14 + n_ID.
     // Slot index is NOT part of data scrambling (only DMRS). Passing n_s into
@@ -2980,6 +2978,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
           }
           status                   = dapp_inline_used ? NR_LDPC_SUCCESS : NR_LDPC_ERROR_CUDA_FAILED;
           dapp_post_eq_noise_valid = dapp_inline_used;
+          dapp_eq_symbols_valid    = dapp_inline_used;
         }
       }
     } else if (resident_mode == pusch_resident_dapp_mode::equalizer) {
@@ -2993,6 +2992,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
         queue_eq_symbol_d2h(d_symbols_, last_nof_eq_re_);
         dapp_inline_used         = demodulate_equalized();
         dapp_post_eq_noise_valid = dapp_inline_used;
+        dapp_eq_symbols_valid    = dapp_inline_used;
       }
     } else if (resident_mode == pusch_resident_dapp_mode::receiver) {
       const auto invoked = resident_dapp_->invoke_receiver(buffers, config);
@@ -3010,6 +3010,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
         }
         dapp_inline_used         = status == NR_LDPC_SUCCESS;
         dapp_post_eq_noise_valid = dapp_inline_used && resident_dapp_->receiver_post_eq_noise_valid();
+        dapp_eq_symbols_valid    = dapp_inline_used && resident_dapp_->receiver_equalized_symbols_valid();
         if (dapp_inline_used && resident_dapp_->receiver_equalized_symbols_valid()) {
           last_nof_eq_re_   = static_cast<std::size_t>(nof_re) * nof_tx_layers;
           last_capture_src_ = d_symbols_;
@@ -3316,7 +3317,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   //
   // Resident no-UCI path (default on; OCUDU_PUSCH_SINR_SIDE_STREAM=0 disables): route the tiny SINR
   // readback copies to d2h_stream_ so the compute stream goes straight from the demod
-  // kernels to the decoder's kernels. Skip when Class-A dApp produced LLRs inline.
+  // kernels to the decoder's kernels. External receivers use the same fenced mailbox.
   static const bool sinr_side_stream = []() {
     const char* v = std::getenv("OCUDU_PUSCH_SINR_SIDE_STREAM");
     return (v == nullptr) || (v[0] != '0');
@@ -3324,12 +3325,20 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   const bool resident_skip_sync =
       gpu_resident_mode_ && !resident_host_uci_demux_enabled(config) && !compact_uci_on_device;
   last_sinr_on_side_stream_ = false;
-  // Inline receivers report their noise through the existing, completion-fenced
-  // noise buffer. Conventional metrics require both readback submissions.
-  last_metrics_submission_ok_  = dapp_inline_used;
+  // Reduce external output on its producer stream, before any readback fence.
+  // Reuse the preallocated baseline mailbox: no per-RE D2H or host vector growth.
+  bool metrics_produced =
+      !dapp_inline_used ||
+      pusch_e2e_measure_external_eq(e2e_handle_,
+                                    dapp_eq_symbols_valid ? static_cast<const float2*>(d_symbols_) : nullptr,
+                                    dapp_post_eq_noise_valid ? static_cast<const float*>(d_noise_vars_) : nullptr,
+                                    static_cast<unsigned>(nof_re * nof_tx_layers),
+                                    mod_order,
+                                    stream_) == NR_LDPC_SUCCESS;
+  last_metrics_submission_ok_  = false;
   last_metrics_fence_recorded_ = false;
   bool producer_event_recorded = false;
-  if (!dapp_inline_used) {
+  if (metrics_produced) {
     if (resident_skip_sync && sinr_side_stream && d2h_stream_ && kernel_complete_[buf_idx] && d2h_complete_[buf_idx]) {
       producer_event_recorded = cudaEventRecord(kernel_complete_[buf_idx], stream_) == cudaSuccess;
       if (producer_event_recorded && cudaStreamWaitEvent(d2h_stream_, kernel_complete_[buf_idx], 0) == cudaSuccess) {
@@ -3385,7 +3394,6 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   last_rnti_                     = static_cast<uint16_t>(config.rnti);
   gpu_llrs_valid_                = true;
   last_dapp_inline_              = dapp_inline_used;
-  last_dapp_post_eq_noise_valid_ = dapp_inline_used && dapp_post_eq_noise_valid;
   // Preserve last_nof_eq_re_ if EQ was already stashed above (NeuralEq / CE-EQ). Only overwrite
   // when dApp-inline succeeded so deferred SINR still has a size; do NOT zero it when soft-demod
   // falls back — constellation force-D2H still needs the EQ buffer size.
@@ -3454,27 +3462,11 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
     }
 
     // Read SINR/EPRE/RSRP/TA from pinned memory (async D2H already complete after event sync).
-    // Class-A dApp inline: derive post-EQ SINR from d_noise_vars_ (E2E SINR path skipped).
+    // Both paths use completion-fenced, fixed-size SINR/EVM mailboxes.
     if (!last_metrics_submission_ok_) {
       notifier.on_end_stats({});
     } else if (dapp_inline_used) {
-      pusch_demodulator_notifier::demodulation_stats stats;
-      float                                          sinr_db = 0.0f;
-      if (last_dapp_post_eq_noise_valid_ && d_noise_vars_ != nullptr && last_nof_eq_re_ != 0) {
-        if (dapp_post_eq_noise_host_.size() < last_nof_eq_re_) {
-          dapp_post_eq_noise_host_.resize(last_nof_eq_re_);
-        }
-        if (cudaMemcpy(dapp_post_eq_noise_host_.data(),
-                       d_noise_vars_,
-                       last_nof_eq_re_ * sizeof(float),
-                       cudaMemcpyDeviceToHost) == cudaSuccess &&
-            mean_post_eq_sinr_db_from_noise(span<const float>(dapp_post_eq_noise_host_.data(), last_nof_eq_re_),
-                                            sinr_db)) {
-          stats.sinr_dB.emplace(sinr_db);
-        } else {
-          static_cast<void>(cudaGetLastError());
-        }
-      }
+      auto stats = external_eq_stats(e2e_handle_);
       sanitize_stats_in_place(stats, static_cast<uint16_t>(config.rnti));
       notifier.on_end_stats(stats);
     } else {
@@ -3856,27 +3848,9 @@ float pusch_demodulator_gpu_impl::report_deferred_sinr(pusch_demodulator_notifie
     notifier.on_end_stats({});
     return 0.0F;
   }
-  // Class-A equalizer dApp inline: E2E SINR D2H was skipped; after decoder
-  // stream sync, derive CSI from post-EQ noise for CRC / scheduler feedback.
+  // Same completed GPU reduction and QAM EVM convention as the fused baseline.
   if (last_dapp_inline_) {
-    pusch_demodulator_notifier::demodulation_stats stats;
-    float                                          sinr_db = 0.0f;
-    if (last_dapp_post_eq_noise_valid_ && d_noise_vars_ != nullptr && last_nof_eq_re_ != 0) {
-      if (dapp_post_eq_noise_host_.size() < last_nof_eq_re_) {
-        dapp_post_eq_noise_host_.resize(last_nof_eq_re_);
-      }
-      // Decoder pre-join already synchronized the demod stream.
-      if (cudaMemcpy(dapp_post_eq_noise_host_.data(),
-                     d_noise_vars_,
-                     last_nof_eq_re_ * sizeof(float),
-                     cudaMemcpyDeviceToHost) == cudaSuccess &&
-          mean_post_eq_sinr_db_from_noise(span<const float>(dapp_post_eq_noise_host_.data(), last_nof_eq_re_),
-                                          sinr_db)) {
-        stats.sinr_dB.emplace(sinr_db);
-      } else {
-        static_cast<void>(cudaGetLastError());
-      }
-    }
+    auto stats = external_eq_stats(e2e_handle_);
     sanitize_stats_in_place(stats, last_rnti_);
     notifier.on_end_stats(stats);
     return 0.0F;
