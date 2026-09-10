@@ -7,7 +7,9 @@
 #include "../ldpc_graph_impl.h"
 #include "../ldpc_luts_impl.h"
 #include "cuda_rt_utils.h"
+#include "pusch_decoder_batch_extent.h"
 #include "ocudu/ocudulog/ocudulog.h"
+#include "ocudu/support/error_handling.h"
 #include "ocudu/support/ocudu_assert.h"
 #include <algorithm>
 #include <array>
@@ -896,11 +898,22 @@ pusch_codeblock_decoder_cuda_batch::decode_batch(span<const described_rx_codeblo
 {
   unsigned nof_cbs = codeblock_llrs.size();
 
-  ocudu_assert(nof_cbs > 0 && nof_cbs <= MAX_BATCH_SIZE, "Invalid number of codeblocks: {}", nof_cbs);
-  ocudu_assert(cb_data_buffers.size() == nof_cbs, "Mismatched cb_data_buffers size");
-  ocudu_assert(rm_buffers.size() == nof_cbs, "Mismatched rm_buffers size");
+  // The caller's bounded result indexing requires the same bounded CB count.
+  report_fatal_error_if_not(nof_cbs <= MAX_BATCH_SIZE, "Invalid number of codeblocks: {}", nof_cbs);
 
   std::vector<codeblock_result> results(nof_cbs);
+  resident_export_.valid = false;
+  const auto extent =
+      pusch_decoder_batch_extent(codeblock_llrs,
+                                 MAX_BATCH_SIZE,
+                                 std::size_t(MAX_BATCH_SIZE) * MAX_RM_LLRS,
+                                 [](const described_rx_codeblock& cb) -> std::size_t {
+                                   return cb.first.size() == cb.second.cb_specific.rm_length ? cb.first.size() : 0;
+                                 });
+  if (!extent || cb_data_buffers.size() != nof_cbs || rm_buffers.size() != nof_cbs) {
+    ocudulog::fetch_basic_logger("PHY").error("Invalid CUDA PUSCH batch buffer extent");
+    return results;
+  }
 
   // Get common parameters from first codeblock (all CBs share tb_common).
   const auto& tb_common    = codeblock_llrs[0].second.tb_common;
@@ -1133,7 +1146,18 @@ pusch_codeblock_decoder_cuda_batch::tb_decode_result pusch_codeblock_decoder_cud
     int                                                  buffer_index)
 {
   unsigned nof_cbs = cb_specific.size();
-  ocudu_assert(nof_cbs > 0 && nof_cbs <= MAX_BATCH_SIZE, "Invalid number of codeblocks: {}", nof_cbs);
+  resident_export_.valid = false;
+  const auto extent =
+      pusch_decoder_batch_extent(cb_specific,
+                                 MAX_BATCH_SIZE,
+                                 std::size_t(MAX_BATCH_SIZE) * MAX_RM_LLRS,
+                                 [](const codeblock_metadata::cb_specific_metadata& cb) { return cb.rm_length; });
+  // Reserve room for the TB CRC before any CUDA reconfiguration or enqueue.
+  if (!extent || *extent != num_llrs || d_llrs_half == nullptr || tb_output.empty() ||
+      tb_output.size() > MAX_TB_BYTES - 3) {
+    ocudulog::fetch_basic_logger("PHY").error("Invalid CUDA PUSCH resident buffer extent");
+    return {};
+  }
 
   // Select buffer index for triple-buffering.
   int buf_idx;

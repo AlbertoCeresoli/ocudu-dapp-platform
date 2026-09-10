@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 //
-// Host-side input validation for native_worker (split TU — no behavior change).
+// Host-side input and caller-owned output validation for native_worker.
 
 #include "native_worker_validation.h"
 #include "ocudu/dapp/abi/v1/metric_catalog.h"
@@ -19,6 +19,19 @@ namespace ocudu::dapp::native_worker_detail {
 
 static_assert(OCUDU_DAPP_HOST_INPUT_CELL_BITMAP_BITS_V1 >= ocudu::MAX_CELLS_PER_DU);
 static_assert(std::atomic<uint32_t>::is_always_lock_free);
+
+const ocudu_dapp_tensor_view_v1* receiver_symbol_storage(const ocudu_dapp_typed_metadata_v1& wrapper) noexcept
+{
+  constexpr auto minimum = OCUDU_DAPP_RECEIVER_EQUALIZED_SYMBOLS_MIN_SIZE_V1;
+  if (wrapper.metadata.data == nullptr || wrapper.metadata.size < minimum) {
+    return nullptr;
+  }
+  const auto& metrics = *static_cast<const ocudu_dapp_receiver_metrics_v1*>(wrapper.metadata.data);
+  if (metrics.struct_size < minimum || metrics.equalized_symbols.struct_size == 0) {
+    return nullptr;
+  }
+  return &metrics.equalized_symbols;
+}
 
 bool valid_invocation(const ocudu_dapp_invocation_v1& invocation, uint32_t worker_id) noexcept
 {

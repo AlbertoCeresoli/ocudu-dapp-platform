@@ -218,7 +218,8 @@ PuschDmrsChannelRecord ::= SEQUENCE {
 
 -- Byte-for-byte relay of one already-generated gNB JSON metrics report.
 GnbMetricsJsonRecord ::= SEQUENCE {
-  json OCTET STRING (SIZE (1..maxTelemetryObjectBytes)),
+  -- Empty when the bytes were delivered by reference (E3-TensorDescriptor).
+  json OCTET STRING (SIZE (0..maxTelemetryObjectBytes)),
   ...
 }
 
@@ -227,7 +228,8 @@ GnbMetricsJsonRecord ::= SEQUENCE {
 ClassCPortableRecord ::= SEQUENCE {
   interfaceId INTEGER (1..4294967295),
   metadata    OCTET STRING (SIZE (0..65536)),
-  tensor      OCTET STRING (SIZE (1..maxTelemetryObjectBytes)),
+  -- Empty when the bytes were delivered by reference (E3-TensorDescriptor).
+  tensor      OCTET STRING (SIZE (0..maxTelemetryObjectBytes)),
   ...
 }
 

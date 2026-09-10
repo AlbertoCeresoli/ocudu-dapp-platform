@@ -18,6 +18,7 @@ extern "C" {
 
 #include "ocudu/adt/span.h"
 #include "ocudu/dapp/management/types.h"
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -277,21 +278,32 @@ std::vector<uint8_t> encode_asn(asn_TYPE_descriptor_t& descriptor, const AsnType
   }
   struct encoding_sink {
     std::vector<uint8_t> bytes;
+    std::size_t          used{};
     std::size_t          maximum{};
     bool                 allocation_failed{};
     bool                 too_large{};
   } sink;
   sink.maximum = maximum_bytes;
-  sink.bytes.reserve(4096);
+  sink.bytes.resize(std::min<std::size_t>(4096, maximum_bytes));
   const auto consume = [](const void* data, std::size_t size, void* key) noexcept {
     auto& output = *static_cast<encoding_sink*>(key);
-    if (size > output.maximum - output.bytes.size()) {
+    if (size > output.maximum - output.used) {
       output.too_large = true;
       return -1;
     }
     try {
-      const auto* first = static_cast<const uint8_t*>(data);
-      output.bytes.insert(output.bytes.end(), first, first + size);
+      // asn1c flushes very small (~30-byte) fragments. Avoid a vector insertion
+      // and its iterator machinery for every fragment, especially in hardened
+      // builds. Grow geometrically within the wire bound, then append by copy.
+      const std::size_t required = output.used + size;
+      if (required > output.bytes.size()) {
+        const std::size_t growth = std::min(output.bytes.size(), output.maximum - output.bytes.size());
+        output.bytes.resize(std::max(required, output.bytes.size() + growth));
+      }
+      if (size != 0) {
+        std::memcpy(output.bytes.data() + output.used, data, size);
+      }
+      output.used = required;
       return 0;
     } catch (...) {
       output.allocation_failed = true;
@@ -309,9 +321,10 @@ std::vector<uint8_t> encode_asn(asn_TYPE_descriptor_t& descriptor, const AsnType
     const char* type = encoded.failed_type != nullptr ? encoded.failed_type->name : "unknown type";
     throw std::runtime_error(std::string("APER encoding failed at ") + type);
   }
-  if ((static_cast<std::size_t>(encoded.encoded) + 7) / 8 != sink.bytes.size()) {
+  if ((static_cast<std::size_t>(encoded.encoded) + 7) / 8 != sink.used) {
     throw std::runtime_error("APER encoder returned an inconsistent size");
   }
+  sink.bytes.resize(sink.used);
   return std::move(sink.bytes);
 }
 

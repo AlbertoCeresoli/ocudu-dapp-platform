@@ -170,6 +170,8 @@ public:
                   const dmrs_pusch_estimator_results& est_results,
                   const configuration&                config) override
   {
+    last_delegated                         = true;
+    captured_symbols_valid                 = false;
     const pusch_dapp_demodulator_mode mode = target->active_mode();
     if (mode == pusch_dapp_demodulator_mode::conflict) {
       target->report_fallback(lane, mode, dapp::class_a_fallback_reason::overlapped_hook);
@@ -204,6 +206,7 @@ public:
       fallback->demodulate(codeword_buffer, notifier, grid, est_results, config);
       return;
     }
+    last_delegated = false;
     emit_codeword(codeword_buffer, notifier, config, mode);
   }
 
@@ -213,6 +216,8 @@ public:
   bool                    is_resident_mode_enabled() const override { return fallback->is_resident_mode_enabled(); }
   resident_softbit_buffer get_resident_softbits() const override { return fallback->get_resident_softbits(); }
   bool                used_host_codeword_fallback() const override { return fallback->used_host_codeword_fallback(); }
+  bool                    used_device_grid() const override { return last_delegated && fallback->used_device_grid(); }
+  bool used_owned_device_grid() const override { return last_delegated && fallback->used_owned_device_grid(); }
   resident_uci_buffer get_resident_uci() const override { return fallback->get_resident_uci(); }
   void                finalize_resident_uci() override { fallback->finalize_resident_uci(); }
   float               get_last_grid_staging_us() const override { return fallback->get_last_grid_staging_us(); }
@@ -234,10 +239,30 @@ public:
   // Constellation diagnostics: must forward to the GPU/layer_select fallback. Without these
   // overrides the base no-ops stay in the vtable and GCC elides the virtual calls entirely
   // (empty-base optimization), so PUSCH.SYM never gets IQ.
-  void                            enable_symbol_capture() override { fallback->enable_symbol_capture(); }
-  void                            disable_symbol_capture() override { fallback->disable_symbol_capture(); }
-  span<const std::complex<float>> get_captured_symbols() const override { return fallback->get_captured_symbols(); }
-  void                            wait_captured_symbols() override { fallback->wait_captured_symbols(); }
+  void enable_symbol_capture() override
+  {
+    capture_symbols = true;
+    fallback->enable_symbol_capture();
+  }
+  void disable_symbol_capture() override
+  {
+    capture_symbols        = false;
+    captured_symbols_valid = false;
+    fallback->disable_symbol_capture();
+  }
+  span<const std::complex<float>> get_captured_symbols() const override
+  {
+    if (last_delegated) {
+      return fallback->get_captured_symbols();
+    }
+    return captured_symbols_valid ? span<const cf_t>(data_symbols).first(data_re_count) : span<const cf_t>{};
+  }
+  void wait_captured_symbols() override
+  {
+    if (last_delegated) {
+      fallback->wait_captured_symbols();
+    }
+  }
 
 private:
   std::optional<dapp::class_a_fallback_reason> preflight(const resource_grid_reader& grid,
@@ -548,17 +573,31 @@ private:
                                                                       {data_re_count, 1});
     metrics.post_equalization_noise.layout_id      = OCUDU_DAPP_LAYOUT_PUSCH_POST_EQ_NOISE_DATA_RE_LAYER_V1;
     metrics.post_equalization_noise.layout_version = 1;
+    if (capture_symbols) {
+      metrics.equalized_symbols                = make_host_tensor(data_symbols.data(),
+                                                   OCUDU_DAPP_ELEMENT_CF32_V1,
+                                                   OCUDU_DAPP_ACCESS_WRITE_V1,
+                                                   output_allocation_base + 2,
+                                                   output_generation,
+                                                                  {data_re_count, 1});
+      metrics.equalized_symbols.layout_id      = OCUDU_DAPP_LAYOUT_PUSCH_EQUALIZED_DATA_RE_LAYER_V1;
+      metrics.equalized_symbols.layout_version = 1;
+    }
     output.metrics                                 = make_metadata(OCUDU_DAPP_METADATA_RECEIVER_METRICS_V1, metrics);
     const auto expected_llrs                       = output.llrs;
     const auto expected_noise                      = metrics.post_equalization_noise;
+    const auto expected_symbols                    = metrics.equalized_symbols;
     const auto result                              = target->invoke(lane, input, output);
     if (result.status != OCUDU_DAPP_OK_V1 || result.invoke_fallback) {
       return false;
     }
     const bool metrics_valid = (output.reserved0 & OCUDU_DAPP_RECEIVER_METRICS_VALID_V1) != 0;
+    const bool symbols_valid = (output.reserved0 & OCUDU_DAPP_RECEIVER_EQUALIZED_SYMBOLS_VALID_V1) != 0;
     if (!dapp::same_tensor_storage(expected_llrs, output.llrs) ||
         (metrics_valid && !dapp::same_tensor_storage(expected_noise, metrics.post_equalization_noise)) ||
-        !commit_receiver(metrics_valid)) {
+        (symbols_valid &&
+         (!capture_symbols || !dapp::same_tensor_storage(expected_symbols, metrics.equalized_symbols))) ||
+        !commit_receiver(metrics_valid, symbols_valid)) {
       target->report_invalid_output(lane, mode, invocation);
       return false;
     }
@@ -598,10 +637,11 @@ private:
                               span<const cf_t>(data_symbols).first(data_re_count),
                               span<const float>(data_noise).first(data_re_count),
                               config.modulation);
+    captured_symbols_valid = capture_symbols;
     return true;
   }
 
-  bool commit_receiver(bool metrics_valid) noexcept
+  bool commit_receiver(bool metrics_valid, bool symbols_valid) noexcept
   {
     receiver_noise_valid   = false;
     const size_t llr_count = data_re_count * modulation_order;
@@ -619,6 +659,15 @@ private:
         data_noise[index] = std::max(data_noise[index], limits.noise_variance_floor);
       }
       receiver_noise_valid = true;
+    }
+    if (symbols_valid) {
+      // Diagnostics do not confer SINR authority or change the receiver's LLRs.
+      for (const cf_t value : span<const cf_t>(data_symbols).first(data_re_count)) {
+        if (!std::isfinite(value.real()) || !std::isfinite(value.imag())) {
+          return false;
+        }
+      }
+      captured_symbols_valid = true;
     }
     return true;
   }
@@ -764,6 +813,9 @@ private:
   }
 
   std::unique_ptr<pusch_demodulator>             fallback;
+  bool                                           last_delegated         = false;
+  bool                                           capture_symbols        = false;
+  bool                                           captured_symbols_valid = false;
   std::shared_ptr<pusch_dapp_demodulator_target> target;
   uint32_t                                       lane;
   std::unique_ptr<pseudo_random_generator>       pilot_prg;

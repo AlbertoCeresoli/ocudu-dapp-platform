@@ -56,6 +56,9 @@ public:
   virtual const float* channel_scheduler_noise_f32() const noexcept { return nullptr; }
   /// True when the most recent receiver invocation filled buffers.post_eq_noise_f32.
   virtual bool receiver_post_eq_noise_valid() const noexcept { return false; }
+
+  /// True only when the most recent receiver invocation supplied current equalized symbols.
+  virtual bool receiver_equalized_symbols_valid() const noexcept { return false; }
   /// Publishes the host-recorded event covering the most recent attempted module enqueue.
   virtual void on_completion(void* completion_token) noexcept = 0;
   /// Records the replacement boundary after the module and required continuation are enqueued.

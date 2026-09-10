@@ -19,6 +19,9 @@ struct portable_data_store_config {
   uint32_t maximum_chunk_bytes{64 * 1024};
   uint64_t minimum_lease_us{100'000};
   uint64_t maximum_lease_us{10'000'000};
+  /// Total metadata + tensor bytes copied across all subscribers by one
+  /// producer call. Whole objects beyond this budget are dropped (full).
+  uint64_t maximum_publication_copy_bytes{8ULL * 1024 * 1024};
 };
 
 struct portable_interface_demand {
@@ -68,7 +71,7 @@ public:
 
   /// Active-subscriber demand for one interface: how many subscribers are live,
   /// how many left the capture interval unspecified, and the fastest interval
-  /// requested. Lock-free; scans the subscription slots.
+  /// requested. Reads cached atomics; never scans shared ownership on the producer.
   portable_interface_demand demand(uint32_t interface_id) const noexcept;
 
   /// Copies one already-encoded metadata/tensor snapshot into each admitted subscriber queue.

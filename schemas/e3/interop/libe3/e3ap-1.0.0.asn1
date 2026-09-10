@@ -1,0 +1,148 @@
+-- Vendored verbatim from https://github.com/wineslab/libe3 messages/asn1/V1/e3ap-1.0.0.asn1
+-- at commit 6f44b6f (2026-09-01, library version 0.1.3) for the OCUDU <-> libe3
+-- interoperability tests in python/tests/test_libe3_interop.py. Do not edit; re-vendor.
+-- SPDX-FileCopyrightText: Copyright (c) 2026 Northeastern University
+-- SPDX-License-Identifier: Apache-2.0
+
+E3 DEFINITIONS AUTOMATIC TAGS ::= BEGIN
+
+    E3-SetupRequest ::= SEQUENCE {
+        e3apProtocolVersion  E3-Version,
+        dAppName             UTF8String (SIZE (1..64)),
+        dAppVersion          E3-Version,
+        vendor               UTF8String (SIZE (1..64)),
+        ...
+    }
+
+    E3-SetupResponse ::= SEQUENCE {
+        requestId            E3-MessageID,
+        responseCode         E3-ResponseCode,
+        ranIdentifier        UTF8String (SIZE (1..64)),
+        e3apProtocolVersion  E3-Version OPTIONAL,
+        dAppIdentifier       E3-DAppID OPTIONAL,
+        ranFunctionList      SEQUENCE OF E3-RanFunctionDefinition OPTIONAL,
+        ...
+    }
+
+    E3-SubscriptionRequest ::= SEQUENCE {
+        dAppIdentifier          E3-DAppID,
+        ranFunctionIdentifier   INTEGER (1..100),
+        telemetryIdentifierList SEQUENCE (SIZE (0..100)) OF INTEGER (1..100),
+        controlIdentifierList   SEQUENCE (SIZE (0..100)) OF INTEGER (1..100),
+        subscriptionTime        INTEGER (0..3600) OPTIONAL,
+        periodicity             INTEGER (0..1000) OPTIONAL,
+        ...
+    }
+
+    E3-SubscriptionDelete ::= SEQUENCE {
+        dAppIdentifier        E3-DAppID,
+        subscriptionId        INTEGER (1..100),
+        ...
+    }
+
+    E3-SubscriptionResponse ::= SEQUENCE {
+        requestId            E3-MessageID,
+        dAppIdentifier       E3-DAppID,
+        responseCode         E3-ResponseCode,
+        subscriptionId       INTEGER (1..100) OPTIONAL,
+        telemetryIdentifierList SEQUENCE (SIZE (0..100)) OF INTEGER (1..100) OPTIONAL,
+        controlIdentifierList   SEQUENCE (SIZE (0..100)) OF INTEGER (1..100) OPTIONAL,
+        ...
+    }
+
+    E3-RanFunctionDefinition ::= SEQUENCE {
+        ranFunctionIdentifier   INTEGER (1..100),
+        telemetryIdentifierList SEQUENCE (SIZE (0..100)) OF INTEGER (1..100),
+        controlIdentifierList   SEQUENCE (SIZE (0..100)) OF INTEGER (1..100),
+        ranFunctionData         OCTET STRING (SIZE (1..32768)),
+        ...
+    }
+
+    E3-IndicationMessage ::= SEQUENCE {
+        dAppIdentifier          E3-DAppID,
+        ranFunctionIdentifier   INTEGER (1..100),
+        protocolData            OCTET STRING (SIZE (1..32768)),
+        ...
+    }
+
+    E3-DAppControlAction ::= SEQUENCE {
+        dAppIdentifier          E3-DAppID,
+        ranFunctionIdentifier   INTEGER (1..100),
+        controlIdentifier       INTEGER (1..100),
+        actionData              OCTET STRING (SIZE (1..32768)),
+        ...
+    }
+
+    E3-DAppReport ::= SEQUENCE {
+        dAppIdentifier          E3-DAppID,
+        ranFunctionIdentifier   INTEGER (1..100),
+        reportData              OCTET STRING (SIZE (1..32768)),
+        ...
+    }
+
+    E3-XAppControlAction ::= SEQUENCE {
+        dAppIdentifier          E3-DAppID,
+        ranFunctionIdentifier   INTEGER (1..100),
+        xAppControlData         OCTET STRING (SIZE (1..32768)),
+        ...
+    }
+
+    E3-ReleaseMessage ::= SEQUENCE {
+        dAppIdentifier       E3-DAppID,
+        ...
+    }
+
+    E3-MessageAck ::= SEQUENCE {
+        requestId            E3-MessageID,
+        responseCode         E3-ResponseCode,
+        ...
+    }
+
+    E3-DAppID ::= INTEGER (1..100)
+    E3-MessageID ::= INTEGER (1..1000)
+    E3-Version ::= UTF8String (SIZE (1..11))
+    -- Deliberately not extensible. An extensible ENUMERATED makes asn1c pass
+    -- unknown values through as bare integers, which would turn every
+    -- response-code switch in the encoders into a partial function. Adding a
+    -- response code is a wire change we are willing to pay for explicitly.
+    E3-ResponseCode ::= ENUMERATED { positive(0), negative(1) }
+
+    -- Nanoseconds since the Unix epoch on the realtime (UTC) clock. Never
+    -- subtract it from a monotonic stamp.
+    --
+    -- Absent means "no producer reference", which is a normal message, not a
+    -- malformed one: a producer that does not want the clock read on its data
+    -- path simply omits it.
+    --
+    -- Unconstrained on purpose. asn1c renders this as a native signed integer
+    -- and APER length-prefixes it, so the field widens by itself instead of
+    -- capping the range, and the codec stays allocation-free on the
+    -- indication path.
+    --
+    -- Do not "tighten" this to INTEGER (0..MAX): a semi-constrained INTEGER is
+    -- APC_SEMI_CONSTRAINED, and asn1c 0.9.29's APER decoder has no branch for
+    -- that flag and fails every decode. An explicit upper bound works but
+    -- forces the arbitrary-precision INTEGER_t and a heap allocation per PDU.
+    E3-Timestamp ::= INTEGER
+
+    E3-PDU ::= SEQUENCE {
+        id        E3-MessageID,
+        timestamp E3-Timestamp OPTIONAL,
+        msg       CHOICE {
+            setupRequest          [0]  E3-SetupRequest,
+            setupResponse         [1]  E3-SetupResponse,
+            subscriptionRequest   [2]  E3-SubscriptionRequest,
+            subscriptionDelete    [3]  E3-SubscriptionDelete,
+            subscriptionResponse  [4]  E3-SubscriptionResponse,
+            indicationMessage     [5]  E3-IndicationMessage,
+            dAppControlAction     [6]  E3-DAppControlAction,
+            dAppReport            [7]  E3-DAppReport,
+            xAppControlAction     [8]  E3-XAppControlAction,
+            releaseMessage        [9]  E3-ReleaseMessage,
+            messageAck            [10] E3-MessageAck,
+            ...
+        },
+        ...
+    }
+
+END

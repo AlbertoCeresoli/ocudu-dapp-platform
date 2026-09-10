@@ -17,6 +17,13 @@ namespace ocudu {
 
 namespace detail {
 
+/// Rotate a pool bitmap without a word-width shift when the CPU scatter offset is zero.
+constexpr uint64_t rotate_pool_bitmap_right(uint64_t value, unsigned shift) noexcept
+{
+  shift &= 63U;
+  return (value >> shift) | (value << ((64U - shift) & 63U));
+}
+
 /// Helper class to collect pool metrics.
 template <bool Enabled = false>
 class bounded_object_pool_metrics_collector
@@ -165,7 +172,7 @@ public:
       // Find the first free object.
       while (true) {
         // Convert the busy bitmap into an available bitmap, but circularly rotated by the bit_shift amount.
-        uint64_t available_rotated = ~((busy_bitmap >> bit_shift) | (busy_bitmap << (64 - bit_shift)));
+        uint64_t available_rotated = ~rotate_pool_bitmap_right(busy_bitmap, bit_shift);
 
         // Find the first bit set to one in the available bitmap.
         uint64_t obj_idx = find_first_lsb_one(available_rotated);

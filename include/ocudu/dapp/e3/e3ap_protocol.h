@@ -56,6 +56,86 @@ enum class e3ap_cause : uint8_t {
 
 const char* to_string(e3ap_cause cause) noexcept;
 
+/// Requested tensor delivery for a subscription.
+enum class e3ap_delivery_mode : uint8_t { in_band, by_reference };
+
+/// Memory domain of a by-reference tensor. Values mirror the Class-C OCC3
+/// metadata (\c MemoryDomain in class-c-publication-v1.fbs).
+enum class e3ap_memory_domain : uint8_t {
+  host,
+  host_pinned,
+  accelerator_device,
+  managed_coherent,
+  posix_shared,
+  accelerator_ipc_export
+};
+
+/// Element type of a by-reference tensor. Values mirror the Class-C OCC3
+/// metadata (\c ElementType in class-c-publication-v1.fbs).
+enum class e3ap_element_type : uint8_t {
+  int8,
+  uint8,
+  int16,
+  uint16,
+  int32,
+  fp16,
+  bf16,
+  fp32,
+  complex_int16,
+  complex_bf16,
+  complex_fp16,
+  complex_fp32
+};
+
+/// One POSIX shared-memory region mapped by the RAN for a by-reference
+/// subscription and advertised once in the subscription response.
+struct e3ap_shared_region {
+  e3ap_memory_domain memory_domain{e3ap_memory_domain::posix_shared};
+  /// POSIX shared-memory name (\c shm_open), e.g. "/ocudu-e3-1234-1-1".
+  std::string region_name;
+  uint64_t    region_bytes{};
+  uint16_t    header_bytes{64};
+  uint64_t    row_bytes{};
+  uint16_t    nof_rows{};
+  uint16_t    layout_version{1};
+};
+
+/// Tensor located in a shared region row (CPU consumers).
+struct e3ap_posix_shared_location {
+  std::string region_name;
+  uint16_t    row_index{};
+  /// Offset of the tensor bytes from the start of the region.
+  uint64_t byte_offset{};
+};
+
+/// Tensor located in an accelerator IPC export (GPU consumers). The handles
+/// mirror the Class-C CUDA export slot: opaque 64-byte memory and ready-event
+/// handles interpreted only by the matching accelerator runtime.
+struct e3ap_accelerator_ipc_location {
+  uint16_t                               device_ordinal{};
+  uint64_t                               allocation_id{};
+  std::array<uint8_t, 64>                memory_handle{};
+  std::optional<std::array<uint8_t, 64>> ready_event_handle;
+  uint64_t                               byte_offset{};
+};
+
+using e3ap_tensor_location = std::variant<e3ap_posix_shared_location, e3ap_accelerator_ipc_location>;
+
+/// Locates one published tensor delivered by reference.
+struct e3ap_tensor_descriptor {
+  e3ap_memory_domain   memory_domain{e3ap_memory_domain::posix_shared};
+  e3ap_tensor_location location;
+  uint64_t             byte_length{};
+  /// Row (or slot) generation at publication; readers that observe a different
+  /// value after copying have read a torn row and must discard it.
+  uint64_t                         generation{};
+  std::optional<e3ap_element_type> element_type;
+  std::vector<uint32_t>            dimensions;
+  std::vector<uint64_t>            byte_strides;
+  std::optional<uint16_t>          layout_id;
+  std::optional<uint64_t>          lease_expiry_ns;
+};
+
 struct e3ap_ran_function_definition {
   uint16_t              ran_function_identifier{};
   std::vector<uint16_t> telemetry_identifiers;
@@ -121,6 +201,10 @@ struct e3ap_subscription_request {
   std::optional<uint32_t> periodicity_ms;
   /// Opaque APER Telemetry-SubscriptionData with per-telemetry filters.
   std::vector<uint8_t> subscription_data;
+  /// Ask for bulk tensors by reference through a shared region.
+  std::optional<e3ap_delivery_mode> delivery_mode;
+  /// Objects whose tensor is smaller than this stay in band.
+  std::optional<uint32_t> minimum_by_reference_bytes;
 };
 
 struct e3ap_subscription_delete {
@@ -137,6 +221,8 @@ struct e3ap_subscription_response {
   std::optional<std::vector<uint16_t>> control_identifiers;
   std::optional<e3ap_cause>            cause;
   std::string                          detail;
+  /// Present when by-reference delivery was granted.
+  std::optional<e3ap_shared_region> shared_region;
 };
 
 struct e3ap_indication_message {
@@ -149,6 +235,8 @@ struct e3ap_indication_message {
   uint16_t                fragment_index{};
   uint32_t                fragment_count{1};
   std::optional<uint32_t> payload_bytes;
+  /// Present when the record's bulk field was delivered by reference.
+  std::optional<e3ap_tensor_descriptor> by_reference;
 };
 
 struct e3ap_dapp_control_action {
@@ -212,8 +300,11 @@ using e3ap_message = std::variant<e3ap_setup_request,
                                   e3ap_control_response>;
 
 struct e3ap_pdu {
-  uint32_t     id{1};
-  e3ap_message message;
+  uint32_t id{1};
+  /// Producer realtime clock at send time in nanoseconds since the Unix epoch
+  /// (libe3-compatible envelope field); absent means no producer reference.
+  std::optional<int64_t> timestamp_ns;
+  e3ap_message           message;
 };
 
 // ---------------------------------------------------------------------------
@@ -282,7 +373,7 @@ struct pusch_grant_parameters {
   std::optional<uint8_t>  mcs_index; ///< TS 38.214 MCS row; absent when unknown.
   std::optional<uint8_t>  mcs_table; ///< 0 qam64, 1 qam256, 2 qam64LowSe.
   bool                    transform_precoding{};
-  std::optional<uint16_t> n_rs_id; ///< DFT-s-OFDM low-PAPR sequence group id.
+  std::optional<uint16_t> n_rs_id;         ///< DFT-s-OFDM low-PAPR sequence group id.
   uint8_t                 cyclic_prefix{}; ///< 0 normal, 1 extended.
   /// Time allocation: first OFDM symbol and symbol count within the slot.
   uint8_t start_symbol{};

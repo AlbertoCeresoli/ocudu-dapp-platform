@@ -105,13 +105,23 @@ class E3Codec:
 
     # E3AP envelope helpers -------------------------------------------------
 
-    def encode_pdu(self, pdu_id: int, message_name: str, body: dict) -> bytes:
-        return self.encode("E3-PDU", {"id": pdu_id, "msg": (message_name, body)})
+    def encode_pdu(self, pdu_id: int, message_name: str, body: dict, timestamp_ns: int | None = None) -> bytes:
+        """Encode one E3-PDU; ``timestamp_ns`` fills the optional libe3-style envelope timestamp."""
+        pdu = {"id": pdu_id, "msg": (message_name, body)}
+        if timestamp_ns is not None:
+            pdu["timestamp"] = int(timestamp_ns)
+        return self.encode("E3-PDU", pdu)
 
     def decode_pdu(self, data: bytes) -> tuple[int, str, dict]:
+        pdu_id, _timestamp, name, body = self.decode_pdu_with_timestamp(data)
+        return pdu_id, name, body
+
+    def decode_pdu_with_timestamp(self, data: bytes) -> tuple[int, int | None, str, dict]:
+        """Decode one E3-PDU returning (id, timestamp_ns or None, message name, body)."""
         decoded = self.decode("E3-PDU", data)
         name, body = decoded["msg"]
-        return int(decoded["id"]), name, body
+        timestamp = decoded.get("timestamp")
+        return int(decoded["id"]), (int(timestamp) if timestamp is not None else None), name, body
 
 
 def load_codec(schema_dir: str | os.PathLike[str] | None = None) -> E3Codec:

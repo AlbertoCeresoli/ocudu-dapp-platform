@@ -9,8 +9,11 @@ extern "C" {
 #include "E3-ControlResponse.h"
 #include "E3-DAppControlAction.h"
 #include "E3-DAppReport.h"
+#include "E3-DeliveryMode.h"
+#include "E3-ElementType.h"
 #include "E3-IdentifierList.h"
 #include "E3-IndicationMessage.h"
+#include "E3-MemoryDomain.h"
 #include "E3-MessageAck.h"
 #include "E3-PDU.h"
 #include "E3-RanFunctionDefinition.h"
@@ -18,9 +21,13 @@ extern "C" {
 #include "E3-ResponseCode.h"
 #include "E3-SetupRequest.h"
 #include "E3-SetupResponse.h"
+#include "E3-SharedRegion.h"
 #include "E3-SubscriptionDelete.h"
 #include "E3-SubscriptionRequest.h"
 #include "E3-SubscriptionResponse.h"
+#include "E3-TensorDescriptor.h"
+#include "E3-TensorLocation.h"
+#include "E3-Timestamp.h"
 #include "E3-XAppControlAction.h"
 #include "GnbMetricsJsonRecord.h"
 #include "Mgmt-RanFunctionData.h"
@@ -48,6 +55,7 @@ extern "C" {
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <type_traits>
 
 using namespace ocudu::dapp;
 using namespace ocudu::dapp::e3;
@@ -391,6 +399,219 @@ e3ap_setup_response read_message(const E3_SetupResponse_t& source)
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// By-reference bulk data: shared region and tensor descriptor
+// ---------------------------------------------------------------------------
+
+long to_wire(e3ap_memory_domain domain) noexcept
+{
+  return static_cast<long>(domain);
+}
+
+e3ap_memory_domain read_memory_domain(long value)
+{
+  if (value < 0 || value > static_cast<long>(e3ap_memory_domain::accelerator_ipc_export)) {
+    throw std::runtime_error("unknown E3 memory domain");
+  }
+  return static_cast<e3ap_memory_domain>(value);
+}
+
+long to_wire(e3ap_element_type type) noexcept
+{
+  return static_cast<long>(type);
+}
+
+e3ap_element_type read_element_type(long value)
+{
+  if (value < 0 || value > static_cast<long>(e3ap_element_type::complex_fp32)) {
+    throw std::runtime_error("unknown E3 element type");
+  }
+  return static_cast<e3ap_element_type>(value);
+}
+
+void set_region(E3_SharedRegion_t& destination, const e3ap_shared_region& source)
+{
+  if (source.region_name.empty() || source.region_name.size() > maximum_name_bytes) {
+    throw std::runtime_error("shared region name is empty or too long");
+  }
+  if (source.row_bytes == 0 || source.nof_rows == 0) {
+    throw std::runtime_error("shared region needs at least one non-empty row");
+  }
+  destination.memoryDomain = to_wire(source.memory_domain);
+  set_text(destination.regionName, source.region_name);
+  set_u64(destination.regionBytes, source.region_bytes);
+  set_u64(destination.headerBytes, source.header_bytes);
+  set_u64(destination.rowBytes, source.row_bytes);
+  set_u64(destination.nofRows, read_ranged(source.nof_rows, 1, 65535, "shared region rows"));
+  set_u64(destination.layoutVersion, source.layout_version);
+}
+
+e3ap_shared_region read_region(const E3_SharedRegion_t& source)
+{
+  e3ap_shared_region result;
+  result.memory_domain  = read_memory_domain(source.memoryDomain);
+  result.region_name    = read_string(source.regionName, maximum_name_bytes);
+  result.region_bytes   = read_u64(source.regionBytes);
+  result.header_bytes   = read_u16(source.headerBytes, "shared region header bytes");
+  result.row_bytes      = read_u64(source.rowBytes);
+  result.nof_rows       = read_id16(source.nofRows, "shared region rows");
+  result.layout_version = read_u16(source.layoutVersion, "shared region layout version");
+  if (result.region_name.empty() || result.row_bytes == 0) {
+    throw std::runtime_error("shared region is malformed");
+  }
+  return result;
+}
+
+void set_descriptor(E3_TensorDescriptor_t& destination, const e3ap_tensor_descriptor& source)
+{
+  destination.memoryDomain = to_wire(source.memory_domain);
+  destination.location     = make_asn<E3_TensorLocation_t>();
+  std::visit(
+      [&](const auto& location) {
+        using location_type = std::decay_t<decltype(location)>;
+        if constexpr (std::is_same_v<location_type, e3ap_posix_shared_location>) {
+          if (location.region_name.empty() || location.region_name.size() > maximum_name_bytes) {
+            throw std::runtime_error("tensor region name is empty or too long");
+          }
+          auto& shared                  = *(destination.location->choice.posixShared =
+                               make_asn<std::remove_pointer_t<decltype(destination.location->choice.posixShared)>>());
+          destination.location->present = E3_TensorLocation_PR_posixShared;
+          set_text(shared.regionName, location.region_name);
+          set_u64(shared.rowIndex, location.row_index);
+          set_u64(shared.byteOffset, location.byte_offset);
+        } else {
+          auto& ipc                     = *(destination.location->choice.acceleratorIpc =
+                            make_asn<std::remove_pointer_t<decltype(destination.location->choice.acceleratorIpc)>>());
+          destination.location->present = E3_TensorLocation_PR_acceleratorIpc;
+          set_u64(ipc.deviceOrdinal, location.device_ordinal);
+          set_u64(ipc.allocationId, location.allocation_id);
+          set_octets(ipc.memoryHandle, location.memory_handle.data(), location.memory_handle.size());
+          if (location.ready_event_handle) {
+            ipc.readyEventHandle = make_asn<OCTET_STRING_t>();
+            set_octets(*ipc.readyEventHandle, location.ready_event_handle->data(), location.ready_event_handle->size());
+          }
+          set_u64(ipc.byteOffset, location.byte_offset);
+        }
+      },
+      source.location);
+  set_u64(destination.byteLength, source.byte_length);
+  set_u64(destination.generation, source.generation);
+  if (source.element_type) {
+    destination.elementType  = make_asn<E3_ElementType_t>();
+    *destination.elementType = to_wire(*source.element_type);
+  }
+  if (!source.dimensions.empty()) {
+    if (source.dimensions.size() > 8) {
+      throw std::runtime_error("tensor descriptor carries more than eight dimensions");
+    }
+    destination.dimensions = make_asn<std::remove_pointer_t<decltype(destination.dimensions)>>();
+    for (const uint32_t dimension : source.dimensions) {
+      long* item = make_asn<long>();
+      *item      = static_cast<long>(dimension);
+      if (ASN_SEQUENCE_ADD(&destination.dimensions->list, item) != 0) {
+        std::free(item);
+        throw std::bad_alloc();
+      }
+    }
+  }
+  if (!source.byte_strides.empty()) {
+    if (source.byte_strides.size() > 8) {
+      throw std::runtime_error("tensor descriptor carries more than eight strides");
+    }
+    destination.byteStrides = make_asn<std::remove_pointer_t<decltype(destination.byteStrides)>>();
+    for (const uint64_t stride : source.byte_strides) {
+      auto* item = make_asn<E3_Unsigned64_t>();
+      set_u64(*item, stride);
+      if (ASN_SEQUENCE_ADD(&destination.byteStrides->list, item) != 0) {
+        ASN_STRUCT_FREE(asn_DEF_E3_Unsigned64, item);
+        throw std::bad_alloc();
+      }
+    }
+  }
+  set_optional_long(destination.layoutId, source.layout_id);
+  set_optional_u64(destination.leaseExpiryNs, source.lease_expiry_ns);
+}
+
+e3ap_tensor_descriptor read_descriptor(const E3_TensorDescriptor_t& source)
+{
+  e3ap_tensor_descriptor result;
+  result.memory_domain = read_memory_domain(source.memoryDomain);
+  if (source.location == nullptr) {
+    throw std::runtime_error("tensor descriptor misses its location");
+  }
+  switch (source.location->present) {
+    case E3_TensorLocation_PR_posixShared: {
+      const auto&                shared = *source.location->choice.posixShared;
+      e3ap_posix_shared_location location;
+      location.region_name = read_string(shared.regionName, maximum_name_bytes);
+      location.row_index   = read_u16(shared.rowIndex, "tensor row index");
+      location.byte_offset = read_u64(shared.byteOffset);
+      result.location      = location;
+      break;
+    }
+    case E3_TensorLocation_PR_acceleratorIpc: {
+      const auto&                   ipc = *source.location->choice.acceleratorIpc;
+      e3ap_accelerator_ipc_location location;
+      location.device_ordinal = read_u16(ipc.deviceOrdinal, "tensor device ordinal");
+      location.allocation_id  = read_u64(ipc.allocationId);
+      const auto handle       = read_bytes(ipc.memoryHandle, 64);
+      if (handle.size() != location.memory_handle.size()) {
+        throw std::runtime_error("accelerator memory handle must be 64 bytes");
+      }
+      std::copy(handle.begin(), handle.end(), location.memory_handle.begin());
+      if (ipc.readyEventHandle != nullptr) {
+        const auto event = read_bytes(*ipc.readyEventHandle, 64);
+        if (event.size() != 64) {
+          throw std::runtime_error("accelerator event handle must be 64 bytes");
+        }
+        std::array<uint8_t, 64> value{};
+        std::copy(event.begin(), event.end(), value.begin());
+        location.ready_event_handle = value;
+      }
+      location.byte_offset = read_u64(ipc.byteOffset);
+      result.location      = location;
+      break;
+    }
+    default:
+      throw std::runtime_error("unknown tensor location");
+  }
+  result.byte_length = read_u64(source.byteLength);
+  result.generation  = read_u64(source.generation);
+  if (source.elementType != nullptr) {
+    result.element_type = read_element_type(*source.elementType);
+  }
+  if (source.dimensions != nullptr) {
+    if (source.dimensions->list.count < 0 || source.dimensions->list.count > 8) {
+      throw std::runtime_error("tensor descriptor dimensions exceed their bound");
+    }
+    for (int index = 0; index != source.dimensions->list.count; ++index) {
+      if (source.dimensions->list.array[index] == nullptr) {
+        throw std::runtime_error("tensor dimension is missing");
+      }
+      result.dimensions.push_back(
+          static_cast<uint32_t>(read_ranged(*source.dimensions->list.array[index], 0, 4294967295ULL, "dimension")));
+    }
+  }
+  if (source.byteStrides != nullptr) {
+    if (source.byteStrides->list.count < 0 || source.byteStrides->list.count > 8) {
+      throw std::runtime_error("tensor descriptor strides exceed their bound");
+    }
+    for (int index = 0; index != source.byteStrides->list.count; ++index) {
+      if (source.byteStrides->list.array[index] == nullptr) {
+        throw std::runtime_error("tensor stride is missing");
+      }
+      result.byte_strides.push_back(read_u64(*source.byteStrides->list.array[index]));
+    }
+  }
+  if (source.layoutId != nullptr) {
+    result.layout_id = read_u16(*source.layoutId, "layout id");
+  }
+  if (source.leaseExpiryNs != nullptr) {
+    result.lease_expiry_ns = read_u64(*source.leaseExpiryNs);
+  }
+  return result;
+}
+
 void set_message(E3_PDU_t& pdu, const e3ap_subscription_request& source)
 {
   auto& destination = *(pdu.msg.choice.subscriptionRequest = make_asn<E3_SubscriptionRequest_t>());
@@ -414,6 +635,14 @@ void set_message(E3_PDU_t& pdu, const e3ap_subscription_request& source)
     destination.subscriptionData = make_asn<OCTET_STRING_t>();
     set_octets(*destination.subscriptionData, source.subscription_data);
   }
+  if (source.delivery_mode) {
+    destination.deliveryMode  = make_asn<E3_DeliveryMode_t>();
+    *destination.deliveryMode = static_cast<long>(*source.delivery_mode);
+  }
+  if (source.minimum_by_reference_bytes) {
+    read_ranged(*source.minimum_by_reference_bytes, 0, e3ap_maximum_payload_bytes, "minimum by-reference bytes");
+  }
+  set_optional_long(destination.minimumByReferenceBytes, source.minimum_by_reference_bytes);
 }
 
 e3ap_subscription_request read_message(const E3_SubscriptionRequest_t& source)
@@ -435,6 +664,16 @@ e3ap_subscription_request read_message(const E3_SubscriptionRequest_t& source)
   }
   if (source.subscriptionData != nullptr) {
     result.subscription_data = read_bytes(*source.subscriptionData, e3ap_maximum_function_data);
+  }
+  if (source.deliveryMode != nullptr) {
+    if (*source.deliveryMode < 0 || *source.deliveryMode > static_cast<long>(e3ap_delivery_mode::by_reference)) {
+      throw std::runtime_error("unknown E3 delivery mode");
+    }
+    result.delivery_mode = static_cast<e3ap_delivery_mode>(*source.deliveryMode);
+  }
+  if (source.minimumByReferenceBytes != nullptr) {
+    result.minimum_by_reference_bytes = static_cast<uint32_t>(
+        read_ranged(*source.minimumByReferenceBytes, 0, e3ap_maximum_payload_bytes, "minimum by-reference bytes"));
   }
   return result;
 }
@@ -471,6 +710,10 @@ void set_message(E3_PDU_t& pdu, const e3ap_subscription_response& source)
   }
   set_optional_cause(destination.cause, source.cause);
   set_optional_text(destination.detail, source.detail);
+  if (source.shared_region) {
+    destination.sharedRegion = make_asn<E3_SharedRegion_t>();
+    set_region(*destination.sharedRegion, *source.shared_region);
+  }
 }
 
 e3ap_subscription_response read_message(const E3_SubscriptionResponse_t& source)
@@ -490,6 +733,9 @@ e3ap_subscription_response read_message(const E3_SubscriptionResponse_t& source)
   }
   result.cause  = read_optional_cause(source.cause);
   result.detail = read_optional_text(source.detail);
+  if (source.sharedRegion != nullptr) {
+    result.shared_region = read_region(*source.sharedRegion);
+  }
   return result;
 }
 
@@ -509,6 +755,10 @@ void set_message(E3_PDU_t& pdu, const e3ap_indication_message& source)
                       source.fragment_index,
                       source.fragment_count,
                       source.payload_bytes);
+  if (source.by_reference) {
+    destination.byReference = make_asn<E3_TensorDescriptor_t>();
+    set_descriptor(*destination.byReference, *source.by_reference);
+  }
 }
 
 e3ap_indication_message read_message(const E3_IndicationMessage_t& source)
@@ -535,6 +785,9 @@ e3ap_indication_message read_message(const E3_IndicationMessage_t& source)
                        result.fragment_index,
                        result.fragment_count,
                        result.payload_bytes);
+  if (source.byReference != nullptr) {
+    result.by_reference = read_descriptor(*source.byReference);
+  }
   return result;
 }
 
@@ -1153,8 +1406,7 @@ void set_object(Telemetry_Object_t& destination, const gnb_metrics_json_record& 
 {
   auto& record        = *(destination.choice.gnbMetricsJson = make_asn<GnbMetricsJsonRecord_t>());
   destination.present = Telemetry_Object_PR_gnbMetricsJson;
-  if (source.json.empty() || source.json.size() > e3ap_maximum_payload_bytes ||
-      !valid_utf8(source.json.data(), source.json.size())) {
+  if (source.json.size() > e3ap_maximum_payload_bytes || !valid_utf8(source.json.data(), source.json.size())) {
     throw std::runtime_error("gNB metrics JSON must be nonempty UTF-8 within the bound");
   }
   set_octets(record.json, source.json);
@@ -1164,7 +1416,7 @@ gnb_metrics_json_record read_object(const GnbMetricsJsonRecord_t& source)
 {
   gnb_metrics_json_record result;
   result.json = read_bytes(source.json, e3ap_maximum_payload_bytes);
-  if (result.json.empty() || !valid_utf8(result.json.data(), result.json.size())) {
+  if (!result.json.empty() && !valid_utf8(result.json.data(), result.json.size())) {
     throw std::runtime_error("gNB metrics JSON must be nonempty UTF-8");
   }
   return result;
@@ -1175,7 +1427,8 @@ void set_object(Telemetry_Object_t& destination, const class_c_portable_record& 
   auto& record        = *(destination.choice.classCPortable = make_asn<ClassCPortableRecord_t>());
   destination.present = Telemetry_Object_PR_classCPortable;
   set_u64(record.interfaceId, read_ranged(source.interface_id, 1, 4294967295ULL, "interface id"));
-  if (source.metadata.size() > 65536 || source.tensor.empty() || source.tensor.size() > e3ap_maximum_payload_bytes) {
+  // An empty tensor is legal: the bytes were delivered by reference.
+  if (source.metadata.size() > 65536 || source.tensor.size() > e3ap_maximum_payload_bytes) {
     throw std::runtime_error("Class-C portable record exceeds its bounds");
   }
   set_octets(record.metadata, source.metadata);
@@ -1188,9 +1441,6 @@ class_c_portable_record read_object(const ClassCPortableRecord_t& source)
   result.interface_id = static_cast<uint32_t>(read_ranged(source.interfaceId, 1, 4294967295ULL, "interface id"));
   result.metadata     = read_bytes(source.metadata, 65536);
   result.tensor       = read_bytes(source.tensor, e3ap_maximum_payload_bytes);
-  if (result.tensor.empty()) {
-    throw std::runtime_error("Class-C portable tensor is empty");
-  }
   return result;
 }
 
@@ -1476,6 +1726,10 @@ codec_result<std::vector<uint8_t>> e3ap_codec::encode(const e3ap_pdu& pdu) noexc
 {
   return encode_with<E3_PDU_t>(asn_DEF_E3_PDU, maximum_pdu_bytes, [&](E3_PDU_t& value) {
     set_u64(value.id, read_ranged(pdu.id, 1, 4294967295ULL, "PDU id"));
+    if (pdu.timestamp_ns) {
+      value.timestamp  = make_asn<E3_Timestamp_t>();
+      *value.timestamp = static_cast<long>(*pdu.timestamp_ns);
+    }
     std::visit([&](const auto& message) { set_message(value, message); }, pdu.message);
   });
 }
@@ -1485,6 +1739,9 @@ codec_result<e3ap_pdu> e3ap_codec::decode(ocudu::span<const uint8_t> bytes) noex
   return decode_with<e3ap_pdu, E3_PDU_t>(asn_DEF_E3_PDU, bytes, maximum_pdu_bytes, "E3-PDU", [](const E3_PDU_t& value) {
     e3ap_pdu result;
     result.id = static_cast<uint32_t>(read_ranged(value.id, 1, 4294967295ULL, "PDU id"));
+    if (value.timestamp != nullptr) {
+      result.timestamp_ns = static_cast<int64_t>(*value.timestamp);
+    }
     switch (value.msg.present) {
       case E3_PDU__msg_PR_setupRequest:
         result.message = read_message(*value.msg.choice.setupRequest);
@@ -1618,7 +1875,8 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
                                                                 uint64_t                   route_epoch,
                                                                 uint64_t                   dropped_objects,
                                                                 ocudu::span<const uint8_t> metadata,
-                                                                ocudu::span<const uint8_t> tensor) noexcept
+                                                                ocudu::span<const uint8_t> tensor,
+                                                                bool                       include_bulk) noexcept
 {
   try {
     const auto telemetry_id = telemetry_id_for(interface_id);
@@ -1637,7 +1895,9 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
       class_c_portable_record record;
       record.interface_id = interface_id;
       record.metadata.assign(metadata.begin(), metadata.end());
-      record.tensor.assign(tensor.begin(), tensor.end());
+      if (include_bulk) {
+        record.tensor.assign(tensor.begin(), tensor.end());
+      }
       result.monotonic_ns = 0;
       result.object       = std::move(record);
       return {std::move(result), {}};
@@ -1692,7 +1952,9 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
         record.time_alignment_us = optional_float(source.time_alignment_us);
         record.cfo_hz            = optional_float(source.cfo_hz);
         record.target_code_rate  = optional_float(source.target_code_rate);
-        record.equalized_symbols.assign(tensor.begin(), tensor.end());
+        if (include_bulk) {
+          record.equalized_symbols.assign(tensor.begin(), tensor.end());
+        }
         result.object = std::move(record);
         break;
       }
@@ -1710,7 +1972,9 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
         record.start_symbol = source.start_symbol;
         record.nof_symbols  = source.nof_symbols;
         record.grant        = grant_from_packed(source.grant);
-        record.resource_elements.assign(tensor.begin(), tensor.end());
+        if (include_bulk) {
+          record.resource_elements.assign(tensor.begin(), tensor.end());
+        }
         result.object = std::move(record);
         break;
       }
@@ -1760,7 +2024,9 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
         record.frequency_position         = source.frequency_position;
         record.frequency_shift            = source.frequency_shift;
         record.frequency_hopping          = source.frequency_hopping;
-        record.coefficients.assign(tensor.begin(), tensor.end());
+        if (include_bulk) {
+          record.coefficients.assign(tensor.begin(), tensor.end());
+        }
         result.object = std::move(record);
         break;
       }
@@ -1795,7 +2061,9 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
         record.time_alignment_us           = optional_float(source.time_alignment_us);
         record.cfo_hz                      = optional_float(source.cfo_hz);
         record.target_code_rate            = optional_float(source.target_code_rate);
-        record.estimates.assign(tensor.begin(), tensor.end());
+        if (include_bulk) {
+          record.estimates.assign(tensor.begin(), tensor.end());
+        }
         result.object = std::move(record);
         break;
       }
@@ -1804,7 +2072,9 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
           return {std::nullopt, "gNB metrics metadata size mismatch"};
         }
         gnb_metrics_json_record record;
-        record.json.assign(tensor.begin(), tensor.end());
+        if (include_bulk) {
+          record.json.assign(tensor.begin(), tensor.end());
+        }
         result.object = std::move(record);
         break;
       }

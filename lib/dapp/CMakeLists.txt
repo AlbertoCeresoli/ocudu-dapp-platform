@@ -89,9 +89,22 @@ if (ENABLE_E3)
   endif ()
 
   if (ENABLE_E3_ASN1_CODEC)
-    find_program(ASN1C_EXECUTABLE asn1c HINTS /opt/asn1c/bin)
+    # The pinned generator (third_party/asn1c) is built at configure time; see
+    # cmake/modules/OCUDUAsn1c.cmake for the overrides.
+    include(${PROJECT_SOURCE_DIR}/cmake/modules/OCUDUAsn1c.cmake)
     if (NOT ASN1C_EXECUTABLE)
-      message(FATAL_ERROR "ENABLE_E3_ASN1_CODEC requires an asn1c build with -gen-APER support")
+      message(FATAL_ERROR "ENABLE_E3_ASN1_CODEC requires asn1c: check out third_party/asn1c "
+        "(git submodule update --init) or set ASN1C_EXECUTABLE")
+    endif ()
+    # The vendored libe3 grammar must be the submodule's file.
+    set(E3_LIBE3_SUBMODULE_SCHEMA ${PROJECT_SOURCE_DIR}/third_party/libe3/messages/asn1/V1/e3ap-1.0.0.asn1)
+    if (EXISTS ${E3_LIBE3_SUBMODULE_SCHEMA})
+      file(READ ${E3_LIBE3_SUBMODULE_SCHEMA} E3_LIBE3_UPSTREAM_TEXT)
+      file(READ ${PROJECT_SOURCE_DIR}/schemas/e3/interop/libe3/e3ap-1.0.0.asn1 E3_LIBE3_VENDORED_TEXT)
+      string(FIND "${E3_LIBE3_VENDORED_TEXT}" "${E3_LIBE3_UPSTREAM_TEXT}" E3_LIBE3_VENDORED_MATCH)
+      if (E3_LIBE3_VENDORED_MATCH EQUAL -1)
+        message(FATAL_ERROR "schemas/e3/interop/libe3/e3ap-1.0.0.asn1 differs from third_party/libe3; re-vendor it")
+      endif ()
     endif ()
 
     set(E3_ASN1_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/e3sm_asn1)
@@ -134,6 +147,54 @@ if (ENABLE_E3)
     target_compile_options(ocudu_dapp_e3sm_asn1 PRIVATE -w)
     target_link_libraries(ocudu_dapp_e3sm_asn1 PUBLIC m)
 
+    # Upstream libe3 E3AP 1.0.0 module (schemas/e3/interop/libe3), generated
+    # verbatim with a type prefix so its E3-PDU family links beside OCUDU's.
+    # Only the prefixed module files are compiled here; the asn1c runtime is
+    # shared with ocudu_dapp_e3sm_asn1 (same generator, same skeletons), except
+    # for the few runtime units the OCUDU modules never needed (UTF8String).
+    set(E3_LIBE3_SCHEMA ${PROJECT_SOURCE_DIR}/schemas/e3/interop/libe3/e3ap-1.0.0.asn1)
+    set(E3_LIBE3_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/e3ap_libe3_asn1)
+    file(MAKE_DIRECTORY ${E3_LIBE3_GENERATED_DIR})
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${E3_LIBE3_SCHEMA})
+    file(GLOB E3_LIBE3_STALE ${E3_LIBE3_GENERATED_DIR}/*.c ${E3_LIBE3_GENERATED_DIR}/*.h)
+    if (E3_LIBE3_STALE)
+      file(REMOVE ${E3_LIBE3_STALE})
+    endif ()
+    execute_process(
+      COMMAND ${ASN1C_EXECUTABLE}
+        -pdu=E3-PDU
+        -gen-APER -no-gen-UPER -no-gen-JER -no-gen-BER -no-gen-XER
+        -no-gen-CBOR -no-gen-OER -no-gen-print -no-gen-random-fill
+        -fgen-only-pdu-deps -fno-include-deps -fcompound-names
+        -findirect-choice -flong-size=${E3_ASN1_LONG_BITS} -no-gen-example
+        -fprefix=LIBE3_
+        -D ${E3_LIBE3_GENERATED_DIR} ${E3_LIBE3_SCHEMA}
+      RESULT_VARIABLE E3_LIBE3_ASN1C_RESULT
+      OUTPUT_QUIET ERROR_VARIABLE E3_LIBE3_ASN1C_ERROR)
+    if (NOT E3_LIBE3_ASN1C_RESULT EQUAL 0)
+      message(FATAL_ERROR "asn1c failed to generate the libe3 E3AP codec: ${E3_LIBE3_ASN1C_ERROR}")
+    endif ()
+    file(GLOB E3_LIBE3_MODULE_SOURCES CONFIGURE_DEPENDS ${E3_LIBE3_GENERATED_DIR}/LIBE3_*.c)
+    file(GLOB E3_LIBE3_RUNTIME_SOURCES CONFIGURE_DEPENDS ${E3_LIBE3_GENERATED_DIR}/*.c)
+    foreach (runtime_source ${E3_LIBE3_RUNTIME_SOURCES})
+      get_filename_component(runtime_name ${runtime_source} NAME)
+      if (runtime_name MATCHES "^LIBE3_" OR EXISTS ${E3_ASN1_GENERATED_DIR}/${runtime_name})
+        continue()
+      endif ()
+      list(APPEND E3_LIBE3_MODULE_SOURCES ${runtime_source})
+    endforeach ()
+    add_library(ocudu_dapp_libe3_asn1 STATIC ${E3_LIBE3_MODULE_SOURCES})
+    set_target_properties(ocudu_dapp_libe3_asn1 PROPERTIES
+      EXPORT_NAME DAppLibE3Asn1
+      POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(ocudu_dapp_libe3_asn1 SYSTEM PRIVATE ${E3_ASN1_GENERATED_DIR} ${E3_LIBE3_GENERATED_DIR})
+    target_compile_definitions(ocudu_dapp_libe3_asn1 PRIVATE
+      ASN_DISABLE_BER_SUPPORT ASN_DISABLE_XER_SUPPORT ASN_DISABLE_OER_SUPPORT
+      ASN_DISABLE_UPER_SUPPORT ASN_DISABLE_PRINT_SUPPORT ASN_DISABLE_RFILL_SUPPORT
+      ASN_DISABLE_JER_SUPPORT ASN_DISABLE_CBOR_SUPPORT)
+    target_compile_options(ocudu_dapp_libe3_asn1 PRIVATE -w)
+    target_link_libraries(ocudu_dapp_libe3_asn1 PUBLIC ocudu_dapp_e3sm_asn1)
+
     add_library(ocudu_dapp_e3_codec STATIC e3/aper_codec.cpp)
     set_target_properties(ocudu_dapp_e3_codec PROPERTIES
       EXPORT_NAME DAppE3Codec
@@ -161,15 +222,15 @@ if (ENABLE_E3)
 
     # E3AP-OCUDU-V1 codec: envelope plus the telemetry and management-carrier
     # service models. Independent clients may link it without the runtime.
-    add_library(ocudu_dapp_e3ap_codec STATIC e3/e3ap_codec.cpp e3/e3ap_protocol.cpp)
+    add_library(ocudu_dapp_e3ap_codec STATIC e3/e3ap_codec.cpp e3/e3ap_libe3_codec.cpp e3/e3ap_protocol.cpp)
     set_target_properties(ocudu_dapp_e3ap_codec PROPERTIES
       EXPORT_NAME DAppE3apCodec
       POSITION_INDEPENDENT_CODE ON)
     target_include_directories(ocudu_dapp_e3ap_codec PUBLIC
       $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-    target_include_directories(ocudu_dapp_e3ap_codec SYSTEM PRIVATE ${E3_ASN1_GENERATED_DIR})
-    target_link_libraries(ocudu_dapp_e3ap_codec PUBLIC ocudu_dapp_e3sm_asn1 ocudu_dapp_management)
+    target_include_directories(ocudu_dapp_e3ap_codec SYSTEM PRIVATE ${E3_ASN1_GENERATED_DIR} ${E3_LIBE3_GENERATED_DIR})
+    target_link_libraries(ocudu_dapp_e3ap_codec PUBLIC ocudu_dapp_e3sm_asn1 ocudu_dapp_libe3_asn1 ocudu_dapp_management)
 
     # SCTP carriers: shared association core, E3AP endpoint, and the optional
     # FlatBuffers data-profile endpoint compatible with the E3 SCTP reference
@@ -178,6 +239,7 @@ if (ENABLE_E3)
     add_library(ocudu_dapp_e3_sctp STATIC
       e3/sctp_association_server.cpp
       e3/e3ap_sctp_server.cpp
+      e3/shared_region.cpp
       e3/telemetry_publisher.cpp)
     target_include_directories(ocudu_dapp_e3_sctp PUBLIC ${PROJECT_SOURCE_DIR}/include)
     target_link_libraries(ocudu_dapp_e3_sctp PUBLIC ocudu_dapp_e3ap_codec ocudu_dapp_e3_codec PRIVATE ocudu_dapp_runtime)

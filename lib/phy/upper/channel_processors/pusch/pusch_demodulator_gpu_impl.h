@@ -429,6 +429,8 @@ private:
   /// True when the last slot's SINR readback copies were routed to d2h_stream_
   /// (OCUDU_PUSCH_SINR_SIDE_STREAM); report_deferred_sinr must sync d2h_complete_.
   bool last_sinr_on_side_stream_        = false;
+  bool last_metrics_submission_ok_      = false;
+  bool last_metrics_fence_recorded_     = false;
   bool gpu_uci_device_decode_requested_ = false;
   /// True when the current demodulation wrote data through the host codeword buffer.
   bool host_codeword_written_ = false;

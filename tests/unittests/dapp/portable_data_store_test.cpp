@@ -60,6 +60,49 @@ portable_publication_source publication(uint64_t                    sequence,
 
 } // namespace
 
+TEST(portable_data_store_test, fanout_copy_budget_drops_whole_objects_and_rotates_admission)
+{
+  auto config                           = test_config();
+  config.maximum_publication_copy_bytes = 1040;
+  auto [store, detail]                  = portable_data_store::create(config);
+  ASSERT_NE(store, nullptr) << detail;
+  ASSERT_TRUE(store->subscribe(request(1)));
+  ASSERT_TRUE(store->subscribe(request(2)));
+  const std::vector<uint8_t> metadata(16, 7), tensor(1024, 9);
+  EXPECT_EQ(store->publish(publication(1, metadata, tensor)), portable_publish_result::published);
+  auto first  = store->poll(make_id(1), 8);
+  auto second = store->poll(make_id(2), 8);
+  ASSERT_EQ(first.chunks.size(), 1U);
+  EXPECT_TRUE(second.chunks.empty());
+  EXPECT_EQ(first.chunks[0].tensor_chunk, tensor);
+  EXPECT_EQ(store->publish(publication(2, metadata, tensor)), portable_publish_result::published);
+  EXPECT_TRUE(store->poll(make_id(1), 8).chunks.empty());
+  EXPECT_EQ(store->poll(make_id(2), 8).chunks.size(), 1U);
+}
+
+TEST(portable_data_store_test, concurrent_removal_and_replacement_do_not_reclaim_a_borrowed_producer_slot)
+{
+  auto [store, detail] = portable_data_store::create(test_config());
+  ASSERT_NE(store, nullptr) << detail;
+  ASSERT_TRUE(store->subscribe(request(1)));
+  const std::vector<uint8_t> metadata(16, 1), tensor(1024, 2);
+  std::atomic<bool>          stop{false};
+  std::thread                producer([&] {
+    uint64_t sequence = 1;
+    while (!stop.load(std::memory_order_relaxed)) {
+      store->publish(publication(sequence++, metadata, tensor));
+    }
+  });
+  for (unsigned iteration = 0; iteration != 200; ++iteration) {
+    EXPECT_TRUE(store->unsubscribe(make_id(1)));
+    EXPECT_TRUE(store->subscribe(request(1)));
+  }
+  stop.store(true, std::memory_order_relaxed);
+  producer.join();
+  EXPECT_TRUE(store->unsubscribe(make_id(1)));
+  EXPECT_FALSE(store->has_active(OCUDU_DAPP_INTERFACE_SPECTRUM_V1));
+}
+
 TEST(portable_data_store_test, rejects_invalid_bounds_and_subscriptions)
 {
   auto invalid                  = test_config();

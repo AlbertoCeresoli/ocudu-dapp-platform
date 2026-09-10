@@ -422,6 +422,7 @@ public:
                                                  const pusch_demodulator::configuration& config) noexcept override
   {
     receiver_noise_valid = false;
+    receiver_symbols_valid = false;
     try {
       return invoke_receiver_impl(buffers, config);
     } catch (...) {
@@ -431,6 +432,7 @@ public:
   }
 
   bool receiver_post_eq_noise_valid() const noexcept override { return receiver_noise_valid; }
+  bool receiver_equalized_symbols_valid() const noexcept override { return receiver_symbols_valid; }
 
   void on_completion(void* completion_token) noexcept override
   {
@@ -1052,6 +1054,16 @@ private:
                                                            prepared.generation,
                                                            {buffers.nof_data_re, config.nof_tx_layers},
                                                            OCUDU_DAPP_LAYOUT_PUSCH_POST_EQ_NOISE_DATA_RE_LAYER_V1);
+      if (buffers.equalized_cf32 != nullptr) {
+        metrics.equalized_symbols = make_device_tensor(static_cast<cf_t*>(buffers.equalized_cf32),
+                                                       OCUDU_DAPP_ELEMENT_CF32_V1,
+                                                       OCUDU_DAPP_ACCESS_WRITE_V1,
+                                                       buffers.device_ordinal,
+                                                       prepared.allocation_base + 7,
+                                                       prepared.generation,
+                                                       {buffers.nof_data_re, config.nof_tx_layers},
+                                                       OCUDU_DAPP_LAYOUT_PUSCH_EQUALIZED_DATA_RE_LAYER_V1);
+      }
       output.metrics                  = make_metadata(OCUDU_DAPP_METADATA_RECEIVER_METRICS_V1, metrics);
     }
     if (!begin_timing(buffers.completion_slot, pusch_resident_dapp_mode::receiver, prepared.invocation)) {
@@ -1062,6 +1074,9 @@ private:
     const auto result    = target->invoke(lane, input, output);
     receiver_noise_valid = result.status == OCUDU_DAPP_OK_V1 && !result.invoke_fallback &&
                            (output.reserved0 & OCUDU_DAPP_RECEIVER_METRICS_VALID_V1) != 0;
+    receiver_symbols_valid = buffers.equalized_cf32 != nullptr && result.status == OCUDU_DAPP_OK_V1 &&
+                             !result.invoke_fallback &&
+                             (output.reserved0 & OCUDU_DAPP_RECEIVER_EQUALIZED_SYMBOLS_VALID_V1) != 0;
     record_module_end(buffers.completion_slot, result);
     return result;
   }
@@ -1143,6 +1158,7 @@ private:
   void*                                                           device_channel_scheduler_noise{};
   bool                                                            scheduler_noise_valid{};
   bool                                                            receiver_noise_valid{};
+  bool                                                            receiver_symbols_valid{};
   uint64_t                                                        invocation_sequence{};
   std::atomic<uint32_t>                                           pending_callbacks{};
   std::atomic<void*>                                              latest_completion{};

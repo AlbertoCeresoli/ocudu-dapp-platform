@@ -25,6 +25,9 @@ constexpr std::size_t max_worker_sources = 1024;
 bool valid_invocation(const ocudu_dapp_invocation_v1& invocation, uint32_t worker_id) noexcept;
 bool valid_input_tensor(const ocudu_dapp_tensor_view_v1& tensor) noexcept;
 bool valid_output_tensor(const ocudu_dapp_tensor_view_v1& tensor) noexcept;
+
+/// Optional receiver symbols are absent unless both extents cover the append-only field.
+const ocudu_dapp_tensor_view_v1* receiver_symbol_storage(const ocudu_dapp_typed_metadata_v1& metadata) noexcept;
 bool valid_ul_resource_plan(const ocudu_dapp_ul_resource_plan_v1& plan) noexcept;
 bool spectrum_plan_generation(const ocudu_dapp_spectrum_input_v1& input, uint64_t& generation) noexcept;
 bool srs_source_metadata(const ocudu_dapp_srs_isac_input_v1& input, uint32_t& resource_id,

@@ -265,6 +265,16 @@ float pusch_e2e_get_sinr_db(pusch_e2e_handle_t handle, cudaStream_t stream);
  */
 void pusch_e2e_sinr_async_launch(pusch_e2e_handle_t handle, cudaStream_t stream);
 
+/** Submit current metric readbacks with checked copy status. On failure, partial
+ * copies may remain queued; drain the stream before reusing host storage. */
+nr_ldpc_status_t pusch_e2e_sinr_async_launch_checked(pusch_e2e_handle_t handle, cudaStream_t stream);
+
+/** Independent post-EQ and pilot SINR sources. Read only after successful current
+ * readback completion. Unavailable measurements return -INFINITY, without
+ * cross-source fallback. The legacy getter retains its compatibility fallback. */
+float pusch_e2e_post_eq_sinr_get_result(pusch_e2e_handle_t handle);
+float pusch_e2e_channel_estimator_sinr_get_result(pusch_e2e_handle_t handle);
+
 /**
  * Read SINR from previously launched async D2H transfer.
  *

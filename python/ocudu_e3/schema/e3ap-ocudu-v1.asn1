@@ -12,8 +12,10 @@ E3AP-OCUDU-V1 DEFINITIONS AUTOMATIC TAGS ::= BEGIN
 -- ack) so that dApp logic ports between the stacks. The module is not
 -- byte-compatible with libe3: every SEQUENCE is extensible, identifier ranges
 -- are wide enough for production deployments, payloads are bounded at
--- 16 MiB with explicit fragmentation, and a control response carries a
--- service-model outcome instead of a bare acknowledgement.
+-- 16 MiB with explicit fragmentation, a control response carries a
+-- service-model outcome instead of a bare acknowledgement, and bulk tensors
+-- may be delivered by reference through a shared-memory region. The envelope
+-- carries the same optional nanosecond timestamp as libe3 0.0.11 and later.
 --
 -- Service-model bodies are opaque APER OCTET STRINGs selected by
 -- ranFunctionIdentifier. Registered RAN functions:
@@ -71,6 +73,88 @@ E3-Cause ::= ENUMERATED {
 
 E3-IdentifierList ::= SEQUENCE (SIZE (0..maxE3Identifiers)) OF INTEGER (1..65535)
 
+-- Nanoseconds since the Unix epoch on the realtime (UTC) clock, mirroring the
+-- libe3 E3AP 1.0.0 envelope timestamp field for field. Absent means "no
+-- producer reference". Unconstrained on purpose: asn1c renders it as a native
+-- 64-bit integer and APER length-prefixes it.
+E3-Timestamp ::= INTEGER
+
+-- ===========================================================================
+-- By-reference bulk data. A subscription may ask for large tensors to be
+-- delivered through a shared-memory region instead of in-band fragments. The
+-- RAN maps one region per subscription, advertises it once in the
+-- subscription response, writes each tensor into the next row, and sends an
+-- indication whose protocolData carries the service-model record with its
+-- bulk field empty plus an E3-TensorDescriptor locating the bytes. Enumerator
+-- values mirror the Class-C OCC3 metadata (class-c-publication-v1.fbs) so a
+-- descriptor and the metadata it accompanies never disagree.
+-- ===========================================================================
+
+E3-DeliveryMode ::= ENUMERATED { inBand(0), byReference(1), ... }
+
+E3-MemoryDomain ::= ENUMERATED {
+  host(0), hostPinned(1), acceleratorDevice(2), managedCoherent(3),
+  posixShared(4), acceleratorIpcExport(5), ...
+}
+
+E3-ElementType ::= ENUMERATED {
+  int8(0), uint8(1), int16(2), uint16(3), int32(4), fp16(5), bf16(6), fp32(7),
+  complexInt16(8), complexBf16(9), complexFp16(10), complexFp32(11), ...
+}
+
+-- One POSIX shared-memory region the RAN maps for a subscription. Layout:
+-- a 64-byte region header followed by nofRows rows of rowBytes; each row
+-- starts with a 64-byte row header carrying a seqlock generation, the
+-- publication sequence and the byte length, followed by the tensor bytes.
+-- Readers re-check the row generation after copying.
+E3-SharedRegion ::= SEQUENCE {
+  memoryDomain  E3-MemoryDomain,
+  regionName    E3-Name,
+  regionBytes   E3-Unsigned64,
+  headerBytes   INTEGER (0..65535),
+  rowBytes      E3-Unsigned64,
+  nofRows       INTEGER (1..65535),
+  layoutVersion INTEGER (0..65535),
+  ...
+}
+
+-- Locates one published tensor for a CPU consumer (shared region row) or a
+-- GPU consumer (accelerator IPC export, mirroring the Class-C CUDA export
+-- slot: opaque 64-byte memory and ready-event handles interpreted only by
+-- the matching accelerator runtime).
+E3-TensorLocation ::= CHOICE {
+  posixShared SEQUENCE {
+    regionName E3-Name,
+    rowIndex   INTEGER (0..65535),
+    byteOffset E3-Unsigned64,
+    ...
+  },
+  acceleratorIpc SEQUENCE {
+    deviceOrdinal    INTEGER (0..65535),
+    allocationId     E3-Unsigned64,
+    memoryHandle     OCTET STRING (SIZE (64)),
+    readyEventHandle OCTET STRING (SIZE (64)) OPTIONAL,
+    byteOffset       E3-Unsigned64,
+    ...
+  },
+  ...
+}
+
+E3-TensorDescriptor ::= SEQUENCE {
+  memoryDomain  E3-MemoryDomain,
+  location      E3-TensorLocation,
+  byteLength    E3-Unsigned64,
+  -- Row (or slot) generation at publication; a reader that observes a
+  -- different value after copying has read a torn row and must discard it.
+  generation    E3-Unsigned64,
+  elementType   E3-ElementType OPTIONAL,
+  dimensions    SEQUENCE (SIZE (1..8)) OF INTEGER (0..4294967295) OPTIONAL,
+  byteStrides   SEQUENCE (SIZE (1..8)) OF E3-Unsigned64 OPTIONAL,
+  layoutId      INTEGER (0..65535) OPTIONAL,
+  leaseExpiryNs E3-Unsigned64 OPTIONAL,
+  ...
+}
+
 E3-RanFunctionDefinition ::= SEQUENCE {
   ranFunctionIdentifier   E3-RanFunctionID,
   telemetryIdentifierList E3-IdentifierList,
@@ -114,7 +198,11 @@ E3-SubscriptionRequest ::= SEQUENCE {
   periodicity             INTEGER (0..60000) OPTIONAL,
   ...,
   -- Service-model subscription parameters (E2-style action definition).
-  subscriptionData        OCTET STRING (SIZE (1..maxE3FunctionData)) OPTIONAL
+  subscriptionData        OCTET STRING (SIZE (1..maxE3FunctionData)) OPTIONAL,
+  -- Ask for bulk tensors by reference; the response advertises the region.
+  deliveryMode            E3-DeliveryMode OPTIONAL,
+  -- Objects whose tensor is smaller than this stay in band (default: one fragment).
+  minimumByReferenceBytes INTEGER (0..maxE3PayloadBytes) OPTIONAL
 }
 
 E3-SubscriptionDelete ::= SEQUENCE {
@@ -132,7 +220,9 @@ E3-SubscriptionResponse ::= SEQUENCE {
   controlIdentifierList   E3-IdentifierList OPTIONAL,
   ...,
   cause                   E3-Cause OPTIONAL,
-  detail                  E3-Text OPTIONAL
+  detail                  E3-Text OPTIONAL,
+  -- Present when deliveryMode byReference was granted.
+  sharedRegion            E3-SharedRegion OPTIONAL
 }
 
 E3-IndicationMessage ::= SEQUENCE {
@@ -145,7 +235,9 @@ E3-IndicationMessage ::= SEQUENCE {
   sequence              E3-Unsigned64 OPTIONAL,
   fragmentIndex         INTEGER (0..65535) DEFAULT 0,
   fragmentCount         INTEGER (1..65536) DEFAULT 1,
-  payloadBytes          INTEGER (1..maxE3PayloadBytes) OPTIONAL
+  payloadBytes          INTEGER (1..maxE3PayloadBytes) OPTIONAL,
+  -- Present when the record's bulk field was delivered by reference.
+  byReference           E3-TensorDescriptor OPTIONAL
 }
 
 E3-DAppControlAction ::= SEQUENCE {
@@ -206,7 +298,7 @@ E3-MessageAck ::= SEQUENCE {
 }
 
 E3-PDU ::= SEQUENCE {
-  id  E3-MessageID,
+  id        E3-MessageID,
   msg CHOICE {
     setupRequest         E3-SetupRequest,
     setupResponse        E3-SetupResponse,
@@ -222,7 +314,10 @@ E3-PDU ::= SEQUENCE {
     controlResponse      E3-ControlResponse,
     ...
   },
-  ...
+  ...,
+  -- Native additions belong after the extension marker: keep legacy ID bits
+  -- unchanged. The separate libe3 codec retains libe3's root placement.
+  timestamp E3-Timestamp OPTIONAL
 }
 
 END

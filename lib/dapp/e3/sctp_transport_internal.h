@@ -120,6 +120,30 @@ inline void set_nodelay(int descriptor)
   ::setsockopt(descriptor, IPPROTO_SCTP, SCTP_NODELAY, &enabled, sizeof(enabled));
 }
 
+/// Disables the delayed-SACK timer (200 ms by default on Linux) and asks for
+/// a SACK on every received chunk.
+///
+/// Measured on Linux 6.11 loopback with 1.7 MB objects in 64 KiB fragments:
+/// with the kernel defaults (16 KiB send buffer, receive window fixed from the
+/// receive buffer at association setup, delayed SACK) a transfer takes 5-16 s
+/// because at most one chunk is in flight and every one waits for the 200 ms
+/// SACK timer. Presetting both sockets' buffers *before* the association is
+/// established (listener before listen(), client before connect()) brings it
+/// to ~1.3 ms; disabling delayed SACK on top of that brings it to ~1.0 ms.
+/// Enlarging buffers after the association exists does not help, and delayed
+/// SACK off alone does not help. Both peers must do this; see
+/// docs/dapp/e3_wire.md, "Socket options".
+/// Set on the listener so accepted associations inherit it, and again on each
+/// accepted socket for kernels that do not propagate the endpoint default.
+inline void disable_delayed_sack(int descriptor)
+{
+  sctp_sack_info info{};
+  info.sack_assoc_id = 0;
+  info.sack_delay    = 0;
+  info.sack_freq     = 1;
+  ::setsockopt(descriptor, IPPROTO_SCTP, SCTP_DELAYED_SACK, &info, sizeof(info));
+}
+
 inline void request_streams(int descriptor, uint16_t nof_streams)
 {
   sctp_initmsg init{};

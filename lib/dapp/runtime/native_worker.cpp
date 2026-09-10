@@ -472,6 +472,12 @@ native_invocation_result native_worker::invoke(const ocudu_dapp_receiver_input_v
     state->incident_source->record(class_a_fallback_reason::invalid_input);
     return {OCUDU_DAPP_INVALID_INPUT_V1, true};
   }
+  const auto* requested_symbols = metrics_requested ? receiver_symbol_storage(output.metrics) : nullptr;
+  if (requested_symbols != nullptr && !valid_output_tensor(*requested_symbols)) {
+    state->incident_source->record(class_a_fallback_reason::invalid_input);
+    return {OCUDU_DAPP_INVALID_INPUT_V1, true};
+  }
+  const auto symbol_storage  = requested_symbols != nullptr ? *requested_symbols : ocudu_dapp_tensor_view_v1{};
   const auto llr_storage     = output.llrs;
   const auto metrics_storage = output.metrics;
   const auto noise_storage =
@@ -488,7 +494,14 @@ native_invocation_result native_worker::invoke(const ocudu_dapp_receiver_input_v
                  : returned_metrics != nullptr && same_metadata_storage(metrics_storage, output.metrics) &&
                       valid_output_tensor(returned_metrics->post_equalization_noise) &&
                       same_tensor_storage(noise_storage, returned_metrics->post_equalization_noise);
-        return valid_output_tensor(output.llrs) && same_tensor_storage(llr_storage, output.llrs) &&
+        const auto* returned_symbols =
+            valid_metrics && metrics_requested ? receiver_symbol_storage(output.metrics) : nullptr;
+        const bool valid_symbols = requested_symbols == nullptr
+                                       ? returned_symbols == nullptr &&
+                                             (output.reserved0 & OCUDU_DAPP_RECEIVER_EQUALIZED_SYMBOLS_VALID_V1) == 0
+                                       : returned_symbols != nullptr && valid_output_tensor(*returned_symbols) &&
+                                             same_tensor_storage(symbol_storage, *returned_symbols);
+        return valid_symbols && valid_output_tensor(output.llrs) && same_tensor_storage(llr_storage, output.llrs) &&
                empty_typed_metadata(output.uci) && valid_metrics && output.confidence_q16 <= (1U << 16U) &&
                (output.reserved0 & ~OCUDU_DAPP_RECEIVER_KNOWN_OUTPUT_FLAGS_V1) == 0 &&
                (metrics_requested || output.reserved0 == 0);

@@ -1,2 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
 # SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+
+# Git-format-patch context and signature trailers intentionally contain spaces.
+tests/interop/libe3/patches/*.patch whitespace=-blank-at-eol,-blank-at-eof

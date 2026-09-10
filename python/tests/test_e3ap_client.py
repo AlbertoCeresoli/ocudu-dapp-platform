@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import struct
 import subprocess
 import sys
@@ -34,9 +35,24 @@ from ocudu_e3.telemetry import (  # noqa: E402
 SERVER = os.environ.get("OCUDU_E3AP_TEST_SERVER")
 # APER bytes of {id 1, setupRequest{"1.0.0","x","0","v"}}; the C++ codec test pins the same vector.
 SETUP_GOLDEN_HEX = "00000080312e302e30007800300076"
+# The same PDU with the optional libe3-style envelope timestamp 1756800000000000000 ns.
+SETUP_TS_GOLDEN_HEX = "80000080312e302e300078003000760109081861684ac5680000"
 
 
 class OfflineCodecTests(unittest.TestCase):
+    def test_legacy_native_wire_at_every_id_width(self):
+        import asn1tools
+        legacy = asn1tools.compile_files(str(Path(__file__).parent / "fixtures/e3ap-ocudu-v1-pre-timestamp.asn1"), "per")
+        body = {"e3apProtocolVersion": b"1.0.0", "dAppName": b"x", "dAppVersion": b"0", "vendor": b"v"}
+        for pdu_id in (1, 256, 257, 65536, 65537, 16777216, 16777217, 4294967295):
+            with self.subTest(pdu_id=pdu_id):
+                expected = {"id": pdu_id, "msg": ("setupRequest", body)}
+                encoded = self.codec.encode_pdu(pdu_id, "setupRequest", body)
+                self.assertEqual(encoded, legacy.encode("E3-PDU", expected))
+                self.assertEqual(self.codec.decode_pdu(encoded), (pdu_id, "setupRequest", body))
+                stamped = self.codec.encode_pdu(pdu_id, "setupRequest", body, timestamp_ns=1756800000000000000)
+                self.assertEqual(legacy.decode("E3-PDU", stamped), expected)
+
     def setUp(self):
         self.codec = ocudu_e3.load_codec()
 
@@ -49,6 +65,46 @@ class OfflineCodecTests(unittest.TestCase):
         pdu_id, name, body = self.codec.decode_pdu(encoded)
         self.assertEqual((pdu_id, name), (1, "setupRequest"))
         self.assertEqual(body["dAppName"], b"x")
+
+    def test_setup_request_with_timestamp_golden_vector(self):
+        encoded = self.codec.encode_pdu(
+            1,
+            "setupRequest",
+            {"e3apProtocolVersion": b"1.0.0", "dAppName": b"x", "dAppVersion": b"0", "vendor": b"v"},
+            timestamp_ns=1756800000000000000,
+        )
+        self.assertEqual(encoded.hex(), SETUP_TS_GOLDEN_HEX)
+        pdu_id, timestamp, name, _body = self.codec.decode_pdu_with_timestamp(encoded)
+        self.assertEqual((pdu_id, timestamp, name), (1, 1756800000000000000, "setupRequest"))
+        _pdu_id, _name, _body = self.codec.decode_pdu(encoded)  # 3-tuple API still works
+
+    def test_tensor_descriptor_round_trip(self):
+        from ocudu_e3.shared_region import TensorDescriptor, PosixSharedLocation, AcceleratorIpcLocation
+
+        body = {
+            "memoryDomain": "posixShared",
+            "location": ("posixShared", {"regionName": b"/ocudu-e3-1-2-3", "rowIndex": 1, "byteOffset": (128).to_bytes(8, "big")}),
+            "byteLength": (734208).to_bytes(8, "big"),
+            "generation": (4).to_bytes(8, "big"),
+            "elementType": "complexFp32",
+            "dimensions": [4, 14, 3276],
+        }
+        encoded = self.codec.encode("E3-TensorDescriptor", body)
+        descriptor = TensorDescriptor.from_asn(self.codec.decode("E3-TensorDescriptor", encoded))
+        self.assertIsInstance(descriptor.location, PosixSharedLocation)
+        self.assertEqual(descriptor.location.row_index, 1)
+        self.assertEqual(descriptor.byte_length, 734208)
+        self.assertEqual(descriptor.dimensions, [4, 14, 3276])
+        gpu = {
+            "memoryDomain": "acceleratorIpcExport",
+            "location": ("acceleratorIpc", {"deviceOrdinal": 0, "allocationId": (9).to_bytes(8, "big"), "memoryHandle": bytes(range(64)), "byteOffset": (0).to_bytes(8, "big")}),
+            "byteLength": (16).to_bytes(8, "big"),
+            "generation": (2).to_bytes(8, "big"),
+        }
+        descriptor = TensorDescriptor.from_asn(self.codec.decode("E3-TensorDescriptor", self.codec.encode("E3-TensorDescriptor", gpu)))
+        self.assertIsInstance(descriptor.location, AcceleratorIpcLocation)
+        self.assertEqual(descriptor.location.memory_handle, bytes(range(64)))
+        self.assertIsNone(descriptor.location.ready_event_handle)
 
     def test_telemetry_indication_round_trip(self):
         payload = self.codec.encode(
@@ -103,6 +159,20 @@ class OfflineCodecTests(unittest.TestCase):
 
 @unittest.skipUnless(SERVER, "set OCUDU_E3AP_TEST_SERVER or pass --server to run live tests")
 class LiveAgentTests(unittest.TestCase):
+    def test_legacy_client_large_ids_against_cpp_agent(self):
+        import asn1tools
+        legacy = asn1tools.compile_files(str(Path(__file__).parent / "fixtures/e3ap-ocudu-v1-pre-timestamp.asn1"), "per")
+        for pdu_id in (257, 65537, 4294967295):
+            with self.subTest(pdu_id=pdu_id), socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP) as peer:
+                peer.settimeout(3)
+                peer.connect(("127.0.0.1", self.e3ap_port))
+                body = {"e3apProtocolVersion": b"1.0.0", "dAppName": b"legacy", "dAppVersion": b"0", "vendor": b"v"}
+                peer.sendall(legacy.encode("E3-PDU", {"id": pdu_id, "msg": ("setupRequest", body)}))
+                kind, response = legacy.decode("E3-PDU", peer.recv(65536))["msg"]
+                self.assertEqual(kind, "setupResponse")
+                self.assertEqual(response["responseCode"], "positive")
+                self.assertEqual(response["requestId"], pdu_id)
+
     process: subprocess.Popen
     e3ap_port: int
     e3dp_port: int
@@ -146,6 +216,53 @@ class LiveAgentTests(unittest.TestCase):
 
     def client(self) -> E3Client:
         return E3Client("127.0.0.1", self.e3ap_port, dapp_name="python-test", timeout=5.0)
+
+    def test_agent_stamps_pdus_with_the_realtime_clock(self):
+        before = time.time_ns()
+        with self.client() as client:
+            client.setup()
+            self.assertIsNotNone(client.last_agent_timestamp_ns)
+            self.assertGreaterEqual(client.last_agent_timestamp_ns, before)
+            self.assertLessEqual(client.last_agent_timestamp_ns, time.time_ns())
+
+    def test_dapp_report_is_acknowledged(self):
+        with self.client() as client:
+            client.setup()
+            client.report(1, b"\x01\x02\x03")  # a Spectrum-style northbound report
+
+    def test_by_reference_subscription_delivers_tensors_through_shared_memory(self):
+        with self.client() as client:
+            client.setup()
+            subscription = client.subscribe(
+                ["pusch.symbols"], configs=[SubscriptionConfig("pusch.symbols", minimum_interval_ms=0)],
+                by_reference=True, minimum_by_reference_bytes=256,
+            )
+            self.assertIsNotNone(subscription.shared_region)
+            self.assertIsNotNone(subscription.region_reader)
+            self.assertEqual(subscription.shared_region.memory_domain, "posixShared")
+            self.assertGreaterEqual(subscription.shared_region.nof_rows, 1)
+            seen = None
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                indication = client.next_indication(timeout=1.0)
+                if indication is None:
+                    continue
+                if isinstance(indication.record, PuschSymbolsRecord) and indication.by_reference is not None:
+                    seen = indication
+                    break
+            self.assertIsNotNone(seen, "no by-reference PUSCH symbol indication within 10 s")
+            self.assertEqual(seen.by_reference.element_type, "complexFp32")
+            self.assertEqual(seen.by_reference.byte_length, len(seen.record.equalized_symbols))
+            self.assertGreater(len(seen.record.equalized_symbols), 256)
+            # The row header agrees with the descriptor and the record.
+            row = subscription.region_reader.row_header(seen.by_reference.location.row_index)
+            self.assertEqual(row["generation"] % 2, 0)
+            self.assertEqual(row["telemetry_id"], seen.telemetry_id)
+            self.assertEqual(row["byte_length"], seen.by_reference.byte_length)
+            self.assertEqual(row["sequence"], seen.sequence)
+            self.assertEqual(client.torn_reads, 0)
+            client.unsubscribe(subscription)
+            self.assertIsNone(subscription.region_reader._map if subscription.region_reader else None)
 
     def test_setup_lists_streams_and_management(self):
         with self.client() as client:

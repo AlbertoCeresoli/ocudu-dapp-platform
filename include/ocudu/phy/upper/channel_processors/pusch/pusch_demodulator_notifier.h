@@ -26,6 +26,10 @@ public:
     std::optional<float> time_alignment_s;
     /// Carrier Frequency Offset in Hz.
     std::optional<float> cfo_Hz;
+    /// Reference-signal SINR from the channel estimator, when computed by this path.
+    /// This is independent of post-EQ SINR and must not contain decoding/reliability gain.
+    /// Leave absent when the receiver bypasses the estimator without a qualified replacement.
+    std::optional<float> channel_estimator_sinr_dB;
   };
 
   /// Default destructor.

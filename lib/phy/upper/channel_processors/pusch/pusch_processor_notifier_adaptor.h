@@ -189,7 +189,9 @@ private:
     {
       if (stats.sinr_dB.has_value()) {
         csi.set_sinr_dB(channel_state_information::sinr_type::post_equalization, *stats.sinr_dB);
-        csi.set_sinr_dB(channel_state_information::sinr_type::channel_estimator, *stats.sinr_dB);
+      }
+      if (stats.channel_estimator_sinr_dB.has_value()) {
+        csi.set_sinr_dB(channel_state_information::sinr_type::channel_estimator, *stats.channel_estimator_sinr_dB);
       }
       if (stats.evm.has_value()) {
         csi.set_symbol_evm(i_symbol, *stats.evm);
@@ -214,7 +216,9 @@ private:
     {
       if (stats.sinr_dB.has_value()) {
         csi.set_sinr_dB(channel_state_information::sinr_type::post_equalization, *stats.sinr_dB);
-        csi.set_sinr_dB(channel_state_information::sinr_type::channel_estimator, *stats.sinr_dB);
+      }
+      if (stats.channel_estimator_sinr_dB.has_value()) {
+        csi.set_sinr_dB(channel_state_information::sinr_type::channel_estimator, *stats.channel_estimator_sinr_dB);
       }
       if (stats.evm.has_value()) {
         csi.set_total_evm(*stats.evm);

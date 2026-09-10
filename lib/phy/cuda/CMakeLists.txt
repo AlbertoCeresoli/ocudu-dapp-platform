@@ -226,6 +226,11 @@ function(ocudu_phy_cuda_add_explicit_cuda_tool target source)
 endfunction()
 
 ocudu_phy_cuda_add_explicit_cuda_tool(test_polar tests/unittests/test_polar.cu)
+ocudu_phy_cuda_add_explicit_cuda_tool(pusch_metric_readback_test tests/unittests/pusch_metric_readback_test.cu)
+ocudu_phy_cuda_add_explicit_cuda_tool(pusch_fd_smoothing_test tests/unittests/pusch_fd_smoothing_test.cu)
+ocudu_phy_cuda_add_explicit_cuda_tool(pusch_metric_readback_fault_test tests/unittests/pusch_metric_readback_fault_test.cpp)
+target_link_options(pusch_metric_readback_fault_test PRIVATE
+    -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaEventQuery -Wl,--wrap=cudaStreamQuery)
 ocudu_phy_cuda_add_explicit_cuda_tool(polar_benchmark tests/benchmarks/polar_benchmark.cu)
 ocudu_phy_cuda_add_explicit_cuda_tool(polar_sensitivity tests/benchmarks/polar_sensitivity.cu)
 ocudu_phy_cuda_add_explicit_cuda_tool(low_phy_tx_smoke_test tests/unittests/low_phy_tx_smoke_test.cu)
@@ -257,6 +262,15 @@ if(BUILD_OCUDU_PHY_CUDA_TESTS)
         enable_testing()
     endif()
     include(GoogleTest)
+
+    # Only host-side admission and fault checks run implicitly; GPU execution is opt-in.
+    set_target_properties(pusch_metric_readback_test pusch_metric_readback_fault_test pusch_fd_smoothing_test
+        PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME pusch_metric_readback_precheck COMMAND pusch_metric_readback_test)
+    add_test(NAME pusch_metric_readback_faults COMMAND pusch_metric_readback_fault_test)
+    add_test(NAME pusch_fd_smoothing_precheck COMMAND pusch_fd_smoothing_test)
+    set_tests_properties(pusch_metric_readback_precheck pusch_metric_readback_faults pusch_fd_smoothing_precheck
+        PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=" LABELS "cuda;dapp;no-gpu")
 
     # ============================================================================
     # E2E Integration Tests (active modules only)

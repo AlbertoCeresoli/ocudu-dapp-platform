@@ -12,23 +12,24 @@
   * Kernel launches go through the wrappers in pusch_e2e_launch.cuh
  */
 
+#include "dmrs_utils.h"
 #include "pusch_e2e.h"
 #include "pusch_e2e_internal.cuh"
 #include "pusch_e2e_launch.cuh"
-#include "pusch_e2e_low_papr.cuh"   // NOF_LOW_PAPR_GROUPS
+#include "pusch_e2e_low_papr.cuh" // NOF_LOW_PAPR_GROUPS
+#include "pusch_sinr_readback.h"
 #include "scrambling.h"
-#include "dmrs_utils.h"
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuComplex.h>
-#include <cstdio>
-#include <cmath>
-#include <vector>
 #include <algorithm>
-#include <new>
-#include <mutex>
-#include <cstring>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cuComplex.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <mutex>
+#include <new>
+#include <vector>
 #ifdef OCUDU_PHY_CUDA_ENABLE_VKFFT
     #include "vkFFT.h"
 #endif
@@ -1474,53 +1475,85 @@ const float* pusch_e2e_get_noise_vars(pusch_e2e_handle_t handle)
 
 void pusch_e2e_sinr_async_launch(pusch_e2e_handle_t handle, cudaStream_t stream)
 {
-    if (!handle || !handle->d_eq_noise_var_sum || !handle->d_eq_noise_var_count) {
-        return;
-    }
-    if (!handle->h_sinr_noise_var_sum || !handle->h_sinr_count) {
-        return;
-    }
-    if (handle->sinr_managed) {
-        /* Host readback pointers alias managed device memory; results are directly
-         * readable after the caller's completion sync. No copies to enqueue. */
-        return;
-    }
+  (void)pusch_e2e_sinr_async_launch_checked(handle, stream);
+}
 
-    /* Single 16-byte D2H copy for adjacent SINR and EVM accumulators in d_accum_block. */
-    cudaMemcpyAsync(handle->h_sinr_eq_block, handle->d_eq_noise_var_sum,
-                    2 * sizeof(float) + 2 * sizeof(unsigned int), cudaMemcpyDeviceToHost, stream);
+nr_ldpc_status_t pusch_e2e_sinr_async_launch_checked(pusch_e2e_handle_t handle, cudaStream_t stream)
+{
+  if (!handle || !handle->d_eq_noise_var_sum || !handle->d_eq_noise_var_count || !handle->h_sinr_eq_block ||
+      !handle->h_sinr_noise_var_sum || !handle->h_sinr_count) {
+    return NR_LDPC_ERROR_INVALID_CONFIG;
+  }
+  // These are owned allocations with fixed contiguous accumulator layouts.
+  // Check aliases before either copy; do not accept a valid-looking sum with
+  // a stale/mismatched count or an unpaired pilot-result buffer.
+  if (reinterpret_cast<uintptr_t>(handle->d_eq_noise_var_count) !=
+          reinterpret_cast<uintptr_t>(handle->d_eq_noise_var_sum) + sizeof(float) ||
+      handle->h_sinr_eq_block != handle->h_sinr_noise_var_sum ||
+      reinterpret_cast<uintptr_t>(handle->h_sinr_count) !=
+          reinterpret_cast<uintptr_t>(handle->h_sinr_noise_var_sum) + sizeof(float) ||
+      (handle->d_sinr_epre_result == nullptr) != (handle->h_sinr_epre_result == nullptr)) {
+    return NR_LDPC_ERROR_INVALID_CONFIG;
+  }
+  if (handle->sinr_managed) {
+    /* Host readback pointers alias managed device memory; results are directly
+     * readable after the caller's completion sync. No copies to enqueue. */
+    return handle->h_sinr_eq_block == handle->d_eq_noise_var_sum &&
+                   handle->h_sinr_count == handle->d_eq_noise_var_count &&
+                   handle->h_sinr_epre_result == handle->d_sinr_epre_result
+               ? NR_LDPC_SUCCESS
+               : NR_LDPC_ERROR_INVALID_CONFIG;
+  }
 
-    /* Launch async D2H copy of DMRS-based SINR/EPRE/RSRP/TA/CFO result (20 bytes) */
-    if (handle->d_sinr_epre_result && handle->h_sinr_epre_result) {
-        cudaMemcpyAsync(handle->h_sinr_epre_result, handle->d_sinr_epre_result,
-                        5 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+  /* Single 16-byte D2H copy for adjacent SINR and EVM accumulators in d_accum_block. */
+  if (cudaMemcpyAsync(handle->h_sinr_eq_block,
+                      handle->d_eq_noise_var_sum,
+                      2 * sizeof(float) + 2 * sizeof(unsigned int),
+                      cudaMemcpyDeviceToHost,
+                      stream) != cudaSuccess) {
+    return NR_LDPC_ERROR_CUDA_FAILED;
+  }
+
+  /* Launch async D2H copy of DMRS-based SINR/EPRE/RSRP/TA/CFO result (20 bytes) */
+  if (handle->d_sinr_epre_result && handle->h_sinr_epre_result) {
+    if (cudaMemcpyAsync(handle->h_sinr_epre_result,
+                        handle->d_sinr_epre_result,
+                        5 * sizeof(float),
+                        cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess) {
+      return NR_LDPC_ERROR_CUDA_FAILED;
     }
+  }
+  return NR_LDPC_SUCCESS;
 }
 
 float pusch_e2e_sinr_get_result(pusch_e2e_handle_t handle)
 {
-    /* Primary: post-equalization SINR = -10*log10(mean(eq_noise_var))
-     * Matches CPU demodulator SINR. Per-RE eq_noise_var captures both
-     * thermal noise and channel estimation error at data positions,
-     * giving accurate SINR under frequency-selective fading. */
-    if (handle && handle->h_sinr_noise_var_sum && handle->h_sinr_count) {
-        float noise_var_sum = *handle->h_sinr_noise_var_sum;
-        unsigned int count = *handle->h_sinr_count;
-        if (count > 0 && noise_var_sum > 0.0f) {
-            float mean_noise_var = noise_var_sum / static_cast<float>(count);
-            return -10.0f * log10f(mean_noise_var);
-        }
-    }
+  // Compatibility accessor for callers that explicitly accept mixed provenance.
+  const float post_eq = pusch_e2e_post_eq_sinr_get_result(handle);
+  return std::isfinite(post_eq) ? post_eq : pusch_e2e_channel_estimator_sinr_get_result(handle);
+}
 
-    /* Fallback: DMRS pilot-ratio SINR (may over-report under fading) */
-    if (handle && handle->h_sinr_epre_result) {
-        float sinr_db = handle->h_sinr_epre_result[0];
-        if (std::isfinite(sinr_db)) {
-            return sinr_db;
-        }
-    }
+float pusch_e2e_post_eq_sinr_get_result(pusch_e2e_handle_t handle)
+{
+  if (handle && handle->h_sinr_noise_var_sum && handle->h_sinr_count) {
+    return ocudu::detail::pusch_post_eq_sinr_from_accumulator(*handle->h_sinr_noise_var_sum, *handle->h_sinr_count);
+  }
+  return -INFINITY;
+}
 
-    return -INFINITY;
+float pusch_e2e_channel_estimator_sinr_get_result(pusch_e2e_handle_t handle)
+{
+  // DM-RS pilot-ratio estimate. Its calibration limitations remain independent
+  // of equalizer noise or decoding performance; this accessor does not fix them.
+  if (handle && handle->h_sinr_epre_result) {
+    float sinr_db = handle->h_sinr_epre_result[0];
+    if (std::isfinite(sinr_db)) {
+      return sinr_db;
+    }
+  }
+
+  return -INFINITY;
 }
 
 float pusch_e2e_epre_get_result(pusch_e2e_handle_t handle)

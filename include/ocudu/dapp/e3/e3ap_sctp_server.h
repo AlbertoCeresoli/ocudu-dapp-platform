@@ -7,8 +7,10 @@
 #include "ocudu/dapp/e3/portable_data_store.h"
 #include "ocudu/dapp/e3/sctp_association_server.h"
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
+#include <sys/types.h>
 #include <vector>
 
 namespace ocudu::dapp::e3 {
@@ -41,6 +43,25 @@ struct e3ap_sctp_server_config {
   std::vector<telemetry_stream_record> streams;
   /// Cells advertised for every stream (informational).
   std::vector<uint16_t> cell_ids;
+  /// By-reference delivery: rows per shared region (each row holds one object
+  /// of up to \c maximum_payload_bytes), the region file mode, and the name
+  /// prefix; regions are named "<prefix>-<pid>-<dApp>-<subscription>".
+  uint16_t    shared_region_rows{4};
+  mode_t      shared_region_mode{0640};
+  std::string shared_region_name_prefix{"/ocudu-e3"};
+  /// Aggregate mapping admission budget, separate from portable queue storage.
+  uint64_t maximum_shared_region_bytes{128ULL * 1024 * 1024};
+  /// Objects smaller than this stay in band unless the subscriber asks otherwise.
+  uint32_t default_minimum_by_reference_bytes{e3ap_maximum_fragment_bytes};
+  /// Accept peers that speak the upstream libe3 E3AP 1.0.0 module on the same
+  /// port. The dialect is fixed per association by its setup request: a PDU
+  /// that decodes under E3AP-OCUDU-V1 selects the native module, one that
+  /// decodes only under the libe3 module selects libe3. libe3 peers get dApp
+  /// identifiers 1..100, message identifiers 1..1000, whole (unfragmented)
+  /// payloads of at most 32 KiB, and E3-MessageAck in place of
+  /// E3-ControlResponse; indications that do not fit are counted in
+  /// \c libe3_indications_dropped.
+  bool libe3_profile{true};
 };
 
 /// Default store queue depth per telemetry stream; large-object streams use the
@@ -60,6 +81,27 @@ struct e3ap_sctp_server_metrics {
   uint64_t            indications_dropped{};
   uint64_t            protocol_errors{};
   uint32_t            live_subscriptions{};
+  uint64_t            indications_by_reference{};
+  uint64_t            reports_received{};
+  uint64_t            xapp_controls_sent{};
+  uint64_t            xapp_controls_dropped{};
+  /// Associations that completed setup with the libe3 module.
+  uint64_t libe3_setups_completed{};
+  /// Indications to libe3 peers dropped because the libe3 module cannot carry them.
+  uint64_t libe3_indications_dropped{};
+};
+
+/// One E3-DAppReport received from a dApp, handed to the report handler on the
+/// server thread (the handler must not block) and kept in a short ring.
+struct e3ap_dapp_report_event {
+  uint16_t               dapp_identifier{};
+  std::string            dapp_name;
+  uint16_t               ran_function_identifier{};
+  std::vector<uint8_t>   report_data;
+  std::optional<int64_t> timestamp_ns;
+  uint64_t               received_ns{};
+  /// Host session identity; pass this when replying to avoid ID reuse races.
+  uint64_t association_id{};
 };
 
 class e3ap_sctp_server;
@@ -92,6 +134,26 @@ public:
   void                     stop() noexcept;
   uint16_t                 port() const noexcept;
   e3ap_sctp_server_metrics metrics() const noexcept;
+
+  /// Consumer of E3-DAppReport messages (for example an E2SM-DAPP bridge).
+  /// Invoked on the server thread; replaces any previous handler.
+  void set_dapp_report_handler(std::function<void(const e3ap_dapp_report_event&)> handler) noexcept;
+  /// The most recent reports (newest last), bounded to sixteen.
+  std::vector<e3ap_dapp_report_event> recent_reports() const noexcept;
+
+  /// Queues an E3-XAppControlAction for the dApp with the given identifier;
+  /// it is sent on the procedure stream at the next timer tick. Returns false
+  /// when the queue is full. A dApp that is not (or no longer) connected is
+  /// counted in \c xapp_controls_dropped.
+  /// Pass a nonzero expected association from discovery/report context to
+  /// reject a stale caller before enqueue. Zero resolves the current session.
+  bool send_xapp_control_action(uint16_t             dapp_identifier,
+                                uint16_t             ran_function_identifier,
+                                std::vector<uint8_t> data) noexcept;
+  bool send_xapp_control_action(uint16_t             dapp_identifier,
+                                uint16_t             ran_function_identifier,
+                                std::vector<uint8_t> data,
+                                uint64_t             expected_association_id) noexcept;
 
 private:
   struct implementation;

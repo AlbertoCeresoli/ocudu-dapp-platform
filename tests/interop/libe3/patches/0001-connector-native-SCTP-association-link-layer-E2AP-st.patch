@@ -1,0 +1,1327 @@
+From b602afe450fb4d276bf2c385084a3ef98c7aa2bc Mon Sep 17 00:00:00 2001
+From: "DeepSig Inc." <tim.oshea753@gmail.com>
+Date: Fri, 4 Sep 2026 10:03:11 -0400
+Subject: [PATCH 1/2] connector: native SCTP association link layer (E2AP-style
+ framing)
+
+Add E3LinkLayer::SCTP_ASSOCIATION and SctpAssociationE3Connector: one SCTP
+one-to-one association per peer carries the setup, inbound and outbound
+channels, one E3-PDU per SCTP message (MSG_EOR boundaries, no length
+prefix), exactly as E2AP, F1AP and NGAP frame their PDUs. Send/receive
+buffers are preset before listen()/connect() and delayed SACK is disabled so
+multi-chunk messages do not stall on the kernel's 200 ms SACK timer.
+
+The RAN role serves many peers on one listener: the first message of a fresh
+association is routed to the setup channel, later ones are inbound, and
+outbound messages are broadcast to every set-up peer (the same semantics as
+the ZMQ PUB/SUB and POSIX connectors). The dApp role gates receive() until
+the SetupResponse has been consumed by the setup thread.
+
+Tests: tests/test_role_aware_connector_sctp.cpp (connector round trip
+including a 200 KiB message) and tests/integration/test_role_pair_sctp.cpp
+(E3Agent RAN + dApp pair end to end). Both skip on hosts without SCTP.
+
+Co-authored-by: DeepSig Inc.
+---
+ README.md                                 |   4 +-
+ cmake/libe3Sources.cmake                  |   1 +
+ include/libe3/c_api.h                     |   4 +-
+ include/libe3/types.hpp                   |  11 +-
+ src/c_api.cpp                             |   2 +-
+ src/connector/connector_factory.cpp       |  10 +
+ src/connector/sctp_connector.cpp          | 620 ++++++++++++++++++++++
+ src/connector/sctp_connector.hpp          | 150 ++++++
+ tests/integration/test_role_pair_sctp.cpp | 214 ++++++++
+ tests/test_role_aware_connector_sctp.cpp  | 151 ++++++
+ 10 files changed, 1161 insertions(+), 6 deletions(-)
+ create mode 100644 src/connector/sctp_connector.cpp
+ create mode 100644 src/connector/sctp_connector.hpp
+ create mode 100644 tests/integration/test_role_pair_sctp.cpp
+ create mode 100644 tests/test_role_aware_connector_sctp.cpp
+
+diff --git a/README.md b/README.md
+index c31034d..90db140 100644
+--- a/README.md
++++ b/README.md
+@@ -12,7 +12,7 @@
+ - **Vendor-Neutral API**: Clean E3Agent facade that hides implementation details
+ - **Both Roles**: Single `E3Agent` class acts as either **RAN** (server, binds sockets) or **dApp** (client, connects to a remote RAN), switched by `E3Config.role`
+ - **Multi-Peer dApps**: One dApp process can hold N `E3Agent` instances connecting to N different RAN agents (e.g. a DU-HIGH and a DU-LOW)
+-- **Multiple Transports**: Support for ZeroMQ and POSIX sockets (TCP, SCTP, Unix Domain)
++- **Multiple Transports**: Support for ZeroMQ, POSIX sockets (TCP, SCTP, Unix Domain), and a native SCTP association (E2AP-style: one association per peer, one PDU per SCTP message)
+ - **Multiple Encodings**: ASN.1 APER (primary), JSON, and Protocol Buffers encoders
+ - **Service Model Extensions**: Easy-to-implement SM interface for custom functionality
+ - **Python Bindings**: Optional SWIG bindings (`LIBE3_ENABLE_SWIG=ON`) so the same C++ library can back Python dApp clients
+@@ -383,7 +383,7 @@ for local development (IPC) or production deployments.
+ | `dapp_version` | string | dApp version advertised in `SetupRequest` |
+ | `vendor` | string | Vendor name for `SetupRequest` |
+ | `e3ap_version` | string | E3AP protocol version string |
+-| `link_layer` | E3LinkLayer | ZMQ or POSIX |
++| `link_layer` | E3LinkLayer | ZMQ, POSIX, or SCTP_ASSOCIATION (one native SCTP association per peer; needs `transport_layer = SCTP` and `LIBE3_ENABLE_SCTP=ON`; uses only `setup_endpoint`/`setup_port`) |
+ | `transport_layer` | E3TransportLayer | SCTP, TCP, IPC |
+ | `setup_endpoint` | string | Setup connection endpoint (default: ipc:///tmp/dapps/setup) |
+ | `subscriber_endpoint` | string | Subscriber endpoint (default: ipc:///tmp/dapps/dapp_socket) |
+diff --git a/cmake/libe3Sources.cmake b/cmake/libe3Sources.cmake
+index 3220674..44b059d 100644
+--- a/cmake/libe3Sources.cmake
++++ b/cmake/libe3Sources.cmake
+@@ -40,6 +40,7 @@ set(LIBE3_SOURCES
+     # Connector
+     src/connector/connector_factory.cpp
+     src/connector/posix_connector.cpp
++    src/connector/sctp_connector.cpp
+     src/c_api.cpp
+ )
+ 
+diff --git a/include/libe3/c_api.h b/include/libe3/c_api.h
+index ffc1b69..999e654 100644
+--- a/include/libe3/c_api.h
++++ b/include/libe3/c_api.h
+@@ -156,13 +156,13 @@ e3_error_t e3_service_model_emit_message_ack(
+  * All string pointers are copied by the library; the caller may free them
+  * after the call. Use NULL for optional strings to keep library defaults.
+  *
+- * Enum values: link_layer: 0=ZMQ, 1=POSIX. transport_layer: 0=SCTP, 1=TCP, 2=IPC.
++ * Enum values: link_layer: 0=ZMQ, 1=POSIX, 2=SCTP_ASSOCIATION. transport_layer: 0=SCTP, 1=TCP, 2=IPC.
+  * encoding: 0=ASN1, 1=JSON. Use -1 for link_layer, transport_layer, encoding, log_level
+  * to keep defaults. Use 0 for setup_port, subscriber_port, publisher_port to keep defaults.
+  */
+ typedef struct {
+     const char* ran_identifier;
+-    int link_layer;       /* 0=ZMQ, 1=POSIX, -1=default */
++    int link_layer;       /* 0=ZMQ, 1=POSIX, 2=SCTP_ASSOCIATION, -1=default */
+     int transport_layer;  /* 0=SCTP, 1=TCP, 2=IPC, -1=default */
+     uint16_t setup_port;
+     uint16_t subscriber_port;
+diff --git a/include/libe3/types.hpp b/include/libe3/types.hpp
+index c9084c4..fa9235a 100644
+--- a/include/libe3/types.hpp
++++ b/include/libe3/types.hpp
+@@ -59,7 +59,15 @@ enum class EncodingFormat : uint8_t {
+  */
+ enum class E3LinkLayer : uint8_t {
+     ZMQ = 0,     ///< ZeroMQ-based transport
+-    POSIX = 1    ///< POSIX socket-based transport
++    POSIX = 1,   ///< POSIX socket-based transport
++    /**
++     * One native SCTP association per peer carrying every channel, one
++     * E3-PDU per SCTP message (MSG_EOR boundaries, no length prefix): the
++     * framing E2AP, F1AP and NGAP use, and the one an O-RAN RAN function
++     * already speaks. Requires transport_layer == SCTP and a build with
++     * LIBE3_ENABLE_SCTP=ON; only setup_endpoint/setup_port are used.
++     */
++    SCTP_ASSOCIATION = 2
+ };
+ 
+ /**
+@@ -608,6 +616,7 @@ inline const char* link_layer_to_string(E3LinkLayer layer) noexcept {
+     switch (layer) {
+         case E3LinkLayer::ZMQ: return "zmq";
+         case E3LinkLayer::POSIX: return "posix";
++        case E3LinkLayer::SCTP_ASSOCIATION: return "sctp-association";
+         default: return "unknown";
+     }
+ }
+diff --git a/src/c_api.cpp b/src/c_api.cpp
+index b75da02..43f616d 100644
+--- a/src/c_api.cpp
++++ b/src/c_api.cpp
+@@ -191,7 +191,7 @@ e3_agent_handle_t* e3_agent_create_with_config(const e3_config_t* config) {
+         E3Config cfg;
+         if (config) {
+             if (config->ran_identifier) cfg.ran_identifier = config->ran_identifier;
+-            if (config->link_layer >= 0 && config->link_layer <= 1)
++            if (config->link_layer >= 0 && config->link_layer <= 2)
+                 cfg.link_layer = static_cast<E3LinkLayer>(config->link_layer);
+             if (config->transport_layer >= 0 && config->transport_layer <= 2)
+                 cfg.transport_layer = static_cast<E3TransportLayer>(config->transport_layer);
+diff --git a/src/connector/connector_factory.cpp b/src/connector/connector_factory.cpp
+index 122ccbe..94e37a6 100644
+--- a/src/connector/connector_factory.cpp
++++ b/src/connector/connector_factory.cpp
+@@ -11,6 +11,7 @@
+ #include "zmq_connector.hpp"
+ #endif
+ #include "posix_connector.hpp"
++#include "sctp_connector.hpp"
+ #include "libe3/logger.hpp"
+ 
+ namespace libe3 {
+@@ -54,6 +55,15 @@ std::unique_ptr<E3Connector> create_connector(
+             );
+             break;
+ 
++        case E3LinkLayer::SCTP_ASSOCIATION:
++            if (transport_layer != E3TransportLayer::SCTP) {
++                E3_LOG_ERROR("ConnFactory")
++                    << "SCTP_ASSOCIATION link layer requires transport_layer SCTP";
++                return nullptr;
++            }
++            conn = std::make_unique<SctpAssociationE3Connector>(setup_endpoint, setup_port);
++            break;
++
+         default:
+             E3_LOG_ERROR("ConnFactory") << "Unsupported link layer: "
+                                         << static_cast<int>(link_layer);
+diff --git a/src/connector/sctp_connector.cpp b/src/connector/sctp_connector.cpp
+new file mode 100644
+index 0000000..52b280a
+--- /dev/null
++++ b/src/connector/sctp_connector.cpp
+@@ -0,0 +1,620 @@
++/**
++ * @file sctp_connector.cpp
++ * @brief Native SCTP association E3 connector implementation
++ *
++ * SPDX-FileCopyrightText: Copyright (c) 2026 Northeastern University
++ * SPDX-FileCopyrightText: Copyright (c) 2026 DeepSig Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include "sctp_connector.hpp"
++#include "libe3/logger.hpp"
++
++#include <arpa/inet.h>
++#include <fcntl.h>
++#include <netinet/in.h>
++#ifdef LIBE3_ENABLE_SCTP
++#include <netinet/sctp.h>
++#endif
++#include <poll.h>
++#include <sys/socket.h>
++#include <sys/uio.h>
++#include <unistd.h>
++
++// Kernel UAPI flag for SCTP event notifications delivered through recvmsg;
++// only <netinet/sctp.h> defines it, and that header is optional here.
++#ifndef MSG_NOTIFICATION
++#define MSG_NOTIFICATION 0x8000
++#endif
++
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cstring>
++#include <thread>
++
++namespace libe3 {
++
++namespace {
++constexpr const char* LOG_TAG = "SctpConn";
++constexpr int POLL_TIMEOUT_MS = 500;         // cooperative shutdown granularity
++constexpr int SEND_TIMEOUT_MS = 500;         // drop a peer that stops reading
++constexpr int SOCKET_BUFFER_BYTES = 8 << 20; // preset before listen()/connect()
++constexpr uint16_t PROCEDURE_STREAM = 0;
++constexpr uint32_t PAYLOAD_PROTOCOL_ID = 0;  // no PPID is registered for E3AP
++
++#ifdef LIBE3_ENABLE_SCTP
++/**
++ * @brief Apply the E2AP-style socket policy to a fresh SCTP socket.
++ *
++ * Must run before listen() or connect(): the INIT/INIT-ACK exchange fixes the
++ * peer's receive window from SO_RCVBUF and accepted sockets inherit every
++ * option from the listener. Failures are logged, not fatal: the association
++ * still works, only slower.
++ */
++void tune_socket(int fd) {
++    int buffer = SOCKET_BUFFER_BYTES;
++    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer)) != 0) {
++        E3_LOG_WARN(LOG_TAG) << "SO_SNDBUF: " << strerror(errno);
++    }
++    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer, sizeof(buffer)) != 0) {
++        E3_LOG_WARN(LOG_TAG) << "SO_RCVBUF: " << strerror(errno);
++    }
++    // Acknowledge every chunk at once: with the kernel's 200 ms delayed-SACK
++    // default a sender of multi-chunk messages waits out that timer per
++    // window.
++    struct sctp_sack_info sack {};
++    sack.sack_delay = 0;
++    sack.sack_freq = 1;
++    if (setsockopt(fd, IPPROTO_SCTP, SCTP_DELAYED_SACK, &sack, sizeof(sack)) != 0) {
++        E3_LOG_WARN(LOG_TAG) << "SCTP_DELAYED_SACK: " << strerror(errno);
++    }
++    int one = 1;
++    if (setsockopt(fd, IPPROTO_SCTP, SCTP_NODELAY, &one, sizeof(one)) != 0) {
++        E3_LOG_WARN(LOG_TAG) << "SCTP_NODELAY: " << strerror(errno);
++    }
++    struct sctp_initmsg init {};
++    init.sinit_num_ostreams = 2;
++    init.sinit_max_instreams = 2;
++    if (setsockopt(fd, IPPROTO_SCTP, SCTP_INITMSG, &init, sizeof(init)) != 0) {
++        E3_LOG_WARN(LOG_TAG) << "SCTP_INITMSG: " << strerror(errno);
++    }
++}
++
++void set_send_timeout(int fd) {
++    struct timeval tv;
++    tv.tv_sec = SEND_TIMEOUT_MS / 1000;
++    tv.tv_usec = (SEND_TIMEOUT_MS % 1000) * 1000;
++    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
++        E3_LOG_WARN(LOG_TAG) << "SO_SNDTIMEO: " << strerror(errno);
++    }
++}
++
++int sctp_socket() {
++    return socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_SCTP);
++}
++#endif
++
++/// "sctp://host:port", "tcp://host:port", "host:port", "host" or "" -> host
++/// ("" when absent). An ipc:// URI (E3Config's default setup_endpoint) names
++/// no host at all and yields "".
++std::string host_of(const std::string& endpoint) {
++    std::string text = endpoint;
++    auto scheme = text.find("://");
++    if (scheme != std::string::npos) {
++        if (text.compare(0, scheme, "ipc") == 0) {
++            return "";
++        }
++        text = text.substr(scheme + 3);
++    }
++    auto colon = text.rfind(':');
++    if (colon != std::string::npos) {
++        text = text.substr(0, colon);
++    }
++    return text;
++}
++
++bool make_address(const std::string& host, uint16_t port, bool any_if_empty, sockaddr_in& out) {
++    out = {};
++    out.sin_family = AF_INET;
++    out.sin_port = htons(port);
++    if (host.empty()) {
++        out.sin_addr.s_addr = any_if_empty ? htonl(INADDR_ANY) : htonl(INADDR_LOOPBACK);
++        return true;
++    }
++    return inet_pton(AF_INET, host.c_str(), &out.sin_addr) == 1;
++}
++
++int wait_readable(int fd, int timeout_ms) {
++    struct pollfd pfd;
++    pfd.fd = fd;
++    pfd.events = POLLIN;
++    pfd.revents = 0;
++    return poll(&pfd, 1, timeout_ms);
++}
++} // namespace
++
++SctpAssociationE3Connector::SctpAssociationE3Connector(const std::string& setup_endpoint,
++                                                       uint16_t setup_port)
++    : host_(host_of(setup_endpoint)), port_(setup_port) {
++    setup_endpoint_ = setup_endpoint;
++    E3_LOG_INFO(LOG_TAG) << "Creating SCTP association connector (host='" << host_
++                         << "' port=" << port_ << ")";
++}
++
++SctpAssociationE3Connector::~SctpAssociationE3Connector() {
++    dispose();
++}
++
++// ===========================================================================
++// Framing: one E3-PDU per SCTP message
++// ===========================================================================
++
++int SctpAssociationE3Connector::send_message(int fd, const uint8_t* data, size_t size,
++                                             uint16_t stream) {
++#ifdef LIBE3_ENABLE_SCTP
++    struct iovec iov;
++    iov.iov_base = const_cast<uint8_t*>(data);
++    iov.iov_len = size;
++
++    alignas(struct cmsghdr) char control[CMSG_SPACE(sizeof(struct sctp_sndrcvinfo))];
++    std::memset(control, 0, sizeof(control));
++    struct msghdr msg {};
++    msg.msg_iov = &iov;
++    msg.msg_iovlen = 1;
++    msg.msg_control = control;
++    msg.msg_controllen = sizeof(control);
++    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
++    cmsg->cmsg_level = IPPROTO_SCTP;
++    cmsg->cmsg_type = SCTP_SNDRCV;
++    cmsg->cmsg_len = CMSG_LEN(sizeof(struct sctp_sndrcvinfo));
++    auto* info = reinterpret_cast<struct sctp_sndrcvinfo*>(CMSG_DATA(cmsg));
++    std::memset(info, 0, sizeof(*info));
++    info->sinfo_stream = stream;
++    info->sinfo_ppid = htonl(PAYLOAD_PROTOCOL_ID);
++
++    for (;;) {
++        ssize_t sent = sendmsg(fd, &msg, MSG_NOSIGNAL);
++        if (sent < 0 && errno == EINTR) {
++            continue;
++        }
++        if (sent < 0 || static_cast<size_t>(sent) != size) {
++            E3_LOG_ERROR(LOG_TAG) << "sendmsg failed: " << strerror(errno);
++            return -1;
++        }
++        return 0;
++    }
++#else
++    (void)fd; (void)data; (void)size; (void)stream;
++    errno = EPROTONOSUPPORT;
++    return -1;
++#endif
++}
++
++int SctpAssociationE3Connector::receive_message(int fd, std::vector<uint8_t>& buffer,
++                                                int timeout_ms) {
++    int ready = wait_readable(fd, timeout_ms);
++    if (ready == 0) {
++        return 0;
++    }
++    if (ready < 0) {
++        return errno == EINTR ? 0 : -1;
++    }
++    buffer.clear();
++    std::vector<uint8_t> chunk(64 * 1024);
++    for (;;) {
++        struct iovec iov;
++        iov.iov_base = chunk.data();
++        iov.iov_len = chunk.size();
++        struct msghdr msg {};
++        msg.msg_iov = &iov;
++        msg.msg_iovlen = 1;
++        ssize_t received = recvmsg(fd, &msg, 0);
++        if (received < 0 && errno == EINTR) {
++            continue;
++        }
++        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++            // The rest of a partial message has not arrived yet.
++            if (wait_readable(fd, POLL_TIMEOUT_MS) <= 0) {
++                return -1;
++            }
++            continue;
++        }
++        if (received <= 0) {
++            return -1;
++        }
++        if ((msg.msg_flags & MSG_NOTIFICATION) != 0) {
++            continue;
++        }
++        if (buffer.size() + static_cast<size_t>(received) > MAX_MESSAGE_BYTES) {
++            E3_LOG_ERROR(LOG_TAG) << "message exceeds " << MAX_MESSAGE_BYTES << " bytes";
++            return -1;
++        }
++        buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + received);
++        if ((msg.msg_flags & MSG_EOR) != 0) {
++            return static_cast<int>(buffer.size());
++        }
++    }
++}
++
++// ===========================================================================
++// RAN role
++// ===========================================================================
++
++ErrorCode SctpAssociationE3Connector::setup_initial_connection() {
++#ifdef LIBE3_ENABLE_SCTP
++    int fd = sctp_socket();
++    if (fd < 0) {
++        E3_LOG_ERROR(LOG_TAG) << "socket(IPPROTO_SCTP): " << strerror(errno);
++        return ErrorCode::CONNECTION_FAILED;
++    }
++    int reuse = 1;
++    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
++    tune_socket(fd);
++    sockaddr_in addr {};
++    if (!make_address(host_, port_, /*any_if_empty=*/true, addr)) {
++        E3_LOG_ERROR(LOG_TAG) << "setup endpoint is not an IPv4 literal: " << host_;
++        close(fd);
++        return ErrorCode::INVALID_PARAM;
++    }
++    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
++        E3_LOG_ERROR(LOG_TAG) << "bind: " << strerror(errno);
++        close(fd);
++        return ErrorCode::CONNECTION_FAILED;
++    }
++    if (listen(fd, 16) < 0) {
++        E3_LOG_ERROR(LOG_TAG) << "listen: " << strerror(errno);
++        close(fd);
++        return ErrorCode::CONNECTION_FAILED;
++    }
++    int flags = fcntl(fd, F_GETFL, 0);
++    if (flags >= 0) {
++        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
++    }
++    listener_ = fd;
++    connected_ = true;
++    E3_LOG_INFO(LOG_TAG) << "SCTP association listener on port " << port_;
++    return ErrorCode::SUCCESS;
++#else
++    E3_LOG_ERROR(LOG_TAG) << "SCTP association link layer requested but libe3 was built "
++                             "without SCTP (rebuild with -DLIBE3_ENABLE_SCTP=ON)";
++    return ErrorCode::CONNECTION_FAILED;
++#endif
++}
++
++int SctpAssociationE3Connector::accept_pending() {
++    int accepted = 0;
++    while (listener_ >= 0 && wait_readable(listener_, 0) == 1) {
++        int fd = accept4(listener_, nullptr, nullptr, SOCK_CLOEXEC);
++        if (fd < 0) {
++            break;
++        }
++        set_send_timeout(fd);
++        std::lock_guard<std::mutex> lock(peers_mutex_);
++        peers_.push_back(Peer{fd, false});
++        ++accepted;
++        E3_LOG_INFO(LOG_TAG) << "association accepted (" << peers_.size() << " total)";
++    }
++    return accepted;
++}
++
++void SctpAssociationE3Connector::drop_peer_locked(int fd) {
++    close(fd);
++    peers_.erase(std::remove_if(peers_.begin(), peers_.end(),
++                                [fd](const Peer& p) { return p.fd == fd; }),
++                 peers_.end());
++    E3_LOG_INFO(LOG_TAG) << "association closed (" << peers_.size() << " remain)";
++}
++
++int SctpAssociationE3Connector::recv_setup_request(std::vector<uint8_t>& buffer) {
++    if (listener_ < 0) {
++        return static_cast<int>(ErrorCode::NOT_CONNECTED);
++    }
++    std::unique_lock<std::mutex> lock(setup_mutex_);
++    if (!setup_cv_.wait_for(lock, std::chrono::milliseconds(POLL_TIMEOUT_MS), [this] {
++            return !pending_setups_.empty() || shutdown_requested_.load();
++        })) {
++        return 0;
++    }
++    if (pending_setups_.empty()) {
++        return 0;
++    }
++    PendingSetup pending = std::move(pending_setups_.front());
++    pending_setups_.pop_front();
++    replying_fd_ = pending.fd;
++    buffer = std::move(pending.bytes);
++    return static_cast<int>(buffer.size());
++}
++
++ErrorCode SctpAssociationE3Connector::send_response(const std::vector<uint8_t>& data) {
++    int fd;
++    {
++        std::lock_guard<std::mutex> lock(setup_mutex_);
++        fd = replying_fd_;
++        replying_fd_ = -1;
++    }
++    if (fd < 0) {
++        return ErrorCode::NOT_CONNECTED;
++    }
++    // Promote the peer before the reply leaves: the dApp may answer the
++    // SetupResponse immediately, and that message must reach the inbound
++    // channel, not the setup queue.
++    {
++        std::lock_guard<std::mutex> lock(peers_mutex_);
++        for (auto& peer : peers_) {
++            if (peer.fd == fd) {
++                peer.setup_done = true;
++            }
++        }
++    }
++    if (send_message(fd, data.data(), data.size(), PROCEDURE_STREAM) < 0) {
++        std::lock_guard<std::mutex> lock(peers_mutex_);
++        drop_peer_locked(fd);
++        return ErrorCode::TRANSPORT_ERROR;
++    }
++    return ErrorCode::SUCCESS;
++}
++
++ErrorCode SctpAssociationE3Connector::setup_inbound_connection() {
++    // The association already carries the inbound channel.
++    return listener_ >= 0 ? ErrorCode::SUCCESS : ErrorCode::NOT_CONNECTED;
++}
++
++ErrorCode SctpAssociationE3Connector::setup_outbound_connection() {
++    return listener_ >= 0 ? ErrorCode::SUCCESS : ErrorCode::NOT_CONNECTED;
++}
++
++int SctpAssociationE3Connector::receive(std::vector<uint8_t>& buffer) {
++    if (role_ == E3Role::DAPP) {
++        if (fd_ < 0) {
++            return static_cast<int>(ErrorCode::NOT_CONNECTED);
++        }
++        // The SetupResponse belongs to the setup thread: do not read the
++        // association until it has been consumed.
++        {
++            std::unique_lock<std::mutex> lock(client_mutex_);
++            if (!client_cv_.wait_for(lock, std::chrono::milliseconds(POLL_TIMEOUT_MS), [this] {
++                    return setup_complete_ || shutdown_requested_.load();
++                })) {
++                return 0;
++            }
++            if (!setup_complete_) {
++                return 0;
++            }
++        }
++        int n = receive_message(fd_, buffer, POLL_TIMEOUT_MS);
++        if (n < 0) {
++            return shutdown_requested_.load() ? 0 : static_cast<int>(ErrorCode::TRANSPORT_ERROR);
++        }
++        return n;
++    }
++
++    if (listener_ < 0) {
++        return static_cast<int>(ErrorCode::NOT_CONNECTED);
++    }
++    std::vector<struct pollfd> pfds;
++    std::vector<Peer> snapshot;
++    {
++        std::lock_guard<std::mutex> lock(peers_mutex_);
++        snapshot = peers_;
++    }
++    pfds.reserve(1 + snapshot.size());
++    pfds.push_back({listener_, POLLIN, 0});
++    for (const auto& peer : snapshot) {
++        pfds.push_back({peer.fd, POLLIN, 0});
++    }
++    int ready = poll(pfds.data(), pfds.size(), POLL_TIMEOUT_MS);
++    if (ready == 0) {
++        return 0;
++    }
++    if (ready < 0) {
++        return errno == EINTR ? 0 : static_cast<int>(ErrorCode::TRANSPORT_ERROR);
++    }
++    if (pfds[0].revents & POLLIN) {
++        accept_pending();
++    }
++    const size_t n_peers = snapshot.size();
++    for (size_t k = 0; k < n_peers; ++k) {
++        const size_t idx = (inbound_rr_ + k) % n_peers;
++        const short re = pfds[idx + 1].revents;
++        if (!(re & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
++            continue;
++        }
++        const Peer peer = snapshot[idx];
++        int n = (re & POLLIN) ? receive_message(peer.fd, buffer, 0) : -1;
++        if (n < 0) {
++            std::lock_guard<std::mutex> lock(peers_mutex_);
++            drop_peer_locked(peer.fd);
++            continue;
++        }
++        if (n == 0) {
++            continue;
++        }
++        inbound_rr_ = idx + 1;
++        bool setup_done = peer.setup_done;
++        if (!setup_done) {
++            // The snapshot may predate send_response(); consult the live state.
++            std::lock_guard<std::mutex> lock(peers_mutex_);
++            for (const auto& live : peers_) {
++                if (live.fd == peer.fd) {
++                    setup_done = live.setup_done;
++                }
++            }
++        }
++        if (!setup_done) {
++            // First message on a fresh association: the SetupRequest.
++            std::lock_guard<std::mutex> lock(setup_mutex_);
++            pending_setups_.push_back(PendingSetup{peer.fd, std::move(buffer)});
++            buffer.clear();
++            setup_cv_.notify_one();
++            return 0;
++        }
++        return n;
++    }
++    if (n_peers > 0) {
++        inbound_rr_ = (inbound_rr_ + 1) % n_peers;
++    }
++    return 0;
++}
++
++ErrorCode SctpAssociationE3Connector::send(const std::vector<uint8_t>& data) {
++    if (shutdown_requested_.load()) {
++        return ErrorCode::CANCELLED;
++    }
++    if (role_ == E3Role::DAPP) {
++        if (fd_ < 0) {
++            return ErrorCode::NOT_CONNECTED;
++        }
++        return send_message(fd_, data.data(), data.size(), PROCEDURE_STREAM) == 0
++            ? ErrorCode::SUCCESS
++            : ErrorCode::TRANSPORT_ERROR;
++    }
++    if (listener_ < 0) {
++        return ErrorCode::NOT_CONNECTED;
++    }
++    accept_pending();
++    std::vector<int> targets;
++    {
++        std::lock_guard<std::mutex> lock(peers_mutex_);
++        for (const auto& peer : peers_) {
++            if (peer.setup_done) {
++                targets.push_back(peer.fd);
++            }
++        }
++    }
++    std::vector<int> failed;
++    for (int fd : targets) {
++        if (send_message(fd, data.data(), data.size(), PROCEDURE_STREAM) < 0) {
++            failed.push_back(fd);
++        }
++    }
++    if (!failed.empty()) {
++        std::lock_guard<std::mutex> lock(peers_mutex_);
++        for (int fd : failed) {
++            drop_peer_locked(fd);
++        }
++        if (failed.size() == targets.size()) {
++            return ErrorCode::TRANSPORT_ERROR;
++        }
++    }
++    return ErrorCode::SUCCESS;
++}
++
++// ===========================================================================
++// dApp role
++// ===========================================================================
++
++ErrorCode SctpAssociationE3Connector::setup_initial_connection_client() {
++#ifdef LIBE3_ENABLE_SCTP
++    sockaddr_in addr {};
++    if (!make_address(host_, port_, /*any_if_empty=*/false, addr)) {
++        E3_LOG_ERROR(LOG_TAG) << "setup endpoint is not an IPv4 literal: " << host_;
++        return ErrorCode::INVALID_PARAM;
++    }
++    int fd = -1;
++    for (int retry = 0; retry < 10 && fd < 0; ++retry) {
++        fd = sctp_socket();
++        if (fd < 0) {
++            E3_LOG_ERROR(LOG_TAG) << "socket(IPPROTO_SCTP): " << strerror(errno);
++            return ErrorCode::CONNECTION_FAILED;
++        }
++        tune_socket(fd);
++        if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
++            close(fd);
++            fd = -1;
++            if (shutdown_requested_.load()) {
++                return ErrorCode::CANCELLED;
++            }
++            std::this_thread::sleep_for(std::chrono::milliseconds(200));
++        }
++    }
++    if (fd < 0) {
++        E3_LOG_ERROR(LOG_TAG) << "connect: " << strerror(errno);
++        return ErrorCode::CONNECTION_FAILED;
++    }
++    fd_ = fd;
++    connected_ = true;
++    E3_LOG_INFO(LOG_TAG) << "SCTP association connected to port " << port_;
++    return ErrorCode::SUCCESS;
++#else
++    E3_LOG_ERROR(LOG_TAG) << "SCTP association link layer requested but libe3 was built "
++                             "without SCTP (rebuild with -DLIBE3_ENABLE_SCTP=ON)";
++    return ErrorCode::CONNECTION_FAILED;
++#endif
++}
++
++ErrorCode SctpAssociationE3Connector::send_setup_request_client(const std::vector<uint8_t>& data) {
++    if (fd_ < 0) {
++        return ErrorCode::NOT_CONNECTED;
++    }
++    return send_message(fd_, data.data(), data.size(), PROCEDURE_STREAM) == 0
++        ? ErrorCode::SUCCESS
++        : ErrorCode::TRANSPORT_ERROR;
++}
++
++int SctpAssociationE3Connector::recv_setup_response_client(std::vector<uint8_t>& buffer) {
++    if (fd_ < 0) {
++        return static_cast<int>(ErrorCode::NOT_CONNECTED);
++    }
++    int n = receive_message(fd_, buffer, POLL_TIMEOUT_MS);
++    if (n < 0) {
++        return static_cast<int>(ErrorCode::TRANSPORT_ERROR);
++    }
++    if (n > 0) {
++        std::lock_guard<std::mutex> lock(client_mutex_);
++        setup_complete_ = true;
++        client_cv_.notify_all();
++    }
++    return n;
++}
++
++ErrorCode SctpAssociationE3Connector::setup_inbound_connection_client() {
++    return fd_ >= 0 ? ErrorCode::SUCCESS : ErrorCode::NOT_CONNECTED;
++}
++
++ErrorCode SctpAssociationE3Connector::setup_outbound_connection_client() {
++    return fd_ >= 0 ? ErrorCode::SUCCESS : ErrorCode::NOT_CONNECTED;
++}
++
++// ===========================================================================
++// Lifecycle
++// ===========================================================================
++
++void SctpAssociationE3Connector::shutdown() {
++    shutdown_requested_.store(true);
++    if (listener_ >= 0) {
++        ::shutdown(listener_, SHUT_RDWR);
++    }
++    if (fd_ >= 0) {
++        ::shutdown(fd_, SHUT_RDWR);
++    }
++    {
++        std::lock_guard<std::mutex> lock(peers_mutex_);
++        for (const auto& peer : peers_) {
++            ::shutdown(peer.fd, SHUT_RDWR);
++        }
++    }
++    setup_cv_.notify_all();
++    client_cv_.notify_all();
++}
++
++void SctpAssociationE3Connector::dispose() {
++    {
++        std::lock_guard<std::mutex> lock(peers_mutex_);
++        for (const auto& peer : peers_) {
++            close(peer.fd);
++        }
++        peers_.clear();
++    }
++    if (listener_ >= 0) {
++        close(listener_);
++        listener_ = -1;
++    }
++    if (fd_ >= 0) {
++        close(fd_);
++        fd_ = -1;
++    }
++    connected_ = false;
++}
++
++} // namespace libe3
+diff --git a/src/connector/sctp_connector.hpp b/src/connector/sctp_connector.hpp
+new file mode 100644
+index 0000000..41661d5
+--- /dev/null
++++ b/src/connector/sctp_connector.hpp
+@@ -0,0 +1,150 @@
++/**
++ * @file sctp_connector.hpp
++ * @brief Native SCTP association E3 connector (E2AP-style transport)
++ *
++ * One SCTP one-to-one association carries every E3AP channel. Each E3-PDU is
++ * one SCTP message, framed by the transport's own message boundaries
++ * (MSG_EOR) with no length prefix, exactly as E2AP, F1AP and NGAP frame their
++ * PDUs over SCTP. This is the transport an O-RAN RAN function already speaks
++ * on its E2 interface, and the one the OCUDU E3 agent exposes.
++ *
++ * SPDX-FileCopyrightText: Copyright (c) 2026 Northeastern University
++ * SPDX-FileCopyrightText: Copyright (c) 2026 DeepSig Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#ifndef LIBE3_SCTP_CONNECTOR_HPP
++#define LIBE3_SCTP_CONNECTOR_HPP
++
++#include "libe3/e3_connector.hpp"
++#include <atomic>
++#include <condition_variable>
++#include <cstddef>
++#include <deque>
++#include <mutex>
++#include <vector>
++
++namespace libe3 {
++
++/**
++ * @brief E3 connector over one native SCTP association per peer.
++ *
++ * Channel mapping. libe3 models E3AP as three channels (setup REQ/REP, an
++ * inbound dApp->RAN channel and an outbound RAN->dApp channel). This connector
++ * multiplexes all three on a single association:
++ *
++ *  - the first message a peer sends on a fresh association is its
++ *    SetupRequest and is handed to the setup channel; the RAN's reply travels
++ *    back on the same association;
++ *  - every later message from the peer is inbound traffic;
++ *  - every message the RAN sends is outbound traffic, delivered to each
++ *    peer that has completed setup (the same broadcast semantics as the
++ *    ZMQ PUB/SUB and POSIX connectors: each dApp filters by its identifier).
++ *
++ * dApp->RAN messages go on SCTP stream 0; RAN->dApp messages go on stream 0
++ * as well. Receivers must not depend on the stream number: it is a hint for
++ * head-of-line blocking, not part of the protocol.
++ *
++ * Framing. sendmsg()/recvmsg() on a SOCK_STREAM SCTP socket preserve message
++ * boundaries; a message larger than one recvmsg() call is reassembled until
++ * MSG_EOR. No 4-byte length prefix is used, so this connector is NOT wire
++ * compatible with PosixE3Connector's SCTP-as-stream mode; it is wire
++ * compatible with every E2AP-style peer.
++ *
++ * Socket tuning. Linux SCTP fixes the receive window at association setup
++ * from the receive buffer and defaults the send buffer to a few tens of KiB
++ * with delayed SACK, which stalls multi-chunk messages by seconds. Both
++ * buffers are preset before listen()/connect() and delayed SACK is disabled
++ * on every socket, so a message of hundreds of KiB crosses loopback in
++ * well under a millisecond.
++ *
++ * Only setup_endpoint / setup_port are used (host and port of the single
++ * association); the inbound and outbound endpoints are ignored.
++ */
++class SctpAssociationE3Connector : public E3Connector {
++public:
++    SctpAssociationE3Connector(const std::string& setup_endpoint, uint16_t setup_port);
++    ~SctpAssociationE3Connector() override;
++
++    // RAN role
++    ErrorCode setup_initial_connection() override;
++    int recv_setup_request(std::vector<uint8_t>& buffer) override;
++    ErrorCode send_response(const std::vector<uint8_t>& data) override;
++    ErrorCode setup_inbound_connection() override;
++    int receive(std::vector<uint8_t>& buffer) override;
++    ErrorCode setup_outbound_connection() override;
++    ErrorCode send(const std::vector<uint8_t>& data) override;
++
++    // dApp role
++    ErrorCode setup_initial_connection_client() override;
++    ErrorCode send_setup_request_client(const std::vector<uint8_t>& data) override;
++    int recv_setup_response_client(std::vector<uint8_t>& buffer) override;
++    ErrorCode setup_inbound_connection_client() override;
++    ErrorCode setup_outbound_connection_client() override;
++
++    void dispose() override;
++    void shutdown() override;
++
++    E3LinkLayer link_layer() const noexcept override {
++        return E3LinkLayer::SCTP_ASSOCIATION;
++    }
++    E3TransportLayer transport_layer() const noexcept override {
++        return E3TransportLayer::SCTP;
++    }
++    bool is_connected() const noexcept override {
++        return connected_;
++    }
++
++    /// Largest message accepted from the wire; larger ones drop the peer.
++    static constexpr size_t MAX_MESSAGE_BYTES = 1u << 20;
++
++private:
++    struct Peer {
++        int fd{-1};
++        bool setup_done{false};
++    };
++
++    /// A SetupRequest read by the inbound thread, waiting for the setup thread.
++    struct PendingSetup {
++        int fd{-1};
++        std::vector<uint8_t> bytes;
++    };
++
++    std::string host_;
++    uint16_t port_;
++
++    // RAN role: the listener and every accepted association. peers_ is
++    // touched by the inbound thread (accept, read, drop), the setup thread
++    // (mark setup_done) and the outbound thread (broadcast), hence the mutex.
++    int listener_{-1};
++    std::mutex peers_mutex_;
++    std::vector<Peer> peers_;
++    size_t inbound_rr_{0};
++
++    // RAN role: setup requests handed from the inbound thread to the setup
++    // thread, and the association the current reply must go to.
++    std::mutex setup_mutex_;
++    std::condition_variable setup_cv_;
++    std::deque<PendingSetup> pending_setups_;
++    int replying_fd_{-1};
++
++    // dApp role: the single association and the "setup response consumed"
++    // gate that keeps the inbound thread from swallowing the SetupResponse.
++    int fd_{-1};
++    std::mutex client_mutex_;
++    std::condition_variable client_cv_;
++    bool setup_complete_{false};
++
++    bool connected_{false};
++    std::atomic<bool> shutdown_requested_{false};
++
++    int accept_pending();
++    void drop_peer_locked(int fd);
++    static int send_message(int fd, const uint8_t* data, size_t size, uint16_t stream);
++    /// Returns bytes received, 0 on timeout, -1 on close/error.
++    static int receive_message(int fd, std::vector<uint8_t>& buffer, int timeout_ms);
++};
++
++} // namespace libe3
++
++#endif // LIBE3_SCTP_CONNECTOR_HPP
+diff --git a/tests/integration/test_role_pair_sctp.cpp b/tests/integration/test_role_pair_sctp.cpp
+new file mode 100644
+index 0000000..9852418
+--- /dev/null
++++ b/tests/integration/test_role_pair_sctp.cpp
+@@ -0,0 +1,214 @@
++/**
++ * @file test_role_pair_sctp.cpp
++ * @brief End-to-end RAN + dApp pair over one native SCTP association
++ *        (E3LinkLayer::SCTP_ASSOCIATION).
++ *
++ * Same scenario as test_role_pair_posix.cpp with the E2AP-style connector:
++ * setup, subscription, indications and release all cross a single
++ * association framed by SCTP message boundaries. Skips (passes) when the host
++ * has no SCTP support.
++ *
++ * SPDX-FileCopyrightText: Copyright (c) 2026 Northeastern University
++ * SPDX-FileCopyrightText: Copyright (c) 2026 DeepSig Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include "test_framework.hpp"
++#include <libe3/libe3.hpp>
++#include "sm_simple/e3sm_simple_wrapper.hpp"
++
++#include <atomic>
++#include <iostream>
++#include <vector>
++#include <chrono>
++#include <condition_variable>
++#include <cstdlib>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <thread>
++#include <unistd.h>
++
++using namespace libe3;
++using namespace std::chrono_literals;
++
++namespace {
++
++class SctpSM : public ServiceModel {
++public:
++    std::string name() const override { return "SCTP-TEST"; }
++    uint32_t version() const override { return 1; }
++    uint32_t ran_function_id() const override { return 1; }
++    std::vector<uint32_t> telemetry_ids() const override { return {1}; }
++    std::vector<uint32_t> control_ids() const override { return {1}; }
++    ErrorCode init() override { return ErrorCode::SUCCESS; }
++    void destroy() override { stop(); }
++    bool is_running() const override { return running_; }
++
++    std::vector<uint8_t> ran_function_data() const override {
++        std::vector<uint8_t> out;
++        if (libe3_examples::encode_ran_function_data("SCTPSM", out)) return out;
++        return {0x01};
++    }
++
++    ErrorCode start() override {
++        if (running_) return ErrorCode::SUCCESS;
++        running_ = true;
++        worker_ = std::thread([this]() {
++            uint32_t seq = 0;
++            while (running_) {
++                std::this_thread::sleep_for(200ms);
++                auto subs = get_subscribers();
++                if (subs.empty()) continue;
++                libe3_examples::SimpleIndication si{seq, 0};
++                std::vector<uint8_t> enc;
++                if (!libe3_examples::encode_simple_indication(si, enc)) continue;
++                for (auto did : subs) {
++                    Pdu pdu = make_indication_pdu(did, 1, enc);
++                    (void)emit_outbound(std::move(pdu));
++                }
++                ++seq;
++            }
++        });
++        return ErrorCode::SUCCESS;
++    }
++    void stop() override {
++        if (!running_) return;
++        running_ = false;
++        if (worker_.joinable()) worker_.join();
++    }
++    ErrorCode handle_control_action(uint32_t request_message_id,
++                                    const DAppControlAction& a) override {
++        ++control_count;
++        Pdu ack = make_message_ack_pdu(request_message_id, ResponseCode::POSITIVE);
++        return emit_outbound(std::move(ack));
++    }
++    std::atomic<int> control_count{0};
++
++private:
++    std::atomic<bool> running_{false};
++    std::thread worker_;
++};
++
++void run_pair(E3TransportLayer transport, uint16_t base_port,
++              const std::string& ipc_dir) {
++    auto make_ran_cfg = [&]() {
++        E3Config c;
++        c.role = E3Role::RAN;
++        c.ran_identifier = "sctp-test-ran";
++        c.link_layer = E3LinkLayer::SCTP_ASSOCIATION;
++        c.setup_endpoint = "sctp://127.0.0.1";
++        c.transport_layer = transport;
++        c.encoding = EncodingFormat::ASN1;
++        c.log_level = 0;
++        if (transport == E3TransportLayer::IPC) {
++            c.setup_endpoint = "ipc://" + ipc_dir + "/setup";
++            c.subscriber_endpoint = "ipc://" + ipc_dir + "/dapp_socket";
++            c.publisher_endpoint = "ipc://" + ipc_dir + "/e3_socket";
++        }
++        c.setup_port = base_port;
++        c.subscriber_port = base_port + 1;
++        c.publisher_port = base_port + 2;
++        return c;
++    };
++    auto ran_cfg = make_ran_cfg();
++    auto dapp_cfg = ran_cfg;
++    dapp_cfg.role = E3Role::DAPP;
++    dapp_cfg.dapp_name = "SctpTestDApp";
++    // E3-SetupRequest.vendor is UTF8String (SIZE (1..64)): an empty vendor
++    // fails the APER constraint check on asn1c builds that enforce it.
++    dapp_cfg.vendor = "libe3";
++
++    E3Agent ran(ran_cfg);
++    auto* sm_ptr = new SctpSM();
++    ASSERT_TRUE(ran.register_sm(std::unique_ptr<ServiceModel>(sm_ptr)) == ErrorCode::SUCCESS);
++    ASSERT_TRUE(ran.start() == ErrorCode::SUCCESS);
++
++    std::mutex mu;
++    std::condition_variable cv;
++    int indications = 0;
++    bool sub_resp_ok = false;
++
++    E3Agent dapp(dapp_cfg);
++    dapp.set_indication_handler([&](const IndicationMessage& msg) {
++        libe3_examples::SimpleIndication si;
++        if (libe3_examples::decode_simple_indication(msg.protocol_data, si)) {
++            std::lock_guard<std::mutex> lk(mu);
++            ++indications;
++            cv.notify_all();
++        }
++    });
++    dapp.set_subscription_response_handler([&](const SubscriptionResponse& r) {
++        std::lock_guard<std::mutex> lk(mu);
++        sub_resp_ok = (r.response_code == ResponseCode::POSITIVE);
++        cv.notify_all();
++    });
++
++    ASSERT_TRUE(dapp.start() == ErrorCode::SUCCESS);
++    ASSERT_TRUE(dapp.wait_for_setup(5000ms) == ErrorCode::SUCCESS);
++    ASSERT_TRUE(dapp.dapp_id().has_value());
++
++    ASSERT_TRUE(dapp.subscribe(1, {1}, {1}) == ErrorCode::SUCCESS);
++    {
++        std::unique_lock<std::mutex> lk(mu);
++        ASSERT_TRUE(cv.wait_for(lk, 5s, [&]() { return sub_resp_ok; }));
++    }
++    {
++        std::unique_lock<std::mutex> lk(mu);
++        ASSERT_TRUE(cv.wait_for(lk, 5s, [&]() { return indications >= 2; }));
++    }
++
++    // A granted subscription must be visible to the dApp that holds it: the
++    // response carries no ranFunctionIdentifier, so this only works if the
++    // request that asked for it was recorded (issue #66).
++    ASSERT_TRUE(dapp.subscribed_ran_functions() == std::vector<uint32_t>{1});
++    ASSERT_EQ(dapp.active_subscription_ids().size(), size_t{1});
++
++    // ... and can therefore be released without ending the session.
++    ASSERT_TRUE(dapp.unsubscribe(1) == ErrorCode::SUCCESS);
++    {
++        // The release is confirmed by a SubscriptionResponse too; wait for the
++        // local state to reflect it rather than sleeping a fixed interval.
++        const auto deadline = std::chrono::steady_clock::now() + 5s;
++        while (!dapp.subscribed_ran_functions().empty()
++               && std::chrono::steady_clock::now() < deadline) {
++            std::this_thread::sleep_for(20ms);
++        }
++    }
++    ASSERT_TRUE(dapp.subscribed_ran_functions().empty());
++    ASSERT_TRUE(dapp.active_subscription_ids().empty());
++
++    // Releasing it twice is a miss, not a second release.
++    ASSERT_TRUE(dapp.unsubscribe(1) == ErrorCode::SUBSCRIPTION_NOT_FOUND);
++
++    dapp.stop();
++    ran.stop();
++}
++
++}  // namespace
++
++bool host_has_sctp() {
++    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP);
++    if (fd < 0) return false;
++    close(fd);
++#ifdef LIBE3_ENABLE_SCTP
++    return true;
++#else
++    return false;
++#endif
++}
++
++TEST(role_pair_sctp_association_end_to_end) {
++    if (!host_has_sctp()) {
++        std::cout << "  (SCTP unavailable on this host; skipped)\n";
++        return;
++    }
++    run_pair(E3TransportLayer::SCTP, /*base_port=*/25991, "");
++}
++
++int main() {
++    return RUN_ALL_TESTS();
++}
+diff --git a/tests/test_role_aware_connector_sctp.cpp b/tests/test_role_aware_connector_sctp.cpp
+new file mode 100644
+index 0000000..9a99906
+--- /dev/null
++++ b/tests/test_role_aware_connector_sctp.cpp
+@@ -0,0 +1,151 @@
++/**
++ * @file test_role_aware_connector_sctp.cpp
++ * @brief SctpAssociationE3Connector: one association carries setup, inbound
++ *        and outbound traffic with SCTP message boundaries.
++ *
++ * Skips (passes) when the host has no SCTP support: ubuntu-latest CI runners
++ * lack the sctp kernel module, and a build with LIBE3_ENABLE_SCTP=OFF cannot
++ * create the socket either.
++ *
++ * SPDX-FileCopyrightText: Copyright (c) 2026 Northeastern University
++ * SPDX-FileCopyrightText: Copyright (c) 2026 DeepSig Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include "test_framework.hpp"
++#include "libe3/types.hpp"
++#include "libe3/e3_connector.hpp"
++
++#include <atomic>
++#include <chrono>
++#include <iostream>
++#include <cstring>
++#include <netinet/in.h>
++#include <string>
++#include <sys/socket.h>
++#include <thread>
++#include <unistd.h>
++#include <vector>
++
++using namespace libe3;
++using namespace std::chrono_literals;
++
++namespace {
++
++bool host_has_sctp() {
++    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP);
++    if (fd < 0) return false;
++    close(fd);
++#ifdef LIBE3_ENABLE_SCTP
++    return true;
++#else
++    return false;
++#endif
++}
++
++std::vector<uint8_t> bytes(const char* text) {
++    return std::vector<uint8_t>(text, text + std::strlen(text));
++}
++
++}  // namespace
++
++TEST(sctp_association_setup_inbound_outbound_share_one_association) {
++    if (!host_has_sctp()) {
++        std::cout << "  (SCTP unavailable on this host; skipped)\n";
++        return;
++    }
++    const uint16_t port = 25990;
++
++    auto ran = create_connector(E3LinkLayer::SCTP_ASSOCIATION, E3TransportLayer::SCTP,
++                                "sctp://127.0.0.1", "", "", port, 0, 0,
++                                /*io_threads=*/1, E3Role::RAN);
++    ASSERT_TRUE(ran != nullptr);
++    ASSERT_TRUE(ran->link_layer() == E3LinkLayer::SCTP_ASSOCIATION);
++    ASSERT_TRUE(ran->setup_initial_connection() == ErrorCode::SUCCESS);
++    ASSERT_TRUE(ran->setup_inbound_connection() == ErrorCode::SUCCESS);
++    ASSERT_TRUE(ran->setup_outbound_connection() == ErrorCode::SUCCESS);
++
++    auto dapp = create_connector(E3LinkLayer::SCTP_ASSOCIATION, E3TransportLayer::SCTP,
++                                 "sctp://127.0.0.1", "", "", port, 0, 0,
++                                 /*io_threads=*/1, E3Role::DAPP);
++    ASSERT_TRUE(dapp != nullptr);
++
++    // RAN side: the inbound loop reads the association; the first message of
++    // a fresh peer is routed to the setup channel, later ones are inbound.
++    std::vector<uint8_t> setup_rx;
++    std::vector<uint8_t> inbound_rx;
++    std::atomic<bool> stop{false};
++    std::thread inbound_t([&]() {
++        std::vector<uint8_t> buf;
++        while (!stop.load()) {
++            int n = ran->receive(buf);
++            if (n > 0) {
++                inbound_rx = buf;
++            }
++        }
++    });
++    std::thread setup_t([&]() {
++        for (int i = 0; i < 40; ++i) {
++            int n = ran->recv_setup_request(setup_rx);
++            if (n > 0) {
++                ran->send_response(bytes("setup-ok"));
++                return;
++            }
++        }
++    });
++
++    ASSERT_TRUE(dapp->setup_initial_connection_client() == ErrorCode::SUCCESS);
++    ASSERT_TRUE(dapp->setup_inbound_connection_client() == ErrorCode::SUCCESS);
++    ASSERT_TRUE(dapp->setup_outbound_connection_client() == ErrorCode::SUCCESS);
++    ASSERT_TRUE(dapp->send_setup_request_client(bytes("setup-req")) == ErrorCode::SUCCESS);
++
++    std::vector<uint8_t> resp;
++    int n = 0;
++    for (int i = 0; i < 40 && n == 0; ++i) {
++        n = dapp->recv_setup_response_client(resp);
++    }
++    setup_t.join();
++    ASSERT_TRUE(n > 0);
++    ASSERT_TRUE(resp == bytes("setup-ok"));
++    ASSERT_TRUE(setup_rx == bytes("setup-req"));
++
++    // dApp -> RAN after setup: inbound.
++    ASSERT_TRUE(dapp->send(bytes("control")) == ErrorCode::SUCCESS);
++    for (int i = 0; i < 100 && inbound_rx.empty(); ++i) {
++        std::this_thread::sleep_for(10ms);
++    }
++    ASSERT_TRUE(inbound_rx == bytes("control"));
++
++    // RAN -> dApp: outbound broadcast reaches the set-up peer, and a message
++    // larger than one recvmsg() call arrives whole (SCTP boundaries, no
++    // length prefix).
++    std::vector<uint8_t> big(200 * 1024);
++    for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<uint8_t>(i * 7);
++    ASSERT_TRUE(ran->send(bytes("indication")) == ErrorCode::SUCCESS);
++    ASSERT_TRUE(ran->send(big) == ErrorCode::SUCCESS);
++    std::vector<uint8_t> rx;
++    n = 0;
++    for (int i = 0; i < 40 && n == 0; ++i) n = dapp->receive(rx);
++    ASSERT_TRUE(n > 0);
++    ASSERT_TRUE(rx == bytes("indication"));
++    n = 0;
++    for (int i = 0; i < 40 && n == 0; ++i) n = dapp->receive(rx);
++    ASSERT_EQ(static_cast<size_t>(n), big.size());
++    ASSERT_TRUE(rx == big);
++
++    stop.store(true);
++    ran->shutdown();
++    inbound_t.join();
++    dapp->dispose();
++    ran->dispose();
++}
++
++TEST(sctp_association_factory_rejects_other_transports) {
++    auto conn = create_connector(E3LinkLayer::SCTP_ASSOCIATION, E3TransportLayer::TCP,
++                                 "", "", "", 1, 2, 3, 1, E3Role::RAN);
++    ASSERT_TRUE(conn == nullptr);
++}
++
++int main() {
++    return RUN_ALL_TESTS();
++}
+-- 
+2.43.0
+

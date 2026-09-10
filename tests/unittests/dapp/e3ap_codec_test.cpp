@@ -432,3 +432,163 @@ TEST(dapp_e3ap_codec, converts_packed_store_metadata_into_records)
   EXPECT_EQ(std::get<class_c_portable_record>(portable.value->object).metadata, envelope);
   EXPECT_EQ(portable.value->dropped_objects, 2U);
 }
+
+TEST(dapp_e3ap_codec, envelope_timestamp_round_trips_and_matches_the_python_golden_vector)
+{
+  // Native timestamps are extensions; libe3 retains its separate root layout.
+  // python/tests/test_e3ap_client.py pins the same bytes.
+  e3ap_pdu pdu;
+  pdu.id           = 1;
+  pdu.timestamp_ns = 1756800000000000000LL;
+  e3ap_setup_request setup;
+  setup.dapp_name    = "x";
+  setup.dapp_version = "0";
+  setup.vendor       = "v";
+  pdu.message        = setup;
+  auto encoded       = e3ap_codec::encode(pdu);
+  ASSERT_TRUE(encoded) << encoded.detail;
+  const std::vector<uint8_t> golden = {0x80, 0x00, 0x00, 0x80, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00, 0x78, 0x00, 0x30,
+                                       0x00, 0x76, 0x01, 0x09, 0x08, 0x18, 0x61, 0x68, 0x4a, 0xc5, 0x68, 0x00, 0x00};
+  EXPECT_EQ(*encoded.value, golden);
+  auto decoded = e3ap_codec::decode(*encoded.value);
+  ASSERT_TRUE(decoded) << decoded.detail;
+  ASSERT_TRUE(decoded.value->timestamp_ns);
+  EXPECT_EQ(*decoded.value->timestamp_ns, 1756800000000000000LL);
+
+  // Without a timestamp the envelope is byte-identical to the pre-timestamp wire.
+  pdu.timestamp_ns.reset();
+  auto plain = e3ap_codec::encode(pdu);
+  ASSERT_TRUE(plain) << plain.detail;
+  const std::vector<uint8_t> plain_golden = {
+      0x00, 0x00, 0x00, 0x80, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00, 0x78, 0x00, 0x30, 0x00, 0x76};
+  EXPECT_EQ(*plain.value, plain_golden);
+  auto plain_decoded = e3ap_codec::decode(*plain.value);
+  ASSERT_TRUE(plain_decoded) << plain_decoded.detail;
+  EXPECT_FALSE(plain_decoded.value->timestamp_ns);
+}
+
+TEST(dapp_e3ap_codec, by_reference_descriptors_and_regions_round_trip)
+{
+  // Subscription request asks for by-reference delivery.
+  e3ap_pdu pdu;
+  pdu.id = 7;
+  e3ap_subscription_request request;
+  request.dapp_identifier            = 3;
+  request.ran_function_identifier    = e3ap_ran_function_telemetry;
+  request.telemetry_identifiers      = {telemetry_id_pusch_symbols};
+  request.delivery_mode              = e3ap_delivery_mode::by_reference;
+  request.minimum_by_reference_bytes = 4096;
+  pdu.message                        = request;
+  auto encoded                       = e3ap_codec::encode(pdu);
+  ASSERT_TRUE(encoded) << encoded.detail;
+  auto decoded = e3ap_codec::decode(*encoded.value);
+  ASSERT_TRUE(decoded) << decoded.detail;
+  const auto& back = std::get<e3ap_subscription_request>(decoded.value->message);
+  ASSERT_TRUE(back.delivery_mode);
+  EXPECT_EQ(*back.delivery_mode, e3ap_delivery_mode::by_reference);
+  ASSERT_TRUE(back.minimum_by_reference_bytes);
+  EXPECT_EQ(*back.minimum_by_reference_bytes, 4096U);
+
+  // Subscription response advertises the region.
+  e3ap_subscription_response response;
+  response.request_id      = 7;
+  response.dapp_identifier = 3;
+  response.response_code   = e3ap_response_code::positive;
+  response.subscription_id = 1;
+  e3ap_shared_region region;
+  region.region_name     = "/ocudu-e3-1234-3-1";
+  region.region_bytes    = 64 + 4 * (64 + 4 * 1024 * 1024);
+  region.row_bytes       = 64 + 4 * 1024 * 1024;
+  region.nof_rows        = 4;
+  response.shared_region = region;
+  pdu.message            = response;
+  encoded                = e3ap_codec::encode(pdu);
+  ASSERT_TRUE(encoded) << encoded.detail;
+  decoded = e3ap_codec::decode(*encoded.value);
+  ASSERT_TRUE(decoded) << decoded.detail;
+  const auto& response_back = std::get<e3ap_subscription_response>(decoded.value->message);
+  ASSERT_TRUE(response_back.shared_region);
+  EXPECT_EQ(response_back.shared_region->region_name, region.region_name);
+  EXPECT_EQ(response_back.shared_region->region_bytes, region.region_bytes);
+  EXPECT_EQ(response_back.shared_region->row_bytes, region.row_bytes);
+  EXPECT_EQ(response_back.shared_region->nof_rows, 4U);
+  EXPECT_EQ(response_back.shared_region->memory_domain, e3ap_memory_domain::posix_shared);
+
+  // Indication carries a POSIX shared-region descriptor.
+  e3ap_indication_message indication;
+  indication.dapp_identifier         = 3;
+  indication.ran_function_identifier = e3ap_ran_function_telemetry;
+  indication.protocol_data           = {0x01, 0x02, 0x03};
+  indication.subscription_id         = 1;
+  indication.telemetry_identifier    = telemetry_id_pusch_symbols;
+  indication.sequence                = 42;
+  e3ap_tensor_descriptor descriptor;
+  descriptor.memory_domain = e3ap_memory_domain::posix_shared;
+  descriptor.location      = e3ap_posix_shared_location{"/ocudu-e3-1234-3-1", 2, 64 + 2 * (64 + 4 * 1024 * 1024) + 64};
+  descriptor.byte_length   = 734208;
+  descriptor.generation    = 10;
+  descriptor.element_type  = e3ap_element_type::complex_fp32;
+  descriptor.dimensions    = {4, 14, 3276};
+  descriptor.byte_strides  = {14 * 3276 * 8, 3276 * 8, 8};
+  descriptor.layout_id     = 2;
+  descriptor.lease_expiry_ns = 123456789ULL;
+  indication.by_reference    = descriptor;
+  pdu.message                = indication;
+  encoded                    = e3ap_codec::encode(pdu);
+  ASSERT_TRUE(encoded) << encoded.detail;
+  decoded = e3ap_codec::decode(*encoded.value);
+  ASSERT_TRUE(decoded) << decoded.detail;
+  const auto& indication_back = std::get<e3ap_indication_message>(decoded.value->message);
+  ASSERT_TRUE(indication_back.by_reference);
+  const auto& d = *indication_back.by_reference;
+  EXPECT_EQ(d.memory_domain, e3ap_memory_domain::posix_shared);
+  ASSERT_TRUE(std::holds_alternative<e3ap_posix_shared_location>(d.location));
+  const auto& location = std::get<e3ap_posix_shared_location>(d.location);
+  EXPECT_EQ(location.region_name, "/ocudu-e3-1234-3-1");
+  EXPECT_EQ(location.row_index, 2U);
+  EXPECT_EQ(location.byte_offset, 64U + 2 * (64 + 4 * 1024 * 1024) + 64);
+  EXPECT_EQ(d.byte_length, 734208U);
+  EXPECT_EQ(d.generation, 10U);
+  ASSERT_TRUE(d.element_type);
+  EXPECT_EQ(*d.element_type, e3ap_element_type::complex_fp32);
+  EXPECT_EQ(d.dimensions, (std::vector<uint32_t>{4, 14, 3276}));
+  EXPECT_EQ(d.byte_strides, (std::vector<uint64_t>{14 * 3276 * 8, 3276 * 8, 8}));
+  ASSERT_TRUE(d.layout_id);
+  EXPECT_EQ(*d.layout_id, 2U);
+  ASSERT_TRUE(d.lease_expiry_ns);
+  EXPECT_EQ(*d.lease_expiry_ns, 123456789ULL);
+
+  // And an accelerator IPC descriptor for GPU consumers.
+  e3ap_accelerator_ipc_location ipc;
+  ipc.device_ordinal = 1;
+  ipc.allocation_id  = 77;
+  for (std::size_t index = 0; index != ipc.memory_handle.size(); ++index) {
+    ipc.memory_handle[index] = static_cast<uint8_t>(index);
+  }
+  std::array<uint8_t, 64> event{};
+  event.fill(0xEE);
+  ipc.ready_event_handle   = event;
+  ipc.byte_offset          = 4096;
+  descriptor.memory_domain = e3ap_memory_domain::accelerator_ipc_export;
+  descriptor.location      = ipc;
+  descriptor.dimensions.clear();
+  descriptor.byte_strides.clear();
+  indication.by_reference = descriptor;
+  pdu.message             = indication;
+  encoded                 = e3ap_codec::encode(pdu);
+  ASSERT_TRUE(encoded) << encoded.detail;
+  decoded = e3ap_codec::decode(*encoded.value);
+  ASSERT_TRUE(decoded) << decoded.detail;
+  const auto& ipc_back = std::get<e3ap_indication_message>(decoded.value->message);
+  ASSERT_TRUE(ipc_back.by_reference);
+  EXPECT_EQ(ipc_back.by_reference->memory_domain, e3ap_memory_domain::accelerator_ipc_export);
+  ASSERT_TRUE(std::holds_alternative<e3ap_accelerator_ipc_location>(ipc_back.by_reference->location));
+  const auto& ipc_location = std::get<e3ap_accelerator_ipc_location>(ipc_back.by_reference->location);
+  EXPECT_EQ(ipc_location.device_ordinal, 1U);
+  EXPECT_EQ(ipc_location.allocation_id, 77U);
+  EXPECT_EQ(ipc_location.memory_handle, ipc.memory_handle);
+  ASSERT_TRUE(ipc_location.ready_event_handle);
+  EXPECT_EQ(*ipc_location.ready_event_handle, event);
+  EXPECT_EQ(ipc_location.byte_offset, 4096U);
+  EXPECT_TRUE(ipc_back.by_reference->dimensions.empty());
+}
