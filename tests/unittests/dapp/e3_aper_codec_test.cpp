@@ -16,6 +16,25 @@ using namespace ocudu::dapp;
 using namespace ocudu::dapp::e3;
 using namespace ocudu::dapp::management;
 
+TEST(dapp_e3_aper_codec, catalog_admission_extension_preserves_headers_and_package_identity)
+{
+  catalog_admit request;
+  request.header.transaction_id.bytes.back()   = 1;
+  request.header.expected_inventory_generation = 27;
+  request.header.dry_run                       = true;
+  request.package_id.bytes.back()              = 9;
+  auto encoded                                 = aper_codec::encode(management_request{request});
+  ASSERT_TRUE(encoded) << encoded.detail;
+  auto decoded = aper_codec::decode_request(*encoded.value);
+  ASSERT_TRUE(decoded) << decoded.detail;
+  const auto* result = std::get_if<catalog_admit>(&*decoded.value);
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result->header.transaction_id, request.header.transaction_id);
+  EXPECT_EQ(result->header.expected_inventory_generation, 27);
+  EXPECT_TRUE(result->header.dry_run);
+  EXPECT_EQ(result->package_id, request.package_id);
+}
+
 namespace {
 
 identifier test_id(uint8_t first)

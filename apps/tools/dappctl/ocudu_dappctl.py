@@ -139,6 +139,14 @@ def read_artifact(path):
 
 
 def build_request(args, transaction):
+    if args.operation == "catalog-admit":
+        header = request_header(args, transaction, mutation=True)
+        if args.expected_inventory_generation is not None:
+            header["expectedInventoryGeneration"] = unsigned64(args.expected_inventory_generation)
+        return {
+            "header": header,
+            "operation": ("catalogAdmit", {"packageId": args.package}),
+        }
     if args.operation == "inventory":
         return {
             "header": request_header(args, transaction),
@@ -406,6 +414,14 @@ def make_parser():
     inventory.add_argument("--omit-packages", action="store_true")
     inventory.add_argument("--omit-instances", action="store_true")
     inventory.set_defaults(operation="inventory")
+
+    catalog = commands.add_parser("catalog", help="Admit a locally staged signed package without restarting")
+    catalog_commands = catalog.add_subparsers(required=True)
+    admit = catalog_commands.add_parser("admit", help="Verify a staged UUID bundle; never load or activate it")
+    admit.add_argument("--package", required=True, type=identifier)
+    admit.add_argument("--expected-inventory-generation", type=positive)
+    admit.add_argument("--dry-run", action="store_true")
+    admit.set_defaults(operation="catalog-admit", expected_generation=None)
 
     load = commands.add_parser("load")
     load.add_argument("--package", required=True, type=identifier)

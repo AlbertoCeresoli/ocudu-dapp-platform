@@ -5,6 +5,7 @@
 
 extern "C" {
 #include "Backend.h"
+#include "CatalogAdmit.h"
 #include "CellDescriptor.h"
 #include "CellInfoQuery.h"
 #include "CellInfoResult.h"
@@ -617,6 +618,10 @@ codec_result<std::vector<uint8_t>> aper_codec::encode(const management_request& 
           } else if constexpr (std::is_same_v<operation_type, cell_info_query>) {
             wire->operation->present         = ManagementOperation_PR_cellInfo;
             wire->operation->choice.cellInfo = make_asn<CellInfoQuery_t>();
+          } else if constexpr (std::is_same_v<operation_type, catalog_admit>) {
+            wire->operation->present             = ManagementOperation_PR_catalogAdmit;
+            wire->operation->choice.catalogAdmit = make_asn<CatalogAdmit_t>();
+            set_identifier(wire->operation->choice.catalogAdmit->packageId, operation.package_id);
           }
         },
         request);
@@ -864,6 +869,15 @@ codec_result<management_request> aper_codec::decode_request(ocudu::span<const ui
       case ManagementOperation_PR_cellInfo: {
         cell_info_query result;
         result.header = common;
+        return {management_request{std::move(result)}, {}};
+      }
+      case ManagementOperation_PR_catalogAdmit: {
+        if (wire.choice.catalogAdmit == nullptr) {
+          break;
+        }
+        catalog_admit result;
+        result.header     = common;
+        result.package_id = read_identifier(wire.choice.catalogAdmit->packageId);
         return {management_request{std::move(result)}, {}};
       }
       default:

@@ -3,6 +3,10 @@
 
 # OCUDU dApp platform capabilities
 
+Native catalog packages can be admitted at runtime by UUID over E3, using
+locally staged signed bundles and a monotonic trust policy. Admission never
+loads or activates a module; see [runtime_catalog.md](runtime_catalog.md).
+
 Guided path: the [step-by-step tutorial series](README.md#start-here) walks
 every workflow this reference covers.
 

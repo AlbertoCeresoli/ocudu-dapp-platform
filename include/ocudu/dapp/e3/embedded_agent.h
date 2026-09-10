@@ -19,6 +19,7 @@ public:
   }
 
   job_submit_result submit(management::load_request request);
+  job_submit_result submit(management::catalog_admit_request request);
   job_submit_result submit(management::lifecycle_request request);
   job_submit_result submit(management::config_set_request request);
   job_submit_result submit(management::model_request request);

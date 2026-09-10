@@ -149,6 +149,16 @@ management_response management_service::handle(const management_request& message
               payload.connections = connections->snapshot();
             }
             return {request.transaction_id, result_code::ok, {}, {}, std::move(payload), {}};
+          } else if constexpr (std::is_same_v<operation_type, catalog_admit>) {
+            if (request.instance_id || request.expected_instance_generation || operation.package_id.is_zero()) {
+              return failure(request, result_code::invalid_request, "catalog admission requires a package ID");
+            }
+            catalog_admit_request update;
+            update.transaction_id                = request.transaction_id;
+            update.expected_inventory_generation = request.expected_inventory_generation;
+            update.package_id                    = operation.package_id;
+            update.dry_run                       = request.dry_run;
+            return submitted(request, agent.submit(std::move(update)));
           } else if constexpr (std::is_same_v<operation_type, lifecycle_control>) {
             if (operation.action == lifecycle_action::load) {
               if (!operation.package_id || !operation.placement || !operation.selected_backend || request.instance_id ||

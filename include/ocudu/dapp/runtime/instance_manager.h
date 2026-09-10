@@ -41,6 +41,9 @@ public:
 
   /// Local catalog/bootstrap API; never exposed as an E3 arbitrary-path operation.
   management::operation_result register_package(const management::package_record& package);
+  /// Management-job only. Verifies one signed catalog-root manifest and its
+  /// artifact/SBOM before admission. Existing resident images are never changed.
+  management::operation_result admit_package(const management::catalog_admit_request& request);
   /// Re-admit a new artifact for an existing package_id from a trusted
   /// catalog-root manifest. Fails if any non-unloaded instance still holds the
   /// old image. Used by load() when the on-disk SHA no longer matches the

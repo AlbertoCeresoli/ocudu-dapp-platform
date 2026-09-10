@@ -7,6 +7,14 @@ using namespace ocudu::dapp;
 using namespace ocudu::dapp::e3;
 using namespace ocudu::dapp::management;
 
+job_submit_result embedded_agent::submit(catalog_admit_request request)
+{
+  const auto fingerprint = canonical_fingerprint(request);
+  const auto transaction = request.transaction_id;
+  return jobs.submit(
+      transaction, fingerprint, [this, request = std::move(request)] { return instance_owner.admit_package(request); });
+}
+
 job_submit_result embedded_agent::submit(load_request request)
 {
   if (request.create_args != nullptr) {

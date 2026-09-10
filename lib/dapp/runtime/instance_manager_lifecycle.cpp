@@ -44,6 +44,14 @@ operation_result instance_manager::load(const load_request& request)
     return response;
   }
   const auto& catalog_package   = package_it->second;
+  if (package_signatures) {
+    auto permitted = package_signatures->authorize_admitted(catalog_package);
+    if (!permitted) {
+      auto response = make_result(result_code::verification_failed, request.transaction_id, permitted.detail.c_str());
+      remember(request_fingerprint, response);
+      return response;
+    }
+  }
   const bool  process_placement = request.placement == OCUDU_DAPP_PLACEMENT_OUT_OF_PROCESS_V1;
   if ((request.placement != OCUDU_DAPP_PLACEMENT_IN_PROCESS_V1 && !process_placement) ||
       (process_placement && request.create_args != nullptr)) {
@@ -263,6 +271,19 @@ operation_result instance_manager::control(const lifecycle_request& request)
     remember(request_fingerprint, response);
     return response;
   }
+  if (request.action == lifecycle_action::activate && package_signatures) {
+    const auto package   = catalog.find_package(managed.record.package_id);
+    auto       permitted = package ? package_signatures->authorize_admitted(*package)
+                                   : package_signature_result{false, "instance package is absent from the catalog"};
+    if (!permitted) {
+      auto response = make_result(result_code::verification_failed, request.transaction_id, permitted.detail.c_str());
+      response.instance_id         = managed.record.instance_id;
+      response.instance_generation = managed.record.generation;
+      response.state               = managed.record.state;
+      remember(request_fingerprint, response);
+      return response;
+    }
+  }
   if (request.dry_run) {
     if (request.action == lifecycle_action::activate && native_hooks != nullptr && managed.native_runtime != nullptr) {
       auto validation = native_hooks->validate(managed.record.interfaces);
@@ -397,4 +418,3 @@ operation_result instance_manager::control(const lifecycle_request& request)
   remember(request_fingerprint, response);
   return response;
 }
-

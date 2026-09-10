@@ -251,6 +251,15 @@ struct load_request {
   const void*             create_args{};
 };
 
+/// Explicit admission of one locally staged, signed native package. No upload,
+/// loader invocation, lifecycle change, or caller-selected trust path.
+struct catalog_admit_request {
+  identifier              transaction_id;
+  identifier              package_id;
+  std::optional<uint64_t> expected_inventory_generation;
+  bool                    dry_run{};
+};
+
 struct lifecycle_request {
   identifier              transaction_id;
   identifier              instance_id;
@@ -264,6 +273,7 @@ struct lifecycle_request {
 };
 
 uint64_t canonical_fingerprint(const load_request& request) noexcept;
+uint64_t canonical_fingerprint(const catalog_admit_request& request) noexcept;
 uint64_t canonical_fingerprint(const lifecycle_request& request) noexcept;
 uint64_t canonical_fingerprint(const config_set_request& request) noexcept;
 uint64_t canonical_fingerprint(const model_request& request) noexcept;

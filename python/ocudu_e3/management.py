@@ -145,6 +145,17 @@ def health_request(transaction=None) -> dict:
     return {"header": header(transaction), "operation": ("health", None)}
 
 
+def catalog_admit_request(package_id: bytes, *, expected_inventory_generation=None,
+                          dry_run: bool = False, transaction=None) -> dict:
+    """Admit a locally staged signed UUID bundle. Never load or activate it."""
+    if not isinstance(package_id, bytes) or len(package_id) != 16 or not any(package_id):
+        raise ValueError("package ID must be 16 nonzero identifier bytes")
+    return {
+        "header": header(transaction, expected_inventory_generation=expected_inventory_generation, dry_run=dry_run),
+        "operation": ("catalogAdmit", {"packageId": package_id}),
+    }
+
+
 def metrics_request(instance_id: bytes, schema: bool = False, transaction=None) -> dict:
     return {
         "header": header(transaction, instance_id),

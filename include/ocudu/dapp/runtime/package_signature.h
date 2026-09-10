@@ -60,6 +60,15 @@ public:
 
   uint64_t policy_epoch() const noexcept;
 
+  /// Re-read only the startup-pinned, locally administered trust-store path.
+  /// Changed policy requires a higher epoch; revocations and sequence floors
+  /// cannot be rolled back. Does not mutate this immutable verifier.
+  package_signature_verifier_result reload() const noexcept;
+
+  /// Recheck current policy against a host-owned, previously verified record.
+  /// No filesystem IO or signature work; this is not initial verification.
+  package_signature_result authorize_admitted(const management::package_record& package) const;
+
 private:
   struct implementation;
   explicit package_signature_verifier(std::unique_ptr<implementation> state_) noexcept;
