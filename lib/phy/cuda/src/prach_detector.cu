@@ -14,6 +14,7 @@
 #include <new>
 #include <vector>
 #include "vkFFT.h"
+#include "vkfft_kernel_cache.h"
 
 #ifndef OCUDU_PHY_CUDA_ENABLE_VKFFT
 #error "OCUDU PHY CUDA PRACH acceleration requires the bundled VkFFT backend."
@@ -53,6 +54,7 @@ struct prach_detector_ctx {
     int vkfft_dft_size = 0;
     int vkfft_batch = 0;
     bool vkfft_valid = false;
+    std::vector<char> vkfft_cache_image; // compiled image the current plan was loaded from, if any
     uint64_t root_cache_key = 0;
     int cached_nof_sequences = 0;
     int cached_sequence_length = 0;
@@ -561,6 +563,44 @@ bool prefer_mapped_results(const prach_detector_ctx* ctx, const prach_detector_c
     return work <= (64u * 4u * 256u);
 }
 
+// Path of the cached kernel image for a plan, or empty when caching is off.
+//
+// Every input that changes the compiled binary goes into the name: 
+// (1) VkFFT version, 
+// (2) CUDA runtime, 
+// (3) device's compute capability,
+// (4) 3 configuration values that the plan is built from. 
+//
+// An image under a name that no longer matches is simply never looked up.
+std::string vkfft_cache_path (int dft_size, int batch, int aim_threads)
+{
+    const std::string dir = ocudu::vkfft_cache::cache_directory();
+    if (dir.empty() || !ocudu::vkfft_cache::make_cache_directory(dir))
+    {
+        return {};
+    }
+    int device = 0;
+    cudaDeviceProp prop{};
+    if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&prop, device) != cudaSuccess)
+    {
+        return {};
+    }
+    char name[160];
+    std::snprintf(
+        name, 
+        sizeof(name), 
+        "/prach_idft_vk%d_rt%d_cc%d%d_d%d_b%d_t%d.bin", 
+        VkFFTGetVersion(),
+        CUDART_VERSION, 
+        prop.major, 
+        prop.minor, 
+        dft_size, 
+        batch, 
+        aim_threads);
+
+    return dir + name;
+}
+
 bool ensure_plan(prach_detector_ctx* ctx, int dft_size, int batch, cudaStream_t stream)
 {
     if (ctx->vkfft_valid && ctx->vkfft_dft_size == dft_size && ctx->vkfft_batch == batch &&
@@ -599,10 +639,43 @@ bool ensure_plan(prach_detector_ctx* ctx, int dft_size, int batch, cudaStream_t 
     // Larger DFTs (format-0, 1024) benefit from more threads on GB10-class GPUs.
     configuration.aimThreads = (dft_size >= 512) ? 256 : 128;
 
-    if (initializeVkFFT(&ctx->vkfft_app, configuration) != VKFFT_SUCCESS) {
+    const std::string cache_path = vkfft_cache_path(dft_size, batch, static_cast<int>(configuration.aimThreads));
+    std::vector<char> cache_image;
+    if (! cache_path.empty() && ocudu::vkfft_cache::read_image(cache_path, cache_image)) 
+    {
+        configuration.loadApplicationFromString = 1;
+        configuration.loadApplicationString = cache_image.data();
+    }
+    else
+        if (! cache_path.empty()) 
+        {
+            configuration.saveApplicationToString = 1;
+        }
+
+    VkFFTResult init_result = initializeVkFFT(&ctx->vkfft_app, configuration);
+    if (init_result != VKFFT_SUCCESS && configuration.loadApplicationFromString != 0) 
+    {
+        // The image checked out, but this VkFFT would not take it -- compile as if it were not there and replace it
+        std::memset(&ctx->vkfft_app, 0, sizeof(ctx->vkfft_app));
+        cache_image.clear();
+        configuration.loadApplicationFromString = 0;
+        configuration.loadApplicationString = nullptr;
+        configuration.saveApplicationToString = 1;
+        init_result = initializeVkFFT(&ctx->vkfft_app, configuration);
+    }
+    if (init_result != VKFFT_SUCCESS) {
         std::memset(&ctx->vkfft_app, 0, sizeof(ctx->vkfft_app));
         return false;
     }
+    if (configuration.saveApplicationToString != 0)
+    {
+        ocudu::vkfft_cache::write_image(
+            cache_path, 
+            ctx->vkfft_app.saveApplicationString,
+            ctx->vkfft_app.applicationStringSize);
+    }
+    // Held for as long as the plan is, so the buffer VkFFT was pointed at outlives the call that read it
+    ctx->vkfft_cache_image = std::move(cache_image);
     ctx->vkfft_dft_size = dft_size;
     ctx->vkfft_batch = batch;
     ctx->vkfft_valid = true;
