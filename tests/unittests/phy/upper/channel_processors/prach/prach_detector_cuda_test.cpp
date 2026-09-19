@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
+#include "channel_processors/prach/prach_detector_cuda_impl.h"
 #include "phy_acceleration_prach_buffer_factory.h"
 #include "ocudu/phy/support/support_factories.h"
 #include "ocudu/phy/upper/channel_processors/prach/factories.h"
@@ -10,6 +11,7 @@
 #include "ocudu/phy/upper/channel_processors/prach/prach_generator.h"
 #include "ocudu/ran/prach/prach_preamble_information.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <gtest/gtest.h>
@@ -98,6 +100,29 @@ const prach_detection_result::preamble_indication* find_preamble(const prach_det
   return nullptr;
 }
 
+/// \brief Runs \c detector against \c buffer with the accelerated path guaranteed to be in use.
+///
+/// \brief Returns the accelerated detector behind a base class reference.
+///
+/// The detectors these tests compare come from the factory in its forced mode, which either yields
+/// the accelerated detector or reports a fatal error, so the type is known. The project builds
+/// without RTTI, hence the static cast.
+prach_detector_cuda_impl& as_accelerated(prach_detector& detector)
+{
+  return static_cast<prach_detector_cuda_impl&>(detector);
+}
+
+/// The first occasion of a workload shape is served by the host fallback while the backend is prepared on a helper
+/// thread, so a test that wants to compare the accelerated result has to prime the detector and wait.
+prach_detection_result
+detect_accelerated(prach_detector& detector, const prach_buffer& buffer, const prach_detector::configuration& config)
+{
+  prach_detector_cuda_impl& cuda = as_accelerated(detector);
+  detector.detect(buffer, config);
+  EXPECT_TRUE(cuda.wait_for_warmup(std::chrono::seconds(60)));
+  return detector.detect(buffer, config);
+}
+
 class prach_detector_cuda_fixture : public ::testing::TestWithParam<test_case>
 {};
 
@@ -125,7 +150,7 @@ TEST_P(prach_detector_cuda_fixture, matches_cpu_detection_for_known_preamble)
 
   prach_detector::configuration config = make_detector_config(test);
   prach_detection_result        cpu    = cpu_detector->detect(*buffer, config);
-  prach_detection_result        gpu    = gpu_detector->detect(*buffer, config);
+  prach_detection_result        gpu    = detect_accelerated(*gpu_detector, *buffer, config);
 
   const auto* cpu_preamble = find_preamble(cpu, test.target_preamble);
   const auto* gpu_preamble = find_preamble(gpu, test.target_preamble);
@@ -175,7 +200,7 @@ TEST(prach_detector_cuda, device_visible_buffer_matches_cpu_detection_and_metric
 
   prach_detector::configuration config = make_detector_config(test);
   prach_detection_result        cpu    = cpu_detector->detect(*cpu_buffer, config);
-  prach_detection_result        gpu    = gpu_detector->detect(*gpu_buffer, config);
+  prach_detection_result        gpu    = detect_accelerated(*gpu_detector, *gpu_buffer, config);
 
   const auto* cpu_preamble = find_preamble(cpu, test.target_preamble);
   const auto* gpu_preamble = find_preamble(gpu, test.target_preamble);
@@ -231,7 +256,7 @@ TEST(prach_detector_cuda, awgn_false_alarm_rate_matches_cpu_format0_zcz0)
     }
 
     prach_detection_result cpu = cpu_detector->detect(*buffer, config);
-    prach_detection_result gpu = gpu_detector->detect(*buffer, config);
+    prach_detection_result gpu = detect_accelerated(*gpu_detector, *buffer, config);
     cpu_detections += static_cast<unsigned>(cpu.preambles.size());
     gpu_detections += static_cast<unsigned>(gpu.preambles.size());
   }
@@ -262,10 +287,202 @@ TEST(prach_detector_cuda, zero_input_does_not_create_false_preamble)
 
   prach_detector::configuration config = make_detector_config(test);
   prach_detection_result        cpu    = cpu_detector->detect(*buffer, config);
-  prach_detection_result        gpu    = gpu_detector->detect(*buffer, config);
+  prach_detection_result        gpu    = detect_accelerated(*gpu_detector, *buffer, config);
 
   EXPECT_TRUE(cpu.preambles.empty());
   EXPECT_TRUE(gpu.preambles.empty());
+}
+
+/// The accelerated detector prepares its backend for a workload shape on a helper thread and hands the occasion
+/// that triggered it to the host detector. These tests cover that hand-over: that the first occasion is answered
+/// correctly without waiting for a kernel to compile, that the shape prepared is the one the cell actually asked
+/// for, and that a detector can be destroyed while a preparation is still running.
+namespace {
+
+/// Builds an accelerated detector and a host detector configured identically.
+struct detector_pair {
+  std::unique_ptr<prach_detector> cpu;
+  std::unique_ptr<prach_detector> gpu;
+};
+
+detector_pair make_detectors()
+{
+  std::shared_ptr<dft_processor_factory> dft_factory = create_dft_processor_factory_fftw_fast();
+  EXPECT_NE(dft_factory, nullptr);
+  std::shared_ptr<prach_generator_factory> generator_factory = create_prach_generator_factory_sw();
+  EXPECT_NE(generator_factory, nullptr);
+
+  return {create_prach_detector_factory_sw(dft_factory, generator_factory)->create(),
+          create_prach_detector_factory_accelerated(dft_factory, generator_factory, {}, "enabled")->create()};
+}
+
+} // namespace
+
+TEST(prach_detector_cuda_warmup, first_occasion_of_a_new_shape_is_served_by_the_host_detector)
+{
+  if (!is_prach_detector_acceleration_available()) {
+    GTEST_SKIP() << "CUDA PRACH detector is not available.";
+  }
+
+  test_case                     test{prach_format_type::zero, prach_subcarrier_spacing::kHz1_25, 0, 1, 12, 8};
+  std::unique_ptr<prach_buffer> buffer = create_test_buffer(test);
+  ASSERT_NE(buffer, nullptr);
+  fill_detectable_preamble(*buffer, test);
+
+  detector_pair                 detectors = make_detectors();
+  prach_detector::configuration config    = make_detector_config(test);
+  prach_detector_cuda_impl&     cuda      = as_accelerated(*detectors.gpu);
+  ASSERT_FALSE(cuda.is_warm_for(config));
+
+  // Nothing is prepared yet, so this occasion runs on the host detector: not merely close to it, the very same
+  // computation. That is what keeps it off the kernel compile that the helper thread is starting behind it.
+  prach_detection_result first = detectors.gpu->detect(*buffer, config);
+  prach_detection_result host  = detectors.cpu->detect(*buffer, config);
+
+  const auto* first_preamble = find_preamble(first, test.target_preamble);
+  const auto* host_preamble  = find_preamble(host, test.target_preamble);
+  ASSERT_NE(first_preamble, nullptr);
+  ASSERT_NE(host_preamble, nullptr);
+  EXPECT_EQ(first.preambles.size(), host.preambles.size());
+  EXPECT_FLOAT_EQ(first_preamble->detection_metric, host_preamble->detection_metric);
+  EXPECT_FLOAT_EQ(first.rssi_dB, host.rssi_dB);
+}
+
+TEST(prach_detector_cuda_warmup, occasions_after_the_warm_up_run_on_the_accelerated_path)
+{
+  if (!is_prach_detector_acceleration_available()) {
+    GTEST_SKIP() << "CUDA PRACH detector is not available.";
+  }
+
+  test_case                     test{prach_format_type::zero, prach_subcarrier_spacing::kHz1_25, 0, 1, 12, 8};
+  std::unique_ptr<prach_buffer> buffer = create_test_buffer(test);
+  ASSERT_NE(buffer, nullptr);
+  fill_detectable_preamble(*buffer, test);
+
+  detector_pair                 detectors = make_detectors();
+  prach_detector::configuration config    = make_detector_config(test);
+
+  prach_detector_cuda_impl& cuda = as_accelerated(*detectors.gpu);
+  detectors.gpu->detect(*buffer, config);
+  ASSERT_TRUE(cuda.wait_for_warmup(std::chrono::seconds(60)));
+  // Without this the comparison below would pass just as well on the fallback, which is the thing it is meant to
+  // be distinguishing itself from.
+  ASSERT_TRUE(cuda.is_warm_for(config));
+
+  prach_detection_result accelerated = detectors.gpu->detect(*buffer, config);
+  prach_detection_result host        = detectors.cpu->detect(*buffer, config);
+
+  const auto* accelerated_preamble = find_preamble(accelerated, test.target_preamble);
+  const auto* host_preamble        = find_preamble(host, test.target_preamble);
+  ASSERT_NE(accelerated_preamble, nullptr);
+  ASSERT_NE(host_preamble, nullptr);
+  EXPECT_EQ(accelerated.preambles.size(), host.preambles.size());
+  EXPECT_NEAR(accelerated_preamble->time_advance.to_seconds(), host_preamble->time_advance.to_seconds(), 1e-9);
+  EXPECT_NEAR(accelerated_preamble->detection_metric,
+              host_preamble->detection_metric,
+              std::max(0.25F, 1.0e-3F * std::abs(host_preamble->detection_metric)));
+}
+
+TEST(prach_detector_cuda_warmup, a_second_workload_shape_is_prepared_on_its_own_terms)
+{
+  if (!is_prach_detector_acceleration_available()) {
+    GTEST_SKIP() << "CUDA PRACH detector is not available.";
+  }
+
+  // Two shapes the same cell can ask for. A zero correlation zone lets preambles share a root sequence, so the two
+  // need a different number of correlations and the backend cannot serve both from one prepared plan. This is what
+  // a warm-up that guesses the shape from a partial configuration gets wrong: it prepares one of them and the cell
+  // then pays for the other on the slot path.
+  test_case zone_zero{prach_format_type::zero, prach_subcarrier_spacing::kHz1_25, 0, 1, 12, 8};
+  test_case zone_five{prach_format_type::zero, prach_subcarrier_spacing::kHz1_25, 5, 1, 3, 4};
+
+  std::unique_ptr<prach_buffer> zone_zero_buffer = create_test_buffer(zone_zero);
+  std::unique_ptr<prach_buffer> zone_five_buffer = create_test_buffer(zone_five);
+  ASSERT_NE(zone_zero_buffer, nullptr);
+  ASSERT_NE(zone_five_buffer, nullptr);
+  fill_detectable_preamble(*zone_zero_buffer, zone_zero);
+  fill_detectable_preamble(*zone_five_buffer, zone_five);
+
+  detector_pair             detectors = make_detectors();
+  prach_detector_cuda_impl& cuda      = as_accelerated(*detectors.gpu);
+
+  // Settle on the first shape.
+  prach_detector::configuration zone_zero_config = make_detector_config(zone_zero);
+  detectors.gpu->detect(*zone_zero_buffer, zone_zero_config);
+  ASSERT_TRUE(cuda.wait_for_warmup(std::chrono::seconds(60)));
+  ASSERT_TRUE(cuda.is_warm_for(zone_zero_config));
+
+  // The second shape has not been prepared, so its first occasion goes to the host detector even though the
+  // detector is warm for something else. Being warm for one zone and not the other is exactly what a warm-up
+  // that guesses the zone before the cell runs cannot get right.
+  prach_detector::configuration zone_five_config = make_detector_config(zone_five);
+  ASSERT_FALSE(cuda.is_warm_for(zone_five_config));
+  prach_detection_result first          = detectors.gpu->detect(*zone_five_buffer, zone_five_config);
+  prach_detection_result host           = detectors.cpu->detect(*zone_five_buffer, zone_five_config);
+  const auto*            first_preamble = find_preamble(first, zone_five.target_preamble);
+  const auto*            host_preamble  = find_preamble(host, zone_five.target_preamble);
+  ASSERT_NE(first_preamble, nullptr);
+  ASSERT_NE(host_preamble, nullptr);
+  EXPECT_FLOAT_EQ(first_preamble->detection_metric, host_preamble->detection_metric);
+
+  // Once prepared for it, the second shape runs accelerated and still finds the preamble.
+  ASSERT_TRUE(cuda.wait_for_warmup(std::chrono::seconds(60)));
+  ASSERT_TRUE(cuda.is_warm_for(zone_five_config));
+  EXPECT_FALSE(cuda.is_warm_for(zone_zero_config)) << "the backend holds one plan at a time";
+  prach_detection_result accelerated          = detectors.gpu->detect(*zone_five_buffer, zone_five_config);
+  const auto*            accelerated_preamble = find_preamble(accelerated, zone_five.target_preamble);
+  ASSERT_NE(accelerated_preamble, nullptr);
+  EXPECT_NEAR(accelerated_preamble->detection_metric,
+              host_preamble->detection_metric,
+              std::max(0.25F, 1.0e-3F * std::abs(host_preamble->detection_metric)));
+}
+
+TEST(prach_detector_cuda_warmup, detector_can_be_destroyed_while_a_warm_up_is_in_flight)
+{
+  if (!is_prach_detector_acceleration_available()) {
+    GTEST_SKIP() << "CUDA PRACH detector is not available.";
+  }
+
+  test_case                     test{prach_format_type::zero, prach_subcarrier_spacing::kHz1_25, 0, 1, 12, 8};
+  std::unique_ptr<prach_buffer> buffer = create_test_buffer(test);
+  ASSERT_NE(buffer, nullptr);
+  fill_detectable_preamble(*buffer, test);
+
+  // A cell that is torn down right after it starts destroys the detector with the helper thread still preparing the
+  // backend. The destructor has to retire that thread before it releases the stream and the handle it is using.
+  detector_pair detectors = make_detectors();
+  detectors.gpu->detect(*buffer, make_detector_config(test));
+  detectors.gpu.reset();
+}
+
+TEST(prach_detector_cuda_warmup, warm_up_can_be_turned_off)
+{
+  if (!is_prach_detector_acceleration_available()) {
+    GTEST_SKIP() << "CUDA PRACH detector is not available.";
+  }
+
+  test_case                     test{prach_format_type::zero, prach_subcarrier_spacing::kHz1_25, 0, 1, 12, 8};
+  std::unique_ptr<prach_buffer> buffer = create_test_buffer(test);
+  ASSERT_NE(buffer, nullptr);
+  fill_detectable_preamble(*buffer, test);
+
+  // With the helper thread disabled the slot path prepares the backend itself, as it did before the warm-up
+  // existed: the very first occasion runs accelerated, and pays for the kernel compile to get there.
+  ASSERT_EQ(::setenv("OCUDU_PRACH_ACCELERATION_ASYNC_WARMUP", "0", 1), 0);
+  detector_pair detectors = make_detectors();
+  ASSERT_EQ(::unsetenv("OCUDU_PRACH_ACCELERATION_ASYNC_WARMUP"), 0);
+
+  prach_detector::configuration config = make_detector_config(test);
+  prach_detection_result        first  = detectors.gpu->detect(*buffer, config);
+  prach_detection_result        host   = detectors.cpu->detect(*buffer, config);
+
+  const auto* first_preamble = find_preamble(first, test.target_preamble);
+  const auto* host_preamble  = find_preamble(host, test.target_preamble);
+  ASSERT_NE(first_preamble, nullptr);
+  ASSERT_NE(host_preamble, nullptr);
+  EXPECT_NEAR(first_preamble->detection_metric,
+              host_preamble->detection_metric,
+              std::max(0.25F, 1.0e-3F * std::abs(host_preamble->detection_metric)));
 }
 
 INSTANTIATE_TEST_SUITE_P(cpu_gpu_parity,
