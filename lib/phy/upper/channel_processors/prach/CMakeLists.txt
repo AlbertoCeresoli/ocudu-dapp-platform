@@ -6,6 +6,7 @@
 add_library(ocudu_prach_detector STATIC
         prach_detector_generic_impl.cpp
         prach_detector_generic_thresholds.cpp
+        prach_detector_geometry.cpp
         prach_generator_impl.cpp
         prach_detector_phy_validator_impl.cpp
         factories.cpp)

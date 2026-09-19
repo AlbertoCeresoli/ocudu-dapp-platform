@@ -5,14 +5,14 @@
 
 #include "prach_detector_cuda_impl.h"
 #include "../../channel_coding/ldpc/cuda/cuda_rt_utils.h"
-#include "prach_detector_generic_thresholds.h"
 #include "ocudu/adt/interval.h"
+#include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/phy/support/prach_buffer.h"
-#include "ocudu/ran/prach/prach_cyclic_shifts.h"
 #include "ocudu/ran/prach/prach_preamble_information.h"
 #include "ocudu/support/error_handling.h"
 #include "ocudu/support/math/math_utils.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -54,25 +54,6 @@ bool is_success(nr_ldpc_status_t status)
 }
 
 } // namespace
-
-struct prach_detector_cuda_impl::detector_geometry {
-  prach_preamble_information preamble_info;
-  unsigned                   n_cs;
-  unsigned                   nof_shifts;
-  unsigned                   nof_sequences;
-  unsigned                   active_sequence_start;
-  unsigned                   active_nof_sequences;
-  unsigned                   sequence_length;
-  unsigned                   dft_size;
-  unsigned                   win_width;
-  unsigned                   win_margin;
-  unsigned                   max_delay_samples;
-  unsigned                   nof_symbols;
-  float                      threshold;
-  bool                       combine_symbols;
-  double                     sampling_rate_hz;
-  unsigned                   cp_prach;
-};
 
 prach_detector_cuda_impl::prach_detector_cuda_impl(std::unique_ptr<prach_generator> generator_,
                                                    std::unique_ptr<prach_detector>  fallback_,
@@ -117,11 +98,23 @@ prach_detector_cuda_impl::prach_detector_cuda_impl(std::unique_ptr<prach_generat
     return;
   }
 
-  gpu_available = true;
+  gpu_available      = true;
+  synchronous_warmup = !env_flag_enabled("OCUDU_PRACH_ACCELERATION_ASYNC_WARMUP", true);
 }
 
 prach_detector_cuda_impl::~prach_detector_cuda_impl()
 {
+  // Stop the warm-up helper before releasing anything it touches. A build already under way is allowed to finish;
+  // it holds detector_mutex and runs for at most the time of one plan build.
+  {
+    std::lock_guard<std::mutex> lock(warmup_mutex);
+    warmup_stop = true;
+  }
+  warmup_cv.notify_all();
+  if (warmup_thread.joinable()) {
+    warmup_thread.join();
+  }
+
   std::lock_guard<std::mutex> lock(detector_mutex);
   if (gpu_available) {
     (void)cudaSetDevice(device_id);
@@ -149,67 +142,28 @@ bool ocudu::is_prach_detector_cuda_available()
 prach_detection_result prach_detector_cuda_impl::detect(const prach_buffer&                  input,
                                                         const prach_detector::configuration& config)
 {
-  detector_geometry geometry;
-  geometry.preamble_info = is_long_preamble(config.format)
-                               ? get_prach_preamble_long_info(config.format)
-                               : get_prach_preamble_short_info(config.format, config.ra_scs, false);
-  geometry.n_cs          = prach_cyclic_shifts_get(config.ra_scs, config.restricted_set, config.zero_correlation_zone);
-  report_fatal_error_if_not(geometry.n_cs != PRACH_CYCLIC_SHIFTS_RESERVED, "Reserved PRACH cyclic shift.");
-
-  geometry.sequence_length =
-      is_short_preamble(config.format) ? prach_constants::SHORT_SEQUENCE_LENGTH : prach_constants::LONG_SEQUENCE_LENGTH;
-  geometry.nof_shifts    = 1;
-  geometry.nof_sequences = 64;
-  if (geometry.n_cs != 0) {
-    geometry.nof_shifts    = std::min(prach_constants::MAX_NUM_PREAMBLES, geometry.sequence_length / geometry.n_cs);
-    geometry.nof_sequences = divide_ceil(64U, geometry.nof_shifts);
-  }
-  unsigned first_requested_sequence =
-      std::min(config.start_preamble_index / geometry.nof_shifts, geometry.nof_sequences - 1U);
-  unsigned requested_preamble_end =
-      std::min(prach_constants::MAX_NUM_PREAMBLES, config.start_preamble_index + config.nof_preamble_indices);
-  unsigned last_requested_sequence =
-      std::min(geometry.nof_sequences, divide_ceil(requested_preamble_end, geometry.nof_shifts));
-  if (last_requested_sequence <= first_requested_sequence) {
-    last_requested_sequence = first_requested_sequence + 1U;
-  }
-  geometry.active_sequence_start = first_requested_sequence;
-  geometry.active_nof_sequences  = last_requested_sequence - first_requested_sequence;
-
-  geometry.dft_size         = is_long_preamble(config.format) ? 1024U : 256U;
-  geometry.sampling_rate_hz = geometry.dft_size * ra_scs_to_Hz(geometry.preamble_info.scs);
-
-  double cp_duration = geometry.preamble_info.cp_length.to_seconds();
-  geometry.cp_prach  = static_cast<unsigned>(
-      std::floor(cp_duration * geometry.sequence_length * ra_scs_to_Hz(geometry.preamble_info.scs)));
-  geometry.win_width = std::min(geometry.n_cs, geometry.cp_prach);
-  if (geometry.n_cs == 0) {
-    geometry.win_width = geometry.cp_prach;
-  }
-  if (geometry.win_width == geometry.sequence_length) {
-    geometry.win_width -= 20;
-  }
-  geometry.win_width = (geometry.win_width * geometry.dft_size) / geometry.sequence_length;
-
-  detail::threshold_params th_params;
-  th_params.nof_rx_ports                        = config.nof_rx_ports;
-  th_params.scs                                 = config.ra_scs;
-  th_params.format                              = config.format;
-  th_params.zero_correlation_zone               = config.zero_correlation_zone;
-  auto [threshold, combine_symbols, win_margin] = detail::get_threshold_and_margin(th_params);
-  geometry.threshold                            = threshold;
-  geometry.combine_symbols                      = combine_symbols;
-  geometry.win_margin                           = win_margin;
-  geometry.max_delay_samples =
-      (geometry.n_cs == 0) ? geometry.cp_prach : std::min(std::max(geometry.n_cs, 1U) - 1U, geometry.cp_prach);
-  geometry.max_delay_samples = (geometry.max_delay_samples * geometry.dft_size) / geometry.sequence_length;
-  geometry.nof_symbols       = geometry.preamble_info.nof_symbols;
+  const detector_geometry geometry = detail::get_prach_detector_geometry(config);
 
   if (!should_use_gpu(input, config, geometry)) {
     return fallback->detect(input, config);
   }
 
+  // Preparing the backend for a workload shape that it has not seen compiles a kernel, which is far too slow to do
+  // here: this runs on a worker the slot chain shares. Hand the occasion to the host detector and let the helper thread
+  // prepare the backend for the next one.
+  const uint64_t plan_key = make_plan_key(config, geometry);
+  if (!synchronous_warmup && (warm_plan_key.load(std::memory_order_acquire) != plan_key)) {
+    request_warmup(config, plan_key);
+    return fallback->detect(input, config);
+  }
+
   std::lock_guard<std::mutex> lock(detector_mutex);
+  // The helper thread can have prepared the backend for a different shape
+  // between the check above and this lock, it holds one plan at a time.
+  // Going ahead anyway would rebuild it here, but it's the thing that we avoid.
+  if (!synchronous_warmup && (warm_plan_key.load(std::memory_order_acquire) != plan_key)) {
+    return fallback->detect(input, config);
+  }
   return detect_gpu(input, config, geometry);
 }
 
@@ -239,12 +193,9 @@ bool prach_detector_cuda_impl::should_use_gpu(const prach_buffer&      input,
   return long_sequence_work >= min_long_sequence_work;
 }
 
-prach_detection_result prach_detector_cuda_impl::detect_gpu(const prach_buffer&      input,
-                                                            const configuration&     config,
-                                                            const detector_geometry& geometry)
+prach_detector_config_t prach_detector_cuda_impl::make_cuda_config(const configuration&     config,
+                                                                   const detector_geometry& geometry) const
 {
-  prepare_roots(config, geometry);
-
   prach_detector_config_t cuda_config = {};
   cuda_config.sequence_length         = static_cast<int>(geometry.sequence_length);
   cuda_config.dft_size                = static_cast<int>(geometry.dft_size);
@@ -265,6 +216,16 @@ prach_detection_result prach_detector_cuda_impl::detect_gpu(const prach_buffer& 
       cached_root_key ^ (0x9e3779b97f4a7c15ULL + (static_cast<uint64_t>(geometry.active_sequence_start) << 6) +
                          (static_cast<uint64_t>(geometry.active_sequence_start) >> 2));
   cuda_config.root_cache_key = active_root_key;
+  return cuda_config;
+}
+
+prach_detection_result prach_detector_cuda_impl::detect_gpu(const prach_buffer&      input,
+                                                            const configuration&     config,
+                                                            const detector_geometry& geometry)
+{
+  prepare_roots(config, geometry);
+
+  prach_detector_config_t cuda_config = make_cuda_config(config, geometry);
 
   const void* prach_input = nullptr;
   if (input.supports_device_prach_buffer_reading() && input.prepare_device_prach_buffer_reading(stream)) {
@@ -358,4 +319,136 @@ uint64_t prach_detector_cuda_impl::make_root_cache_key(const configuration&     
   key ^= static_cast<uint64_t>(geometry.nof_sequences & 0xffU) << 42;
   key ^= static_cast<uint64_t>(geometry.nof_shifts & 0x3fffU) << 50;
   return key;
+}
+
+uint64_t prach_detector_cuda_impl::make_plan_key(const configuration& config, const detector_geometry& geometry)
+{
+  // The backend keys its IDFT plan on the transform size and the batch count, and rebuilds whenever either moves.
+  // The top bit keeps a valid key away from zero, which stands for "no plan prepared yet".
+  constexpr uint64_t valid_flag = uint64_t(1) << 63;
+  return valid_flag | (static_cast<uint64_t>(geometry.dft_size) << 32) |
+         static_cast<uint64_t>(detail::get_nof_idft_batches(config, geometry));
+}
+
+bool prach_detector_cuda_impl::request_warmup(const configuration& config, uint64_t plan_key)
+{
+  std::lock_guard<std::mutex> lock(warmup_mutex);
+  if (warmup_stop || warmup_pending) {
+    return false;
+  }
+
+  // Each shape is prepared once. The backend holds a single plan, so a cell that alternates
+  // between 2 shapes -- for instance, (1) a contention-free occasion next to (2) a contention-based one --
+  // would otherwise have the helper thread rebuilt for each of them in turn forever.
+  // Preparing each shape once (a) lets whichever one wins the plan run accelerated
+  // and (b) leaves the other with the host detector, which is where it would end up anyway.
+  if (std::find(warmed_plan_keys.begin(), warmed_plan_keys.end(), plan_key) != warmed_plan_keys.end()) {
+    return false;
+  }
+  warmed_plan_keys.push_back(plan_key);
+
+  warmup_config  = config;
+  warmup_pending = true;
+  if (!warmup_thread.joinable()) {
+    warmup_thread = std::thread([this]() { warmup_worker(); });
+  }
+  warmup_cv.notify_one();
+  return true;
+}
+
+void prach_detector_cuda_impl::warmup_worker()
+{
+  for (;;) {
+    configuration config;
+    {
+      std::unique_lock<std::mutex> lock(warmup_mutex);
+      warmup_cv.wait(lock, [this]() { return warmup_stop || warmup_pending; });
+      if (warmup_stop) {
+        return;
+      }
+      config = warmup_config;
+    }
+
+    build_plan(config);
+
+    {
+      std::lock_guard<std::mutex> lock(warmup_mutex);
+      warmup_pending = false;
+    }
+    warmup_cv.notify_all();
+  }
+}
+
+void prach_detector_cuda_impl::build_plan(const configuration& config)
+{
+  if (!gpu_available || (handle == nullptr) || (stream == nullptr)) {
+    return;
+  }
+  // The helper thread needs the detector's device bound to it as well.
+  if (cudaSetDevice(device_id) != cudaSuccess) {
+    cudaGetLastError();
+    return;
+  }
+
+  ocudulog::basic_logger& logger = ocudulog::fetch_basic_logger("PHY");
+
+  const auto              t0       = std::chrono::steady_clock::now();
+  const detector_geometry geometry = detail::get_prach_detector_geometry(config);
+  const uint64_t          plan_key = make_plan_key(config, geometry);
+
+  nr_ldpc_status_t status = NR_LDPC_SUCCESS;
+  {
+    std::lock_guard<std::mutex> lock(detector_mutex);
+    prepare_roots(config, geometry);
+
+    // One detection on zeroed input of the live shape: ports x symbols x sequence length, one packed sample per
+    // word. It builds the plan, the device buffers, the kernels, and the graph. The live occasion that follows
+    // re-uploads the root sequences and recaptures the graph, which costs microseconds.
+    host_prach_packed.assign(static_cast<size_t>(config.nof_rx_ports) * geometry.nof_symbols * geometry.sequence_length,
+                             0U);
+
+    prach_detector_config_t cuda_config = make_cuda_config(config, geometry);
+    cuda_config.input_is_device         = 0;
+    cuda_config.input_symbol_stride     = static_cast<int>(geometry.sequence_length);
+    cuda_config.input_port_stride       = static_cast<int>(geometry.nof_symbols * geometry.sequence_length);
+
+    const cf_t* active_roots =
+        host_roots.data() + static_cast<size_t>(geometry.active_sequence_start) * geometry.sequence_length;
+    prach_detector_result_t cuda_result = {};
+    status = prach_detector_detect(handle, host_prach_packed.data(), active_roots, &cuda_config, &cuda_result, stream);
+  }
+
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (!is_success(status)) {
+    report_fatal_error_if_not(!force_gpu_path, "Accelerated PRACH detector could not be prepared.");
+    logger.warning("CUDA: PRACH detector preparation failed (status {}) after {:.1f} ms; {} x {} batches stay on the "
+                   "host detector",
+                   static_cast<int>(status),
+                   elapsed_ms,
+                   geometry.dft_size,
+                   detail::get_nof_idft_batches(config, geometry));
+    return;
+  }
+
+  warm_plan_key.store(plan_key, std::memory_order_release);
+  logger.info("CUDA: PRACH detector prepared for format {}, {} rx port(s), zcz {} in {:.1f} ms (IDFT {} x {} batches). "
+              "The occasion that triggered it was served by the host detector",
+              to_string(config.format),
+              config.nof_rx_ports,
+              config.zero_correlation_zone,
+              elapsed_ms,
+              geometry.dft_size,
+              detail::get_nof_idft_batches(config, geometry));
+}
+
+bool prach_detector_cuda_impl::is_warm_for(const configuration& config) const
+{
+  const detector_geometry geometry = detail::get_prach_detector_geometry(config);
+  return warm_plan_key.load(std::memory_order_acquire) == make_plan_key(config, geometry);
+}
+
+bool prach_detector_cuda_impl::wait_for_warmup(std::chrono::milliseconds timeout)
+{
+  std::unique_lock<std::mutex> lock(warmup_mutex);
+  return warmup_cv.wait_for(lock, timeout, [this]() { return !warmup_pending; });
 }
