@@ -582,18 +582,26 @@ cuda pdsch issue 1 regression:
 dapp interoperability release gate:
   extends: .build_and_unit_template
   stage: build and unit tests
+  # Independent of the ci stage: runs even when an unrelated trigger fails.
+  needs: []
   # Required for every MR/default-branch/tag pipeline, not an opt-in/manual job.
   rules:
     - if: '$ON_MR || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_TAG'
+  tags:
+    - ${OCUDU_INTEROP_RUNNER_TAG}
   variables:
+    OCUDU_INTEROP_RUNNER_TAG: saas-linux-large-amd64
     OS: ubuntu-24.04
     OCUDU_BUILD_DIR: build-dapp-interop-ci
     GIT_SUBMODULE_STRATEGY: recursive
     OCUDU_DAPP_SDK_URL: https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-sdk.git
     OCUDU_DAPP_SDK_REF: 70ee0db287d72b4fdeabf2afbde705e0b8d283e6
   script:
+    # E3AP, E3DP and the libe3 session run over SCTP; a runner whose kernel lacks the module fails
+    # every one of those tests with "Protocol not supported". Say so once, up front.
+    - python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP).close()" || { echo "This runner cannot open SCTP sockets; run this job on a runner with the sctp kernel module (set OCUDU_INTEROP_RUNNER_TAG)."; exit 1; }
     - apt-get update
-    - apt-get install --no-install-recommends -y autoconf automake libtool bison flex libsctp-dev flatbuffers-compiler libflatbuffers-dev clang
+    - apt-get install --no-install-recommends -y autoconf automake libtool bison flex libsctp-dev flatbuffers-compiler libflatbuffers-dev clang python3-pip
     - python3 -m pip install --break-system-packages 'asn1tools>=0.166,<1' numpy h5py flatbuffers
     - >-
       builder.sh -b "${OCUDU_BUILD_DIR}" -c gcc
@@ -631,16 +639,25 @@ dapp interoperability release gate:
 libe3 interoperability report:
   extends: .build_and_unit_template
   stage: build and unit tests
+  # Independent of the ci stage: runs even when an unrelated trigger fails.
+  needs: []
   rules:
     - if: '$ON_MR || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_TAG'
+  tags:
+    - ${OCUDU_INTEROP_RUNNER_TAG}
   variables:
+    OCUDU_INTEROP_RUNNER_TAG: saas-linux-large-amd64
     OS: ubuntu-24.04
     OCUDU_BUILD_DIR: build-dapp-libe3-ci
     GIT_SUBMODULE_STRATEGY: recursive
   script:
+    # E3AP, E3DP and the libe3 session run over SCTP; a runner whose kernel lacks the module fails
+    # every one of those tests with "Protocol not supported". Say so once, up front.
+    - python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP).close()" || { echo "This runner cannot open SCTP sockets; run this job on a runner with the sctp kernel module (set OCUDU_INTEROP_RUNNER_TAG)."; exit 1; }
     - apt-get update
     - >-
-      apt-get install --no-install-recommends -y autoconf automake libtool bison flex libsctp-dev clang
+      apt-get install --no-install-recommends -y autoconf automake libtool bison flex libsctp-dev
+      flatbuffers-compiler libflatbuffers-dev clang python3-pip
       texlive-latex-base texlive-latex-recommended texlive-latex-extra texlive-fonts-recommended cm-super
     - python3 -m pip install --break-system-packages 'asn1tools>=0.166,<1' numpy
     - >-

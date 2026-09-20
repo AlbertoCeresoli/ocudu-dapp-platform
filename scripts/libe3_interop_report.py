@@ -128,7 +128,7 @@ def load_tests(build: Path) -> list[dict]:
                   else "passed" if case.attrib.get("status") == "run" else case.attrib.get("status", "unknown"))
         out = case.find("system-out")
         tests.append({"name": name, "status": status, "time": float(case.attrib.get("time", 0.0)),
-                      "output": (out.text or "") if out is not None else "",
+                      "output": plain(out.text or "") if out is not None else "",
                       "category": next((label for pattern, label in CATEGORIES if re.search(pattern, name)),
                                        "Other E3 host tests")})
     return tests
@@ -179,8 +179,18 @@ def path(text: str) -> str:
     return r"\path{" + text.replace("{", "").replace("}", "") + "}"
 
 
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def plain(text: str) -> str:
+    """Captured output without ANSI colour sequences and control characters (CI runners colour
+    gtest output; pdflatex rejects the escape byte)."""
+    return CONTROL.sub("", ANSI.sub("", text))
+
+
 def clip(output: str) -> str:
-    lines = [textwrap.shorten(line, 112, placeholder=" ...") for line in output.splitlines() if line.strip()]
+    lines = [textwrap.shorten(line, 112, placeholder=" ...") for line in plain(output).splitlines() if line.strip()]
     if len(lines) > MAX_OUTPUT_LINES:
         lines = lines[:MAX_OUTPUT_LINES] + [f"... {len(lines) - MAX_OUTPUT_LINES} more lines in dapp-interop.log"]
     return "\n".join(lines)
@@ -299,7 +309,7 @@ def main() -> int:
         rc, log = run_gate(build, summary_file)
     tests = load_tests(build)
     ctx = {"provenance": provenance(build), "tests": tests, "summaries": load_summaries(summary_file),
-           "gate_log": log, "verdict": "PASSED" if rc == 0 and tests and all(t["status"] == "passed" for t in tests) else "FAILED"}
+           "gate_log": plain(log), "verdict": "PASSED" if rc == 0 and tests and all(t["status"] == "passed" for t in tests) else "FAILED"}
     ctx["coverage"] = coverage(tests, ctx["summaries"])
     (out / "libe3_interop_report.md").write_text(render_markdown(ctx))
     (out / "libe3_interop_report.tex").write_text(render_latex(ctx))

@@ -27,6 +27,9 @@ install_dependencies_debian_ubuntu() {
     local -a build_pkgs=(
         cmake make gcc g++ pkg-config
         libfftw3-dev libmbedtls-dev libsctp-dev libyaml-cpp-dev libgtest-dev
+        # the pinned asn1c (third_party/asn1c) is built at configure time; FlatBuffers
+        # generates the upper-PHY diagnostics schema
+        autoconf automake libtool bison flex flatbuffers-compiler libflatbuffers-dev
     )
     local -a run_pkgs=(
         libfftw3-dev libmbedtls-dev libsctp-dev libyaml-cpp-dev libgtest-dev libcap2-bin
@@ -101,6 +104,7 @@ install_dependencies_fedora() {
 
     local -a build_pkgs=(
         cmake make libatomic fftw-devel lksctp-tools-devel yaml-cpp-devel mbedtls-devel gtest-devel
+        autoconf automake libtool bison flex flatbuffers-compiler flatbuffers-devel
     )
     local -a run_pkgs=(
         fftw-libs-single lksctp-tools yaml-cpp mbedtls libcap
@@ -139,6 +143,7 @@ install_dependencies_arch() {
 
     local -a build_pkgs=(
         cmake fftw mbedtls yaml-cpp lksctp-tools gtest pkgconf
+        autoconf automake libtool bison flex flatbuffers
     )
     local -a run_pkgs=(
         fftw mbedtls yaml-cpp lksctp-tools gtest libcap
@@ -179,6 +184,7 @@ install_dependencies_rhel() {
     # yaml-cpp-devel and mbedtls-devel come from EPEL (installed below).
     local -a build_pkgs=(
         cmake fftw-devel lksctp-tools-devel
+        autoconf automake libtool bison flex flatbuffers-compiler flatbuffers-devel
         gcc gcc-c++ libatomic
         yaml-cpp-devel mbedtls-devel
     )
