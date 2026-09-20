@@ -590,7 +590,7 @@ dapp interoperability release gate:
     OCUDU_BUILD_DIR: build-dapp-interop-ci
     GIT_SUBMODULE_STRATEGY: recursive
     OCUDU_DAPP_SDK_URL: https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-sdk.git
-    OCUDU_DAPP_SDK_REF: c38255585991ad7005737a4308cd433dee5bcfea
+    OCUDU_DAPP_SDK_REF: 70ee0db287d72b4fdeabf2afbde705e0b8d283e6
   script:
     - apt-get update
     - apt-get install --no-install-recommends -y autoconf automake libtool bison flex libsctp-dev flatbuffers-compiler libflatbuffers-dev clang
