@@ -19,6 +19,9 @@ The required cross-repository jobs run `scripts/check_dapp_interop_gate.py`:
 real patched-libe3 E2E, native/Python wire compatibility, SHM validation,
 telemetry isolation, and the SDK built against that host's installed SDK.
 Missing or skipped required tests fail the job. Record both full commit IDs.
+The job also renders `dapp-interop-report/libe3_interop_report.{md,pdf}`
+(`scripts/libe3_interop_report.py`): attach it to the release record as the
+libe3 interoperability evidence.
 The SDK job requires a paired host commit containing this gate; update its host
 lock (or explicitly set `OCUDU_HOST_REF`) after the host changes are committed
 and published. Never waive the job merely because the old host pin lacks it.

@@ -96,24 +96,42 @@ class LibE3DAppAgainstOcuduAgent(unittest.TestCase):
             cls.process.kill()
         cls.tempdir.cleanup()
 
-    def run_dapp(self, *extra: str) -> dict:
-        completed = subprocess.run(
+    def run_dapp(self, *extra: str, xapp: bytes | None = None) -> dict:
+        """Run the libe3 dApp to completion. With ``xapp`` the agent is told, as soon as the dApp
+        announces its identifier, to queue that xApp control action to it (RAN function 11)."""
+        process = subprocess.Popen(
             [DAPP, "--port", str(self.e3ap_port), *extra],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=60,
         )
-        lines = [line for line in completed.stdout.splitlines() if line.startswith("{")]
-        self.assertTrue(lines, "dApp printed no JSON summary: " + completed.stderr[-2000:])
-        summary = json.loads(lines[-1])
-        summary["_exit"] = completed.returncode
+        records = []
+        for line in process.stdout:
+            if not line.startswith("{"):
+                continue
+            record = json.loads(line)
+            records.append(record)
+            if record.get("event") == "setup" and xapp is not None:
+                self.process.stdin.write(f"xapp {record['dapp_id']} 11 {xapp.hex()}\n")
+                self.process.stdin.flush()
+                self.assertEqual(self.process.stdout.readline().strip(), "xapp sent")
+        stderr = process.communicate(timeout=60)[1]
+        summaries = [record for record in records if "event" not in record]
+        self.assertTrue(summaries, "dApp printed no JSON summary: " + stderr[-2000:])
+        summary = summaries[-1]
+        summary["_exit"] = process.returncode
+        # scripts/libe3_interop_report.py collects what the real libe3 dApp reported per session.
+        record = os.environ.get("OCUDU_LIBE3_E2E_SUMMARY")
+        if record:
+            with open(record, "a", encoding="utf-8") as sink:
+                sink.write(json.dumps({"test": self._testMethodName, "args": list(extra), **summary}) + "\n")
         return summary
 
     def test_full_session_over_one_sctp_association(self):
         codec = load_codec(os.environ.get("OCUDU_E3_SCHEMA_DIR"))
         control = codec.encode("ManagementRequest", management.inventory_request())
-        summary = self.run_dapp("--telemetry", "2", "--indications", "3", "--control-hex", control.hex())
+        summary = self.run_dapp("--telemetry", "2", "--indications", "3", "--control-hex", control.hex(),
+                                "--expect-xapp", "1", xapp=bytes.fromhex("a55a0102"))
         self.assertTrue(summary["setup"], summary)
         self.assertGreaterEqual(summary["dapp_id"], 1)
         self.assertLessEqual(summary["dapp_id"], 100, "libe3 dApp identifiers are 1..100")
@@ -129,6 +147,9 @@ class LibE3DAppAgainstOcuduAgent(unittest.TestCase):
             self.assertLessEqual(size, 32768)
         self.assertEqual(summary["control_ack"], "positive", "management inventory query over libe3")
         self.assertEqual(summary["report_ack"], "positive")
+        self.assertEqual(summary["xapp_controls"], 1, "the xApp control action must reach the libe3 dApp")
+        self.assertEqual(summary["xapp_control_hex"], "a55a0102")
+        self.assertEqual(summary["xapp_ran_function"], 11)
         self.assertTrue(summary["unsubscribed"], "delete confirmed by a SubscriptionResponse")
         self.assertTrue(summary["released"])
         self.assertTrue(summary["ok"])

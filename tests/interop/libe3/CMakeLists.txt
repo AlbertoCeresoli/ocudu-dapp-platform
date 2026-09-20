@@ -121,4 +121,12 @@ if (DAPP_TEST_PYTHON_EXECUTABLE AND TARGET e3ap_test_server)
     ENVIRONMENT "OCUDU_E3_SCHEMA_DIR=${PROJECT_SOURCE_DIR}/schemas/e3"
     TIMEOUT 300
     LABELS "dapp;e3;python;interop;libe3")
+  # Runs the fail-closed interop gate and renders its report (Markdown, and PDF when pdflatex is
+  # present) into <build>/dapp-interop-report; see scripts/libe3_interop_report.py.
+  add_custom_target(libe3_interop_report
+    COMMAND ${DAPP_TEST_PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/libe3_interop_report.py --build ${PROJECT_BINARY_DIR}
+    USES_TERMINAL
+    COMMENT "libe3 interoperability gate + report")
+  add_dependencies(libe3_interop_report libe3_interop_dapp libe3_interop_vectors e3ap_test_server
+                   dapp_runtime_test dapp_telemetry_allocation_test)
 endif ()

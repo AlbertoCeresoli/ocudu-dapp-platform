@@ -600,7 +600,7 @@ dapp interoperability release gate:
       -m "-j${CPU_JOBS} dapp_runtime_test dapp_telemetry_allocation_test e3ap_test_server libe3_interop_dapp libe3_interop_vectors ocudu-dappctl"
       -DCMAKE_BUILD_TYPE=Release -DENABLE_DAPP=ON -DENABLE_E3=ON
       -DENABLE_E3_ASN1_CODEC=ON -DOCUDU_DAPP_LIBE3_INTEROP=ON -DENABLE_UHD=OFF .
-    - python3 scripts/check_dapp_interop_gate.py --build "${OCUDU_BUILD_DIR}"
+    - python3 scripts/libe3_interop_report.py --build "${OCUDU_BUILD_DIR}"
     - cmake --install "${OCUDU_BUILD_DIR}" --prefix "${CI_PROJECT_DIR}/interop-install" --component dapp_sdk
     - git clone --no-checkout "${OCUDU_DAPP_SDK_URL}" interop-sdk
     - git -C interop-sdk checkout --detach "${OCUDU_DAPP_SDK_REF}"
@@ -620,6 +620,7 @@ dapp interoperability release gate:
         - interop-sdk-build/dapp-interop.xml
     paths:
       - build-dapp-interop-ci/dapp-interop.log
+      - build-dapp-interop-ci/dapp-interop-report/
       - interop-sdk-build/dapp-interop.log
     expire_in: 30 days
 

@@ -152,6 +152,22 @@ compiled in. See [quickstart.md](quickstart.md) § Run and verify for a minimal
 enable-and-check recipe (`ctest -R dapp`, `python3 -m ocudu_e3 catalog`,
 `ocudu_dappctl.py --sctp 127.0.0.1:36423 inventory`).
 
+## libe3 interoperability
+
+The E3AP agent speaks the upstream [libe3](https://github.com/wineslab/libe3)
+E3AP 1.0.0 module beside its native one on the same SCTP port; the dialect is
+fixed per association by the setup request (see the
+[libe3 dialect](e3_wire.md#the-libe3-dialect-of-the-e3ap-agent) section for the
+identifier, payload and control-response limits a libe3 peer has).
+`tests/interop/libe3` builds the pinned upstream library from the
+`third_party/libe3` submodule and drives a real libe3 dApp through a complete
+session against the agent; libe3's own encoder output is pinned as byte-exact
+vectors the OCUDU codec must reproduce. Configure with
+`-DOCUDU_DAPP_LIBE3_INTEROP=ON`, run `ctest -R dapp_e3ap_libe3`, and build the
+`libe3_interop_report` target for the gate's Markdown/PDF report
+(`build/dapp-interop-report/`); [tests/interop/libe3/README.md](../../tests/interop/libe3/README.md)
+describes the patches and the report.
+
 ## Class-A equalizer CSI and DMRS notes (host)
 
 See [quickstart.md](quickstart.md) § Class-A equalizer health under UL traffic —

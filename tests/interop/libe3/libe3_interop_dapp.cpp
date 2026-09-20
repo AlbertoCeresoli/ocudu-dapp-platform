@@ -34,6 +34,7 @@ struct options {
   uint32_t             telemetry{2};
   unsigned             indications{3};
   unsigned             timeout_ms{10000};
+  unsigned             expect_xapp{0};  // xApp control actions to wait for after the report
   std::vector<uint8_t> control;
 };
 
@@ -62,6 +63,8 @@ options parse(int argc, char** argv)
       result.timeout_ms = static_cast<unsigned>(std::stoul(value));
     } else if (option == "--control-hex") {
       result.control = bytes_of_hex(value);
+    } else if (option == "--expect-xapp") {
+      result.expect_xapp = static_cast<unsigned>(std::stoul(value));
     } else {
       std::fprintf(stderr, "unknown option %s\n", option.c_str());
       std::exit(2);
@@ -70,7 +73,7 @@ options parse(int argc, char** argv)
   if (result.port == 0) {
     std::fprintf(stderr,
                  "usage: libe3_interop_dapp --port <e3ap port> [--telemetry id] [--indications n] "
-                 "[--control-hex hex] [--timeout-ms ms]\n");
+                 "[--control-hex hex] [--expect-xapp n] [--timeout-ms ms]\n");
     std::exit(2);
   }
   return result;
@@ -88,6 +91,7 @@ struct session_log {
   std::map<uint32_t, SubscriptionResponse> subscription_responses;
   std::vector<std::size_t>                 indication_bytes;
   std::map<uint32_t, ResponseCode>         acks;
+  std::vector<XAppControlAction>           xapp_controls;
   unsigned                                 unexpected_pdus{0};
 
   template <typename Predicate>
@@ -114,6 +118,17 @@ std::string json_sizes(const std::vector<std::size_t>& values)
     text += (index ? "," : "") + std::to_string(values[index]);
   }
   return text + "]";
+}
+
+std::string hex_of(const std::vector<uint8_t>& bytes)
+{
+  static const char digits[] = "0123456789abcdef";
+  std::string       text;
+  for (uint8_t byte : bytes) {
+    text += digits[byte >> 4];
+    text += digits[byte & 0x0f];
+  }
+  return text;
 }
 
 const char* code_text(const std::map<uint32_t, ResponseCode>& acks, uint32_t id)
@@ -177,6 +192,11 @@ int main(int argc, char** argv)
     log.acks[ack.request_id] = ack.response_code;
     log.changed.notify_all();
   });
+  dapp.set_xapp_control_handler([&](const XAppControlAction& action) {
+    std::lock_guard<std::mutex> lock(log.mutex);
+    log.xapp_controls.push_back(action);
+    log.changed.notify_all();
+  });
 
   bool ok = true;
   if (dapp.start() != ErrorCode::SUCCESS) {
@@ -185,6 +205,12 @@ int main(int argc, char** argv)
   }
   const bool setup = dapp.wait_for_setup(limit) == ErrorCode::SUCCESS;
   ok               = ok && setup && dapp.dapp_id().has_value();
+  if (setup) {
+    // Announced as soon as it is known so the driver can address this dApp (xApp control) while the
+    // session is still open; the summary at the end is the last JSON object printed.
+    std::lock_guard<std::mutex> lock(log.mutex);
+    std::cout << "{\"event\": \"setup\", \"dapp_id\": " << log.dapp_id << "}" << std::endl;
+  }
 
   uint32_t subscribe_id = 0;
   bool     subscribed   = false;
@@ -207,6 +233,8 @@ int main(int argc, char** argv)
     ok = dapp.send_report(10, {0x01, 0x02, 0x03}, &report_id) == ErrorCode::SUCCESS &&
          log.wait([&] { return log.acks.count(report_id) != 0; }, limit);
   }
+  const bool got_xapp = ok && log.wait([&] { return log.xapp_controls.size() >= opts.expect_xapp; }, limit);
+  ok                  = ok && got_xapp;
   bool unsubscribed = false;
   if (ok) {
     ok                  = dapp.unsubscribe(10) == ErrorCode::SUCCESS;
@@ -239,7 +267,12 @@ int main(int argc, char** argv)
   std::cout << ", \"indications\": " << log.indication_bytes.size()
             << ", \"indication_bytes\": " << json_sizes(log.indication_bytes) << ", \"control_ack\": \""
             << (opts.control.empty() ? "skipped" : code_text(log.acks, control_id)) << "\"" << ", \"report_ack\": \""
-            << code_text(log.acks, report_id) << "\"" << ", \"unsubscribed\": " << (unsubscribed ? "true" : "false")
+            << code_text(log.acks, report_id) << "\"" << ", \"xapp_controls\": " << log.xapp_controls.size()
+            << ", \"xapp_control_hex\": \""
+            << (log.xapp_controls.empty() ? "" : hex_of(log.xapp_controls.front().xapp_control_data)) << "\""
+            << ", \"xapp_ran_function\": "
+            << (log.xapp_controls.empty() ? 0U : log.xapp_controls.front().ran_function_identifier)
+            << ", \"unsubscribed\": " << (unsubscribed ? "true" : "false")
             << ", \"released\": " << (released ? "true" : "false") << ", \"ok\": " << (ok ? "true" : "false") << "}\n";
   return ok ? 0 : 1;
 }

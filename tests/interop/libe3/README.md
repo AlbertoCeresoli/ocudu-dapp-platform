@@ -29,7 +29,22 @@ git submodule update --init third_party/asn1c third_party/libe3
 cmake -S . -B build -DOCUDU_DAPP_LIBE3_INTEROP=ON
 cmake --build build --target libe3_interop_dapp libe3_interop_vectors e3ap_test_server
 ctest --test-dir build -R 'dapp_e3ap_libe3'
+cmake --build build --target libe3_interop_report   # gate + report in build/dapp-interop-report/
 ```
+
+## The report
+
+`scripts/libe3_interop_report.py --build build` (the `libe3_interop_report`
+target) runs the fail-closed gate `scripts/check_dapp_interop_gate.py` and
+renders what it proved into `build/dapp-interop-report/`: provenance (OCUDU
+commit, libe3 and asn1c submodule commits, patches applied, CMake options,
+toolchain, binary build times), the coverage of every libe3 E3AP 1.0.0
+procedure (pinned vector, codec reproduction, asn1tools crossing, exchanged
+on the wire in the end-to-end session), the sessions the real libe3 dApp
+reported, every required test with status and time, and the captured output
+of the interoperability tests. Markdown always, PDF when `pdflatex` is on the
+path; the CI gate job publishes the directory as an artifact. The exit code is
+the gate's.
 
 ## The patches
 

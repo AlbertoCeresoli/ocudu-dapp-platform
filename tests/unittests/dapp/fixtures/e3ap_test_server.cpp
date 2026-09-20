@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -196,11 +197,25 @@ int main(int argc, char** argv)
     }
   });
 
-  // Run until stdin closes so the parent test controls the lifetime.
+  // Run until stdin closes so the parent test controls the lifetime. "xapp <dapp id> <ran function>
+  // <hex>" queues an E3-XAppControlAction to that dApp (the interop tests drive the xApp -> dApp
+  // direction this way) and answers "xapp sent" or "xapp refused" on stdout.
   std::string line;
   while (std::getline(std::cin, line)) {
     if (line == "quit") {
       break;
+    }
+    if (line.rfind("xapp ", 0) == 0) {
+      unsigned    dapp_id = 0, ran_function = 0;
+      std::string hex;
+      std::istringstream(line.substr(5)) >> dapp_id >> ran_function >> hex;
+      std::vector<uint8_t> data;
+      for (std::size_t index = 0; index + 1 < hex.size(); index += 2) {
+        data.push_back(static_cast<uint8_t>(std::stoul(hex.substr(index, 2), nullptr, 16)));
+      }
+      const bool sent = e3ap.server->send_xapp_control_action(static_cast<uint16_t>(dapp_id),
+                                                              static_cast<uint16_t>(ran_function), std::move(data));
+      std::cout << (sent ? "xapp sent" : "xapp refused") << std::endl;
     }
   }
   stop.store(true, std::memory_order_release);
