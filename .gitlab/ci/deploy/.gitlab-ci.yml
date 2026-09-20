@@ -16,6 +16,12 @@ stages:
   - promote-stable
   - preflight
 
+variables:
+  # Every image job builds from its checkout (`ADD . /src`): the E3 codec generator
+  # and the libe3 grammar come from third_party submodules, without which the OCUDU
+  # configure inside the image stops.
+  GIT_SUBMODULE_STRATEGY: recursive
+
 ################################################################################
 # Legacy all-binary Ubuntu image (docker-compose / dev builds)
 ################################################################################
