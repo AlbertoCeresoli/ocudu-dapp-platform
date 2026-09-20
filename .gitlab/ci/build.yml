@@ -600,7 +600,7 @@ dapp interoperability release gate:
       -m "-j${CPU_JOBS} dapp_runtime_test dapp_telemetry_allocation_test e3ap_test_server libe3_interop_dapp libe3_interop_vectors ocudu-dappctl"
       -DCMAKE_BUILD_TYPE=Release -DENABLE_DAPP=ON -DENABLE_E3=ON
       -DENABLE_E3_ASN1_CODEC=ON -DOCUDU_DAPP_LIBE3_INTEROP=ON -DENABLE_UHD=OFF .
-    - python3 scripts/libe3_interop_report.py --build "${OCUDU_BUILD_DIR}"
+    - python3 scripts/check_dapp_interop_gate.py --build "${OCUDU_BUILD_DIR}"
     - cmake --install "${OCUDU_BUILD_DIR}" --prefix "${CI_PROJECT_DIR}/interop-install" --component dapp_sdk
     - git clone --no-checkout "${OCUDU_DAPP_SDK_URL}" interop-sdk
     - git -C interop-sdk checkout --detach "${OCUDU_DAPP_SDK_REF}"
@@ -620,9 +620,46 @@ dapp interoperability release gate:
         - interop-sdk-build/dapp-interop.xml
     paths:
       - build-dapp-interop-ci/dapp-interop.log
-      - build-dapp-interop-ci/dapp-interop-report/
       - interop-sdk-build/dapp-interop.log
     expire_in: 30 days
+
+# libe3 interoperability, as a report. Builds the host gate targets and the
+# pinned upstream libe3 (submodules), runs the fail-closed host gate through
+# scripts/libe3_interop_report.py and publishes the rendered report (Markdown
+# and PDF) beside the JUnit results, exposed on the merge request. The job
+# fails with the gate; the report of a failed run is still published.
+libe3 interoperability report:
+  extends: .build_and_unit_template
+  stage: build and unit tests
+  rules:
+    - if: '$ON_MR || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_TAG'
+  variables:
+    OS: ubuntu-24.04
+    OCUDU_BUILD_DIR: build-dapp-libe3-ci
+    GIT_SUBMODULE_STRATEGY: recursive
+  script:
+    - apt-get update
+    - >-
+      apt-get install --no-install-recommends -y autoconf automake libtool bison flex libsctp-dev clang
+      texlive-latex-base texlive-latex-recommended texlive-latex-extra texlive-fonts-recommended cm-super
+    - python3 -m pip install --break-system-packages 'asn1tools>=0.166,<1' numpy
+    - >-
+      builder.sh -b "${OCUDU_BUILD_DIR}" -c gcc
+      -m "-j${CPU_JOBS} dapp_runtime_test dapp_telemetry_allocation_test e3ap_test_server libe3_interop_dapp libe3_interop_vectors ocudu-dappctl"
+      -DCMAKE_BUILD_TYPE=Release -DENABLE_DAPP=ON -DENABLE_E3=ON
+      -DENABLE_E3_ASN1_CODEC=ON -DOCUDU_DAPP_LIBE3_INTEROP=ON -DENABLE_UHD=OFF .
+    - python3 scripts/libe3_interop_report.py --build "${OCUDU_BUILD_DIR}" --out libe3-interop-report
+    - test -f libe3-interop-report/libe3_interop_report.pdf
+  artifacts:
+    when: always
+    name: "libe3-interop-report-${CI_COMMIT_SHORT_SHA}"
+    expose_as: "libe3 interoperability report"
+    reports:
+      junit:
+        - libe3-interop-report/dapp-interop.xml
+    paths:
+      - libe3-interop-report/
+    expire_in: 90 days
 
 dapp host cpu matrix:
   extends: .build_and_unit_template

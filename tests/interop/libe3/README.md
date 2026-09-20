@@ -43,7 +43,8 @@ procedure (pinned vector, codec reproduction, asn1tools crossing, exchanged
 on the wire in the end-to-end session), the sessions the real libe3 dApp
 reported, every required test with status and time, and the captured output
 of the interoperability tests. Markdown always, PDF when `pdflatex` is on the
-path; the CI gate job publishes the directory as an artifact. The exit code is
+path; the `libe3 interoperability report` CI job publishes the directory as an
+artifact exposed on the merge request. The exit code is
 the gate's.
 
 ## The patches
