@@ -1,0 +1,93 @@
+From 6c167060304c960cd83171d07967baa0c908800b Mon Sep 17 00:00:00 2001
+From: "DeepSig Inc." <tim.oshea753@gmail.com>
+Date: Fri, 4 Sep 2026 10:19:28 -0400
+Subject: [PATCH 2/2] build: pin asn1c to mouse07410 844f9caa and list the
+ runtime units it emits
+
+Move build_libe3's asn1c pin from 940dd5fa (2024-04) to the current
+vlm_master tip 844f9caa (2026-07, v1.5.1-44): two years of APER decoder
+fixes (NULL alignment and extension skipping in SEQUENCE, INTEGER constrained
+length determinants, extensible ENUMERATED lookups, OPEN TYPE handling, PER
+constraint inheritance for aliases) and fuzzer/security fixes.
+
+That generator also emits the CBOR codec, BOOLEAN, asn_constraint_value and
+OPEN_TYPE_print units, which the shared skeletons reference; add them to the
+explicit source and header lists so libasn1_e3ap links without compiling
+those codecs out.
+---
+ README.md                         |  2 +-
+ build_libe3                       |  2 +-
+ messages/asn1/V1/e3ap-1.0.0.cmake | 24 ++++++++++++++++++++++++
+ 3 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/README.md b/README.md
+index 90db140..cd1df21 100644
+--- a/README.md
++++ b/README.md
+@@ -145,7 +145,7 @@ make -j$(nproc)
+ | `LIBE3_ENABLE_ASAN` | OFF | Enable AddressSanitizer |
+ | `LIBE3_ENABLE_TSAN` | OFF | Enable ThreadSanitizer |
+ | `LIBE3_ENABLE_SWIG` | OFF | Build the SWIG-generated Python bindings (`_libe3py.so` + `libe3py.py`) |
+-| `LIBE3_ENABLE_SCTP` | OFF | Enable the SCTP POSIX transport (needs `libsctp-dev`) |
++| `LIBE3_ENABLE_SCTP` | OFF | Enable the SCTP POSIX transport and the native SCTP association link layer (needs `libsctp-dev`) |
+ 
+ > **Note on SCTP:** the transport is **off by default**. It is the only dependency that needs a
+ > kernel module plus a distro `-dev` package for a single system header, and the deployed E3 links
+diff --git a/build_libe3 b/build_libe3
+index c31e256..1fda5d3 100755
+--- a/build_libe3
++++ b/build_libe3
+@@ -193,7 +193,7 @@ EOF
+ 
+ # Install ASN.1 compiler from source (used on Debian where package may be outdated)
+ install_asn1c_from_source() {
+-    local pinned_commit="940dd5fa9f3917913fd487b13dfddfacd0ded06e"
++    local pinned_commit="844f9caa33f53d887a58f7696cca17e9657bf984"
+     local stamp="/opt/asn1c/.installed-commit"
+ 
+     # Already installed for this exact pinned commit (e.g. restored from a CI
+diff --git a/messages/asn1/V1/e3ap-1.0.0.cmake b/messages/asn1/V1/e3ap-1.0.0.cmake
+index 133b937..b28e997 100644
+--- a/messages/asn1/V1/e3ap-1.0.0.cmake
++++ b/messages/asn1/V1/e3ap-1.0.0.cmake
+@@ -107,6 +107,26 @@ set(e3ap_source
+     xer_decoder.c
+     xer_encoder.c
+     xer_support.c
++    # Runtime units emitted by asn1c 844f9caa (2026-07) and later: the CBOR
++    # codec, the constraint-value helper and OPEN TYPE printing. Referenced
++    # from the shared skeletons whether or not the codec is used.
++    asn_codecs_prim_cbor.c
++    asn_constraint_value.c
++    BIT_STRING_cbor.c
++    cbor_decoder.c
++    cbor_encoder.c
++    cbor_support.c
++    constr_CHOICE_cbor.c
++    constr_SEQUENCE_cbor.c
++    constr_SEQUENCE_OF_cbor.c
++    constr_SET_OF_cbor.c
++    ENUMERATED_cbor.c
++    INTEGER_cbor.c
++    NativeEnumerated_cbor.c
++    NativeInteger_cbor.c
++    OCTET_STRING_cbor.c
++    OPEN_TYPE_cbor.c
++    OPEN_TYPE_print.c
+     # E3AP protocol types
+     E3-DAppControlAction.c
+     E3-DAppID.c
+@@ -177,6 +197,10 @@ set(e3ap_headers
+     xer_decoder.h
+     xer_encoder.h
+     xer_support.h
++    asn_constraint_value.h
++    cbor_decoder.h
++    cbor_encoder.h
++    cbor_support.h
+     # E3AP protocol headers
+     E3-DAppControlAction.h
+     E3-DAppID.h
+-- 
+2.43.0
+

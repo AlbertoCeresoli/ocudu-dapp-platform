@@ -183,6 +183,12 @@ struct sctp_association_server::implementation {
     const int reuse = 1;
     ::setsockopt(listener.value(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     request_streams(listener.value(), config.nof_streams);
+    // Buffers must be requested before listen(): the INIT-ACK advertises the
+    // receive window from the listener's buffer and accepted sockets inherit
+    // both sizes. Delayed SACK is disabled here for the same inheritance
+    // reason; see disable_delayed_sack().
+    request_socket_buffers(listener.value(), config.socket_buffer_bytes);
+    disable_delayed_sack(listener.value());
     if (::bind(listener.value(), reinterpret_cast<const sockaddr*>(&address), length) != 0) {
       detail = error_text("bind SCTP socket");
       return false;
@@ -331,6 +337,7 @@ private:
         continue;
       }
       request_socket_buffers(accepted_fd.value(), config.socket_buffer_bytes);
+      disable_delayed_sack(accepted_fd.value());
       set_nodelay(accepted_fd.value());
       enable_receive_info(accepted_fd.value());
       try {

@@ -1,22 +1,32 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
+#include "ocudu/adt/scope_exit.h"
 #include "ocudu/dapp/e3/aper_codec.h"
 #include "ocudu/dapp/e3/e3_connection_registry.h"
 #include "ocudu/dapp/e3/e3ap_codec.h"
+#include "ocudu/dapp/e3/e3ap_libe3_codec.h"
 #include "ocudu/dapp/e3/e3ap_sctp_server.h"
 #include "ocudu/dapp/e3/embedded_agent.h"
 #include "ocudu/dapp/e3/management_service.h"
+#include "ocudu/dapp/e3/shared_region.h"
+#include "ocudu/dapp/e3/shared_region_layout.h"
 #include "ocudu/dapp/e3/telemetry_publisher.h"
 #include "ocudu/dapp/runtime/instance_manager.h"
+#include <algorithm>
 #include <arpa/inet.h>
+#include <cerrno>
 #include <chrono>
 #include <complex>
+#include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <map>
+#include <mutex>
 #include <netinet/in.h>
 #include <netinet/sctp.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -31,13 +41,27 @@ namespace {
 class test_client
 {
 public:
-  explicit test_client(uint16_t port)
+  explicit test_client(uint16_t port, bool libe3_ = false) : libe3(libe3_)
   {
     descriptor = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_SCTP);
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port   = htons(port);
     ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+    // The receiver of bulk indications must acknowledge every chunk: with the
+    // kernel's 200 ms delayed-SACK default the agent's sender stalls on every
+    // multi-fragment object. Production clients (python/ocudu_e3/sctp.py) set
+    // the same option.
+    sctp_sack_info sack{};
+    sack.sack_delay = 0;
+    sack.sack_freq  = 1;
+    ::setsockopt(descriptor, IPPROTO_SCTP, SCTP_DELAYED_SACK, &sack, sizeof(sack));
+    // Buffers must be preset before connect(): the receive window is fixed
+    // from the receive buffer at association setup, and the 16 KiB default
+    // send buffer keeps one chunk in flight.
+    const int buffer_bytes = 8 * 1024 * 1024;
+    ::setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &buffer_bytes, sizeof(buffer_bytes));
+    ::setsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &buffer_bytes, sizeof(buffer_bytes));
     connected = descriptor >= 0 && ::connect(descriptor, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
     timeval timeout{2, 0};
     ::setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -53,7 +77,7 @@ public:
 
   bool send(const e3ap_pdu& pdu)
   {
-    auto encoded = e3ap_codec::encode(pdu);
+    auto encoded = libe3 ? e3ap_libe3_codec::encode(pdu) : e3ap_codec::encode(pdu);
     if (!encoded) {
       return false;
     }
@@ -82,7 +106,7 @@ public:
         break;
       }
     }
-    auto decoded = e3ap_codec::decode(message);
+    auto decoded = libe3 ? e3ap_libe3_codec::decode(message) : e3ap_codec::decode(message);
     if (!decoded) {
       ADD_FAILURE() << decoded.detail;
       return std::nullopt;
@@ -102,10 +126,15 @@ public:
   }
 
   /// Completes setup and returns the assigned dApp identifier.
-  std::optional<uint16_t> setup()
+  std::optional<uint16_t> setup(bool stamp = true)
   {
     e3ap_pdu pdu;
     pdu.id = 1;
+    if (stamp) {
+      pdu.timestamp_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+              .count();
+    }
     e3ap_setup_request request;
     request.dapp_name    = "test-dapp";
     request.dapp_version = "0.0.1";
@@ -127,6 +156,8 @@ public:
 private:
   int  descriptor{-1};
   bool connected{};
+  /// Speak the upstream libe3 E3AP 1.0.0 module instead of E3AP-OCUDU-V1.
+  bool libe3{};
 };
 
 std::unique_ptr<instance_manager> make_manager()
@@ -574,13 +605,14 @@ TEST(dapp_e3ap_sctp_server, reclaims_the_slot_of_a_peer_that_vanishes_with_outpu
   setup_request.dapp_name    = "survivor";
   setup_request.dapp_version = "0.0.1";
   setup_request.vendor       = "DeepSig";
-  setup_pdu.message       = setup_request;
+  setup_pdu.message          = setup_request;
   ASSERT_TRUE(survivor.send(setup_pdu));
-  auto setup_response = survivor.receive();
-  const auto m = server.server->metrics();
+  auto       setup_response = survivor.receive();
+  const auto m              = server.server->metrics();
   ASSERT_TRUE(setup_response) << "no setup response: association dropped, slot was not reclaimed; accepted="
                               << m.transport.accepted_associations << " rejected=" << m.transport.rejected_associations
-                              << " closed=" << m.transport.closed_associations << " live=" << m.transport.live_associations
+                              << " closed=" << m.transport.closed_associations
+                              << " live=" << m.transport.live_associations
                               << " failures=" << m.transport.transport_failures << " setups=" << m.setups_completed
                               << " setups_rejected=" << m.setups_rejected << " protocol_errors=" << m.protocol_errors
                               << " live_subs=" << m.live_subscriptions;
@@ -588,4 +620,791 @@ TEST(dapp_e3ap_sctp_server, reclaims_the_slot_of_a_peer_that_vanishes_with_outpu
   ASSERT_NE(positive, nullptr);
   EXPECT_EQ(positive->response_code, e3ap_response_code::positive) << positive->detail;
   EXPECT_EQ(server.server->metrics().transport.rejected_associations, 0U);
+}
+
+TEST(dapp_e3ap_sctp_server, stamps_outbound_pdus_with_the_realtime_clock)
+{
+  fixture f;
+  auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config(), f.connections);
+  ASSERT_TRUE(server) << server.detail;
+  test_client client(server.server->port());
+  ASSERT_TRUE(client.ok());
+  e3ap_pdu pdu;
+  pdu.id = 1;
+  e3ap_setup_request request;
+  request.dapp_name    = "ts-dapp";
+  request.dapp_version = "1";
+  request.vendor       = "DeepSig";
+  pdu.message          = request;
+  const auto before =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  pdu.timestamp_ns = before;
+  ASSERT_TRUE(client.send(pdu));
+  auto reply = client.receive();
+  ASSERT_TRUE(reply);
+  ASSERT_TRUE(std::holds_alternative<e3ap_setup_response>(reply->message));
+  ASSERT_TRUE(reply->timestamp_ns) << "the agent must stamp every PDU to a peer that stamps";
+  const auto after =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  EXPECT_GE(*reply->timestamp_ns, before);
+  EXPECT_LE(*reply->timestamp_ns, after);
+
+  // A peer built against the pre-timestamp module never stamps its setup and
+  // cannot decode the field: the agent must answer it without timestamps.
+  test_client legacy(server.server->port());
+  ASSERT_TRUE(legacy.ok());
+  e3ap_pdu legacy_pdu;
+  legacy_pdu.id      = 1;
+  legacy_pdu.message = request;
+  ASSERT_TRUE(legacy.send(legacy_pdu));
+  auto legacy_reply = legacy.receive();
+  ASSERT_TRUE(legacy_reply);
+  ASSERT_TRUE(std::holds_alternative<e3ap_setup_response>(legacy_reply->message));
+  EXPECT_FALSE(legacy_reply->timestamp_ns) << "unstamped peers must get the pre-timestamp wire";
+}
+
+TEST(dapp_e3ap_sctp_server, hands_dapp_reports_to_the_handler_and_keeps_recent_ones)
+{
+  fixture f;
+  auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config(), f.connections);
+  ASSERT_TRUE(server) << server.detail;
+  std::mutex                          mutex;
+  std::vector<e3ap_dapp_report_event> seen;
+  server.server->set_dapp_report_handler([&](const e3ap_dapp_report_event& event) {
+    std::lock_guard<std::mutex> lock(mutex);
+    seen.push_back(event);
+  });
+  test_client client(server.server->port());
+  ASSERT_TRUE(client.ok());
+  auto dapp_id = client.setup();
+  ASSERT_TRUE(dapp_id);
+
+  e3ap_pdu pdu;
+  pdu.id           = 9;
+  pdu.timestamp_ns = 1756800000000000000LL;
+  e3ap_dapp_report report;
+  report.dapp_identifier         = *dapp_id;
+  report.ran_function_identifier = 1; // a Spectrum-style service model
+  report.report_data             = {0xAA, 0xBB, 0xCC};
+  pdu.message                    = report;
+  ASSERT_TRUE(client.send(pdu));
+  auto ack = client.receive_as<e3ap_message_ack>();
+  ASSERT_TRUE(ack);
+  EXPECT_EQ(ack->request_id, 9U);
+  EXPECT_EQ(ack->response_code, e3ap_response_code::positive);
+  ASSERT_TRUE(wait_until([&] {
+    std::lock_guard<std::mutex> lock(mutex);
+    return seen.size() == 1;
+  }));
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    EXPECT_EQ(seen[0].dapp_identifier, *dapp_id);
+    EXPECT_EQ(seen[0].dapp_name, "test-dapp");
+    EXPECT_EQ(seen[0].ran_function_identifier, 1U);
+    EXPECT_EQ(seen[0].report_data, (std::vector<uint8_t>{0xAA, 0xBB, 0xCC}));
+    ASSERT_TRUE(seen[0].timestamp_ns);
+    EXPECT_EQ(*seen[0].timestamp_ns, 1756800000000000000LL);
+  }
+  const auto recent = server.server->recent_reports();
+  ASSERT_EQ(recent.size(), 1U);
+  EXPECT_EQ(recent[0].report_data.size(), 3U);
+  EXPECT_EQ(server.server->metrics().reports_received, 1U);
+
+  // A report that names another dApp is refused and not consumed.
+  report.dapp_identifier = static_cast<uint16_t>(*dapp_id + 1);
+  pdu.id                 = 10;
+  pdu.message            = report;
+  ASSERT_TRUE(client.send(pdu));
+  ack = client.receive_as<e3ap_message_ack>();
+  ASSERT_TRUE(ack);
+  EXPECT_EQ(ack->response_code, e3ap_response_code::negative);
+  EXPECT_EQ(server.server->metrics().reports_received, 1U);
+}
+
+TEST(dapp_e3ap_sctp_server, relays_xapp_control_actions_to_the_named_dapp)
+{
+  fixture f;
+  auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config(), f.connections);
+  ASSERT_TRUE(server) << server.detail;
+  test_client client(server.server->port());
+  ASSERT_TRUE(client.ok());
+  auto dapp_id = client.setup();
+  ASSERT_TRUE(dapp_id);
+
+  ASSERT_TRUE(server.server->send_xapp_control_action(*dapp_id, 1, {0x01, 0x02}));
+  auto action = client.receive_as<e3ap_xapp_control_action>();
+  ASSERT_TRUE(action) << "the xApp control action must reach the dApp on the procedure stream";
+  EXPECT_EQ(action->dapp_identifier, *dapp_id);
+  EXPECT_EQ(action->ran_function_identifier, 1U);
+  EXPECT_EQ(action->xapp_control_data, (std::vector<uint8_t>{0x01, 0x02}));
+  EXPECT_TRUE(wait_until([&] { return server.server->metrics().xapp_controls_sent == 1; }));
+
+  // An unknown dApp identifier is counted as dropped, not delivered.
+  ASSERT_TRUE(server.server->send_xapp_control_action(static_cast<uint16_t>(*dapp_id + 7), 1, {0x03}));
+  EXPECT_TRUE(wait_until([&] { return server.server->metrics().xapp_controls_dropped == 1; }));
+  EXPECT_FALSE(server.server->send_xapp_control_action(*dapp_id, 1, {}));
+}
+
+TEST(dapp_e3ap_sctp_server, delivers_large_tensors_by_reference_through_a_shared_region)
+{
+  fixture f;
+  auto    config            = test_server_config();
+  config.shared_region_rows = 2;
+  auto server               = e3ap_sctp_server::create(&f.service, f.store, config, f.connections);
+  ASSERT_TRUE(server) << server.detail;
+  test_client client(server.server->port());
+  ASSERT_TRUE(client.ok());
+  auto dapp_id = client.setup();
+  ASSERT_TRUE(dapp_id);
+
+  e3ap_pdu pdu;
+  pdu.id = 5;
+  e3ap_subscription_request subscription;
+  subscription.dapp_identifier            = *dapp_id;
+  subscription.ran_function_identifier    = e3ap_ran_function_telemetry;
+  subscription.telemetry_identifiers      = {telemetry_id_pusch_symbols, telemetry_id_pusch_crc};
+  subscription.delivery_mode              = e3ap_delivery_mode::by_reference;
+  subscription.minimum_by_reference_bytes = 1024;
+  pdu.message                             = subscription;
+  ASSERT_TRUE(client.send(pdu));
+  auto response = client.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(response);
+  ASSERT_EQ(response->response_code, e3ap_response_code::positive) << response->detail;
+  ASSERT_TRUE(response->shared_region) << "by-reference subscriptions advertise their region";
+  const auto region = *response->shared_region;
+  EXPECT_EQ(region.memory_domain, e3ap_memory_domain::posix_shared);
+  EXPECT_EQ(region.nof_rows, 2U);
+  EXPECT_EQ(region.header_bytes, 64U);
+  EXPECT_GE(region.row_bytes, 64U + 4 * 1024 * 1024);
+  EXPECT_EQ(region.region_bytes, 64U + region.row_bytes * 2);
+
+  // Map the region read-only exactly as an external dApp would.
+  const int fd = ::shm_open(region.region_name.c_str(), O_RDONLY, 0);
+  ASSERT_GE(fd, 0) << "region " << region.region_name << " must exist: " << std::strerror(errno);
+  void* base = ::mmap(nullptr, region.region_bytes, PROT_READ, MAP_SHARED, fd, 0);
+  ASSERT_NE(base, MAP_FAILED);
+  ::close(fd);
+  const auto* header = static_cast<const ocudu_e3_shared_region_header_v1*>(base);
+  EXPECT_EQ(header->magic, OCUDU_E3_SHARED_REGION_MAGIC_V1);
+  EXPECT_EQ(header->nof_rows, 2U);
+  EXPECT_EQ(header->row_bytes, region.row_bytes);
+  EXPECT_EQ(header->write_index, OCUDU_E3_SHARED_REGION_NO_ROW);
+
+  EXPECT_TRUE(wait_until([&] { return f.store->has_active(telemetry_stream_pusch_symbols); }));
+  std::vector<std::complex<float>> symbols(273 * 12 * 13);
+  for (std::size_t index = 0; index != symbols.size(); ++index) {
+    symbols[index] = {static_cast<float>(index % 89), -2.0F};
+  }
+  pusch_symbols_diagnostic event;
+  event.rnti              = 0x4601;
+  event.slot              = slot_point{1, 20, 3};
+  event.nof_prb           = 273;
+  event.nof_data_symbols  = 13;
+  event.nof_layers        = 1;
+  event.mod_bits          = 8;
+  event.equalized_symbols = symbols;
+  ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_symbols, 0x4601));
+  f.publisher->on_pusch_symbols(event);
+  ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_crc, 0x4601));
+  f.publisher->on_pusch_crc({0x4601, slot_point{1, 20, 3}, true});
+
+  bool saw_symbols = false;
+  bool saw_crc     = false;
+  while (!(saw_symbols && saw_crc)) {
+    auto indication = client.receive_as<e3ap_indication_message>();
+    ASSERT_TRUE(indication) << "indication stream stalled";
+    ASSERT_TRUE(indication->telemetry_identifier);
+    if (*indication->telemetry_identifier == telemetry_id_pusch_crc) {
+      // One byte: below the by-reference threshold, so it stays in band.
+      EXPECT_FALSE(indication->by_reference);
+      saw_crc = true;
+      continue;
+    }
+    ASSERT_EQ(*indication->telemetry_identifier, telemetry_id_pusch_symbols);
+    EXPECT_EQ(indication->fragment_count, 1U) << "the record without its tensor fits one fragment";
+    ASSERT_TRUE(indication->by_reference) << "large tensors must be delivered by reference";
+    const auto& descriptor = *indication->by_reference;
+    EXPECT_EQ(descriptor.byte_length, symbols.size() * sizeof(std::complex<float>));
+    ASSERT_TRUE(descriptor.element_type);
+    EXPECT_EQ(*descriptor.element_type, e3ap_element_type::complex_fp32);
+    ASSERT_TRUE(std::holds_alternative<e3ap_posix_shared_location>(descriptor.location));
+    const auto& location = std::get<e3ap_posix_shared_location>(descriptor.location);
+    EXPECT_EQ(location.region_name, region.region_name);
+    EXPECT_EQ(location.row_index, 0U);
+    EXPECT_EQ(location.byte_offset, 64U + 64U);
+    // The record itself arrived with its bulk field empty.
+    auto decoded = e3ap_codec::decode_telemetry(indication->protocol_data);
+    ASSERT_TRUE(decoded) << decoded.detail;
+    const auto& record = std::get<pusch_symbols_record>(decoded.value->object);
+    EXPECT_EQ(record.rnti, 0x4601);
+    EXPECT_TRUE(record.equalized_symbols.empty());
+    // Read the row like a dApp: check the generation before and after the copy.
+    const auto* bytes = static_cast<const uint8_t*>(base);
+    const auto* row_header =
+        reinterpret_cast<const ocudu_e3_shared_row_header_v1*>(bytes + 64 + region.row_bytes * location.row_index);
+    EXPECT_EQ(__atomic_load_n(&row_header->generation, __ATOMIC_ACQUIRE), descriptor.generation);
+    EXPECT_EQ(row_header->byte_length, descriptor.byte_length);
+    EXPECT_EQ(row_header->telemetry_id, telemetry_id_pusch_symbols);
+    EXPECT_EQ(row_header->sequence, decoded.value->sequence);
+    std::vector<uint8_t> copy(bytes + location.byte_offset, bytes + location.byte_offset + descriptor.byte_length);
+    EXPECT_EQ(__atomic_load_n(&row_header->generation, __ATOMIC_ACQUIRE), descriptor.generation);
+    EXPECT_EQ(std::memcmp(copy.data(), symbols.data(), copy.size()), 0);
+    EXPECT_EQ(header->write_index, 0U);
+    EXPECT_EQ(header->generation, descriptor.generation);
+    saw_symbols = true;
+  }
+  EXPECT_TRUE(wait_until([&] { return server.server->metrics().indications_by_reference == 1; }));
+  ::munmap(base, region.region_bytes);
+
+  // Deleting the subscription unlinks the region.
+  e3ap_pdu remove;
+  remove.id      = 6;
+  remove.message = e3ap_subscription_delete{*dapp_id, *response->subscription_id};
+  ASSERT_TRUE(client.send(remove));
+  auto ack = client.receive_as<e3ap_message_ack>();
+  ASSERT_TRUE(ack);
+  EXPECT_EQ(ack->response_code, e3ap_response_code::positive);
+  EXPECT_TRUE(wait_until([&] { return ::shm_open(region.region_name.c_str(), O_RDONLY, 0) < 0; }));
+}
+
+TEST(dapp_e3ap_sctp_server, streams_multi_megabyte_indications_without_delayed_sack_stalls)
+{
+  // With the kernel defaults (16 KiB send buffer, receive window fixed at
+  // association setup, 200 ms delayed SACK) a ~1.7 MB object in 64 KiB
+  // fragments takes seconds on loopback; with buffers preset on the listener
+  // before listen() and on the client before connect() it completes in
+  // milliseconds. This guards the socket options, not a precise latency.
+  fixture f;
+  auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config(), f.connections);
+  ASSERT_TRUE(server) << server.detail;
+  test_client client(server.server->port());
+  ASSERT_TRUE(client.ok());
+  auto dapp_id = client.setup();
+  ASSERT_TRUE(dapp_id);
+
+  // Full rate: the stream's default capture floor would thin back-to-back objects.
+  telemetry_subscription_data   data;
+  telemetry_subscription_config full_rate;
+  full_rate.telemetry_id        = telemetry_id_pusch_symbols;
+  full_rate.minimum_interval_ms = 0;
+  data.configs.push_back(full_rate);
+  auto data_bytes = e3ap_codec::encode(data);
+  ASSERT_TRUE(data_bytes) << data_bytes.detail;
+  e3ap_pdu pdu;
+  pdu.id = 5;
+  e3ap_subscription_request subscription;
+  subscription.dapp_identifier         = *dapp_id;
+  subscription.ran_function_identifier = e3ap_ran_function_telemetry;
+  subscription.telemetry_identifiers   = {telemetry_id_pusch_symbols};
+  subscription.subscription_data       = *data_bytes.value;
+  pdu.message                          = subscription;
+  ASSERT_TRUE(client.send(pdu));
+  auto response = client.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(response);
+  ASSERT_EQ(response->response_code, e3ap_response_code::positive) << response->detail;
+  EXPECT_TRUE(wait_until([&] { return f.store->has_active(telemetry_stream_pusch_symbols); }));
+
+  // Three objects of ~1.7 MB each (273 PRB x 12 x 13 symbols x 4 layers).
+  std::vector<std::complex<float>> symbols(273 * 12 * 13 * 4, {1.0F, 1.0F});
+  pusch_symbols_diagnostic         event;
+  event.rnti              = 0x4601;
+  event.slot              = slot_point{1, 20, 3};
+  event.nof_prb           = 273;
+  event.nof_data_symbols  = 13;
+  event.nof_layers        = 4;
+  event.mod_bits          = 8;
+  event.equalized_symbols = symbols;
+  const auto started      = std::chrono::steady_clock::now();
+  unsigned   received     = 0;
+  for (unsigned object = 0; object != 3; ++object) {
+    ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_symbols, 0x4601));
+    f.publisher->on_pusch_symbols(event);
+    std::size_t bytes = 0;
+    while (true) {
+      auto indication = client.receive_as<e3ap_indication_message>();
+      ASSERT_TRUE(indication) << "indication stream stalled after " << received << " objects";
+      bytes += indication->protocol_data.size();
+      if (static_cast<uint32_t>(indication->fragment_index) + 1 == indication->fragment_count) {
+        break;
+      }
+    }
+    EXPECT_GE(bytes, symbols.size() * sizeof(std::complex<float>));
+    ++received;
+  }
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+  EXPECT_LT(elapsed.count(), 1500) << "three ~1.7 MB objects over loopback took " << elapsed.count()
+                                   << " ms; the listener probably no longer presets its socket buffers";
+}
+
+namespace {
+
+/// Publishes \p objects PUSCH-symbol objects of \p symbols_per_object samples
+/// and returns the per-object latency (publish call to complete receipt,
+/// including the client's copy out of the shared region for by-reference
+/// delivery), sorted ascending.
+std::vector<double> measure_delivery(fixture&     f,
+                                     test_client& client,
+                                     uint16_t     dapp_id,
+                                     bool         by_reference,
+                                     unsigned     objects,
+                                     std::size_t  symbols_per_object)
+{
+  telemetry_subscription_data   data;
+  telemetry_subscription_config full_rate;
+  full_rate.telemetry_id        = telemetry_id_pusch_symbols;
+  full_rate.minimum_interval_ms = 0;
+  data.configs.push_back(full_rate);
+  auto data_bytes = e3ap_codec::encode(data);
+  EXPECT_TRUE(data_bytes) << data_bytes.detail;
+  e3ap_pdu pdu;
+  pdu.id = 5;
+  e3ap_subscription_request subscription;
+  subscription.dapp_identifier         = dapp_id;
+  subscription.ran_function_identifier = e3ap_ran_function_telemetry;
+  subscription.telemetry_identifiers   = {telemetry_id_pusch_symbols};
+  subscription.subscription_data       = *data_bytes.value;
+  if (by_reference) {
+    subscription.delivery_mode              = e3ap_delivery_mode::by_reference;
+    subscription.minimum_by_reference_bytes = 4096;
+  }
+  pdu.message = subscription;
+  EXPECT_TRUE(client.send(pdu));
+  auto response = client.receive_as<e3ap_subscription_response>();
+  if (!response || response->response_code != e3ap_response_code::positive || !response->subscription_id) {
+    ADD_FAILURE() << "benchmark subscription was not admitted";
+    return {};
+  }
+  EXPECT_TRUE(wait_until([&] { return f.store->has_active(telemetry_stream_pusch_symbols); }));
+
+  const uint8_t* region_base  = nullptr;
+  std::size_t    region_bytes = 0;
+  auto           cleanup      = make_scope_exit([&] {
+    if (region_base != nullptr) {
+      ::munmap(const_cast<uint8_t*>(region_base), region_bytes);
+    }
+    e3ap_pdu remove;
+    remove.id      = 6;
+    remove.message = e3ap_subscription_delete{dapp_id, *response->subscription_id};
+    EXPECT_TRUE(client.send(remove));
+    EXPECT_TRUE(client.receive_as<e3ap_message_ack>());
+  });
+  if (by_reference) {
+    if (!response->shared_region) {
+      ADD_FAILURE() << "missing shared region";
+      return {};
+    }
+    const int fd = ::shm_open(response->shared_region->region_name.c_str(), O_RDONLY, 0);
+    if (fd < 0) {
+      ADD_FAILURE() << "cannot open shared region";
+      return {};
+    }
+    region_bytes = response->shared_region->region_bytes;
+    void* base   = ::mmap(nullptr, region_bytes, PROT_READ, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (base == MAP_FAILED) {
+      ADD_FAILURE() << "cannot map shared region";
+      return {};
+    }
+    region_base = static_cast<const uint8_t*>(base);
+  }
+
+  std::vector<std::complex<float>> symbols(symbols_per_object, {1.0F, -1.0F});
+  pusch_symbols_diagnostic         event;
+  event.rnti              = 0x4601;
+  event.slot              = slot_point{1, 20, 3};
+  event.nof_prb           = 273;
+  event.nof_data_symbols  = 13;
+  event.nof_layers        = 4;
+  event.mod_bits          = 8;
+  event.equalized_symbols = symbols;
+  std::vector<double>  latencies;
+  std::vector<uint8_t> copy;
+  const uint64_t       drops_before = f.publisher->metrics().dropped;
+  for (unsigned object = 0; object != objects; ++object) {
+    EXPECT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_symbols, 0x4601));
+    const auto     started          = std::chrono::steady_clock::now();
+    const uint64_t published_before = f.publisher->metrics().published;
+    // Admission is deliberately lossy under contention. Retry only a dropped
+    // publication; include that cost in latency and report the drop count.
+    if (!wait_until([&] {
+          f.publisher->on_pusch_symbols(event);
+          return f.publisher->metrics().published > published_before;
+        })) {
+      ADD_FAILURE() << "publication admission stalled";
+      return latencies;
+    }
+    std::size_t bytes = 0;
+    while (true) {
+      auto indication = client.receive_as<e3ap_indication_message>();
+      if (!indication) {
+        ADD_FAILURE() << "indication stream stalled";
+        return latencies;
+      }
+      bytes += indication->protocol_data.size();
+      if (indication->fragment_index + 1U == indication->fragment_count) {
+        if (by_reference) {
+          if (!indication->by_reference ||
+              !std::holds_alternative<e3ap_posix_shared_location>(indication->by_reference->location)) {
+            ADD_FAILURE() << "expected POSIX by-reference indication";
+            return latencies;
+          }
+          const auto& location = std::get<e3ap_posix_shared_location>(indication->by_reference->location);
+          copy.assign(region_base + location.byte_offset,
+                      region_base + location.byte_offset + indication->by_reference->byte_length);
+          const auto* row_header = reinterpret_cast<const ocudu_e3_shared_row_header_v1*>(
+              region_base + 64 + response->shared_region->row_bytes * location.row_index);
+          EXPECT_EQ(__atomic_load_n(&row_header->generation, __ATOMIC_ACQUIRE), indication->by_reference->generation);
+          bytes += copy.size();
+        }
+        break;
+      }
+    }
+    EXPECT_GE(bytes, symbols.size() * sizeof(std::complex<float>));
+    latencies.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count());
+  }
+  std::printf("[ admission ] by_reference=%d dropped_attempts=%llu\n",
+              by_reference,
+              static_cast<unsigned long long>(f.publisher->metrics().dropped - drops_before));
+  std::sort(latencies.begin(), latencies.end());
+  return latencies;
+}
+
+} // namespace
+
+TEST(dapp_e3ap_sctp_server, by_reference_delivery_is_faster_than_in_band_for_large_objects)
+{
+  // 1.7 MB PUSCH-symbol objects (273 PRB x 12 x 13 symbols x 4 layers, cf32):
+  // in band they travel as 27 APER fragments; by reference as one row copy plus
+  // a descriptor. Prints the medians; asserts only the ordering.
+  fixture f;
+  auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config(), f.connections);
+  ASSERT_TRUE(server) << server.detail;
+  test_client client(server.server->port());
+  ASSERT_TRUE(client.ok());
+  auto dapp_id = client.setup();
+  ASSERT_TRUE(dapp_id);
+  constexpr unsigned    objects = 40;
+  constexpr std::size_t samples = 273 * 12 * 13 * 4;
+  const auto            in_band = measure_delivery(f, client, *dapp_id, false, objects, samples);
+  ASSERT_EQ(in_band.size(), objects);
+  const auto by_ref = measure_delivery(f, client, *dapp_id, true, objects, samples);
+  ASSERT_EQ(by_ref.size(), objects);
+  const double mb = static_cast<double>(samples * sizeof(std::complex<float>)) / 1e6;
+  std::printf("[ latency ] %.2f MB objects, %u each: in-band median %.0f us (p90 %.0f), by-reference median %.0f us "
+              "(p90 %.0f)\n",
+              mb,
+              objects,
+              in_band[objects / 2],
+              in_band[objects * 9 / 10],
+              by_ref[objects / 2],
+              by_ref[objects * 9 / 10]);
+  std::printf("[ throughput ] in-band %.0f MB/s, by-reference %.0f MB/s (single subscriber, median)\n",
+              mb / (in_band[objects / 2] / 1e6),
+              mb / (by_ref[objects / 2] / 1e6));
+  EXPECT_LT(by_ref[objects / 2], in_band[objects / 2]);
+}
+
+TEST(dapp_e3ap_sctp_server, serves_libe3_module_peers_on_the_same_port_beside_native_ones)
+{
+  fixture f;
+  auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config(), f.connections);
+  ASSERT_TRUE(server) << server.detail;
+
+  test_client native(server.server->port());
+  ASSERT_TRUE(native.ok());
+  ASSERT_TRUE(native.setup());
+
+  // The libe3 peer sends the upstream E3AP 1.0.0 module: the agent binds the
+  // association to that module at setup and answers in it from then on.
+  test_client peer(server.server->port(), /*libe3=*/true);
+  ASSERT_TRUE(peer.ok());
+  auto dapp_id = peer.setup();
+  ASSERT_TRUE(dapp_id);
+  EXPECT_GE(*dapp_id, 1U);
+  EXPECT_LE(*dapp_id, e3ap_libe3_codec::maximum_identifier);
+  EXPECT_EQ(peer.last_setup.ran_identifier, "ocudu-gnb");
+  EXPECT_EQ(peer.last_setup.e3ap_protocol_version, std::optional<std::string>("1.0.0"));
+  EXPECT_FALSE(peer.last_setup.cause.has_value()) << "OCUDU-only fields do not reach a libe3 peer";
+  ASSERT_EQ(peer.last_setup.ran_functions.size(), 2U);
+  EXPECT_EQ(peer.last_setup.ran_functions[0].ran_function_identifier, e3ap_ran_function_telemetry);
+  EXPECT_EQ(peer.last_setup.ran_functions[0].telemetry_identifiers, (std::vector<uint16_t>{1, 2, 3, 4, 5, 6, 7, 8}));
+  EXPECT_EQ(peer.last_setup.ran_functions[1].control_identifiers, std::vector<uint16_t>{1});
+  auto catalog = e3ap_codec::decode_telemetry_function(peer.last_setup.ran_functions[0].ran_function_data);
+  ASSERT_TRUE(catalog) << catalog.detail;
+  EXPECT_TRUE(wait_until([&] { return server.server->metrics().libe3_setups_completed == 1; }));
+  EXPECT_EQ(server.server->metrics().setups_completed, 2U);
+
+  // A plain libe3 subscription (no OCUDU subscriptionData) to the CRC stream.
+  e3ap_pdu pdu;
+  pdu.id = 5;
+  e3ap_subscription_request subscription;
+  subscription.dapp_identifier         = *dapp_id;
+  subscription.ran_function_identifier = e3ap_ran_function_telemetry;
+  subscription.telemetry_identifiers   = {telemetry_id_pusch_crc};
+  pdu.message                          = subscription;
+  ASSERT_TRUE(peer.send(pdu));
+  auto granted = peer.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(granted);
+  EXPECT_EQ(granted->request_id, 5U);
+  EXPECT_EQ(granted->response_code, e3ap_response_code::positive);
+  ASSERT_TRUE(granted->subscription_id);
+  EXPECT_LE(*granted->subscription_id, e3ap_libe3_codec::maximum_identifier);
+  EXPECT_EQ(granted->telemetry_identifiers, std::optional<std::vector<uint16_t>>(std::vector<uint16_t>{2}));
+  EXPECT_TRUE(wait_until([&] { return f.store->has_active(telemetry_stream_pusch_crc); }));
+
+  ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_crc, 0x4601));
+  f.publisher->on_pusch_crc({0x4601, slot_point{1, 20, 3}, true});
+  auto indication = peer.receive_as<e3ap_indication_message>();
+  ASSERT_TRUE(indication);
+  EXPECT_EQ(indication->dapp_identifier, *dapp_id);
+  EXPECT_EQ(indication->ran_function_identifier, e3ap_ran_function_telemetry);
+  EXPECT_EQ(indication->fragment_count, 1U);
+  auto record = e3ap_codec::decode_telemetry(indication->protocol_data);
+  ASSERT_TRUE(record) << record.detail;
+  EXPECT_EQ(record.value->telemetry_id, telemetry_id_pusch_crc);
+  EXPECT_TRUE(std::get<pusch_crc_record>(record.value->object).crc_ok);
+
+  // A management control action is answered with exactly one E3-MessageAck
+  // carrying the outcome (libe3 has no control response), and a report is
+  // acknowledged; the two acks arrive in order with nothing in between.
+  inventory_query query;
+  query.header.transaction_id.bytes[15] = 0x43;
+  auto request_bytes                    = aper_codec::encode(management_request{query});
+  ASSERT_TRUE(request_bytes) << request_bytes.detail;
+  pdu.id = 11;
+  e3ap_dapp_control_action action;
+  action.dapp_identifier         = *dapp_id;
+  action.ran_function_identifier = e3ap_ran_function_management;
+  action.control_identifier      = e3ap_management_control_request;
+  action.action_data             = *request_bytes.value;
+  pdu.message                    = action;
+  ASSERT_TRUE(peer.send(pdu));
+  pdu.id = 12;
+  e3ap_dapp_report report;
+  report.dapp_identifier         = *dapp_id;
+  report.ran_function_identifier = e3ap_ran_function_telemetry;
+  report.report_data             = {0x01, 0x02};
+  pdu.message                    = report;
+  ASSERT_TRUE(peer.send(pdu));
+  auto first = peer.receive();
+  ASSERT_TRUE(first);
+  auto* control_ack = std::get_if<e3ap_message_ack>(&first->message);
+  ASSERT_NE(control_ack, nullptr);
+  EXPECT_EQ(control_ack->request_id, 11U);
+  EXPECT_EQ(control_ack->response_code, e3ap_response_code::positive);
+  auto second = peer.receive();
+  ASSERT_TRUE(second);
+  auto* report_ack = std::get_if<e3ap_message_ack>(&second->message);
+  ASSERT_NE(report_ack, nullptr);
+  EXPECT_EQ(report_ack->request_id, 12U);
+  EXPECT_EQ(report_ack->response_code, e3ap_response_code::positive);
+  EXPECT_TRUE(wait_until([&] { return server.server->metrics().reports_received == 1; }));
+  EXPECT_EQ(server.server->metrics().control_requests, 1U);
+
+  // libe3 confirms a subscription delete with a subscription response.
+  pdu.id = 13;
+  e3ap_subscription_delete remove;
+  remove.dapp_identifier = *dapp_id;
+  remove.subscription_id = *granted->subscription_id;
+  pdu.message            = remove;
+  ASSERT_TRUE(peer.send(pdu));
+  auto confirmed = peer.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(confirmed);
+  EXPECT_EQ(confirmed->request_id, 13U);
+  EXPECT_EQ(confirmed->response_code, e3ap_response_code::positive);
+  EXPECT_EQ(confirmed->subscription_id, granted->subscription_id);
+  EXPECT_TRUE(wait_until([&] { return !f.store->has_active(telemetry_stream_pusch_crc); }));
+
+  // The native peer was never affected.
+  EXPECT_TRUE(native.setup() == std::nullopt) << "second setup on the native association is refused, not broken";
+
+  pdu.id = 14;
+  e3ap_release_message release;
+  release.dapp_identifier = *dapp_id;
+  pdu.message             = release;
+  ASSERT_TRUE(peer.send(pdu));
+  auto released = peer.receive_as<e3ap_message_ack>();
+  ASSERT_TRUE(released);
+  EXPECT_EQ(released->response_code, e3ap_response_code::positive);
+  EXPECT_FALSE(peer.receive()) << "the agent closes the association after a release";
+}
+
+TEST(dapp_e3ap_sctp_server, drops_indications_the_libe3_module_cannot_carry)
+{
+  fixture f;
+  auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config(), f.connections);
+  ASSERT_TRUE(server) << server.detail;
+  test_client peer(server.server->port(), /*libe3=*/true);
+  ASSERT_TRUE(peer.ok());
+  auto dapp_id = peer.setup();
+  ASSERT_TRUE(dapp_id);
+
+  e3ap_pdu pdu;
+  pdu.id = 5;
+  e3ap_subscription_request subscription;
+  subscription.dapp_identifier         = *dapp_id;
+  subscription.ran_function_identifier = e3ap_ran_function_telemetry;
+  subscription.telemetry_identifiers   = {telemetry_id_pusch_symbols, telemetry_id_pusch_crc};
+  pdu.message                          = subscription;
+  ASSERT_TRUE(peer.send(pdu));
+  auto granted = peer.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(granted);
+  EXPECT_EQ(granted->response_code, e3ap_response_code::positive);
+  EXPECT_TRUE(wait_until([&] { return f.store->has_active(telemetry_stream_pusch_symbols); }));
+
+  // A 273-PRB symbol object encodes to hundreds of KiB: far beyond libe3's
+  // 32 KiB protocolData, so it is dropped and counted; the CRC record that
+  // follows it still arrives.
+  std::vector<std::complex<float>> symbols(273 * 12 * 13);
+  pusch_symbols_diagnostic         event;
+  event.rnti              = 0x4601;
+  event.slot              = slot_point{1, 20, 3};
+  event.nof_prb           = 273;
+  event.nof_data_symbols  = 13;
+  event.nof_layers        = 1;
+  event.mod_bits          = 8;
+  event.equalized_symbols = symbols;
+  ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_symbols, 0x4601));
+  f.publisher->on_pusch_symbols(event);
+  ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_crc, 0x4601));
+  f.publisher->on_pusch_crc({0x4601, slot_point{1, 20, 3}, false});
+  auto indication = peer.receive_as<e3ap_indication_message>();
+  ASSERT_TRUE(indication);
+  auto record = e3ap_codec::decode_telemetry(indication->protocol_data);
+  ASSERT_TRUE(record) << record.detail;
+  EXPECT_EQ(record.value->telemetry_id, telemetry_id_pusch_crc);
+  EXPECT_TRUE(wait_until([&] { return server.server->metrics().libe3_indications_dropped == 1; }));
+  EXPECT_EQ(server.server->metrics().indications_sent, 1U);
+}
+
+TEST(dapp_e3ap_sctp_server, native_and_libe3_identifiers_remain_disjoint_during_churn)
+{
+  fixture f;
+  auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config(), f.connections);
+  ASSERT_TRUE(server);
+  test_client foreign(server.server->port(), true);
+  const auto  foreign_id = foreign.setup();
+  ASSERT_TRUE(foreign_id);
+  for (unsigned iteration = 0; iteration != 105; ++iteration) {
+    SCOPED_TRACE(iteration);
+    ASSERT_TRUE(wait_until([&] { return server.server->metrics().transport.live_associations == 1; }));
+    test_client native(server.server->port());
+    auto        id = native.setup();
+    ASSERT_TRUE(id);
+    EXPECT_GT(*id, e3ap_libe3_codec::maximum_identifier);
+    EXPECT_NE(*id, *foreign_id);
+    EXPECT_FALSE(server.server->send_xapp_control_action(*id, 10, {0}, UINT64_MAX));
+    ASSERT_TRUE(server.server->send_xapp_control_action(*id, 10, {1, 2, 3}));
+    auto action = native.receive_as<e3ap_xapp_control_action>();
+    ASSERT_TRUE(action);
+    EXPECT_EQ(action->dapp_identifier, *id);
+    EXPECT_EQ(action->xapp_control_data, (std::vector<uint8_t>{1, 2, 3}));
+  }
+  ASSERT_TRUE(server.server->send_xapp_control_action(*foreign_id, 10, {4, 5, 6}));
+  auto action = foreign.receive_as<e3ap_xapp_control_action>();
+  ASSERT_TRUE(action);
+  EXPECT_EQ(action->xapp_control_data, (std::vector<uint8_t>{4, 5, 6}));
+}
+
+TEST(dapp_e3ap_sctp_server, subscription_wrap_never_replaces_a_live_libe3_subscription)
+{
+  fixture f;
+  auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config(), f.connections);
+  ASSERT_TRUE(server);
+  test_client peer(server.server->port(), true);
+  auto        id = peer.setup();
+  ASSERT_TRUE(id);
+  e3ap_subscription_request request;
+  request.dapp_identifier         = *id;
+  request.ran_function_identifier = e3ap_ran_function_telemetry;
+  request.telemetry_identifiers   = {telemetry_id_pusch_crc};
+  e3ap_pdu pdu;
+  pdu.id      = 2;
+  pdu.message = request;
+  ASSERT_TRUE(peer.send(pdu));
+  auto held = peer.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(held && held->subscription_id);
+  for (unsigned iteration = 0; iteration != 105; ++iteration) {
+    pdu.message = request;
+    ASSERT_TRUE(peer.send(pdu));
+    auto added = peer.receive_as<e3ap_subscription_response>();
+    ASSERT_TRUE(added && added->subscription_id);
+    ASSERT_EQ(added->response_code, e3ap_response_code::positive);
+    EXPECT_NE(added->subscription_id, held->subscription_id);
+    pdu.message = e3ap_subscription_delete{*id, *added->subscription_id};
+    ASSERT_TRUE(peer.send(pdu));
+    ASSERT_TRUE(peer.receive_as<e3ap_subscription_response>());
+  }
+  EXPECT_EQ(server.server->metrics().live_subscriptions, 1U);
+  pdu.message = e3ap_subscription_delete{*id, *held->subscription_id};
+  ASSERT_TRUE(peer.send(pdu));
+  auto removed = peer.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(removed);
+  EXPECT_EQ(removed->response_code, e3ap_response_code::positive);
+}
+
+TEST(dapp_e3ap_sctp_server, shared_region_budget_rejects_and_reclaims_without_store_leaks)
+{
+  fixture f;
+  auto    config                     = test_server_config();
+  config.maximum_payload_bytes       = 65536;
+  config.shared_region_rows          = 1;
+  config.maximum_shared_region_bytes = 65664;
+  auto server                        = e3ap_sctp_server::create(&f.service, f.store, config, f.connections);
+  ASSERT_TRUE(server);
+  test_client peer(server.server->port());
+  auto        id = peer.setup();
+  ASSERT_TRUE(id);
+  e3ap_subscription_request request;
+  request.dapp_identifier         = *id;
+  request.ran_function_identifier = e3ap_ran_function_telemetry;
+  request.telemetry_identifiers   = {telemetry_id_pusch_crc};
+  request.delivery_mode           = e3ap_delivery_mode::by_reference;
+  e3ap_pdu pdu;
+  pdu.id      = 3;
+  pdu.message = request;
+  ASSERT_TRUE(peer.send(pdu));
+  auto first = peer.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(first && first->subscription_id && first->shared_region);
+  ASSERT_TRUE(peer.send(pdu));
+  auto rejected = peer.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(rejected);
+  EXPECT_EQ(rejected->cause, e3ap_cause::resource_exhausted);
+  EXPECT_EQ(f.store->subscriptions().subscriptions.size(), 1U);
+  pdu.message = e3ap_subscription_delete{*id, *first->subscription_id};
+  ASSERT_TRUE(peer.send(pdu));
+  ASSERT_TRUE(peer.receive_as<e3ap_message_ack>());
+  pdu.message = request;
+  ASSERT_TRUE(peer.send(pdu));
+  auto replacement = peer.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(replacement && replacement->shared_region);
+  EXPECT_EQ(replacement->response_code, e3ap_response_code::positive);
+}
+
+TEST(dapp_e3ap_sctp_server, shared_region_creation_does_not_unlink_an_existing_owner)
+{
+  e3_shared_region_config config;
+  config.name              = "/ocudu-e3-owner-test-" + std::to_string(::getpid());
+  config.row_payload_bytes = 128;
+  config.nof_rows          = 1;
+  auto first               = e3_shared_region::create(config);
+  ASSERT_TRUE(first.first) << first.second;
+  const std::array<uint8_t, 4> payload{1, 2, 3, 4};
+  auto                         written = first.first->write(1, 1, 1, 0, payload);
+  ASSERT_TRUE(written);
+  EXPECT_EQ(first.first->bytes_of(*written).size(), payload.size());
+  auto invalid        = *written;
+  invalid.byte_offset = UINT64_MAX;
+  EXPECT_TRUE(first.first->bytes_of(invalid).empty());
+  invalid            = *written;
+  invalid.generation = 1;
+  EXPECT_TRUE(first.first->bytes_of(invalid).empty());
+  auto second = e3_shared_region::create(config);
+  EXPECT_FALSE(second.first);
+  int fd = ::shm_open(config.name.c_str(), O_RDONLY, 0);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  config.name = "/../bad";
+  EXPECT_FALSE(e3_shared_region::create(config).first);
 }

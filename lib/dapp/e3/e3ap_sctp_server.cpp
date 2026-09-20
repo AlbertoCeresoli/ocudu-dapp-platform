@@ -5,18 +5,30 @@
 #include "ocudu/dapp/e3/aper_codec.h"
 #include "ocudu/dapp/e3/e3_connection_registry.h"
 #include "ocudu/dapp/e3/e3ap_codec.h"
+#include "ocudu/dapp/e3/e3ap_libe3_codec.h"
 #include "ocudu/dapp/e3/management_service.h"
+#include "ocudu/dapp/e3/shared_region.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <map>
+#include <mutex>
+#include <unistd.h>
 #include <unordered_map>
 
 using namespace ocudu::dapp;
 using namespace ocudu::dapp::e3;
 
 namespace {
+
+int64_t realtime_ns() noexcept
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
 
 uint64_t monotonic_ns() noexcept
 {
@@ -39,7 +51,11 @@ struct control_assembly {
 
 /// Partially reassembled published object drained from the store.
 struct object_assembly {
-  bool                 active{};
+  bool active{};
+  /// Chunks go straight into the shared-region row (by-reference delivery).
+  bool direct{};
+  /// The object failed its filters at chunk 0; later chunks are ignored silently.
+  bool                 skipping{};
   uint64_t             sequence{};
   uint64_t             route_epoch{};
   uint32_t             cell_id{};
@@ -52,7 +68,9 @@ struct object_assembly {
 
   void reset() noexcept
   {
-    active = false;
+    active   = false;
+    direct   = false;
+    skipping = false;
     metadata.clear();
     tensor.clear();
   }
@@ -73,13 +91,41 @@ struct subscription_state {
   uint16_t                    subscription_id{};
   uint16_t                    ran_function{};
   std::vector<stream_binding> streams;
+  /// Present when the dApp asked for by-reference delivery.
+  std::unique_ptr<e3_shared_region> region;
+  uint32_t                          minimum_by_reference_bytes{};
 };
 
+/// Element type of the bulk field of each telemetry record kind, when known.
+std::optional<e3ap_element_type> element_type_of(uint32_t interface_id) noexcept
+{
+  const auto kind = telemetry_kind_of(interface_id);
+  if (!kind) {
+    return std::nullopt;
+  }
+  switch (*kind) {
+    case telemetry_kind::pusch_symbols:
+    case telemetry_kind::srs_channel:
+    case telemetry_kind::pusch_dmrs_channel:
+    case telemetry_kind::pusch_grid:
+      return e3ap_element_type::complex_fp32;
+    case telemetry_kind::pusch_crc:
+    case telemetry_kind::gnb_metrics_json:
+      return e3ap_element_type::uint8;
+  }
+  return std::nullopt;
+}
+
 struct dapp_session {
-  uint64_t                               association_id{};
-  uint64_t                               opened_ns{};
-  std::string                            peer_address;
-  bool                                   setup_done{};
+  uint64_t    association_id{};
+  uint64_t    opened_ns{};
+  std::string peer_address;
+  bool        setup_done{};
+  /// The peer stamped its setup request, so it decodes the timestamp field;
+  /// a peer built against the pre-timestamp module cannot, and gets none.
+  bool peer_timestamps{};
+  /// The peer speaks the upstream libe3 E3AP 1.0.0 module (fixed at setup).
+  bool                                   libe3{};
   uint16_t                               dapp_id{};
   std::string                            dapp_name;
   uint32_t                               next_pdu_id{1};
@@ -90,9 +136,16 @@ struct dapp_session {
 
   uint32_t take_pdu_id() noexcept
   {
-    const uint32_t id = next_pdu_id;
-    next_pdu_id       = next_pdu_id == 0xFFFFFFFFU ? 1 : next_pdu_id + 1;
+    const uint32_t id   = next_pdu_id;
+    const uint32_t last = libe3 ? e3ap_libe3_codec::maximum_message_id : 0xFFFFFFFFU;
+    next_pdu_id         = next_pdu_id >= last ? 1 : next_pdu_id + 1;
     return id;
+  }
+
+  /// Encodes with the module the peer speaks.
+  codec_result<std::vector<uint8_t>> encode(const e3ap_pdu& pdu) const noexcept
+  {
+    return libe3 ? e3ap_libe3_codec::encode(pdu) : e3ap_codec::encode(pdu);
   }
 };
 
@@ -176,6 +229,124 @@ struct e3ap_sctp_server::implementation {
     return static_cast<dapp_session*>(association.context());
   }
 
+  struct pending_xapp_control {
+    uint16_t             dapp_identifier{};
+    uint16_t             ran_function_identifier{};
+    std::vector<uint8_t> data;
+    uint64_t             association_id{};
+  };
+  static constexpr std::size_t maximum_pending_xapp_controls = 64;
+  static constexpr std::size_t maximum_recent_reports        = 16;
+
+  /// One namespace, partitioned by wire bounds. Protected by cross_thread_mutex.
+  /// Each ID is bound to a non-reused transport association, including queued controls.
+  std::array<uint64_t, 65536> dapp_associations{};
+  uint16_t                    next_native_id{e3ap_libe3_codec::maximum_identifier + 1};
+  uint64_t                    shared_region_bytes{};
+
+  std::optional<uint16_t> allocate_dapp_id(const dapp_session& session) noexcept
+  {
+    std::lock_guard<std::mutex> lock(cross_thread_mutex);
+    if (session.libe3) {
+      for (uint16_t id = e3ap_libe3_codec::maximum_identifier; id >= 1; --id) {
+        if (dapp_associations[id] == 0) {
+          dapp_associations[id] = session.association_id;
+          return id;
+        }
+      }
+    } else {
+      constexpr uint16_t first = e3ap_libe3_codec::maximum_identifier + 1;
+      for (uint32_t remaining = 65536U - first; remaining != 0; --remaining) {
+        const uint16_t id = next_native_id;
+        next_native_id    = id == 65535 ? first : id + 1;
+        if (dapp_associations[id] == 0) {
+          dapp_associations[id] = session.association_id;
+          return id;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  void release_dapp_id(const dapp_session& session) noexcept
+  {
+    std::lock_guard<std::mutex> lock(cross_thread_mutex);
+    if (dapp_associations[session.dapp_id] == session.association_id) {
+      dapp_associations[session.dapp_id] = 0;
+    }
+  }
+
+  mutable std::mutex                                 cross_thread_mutex;
+  std::atomic<uint32_t>                              pending_xapp_count{0};
+  std::deque<pending_xapp_control>                   pending_xapp_controls;
+  std::function<void(const e3ap_dapp_report_event&)> report_handler;
+  std::deque<e3ap_dapp_report_event>                 recent_reports;
+
+  void handle_report(dapp_session&           session,
+                     uint32_t                pdu_id,
+                     std::optional<int64_t>  timestamp_ns,
+                     const e3ap_dapp_report& body) noexcept
+  {
+    static_cast<void>(pdu_id);
+    e3ap_dapp_report_event event;
+    event.dapp_identifier         = session.dapp_id;
+    event.dapp_name               = session.dapp_name;
+    event.ran_function_identifier = body.ran_function_identifier;
+    event.report_data             = body.report_data;
+    event.timestamp_ns            = timestamp_ns;
+    event.received_ns             = monotonic_ns();
+    event.association_id          = session.association_id;
+    reports_received.fetch_add(1, std::memory_order_relaxed);
+    std::function<void(const e3ap_dapp_report_event&)> handler;
+    {
+      std::lock_guard<std::mutex> lock(cross_thread_mutex);
+      if (recent_reports.size() >= maximum_recent_reports) {
+        recent_reports.pop_front();
+      }
+      recent_reports.push_back(event);
+      handler = report_handler;
+    }
+    if (handler) {
+      handler(event);
+    }
+  }
+
+  /// Sends queued xApp control actions to their dApps; unknown dApps are dropped.
+  void flush_xapp_controls(std::vector<sctp_association*>& associations) noexcept
+  {
+    // One relaxed load per tick; the mutex is taken only when work is queued.
+    if (pending_xapp_count.load(std::memory_order_relaxed) == 0) {
+      return;
+    }
+    std::deque<pending_xapp_control> queued;
+    {
+      std::lock_guard<std::mutex> lock(cross_thread_mutex);
+      queued.swap(pending_xapp_controls);
+      pending_xapp_count.store(0, std::memory_order_relaxed);
+    }
+    for (auto& item : queued) {
+      bool delivered = false;
+      for (auto* association : associations) {
+        auto* session = session_of(*association);
+        if (session == nullptr || !session->setup_done || session->dapp_id != item.dapp_identifier ||
+            session->association_id != item.association_id) {
+          continue;
+        }
+        e3ap_xapp_control_action action;
+        action.dapp_identifier         = item.dapp_identifier;
+        action.ran_function_identifier = item.ran_function_identifier;
+        action.xapp_control_data       = std::move(item.data);
+        delivered                      = send_pdu(*association, *session, std::move(action), e3ap_procedure_stream);
+        break;
+      }
+      if (delivered) {
+        xapp_controls_sent.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        xapp_controls_dropped.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+
   void publish_connection(const dapp_session& session) noexcept
   {
     if (!connections) {
@@ -208,9 +379,12 @@ struct e3ap_sctp_server::implementation {
   bool send_pdu(sctp_association& association, dapp_session& session, e3ap_message message, uint16_t stream) noexcept
   {
     e3ap_pdu pdu;
-    pdu.id       = session.take_pdu_id();
+    pdu.id = session.take_pdu_id();
+    if (session.peer_timestamps) {
+      pdu.timestamp_ns = realtime_ns();
+    }
     pdu.message  = std::move(message);
-    auto encoded = e3ap_codec::encode(pdu);
+    auto encoded = session.encode(pdu);
     if (!encoded) {
       protocol_errors.fetch_add(1, std::memory_order_relaxed);
       return false;
@@ -222,9 +396,12 @@ struct e3ap_sctp_server::implementation {
   send_reply(sctp_association& association, dapp_session& session, uint32_t request_id, e3ap_message message) noexcept
   {
     e3ap_pdu pdu;
-    pdu.id       = request_id;
+    pdu.id = request_id;
+    if (session.peer_timestamps) {
+      pdu.timestamp_ns = realtime_ns();
+    }
     pdu.message  = std::move(message);
-    auto encoded = e3ap_codec::encode(pdu);
+    auto encoded = session.encode(pdu);
     if (!encoded) {
       protocol_errors.fetch_add(1, std::memory_order_relaxed);
       return false;
@@ -323,6 +500,16 @@ struct e3ap_sctp_server::implementation {
   // Procedures
   // ------------------------------------------------------------------------
 
+  bool allocate_dapp_id_into(dapp_session& session) noexcept
+  {
+    const auto id = allocate_dapp_id(session);
+    if (!id) {
+      return false;
+    }
+    session.dapp_id = *id;
+    return true;
+  }
+
   void handle_setup(sctp_association&         association,
                     dapp_session&             session,
                     uint32_t                  pdu_id,
@@ -340,9 +527,15 @@ struct e3ap_sctp_server::implementation {
       response.cause  = e3ap_cause::unsupported_protocol_version;
       response.detail = "E3AP protocol version must be 1.x";
       setups_rejected.fetch_add(1, std::memory_order_relaxed);
+    } else if (!allocate_dapp_id_into(session)) {
+      response.cause  = e3ap_cause::resource_exhausted;
+      response.detail = "no dApp identifier is free for this wire profile";
+      setups_rejected.fetch_add(1, std::memory_order_relaxed);
     } else {
-      session.setup_done              = true;
-      session.dapp_id                 = static_cast<uint16_t>((session.association_id - 1) % 65535 + 1);
+      session.setup_done = true;
+      if (session.libe3) {
+        libe3_setups_completed.fetch_add(1, std::memory_order_relaxed);
+      }
       session.dapp_name               = request.dapp_name;
       response.response_code          = e3ap_response_code::positive;
       response.dapp_identifier        = session.dapp_id;
@@ -401,7 +594,17 @@ struct e3ap_sctp_server::implementation {
     }
 
     subscription_state created;
-    created.ran_function    = e3ap_ran_function_telemetry;
+    created.ran_function = e3ap_ran_function_telemetry;
+    const uint16_t last_subscription_id =
+        session.libe3 ? static_cast<uint16_t>(e3ap_libe3_codec::maximum_identifier) : uint16_t{65535};
+    if (session.subscriptions.size() >= last_subscription_id) {
+      return reject(e3ap_cause::resource_exhausted, "subscription identifiers exhausted");
+    }
+    // Find a free alias; wrapping must never revoke another live subscription.
+    while (session.subscriptions.count(session.next_subscription_id) != 0) {
+      session.next_subscription_id =
+          session.next_subscription_id >= last_subscription_id ? 1 : session.next_subscription_id + 1;
+    }
     created.subscription_id = session.next_subscription_id;
     std::string failure;
     for (const uint16_t telemetry_id : request.telemetry_identifiers) {
@@ -470,14 +673,37 @@ struct e3ap_sctp_server::implementation {
                                                             : e3ap_cause::unsupported_identifier,
                     failure);
     }
-    session.next_subscription_id = session.next_subscription_id == 65535 ? 1 : session.next_subscription_id + 1;
-    const uint16_t id            = created.subscription_id;
-    // After a wrap the id can collide with a live subscription; release its
-    // store subscriptions before overwriting so they do not leak until the
-    // lease lapses.
-    if (auto existing = session.subscriptions.find(id); existing != session.subscriptions.end()) {
-      remove_subscription(session, existing->second);
+    if (request.delivery_mode == e3ap_delivery_mode::by_reference) {
+      const uint64_t row_bytes      = (64ULL + config.maximum_payload_bytes + 63) / 64 * 64;
+      const uint64_t required_bytes = 64 + row_bytes * config.shared_region_rows;
+      if (required_bytes > config.maximum_shared_region_bytes - shared_region_bytes) {
+        for (const auto& binding : created.streams) {
+          static_cast<void>(store->unsubscribe(binding.store_id));
+        }
+        return reject(e3ap_cause::resource_exhausted, "shared region admission budget exhausted");
+      }
+      e3_shared_region_config region_config;
+      region_config.name = config.shared_region_name_prefix + "-" + std::to_string(::getpid()) + "-" +
+                           std::to_string(session.association_id) + "-" + std::to_string(created.subscription_id);
+      region_config.row_payload_bytes = config.maximum_payload_bytes;
+      region_config.nof_rows          = std::max<uint16_t>(1, config.shared_region_rows);
+      region_config.mode              = config.shared_region_mode;
+      auto region                     = e3_shared_region::create(region_config);
+      if (!region.first) {
+        for (const auto& binding : created.streams) {
+          static_cast<void>(store->unsubscribe(binding.store_id));
+        }
+        return reject(e3ap_cause::resource_exhausted, "cannot map a shared region: " + region.second);
+      }
+      created.region = std::move(region.first);
+      shared_region_bytes += required_bytes;
+      created.minimum_by_reference_bytes =
+          request.minimum_by_reference_bytes.value_or(config.default_minimum_by_reference_bytes);
+      response.shared_region = created.region->descriptor();
     }
+    session.next_subscription_id =
+        session.next_subscription_id >= last_subscription_id ? 1 : session.next_subscription_id + 1;
+    const uint16_t id         = created.subscription_id;
     session.subscriptions[id] = std::move(created);
     subscriptions_created.fetch_add(1, std::memory_order_relaxed);
     live_subscriptions.fetch_add(1, std::memory_order_relaxed);
@@ -492,6 +718,10 @@ struct e3ap_sctp_server::implementation {
 
   void remove_subscription(dapp_session& session, subscription_state& subscription) noexcept
   {
+    if (subscription.region) {
+      shared_region_bytes -= subscription.region->descriptor().region_bytes;
+      subscription.region.reset();
+    }
     for (const auto& binding : subscription.streams) {
       static_cast<void>(store->unsubscribe(binding.store_id));
     }
@@ -519,6 +749,17 @@ struct e3ap_sctp_server::implementation {
     remove_subscription(session, found->second);
     session.subscriptions.erase(found);
     publish_connection(session);
+    if (session.libe3) {
+      // libe3 confirms a delete with an E3-SubscriptionResponse that echoes
+      // the subscription identifier; its dApp state machine waits for it.
+      e3ap_subscription_response confirmation;
+      confirmation.request_id      = pdu_id;
+      confirmation.dapp_identifier = session.dapp_id;
+      confirmation.response_code   = e3ap_response_code::positive;
+      confirmation.subscription_id = request.subscription_id;
+      send_reply(association, session, pdu_id, confirmation);
+      return;
+    }
     ack(association, session, pdu_id, true);
   }
 
@@ -602,7 +843,12 @@ struct e3ap_sctp_server::implementation {
     // fragment: publish_connection takes the registry mutex and deep-copies the
     // record, so a fragmented action must not multiply that cost.
     publish_connection(session);
-    ack(association, session, pdu_id, true);
+    // libe3 answers a control action with exactly one E3-MessageAck (its
+    // module has no control response), so for those peers the ack is sent
+    // after the service model has produced its outcome.
+    if (!session.libe3) {
+      ack(association, session, pdu_id, true);
+    }
 
     // Remote-facing ceiling: the wire schema permits timeoutUs up to one hour,
     // but the runtime has a single lifecycle job worker — one long remote
@@ -613,8 +859,24 @@ struct e3ap_sctp_server::implementation {
       lifecycle->timeout_us = std::min(lifecycle->timeout_us, maximum_remote_lifecycle_timeout_us);
     }
 
-    const auto            response = management->handle(*request.value);
-    auto                  encoded  = aper_codec::encode(response);
+    const auto response = management->handle(*request.value);
+    auto       encoded  = aper_codec::encode(response);
+    if (session.libe3) {
+      const bool ok = response.code == management::result_code::ok ||
+                      response.code == management::result_code::dry_run_ok ||
+                      response.code == management::result_code::accepted;
+      if (!ok) {
+        control_failures.fetch_add(1, std::memory_order_relaxed);
+      }
+      ack(association,
+          session,
+          pdu_id,
+          ok,
+          ok ? std::nullopt : std::optional<e3ap_cause>(e3ap_cause::invalid_request),
+          ok ? std::string{}
+             : (response.error_text.empty() ? std::string(management::to_string(response.code)) : response.error_text));
+      return;
+    }
     e3ap_control_response outcome;
     outcome.request_id              = pdu_id;
     outcome.dapp_identifier         = session.dapp_id;
@@ -741,6 +1003,9 @@ struct e3ap_sctp_server::implementation {
   {
     auto& assembly = binding.assembly;
     if (chunk.chunk_index == 0) {
+      if (assembly.direct && subscription.region) {
+        subscription.region->abort();
+      }
       assembly.reset();
       assembly.active          = true;
       assembly.sequence        = chunk.publication_sequence;
@@ -756,27 +1021,74 @@ struct e3ap_sctp_server::implementation {
         indications_dropped.fetch_add(1, std::memory_order_relaxed);
         return;
       }
-      assembly.tensor.reserve(static_cast<std::size_t>(chunk.tensor_size));
+      // By reference: decide at chunk 0 (filters only need the metadata) and
+      // stream the chunks straight into the shared-region row, so the tensor
+      // is copied exactly once on this thread and never assembled in between.
+      if (subscription.region && chunk.tensor_size >= subscription.minimum_by_reference_bytes) {
+        if (!passes_filters(binding, assembly)) {
+          indications_filtered.fetch_add(1, std::memory_order_relaxed);
+          assembly.active   = false;
+          assembly.skipping = true;
+          return;
+        }
+        if (!subscription.region->begin(chunk.publication_sequence,
+                                        chunk.route_epoch,
+                                        binding.telemetry_id,
+                                        static_cast<uint16_t>(chunk.cell_id),
+                                        chunk.tensor_size)) {
+          assembly.reset();
+          indications_dropped.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        assembly.direct = true;
+      } else {
+        assembly.tensor.reserve(static_cast<std::size_t>(chunk.tensor_size));
+      }
+    } else if (assembly.skipping && chunk.publication_sequence == assembly.sequence &&
+               chunk.route_epoch == assembly.route_epoch) {
+      return;
     }
     if (!assembly.active || chunk.chunk_index != assembly.next_index || chunk.chunk_count != assembly.chunk_count ||
         chunk.publication_sequence != assembly.sequence || chunk.route_epoch != assembly.route_epoch ||
         chunk.tensor_size != assembly.tensor_size ||
-        assembly.tensor.size() + chunk.tensor_chunk.size() > assembly.tensor_size) {
+        (assembly.direct ? false : assembly.tensor.size() + chunk.tensor_chunk.size() > assembly.tensor_size)) {
+      if (assembly.direct && subscription.region) {
+        subscription.region->abort();
+      }
       assembly.reset();
       indications_dropped.fetch_add(1, std::memory_order_relaxed);
       return;
     }
-    assembly.tensor.insert(assembly.tensor.end(), chunk.tensor_chunk.begin(), chunk.tensor_chunk.end());
+    if (assembly.direct) {
+      if (!subscription.region->append(chunk.tensor_chunk)) {
+        subscription.region->abort();
+        assembly.reset();
+        indications_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    } else {
+      assembly.tensor.insert(assembly.tensor.end(), chunk.tensor_chunk.begin(), chunk.tensor_chunk.end());
+    }
     ++assembly.next_index;
     if (assembly.next_index != assembly.chunk_count) {
       return;
     }
-    if (assembly.tensor.size() != assembly.tensor_size) {
-      assembly.reset();
-      indications_dropped.fetch_add(1, std::memory_order_relaxed);
-      return;
+    if (assembly.direct) {
+      auto written = subscription.region->commit();
+      if (!written) {
+        assembly.reset();
+        indications_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      publish_object(association, session, subscription, binding, written);
+    } else {
+      if (assembly.tensor.size() != assembly.tensor_size) {
+        assembly.reset();
+        indications_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      publish_object(association, session, subscription, binding, std::nullopt);
     }
-    publish_object(association, session, subscription, binding);
     assembly.reset();
   }
 
@@ -807,29 +1119,58 @@ struct e3ap_sctp_server::implementation {
     return true;
   }
 
-  void publish_object(sctp_association&         association,
-                      dapp_session&             session,
-                      const subscription_state& subscription,
-                      stream_binding&           binding) noexcept
+  void publish_object(sctp_association&                            association,
+                      dapp_session&                                session,
+                      const subscription_state&                    subscription,
+                      stream_binding&                              binding,
+                      const std::optional<e3_shared_region_write>& written) noexcept
   {
     auto& assembly = binding.assembly;
-    if (!passes_filters(binding, assembly)) {
+    // In-band objects are filtered here; by-reference objects were filtered at chunk 0.
+    if (!written && !passes_filters(binding, assembly)) {
       indications_filtered.fetch_add(1, std::memory_order_relaxed);
       return;
     }
+    // By reference the tensor already sits in the row: the record is built
+    // without its bulk field (validated against the row bytes, no copy) and
+    // the indication carries the descriptor.
+    const ocudu::span<const uint8_t> tensor_view =
+        written ? subscription.region->bytes_of(*written) : ocudu::span<const uint8_t>(assembly.tensor);
     auto indication = e3ap_codec::from_publication(binding.interface_id,
                                                    assembly.cell_id,
                                                    assembly.sequence,
                                                    assembly.route_epoch,
                                                    assembly.dropped_objects,
                                                    assembly.metadata,
-                                                   assembly.tensor);
+                                                   tensor_view,
+                                                   !written.has_value());
     if (!indication) {
       indications_dropped.fetch_add(1, std::memory_order_relaxed);
       return;
     }
+    std::optional<e3ap_tensor_descriptor> by_reference;
+    if (written) {
+      e3ap_posix_shared_location location;
+      location.region_name = subscription.region->name();
+      location.row_index   = written->row_index;
+      location.byte_offset = written->byte_offset;
+      e3ap_tensor_descriptor descriptor;
+      descriptor.memory_domain = e3ap_memory_domain::posix_shared;
+      descriptor.location      = location;
+      descriptor.byte_length   = written->byte_length;
+      descriptor.generation    = written->generation;
+      descriptor.element_type  = element_type_of(binding.interface_id);
+      by_reference             = std::move(descriptor);
+    }
     auto encoded = e3ap_codec::encode(*indication.value);
     if (!encoded || encoded.value->size() > config.maximum_payload_bytes) {
+      indications_dropped.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    // The libe3 module carries whole payloads of at most 32 KiB and no
+    // by-reference descriptor: larger objects cannot reach such a peer.
+    if (session.libe3 && (encoded.value->size() > e3ap_libe3_codec::maximum_payload_bytes || by_reference)) {
+      libe3_indications_dropped.fetch_add(1, std::memory_order_relaxed);
       indications_dropped.fetch_add(1, std::memory_order_relaxed);
       return;
     }
@@ -846,6 +1187,10 @@ struct e3ap_sctp_server::implementation {
     message.sequence                = assembly.sequence;
     message.fragment_count          = static_cast<uint32_t>(fragments.size());
     message.payload_bytes           = static_cast<uint32_t>(encoded.value->size());
+    message.by_reference            = std::move(by_reference);
+    if (message.by_reference) {
+      indications_by_reference.fetch_add(1, std::memory_order_relaxed);
+    }
     for (std::size_t index = 0; index != fragments.size(); ++index) {
       message.fragment_index = static_cast<uint16_t>(index);
       message.protocol_data.assign(fragments[index].begin(), fragments[index].end());
@@ -873,6 +1218,12 @@ struct e3ap_sctp_server::implementation {
   std::atomic<uint64_t>                    indications_filtered{0};
   std::atomic<uint64_t>                    indications_dropped{0};
   std::atomic<uint64_t>                    protocol_errors{0};
+  std::atomic<uint64_t>                    indications_by_reference{0};
+  std::atomic<uint64_t>                    reports_received{0};
+  std::atomic<uint64_t>                    xapp_controls_sent{0};
+  std::atomic<uint64_t>                    xapp_controls_dropped{0};
+  std::atomic<uint64_t>                    libe3_setups_completed{0};
+  std::atomic<uint64_t>                    libe3_indications_dropped{0};
   std::atomic<uint32_t>                    live_subscriptions{0};
 };
 
@@ -897,7 +1248,26 @@ void e3ap_sctp_server::on_message(sctp_association& association, ocudu::span<con
     association.close();
     return;
   }
-  auto decoded = e3ap_codec::decode(message);
+  // The dialect is fixed by the setup request: until setup completes a PDU
+  // that fails the native module is retried under the libe3 module, and a
+  // libe3 setup request binds the association to that module for good.
+  codec_result<e3ap_pdu> decoded = session->libe3 ? e3ap_libe3_codec::decode(message) : e3ap_codec::decode(message);
+  if (!session->setup_done && !session->libe3 && state->config.libe3_profile) {
+    auto       alternative  = e3ap_libe3_codec::decode(message);
+    const bool native_setup = decoded && std::holds_alternative<e3ap_setup_request>(decoded.value->message);
+    const bool libe3_setup  = alternative && std::holds_alternative<e3ap_setup_request>(alternative.value->message);
+    // A foreign setup can parse as a DIFFERENT native procedure. Successful
+    // decoding alone is not profile negotiation; only a setup can select it.
+    if (native_setup && libe3_setup) {
+      state->protocol_errors.fetch_add(1, std::memory_order_relaxed);
+      association.close();
+      return;
+    }
+    if (libe3_setup) {
+      session->libe3 = true;
+      decoded        = std::move(alternative);
+    }
+  }
   if (!decoded) {
     state->protocol_errors.fetch_add(1, std::memory_order_relaxed);
     // A malformed PDU leaves the peer state untrusted; libe3-style peers reconnect.
@@ -911,6 +1281,7 @@ void e3ap_sctp_server::on_message(sctp_association& association, ocudu::span<con
       [&](auto& body) {
         using body_type = std::decay_t<decltype(body)>;
         if constexpr (std::is_same_v<body_type, e3ap_setup_request>) {
+          session->peer_timestamps = decoded.value->timestamp_ns.has_value();
           state->handle_setup(association, *session, pdu_id, body);
         } else if constexpr (std::is_same_v<body_type, e3ap_subscription_request>) {
           state->handle_subscription(association, *session, pdu_id, body);
@@ -921,11 +1292,14 @@ void e3ap_sctp_server::on_message(sctp_association& association, ocudu::span<con
         } else if constexpr (std::is_same_v<body_type, e3ap_release_message>) {
           state->handle_release(association, *session, pdu_id, body);
         } else if constexpr (std::is_same_v<body_type, e3ap_dapp_report>) {
-          // Reports are accepted for accounting; no consumer exists yet.
+          const bool accepted = session->setup_done && body.dapp_identifier == session->dapp_id;
+          if (accepted) {
+            state->handle_report(*session, pdu_id, decoded.value->timestamp_ns, body);
+          }
           state->ack(association,
                      *session,
                      pdu_id,
-                     session->setup_done && body.dapp_identifier == session->dapp_id,
+                     accepted,
                      session->setup_done ? std::nullopt : std::optional<e3ap_cause>(e3ap_cause::setup_required));
         } else if constexpr (std::is_same_v<body_type, e3ap_message_ack>) {
           // Acknowledgements from the dApp carry no state; nothing to do.
@@ -948,6 +1322,9 @@ void e3ap_sctp_server::on_closed(sctp_association& association)
     state->remove_subscription(*session, item.second);
   }
   session->subscriptions.clear();
+  if (session->setup_done) {
+    state->release_dapp_id(*session);
+  }
   if (state->connections) {
     state->connections->erase(session->association_id);
   }
@@ -977,6 +1354,7 @@ void e3ap_sctp_server::on_timer(std::vector<sctp_association*>& associations)
     }
     state->drain(*association, *session);
   }
+  state->flush_xapp_controls(associations);
 }
 
 // ---------------------------------------------------------------------------
@@ -997,7 +1375,9 @@ e3ap_sctp_server_create_result e3ap_sctp_server::create(management_service*     
       config.maximum_payload_bytes == 0 || config.maximum_payload_bytes > e3ap_maximum_payload_bytes ||
       config.maximum_subscriptions_per_dapp == 0 || config.maximum_subscriptions_per_dapp > 1024 ||
       config.lease_us == 0 || config.queue_depth_chunks == 0 || config.queue_depth_chunks > 1024 ||
-      config.ran_identifier.empty() || config.ran_identifier.size() > 64 || config.setup_timeout.count() < 0) {
+      config.ran_identifier.empty() || config.ran_identifier.size() > 64 || config.setup_timeout.count() < 0 ||
+      config.shared_region_rows == 0 || config.maximum_shared_region_bytes == 0 ||
+      config.maximum_shared_region_bytes > 256ULL * 1024 * 1024) {
     return {nullptr, "invalid E3AP SCTP server bounds"};
   }
   try {
@@ -1054,16 +1434,74 @@ e3ap_sctp_server_metrics e3ap_sctp_server::metrics() const noexcept
   if (state->transport != nullptr) {
     result.transport = state->transport->metrics();
   }
-  result.setups_completed      = state->setups_completed.load(std::memory_order_relaxed);
-  result.setups_rejected       = state->setups_rejected.load(std::memory_order_relaxed);
-  result.subscriptions_created = state->subscriptions_created.load(std::memory_order_relaxed);
-  result.subscriptions_removed = state->subscriptions_removed.load(std::memory_order_relaxed);
-  result.control_requests      = state->control_requests.load(std::memory_order_relaxed);
-  result.control_failures      = state->control_failures.load(std::memory_order_relaxed);
-  result.indications_sent      = state->indications_sent.load(std::memory_order_relaxed);
-  result.indications_filtered  = state->indications_filtered.load(std::memory_order_relaxed);
-  result.indications_dropped   = state->indications_dropped.load(std::memory_order_relaxed);
-  result.protocol_errors       = state->protocol_errors.load(std::memory_order_relaxed);
-  result.live_subscriptions    = state->live_subscriptions.load(std::memory_order_relaxed);
+  result.setups_completed          = state->setups_completed.load(std::memory_order_relaxed);
+  result.setups_rejected           = state->setups_rejected.load(std::memory_order_relaxed);
+  result.subscriptions_created     = state->subscriptions_created.load(std::memory_order_relaxed);
+  result.subscriptions_removed     = state->subscriptions_removed.load(std::memory_order_relaxed);
+  result.control_requests          = state->control_requests.load(std::memory_order_relaxed);
+  result.control_failures          = state->control_failures.load(std::memory_order_relaxed);
+  result.indications_sent          = state->indications_sent.load(std::memory_order_relaxed);
+  result.indications_filtered      = state->indications_filtered.load(std::memory_order_relaxed);
+  result.indications_dropped       = state->indications_dropped.load(std::memory_order_relaxed);
+  result.protocol_errors           = state->protocol_errors.load(std::memory_order_relaxed);
+  result.live_subscriptions        = state->live_subscriptions.load(std::memory_order_relaxed);
+  result.indications_by_reference  = state->indications_by_reference.load(std::memory_order_relaxed);
+  result.reports_received          = state->reports_received.load(std::memory_order_relaxed);
+  result.xapp_controls_sent        = state->xapp_controls_sent.load(std::memory_order_relaxed);
+  result.xapp_controls_dropped     = state->xapp_controls_dropped.load(std::memory_order_relaxed);
+  result.libe3_setups_completed    = state->libe3_setups_completed.load(std::memory_order_relaxed);
+  result.libe3_indications_dropped = state->libe3_indications_dropped.load(std::memory_order_relaxed);
   return result;
+}
+
+void e3ap_sctp_server::set_dapp_report_handler(std::function<void(const e3ap_dapp_report_event&)> handler) noexcept
+{
+  if (state == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(state->cross_thread_mutex);
+  state->report_handler = std::move(handler);
+}
+
+std::vector<e3ap_dapp_report_event> e3ap_sctp_server::recent_reports() const noexcept
+{
+  std::vector<e3ap_dapp_report_event> result;
+  if (state == nullptr) {
+    return result;
+  }
+  std::lock_guard<std::mutex> lock(state->cross_thread_mutex);
+  result.assign(state->recent_reports.begin(), state->recent_reports.end());
+  return result;
+}
+
+bool e3ap_sctp_server::send_xapp_control_action(uint16_t             dapp_identifier,
+                                                uint16_t             ran_function_identifier,
+                                                std::vector<uint8_t> data) noexcept
+{
+  return send_xapp_control_action(dapp_identifier, ran_function_identifier, std::move(data), 0);
+}
+
+bool e3ap_sctp_server::send_xapp_control_action(uint16_t             dapp_identifier,
+                                                uint16_t             ran_function_identifier,
+                                                std::vector<uint8_t> data,
+                                                uint64_t             expected_association_id) noexcept
+{
+  if (state == nullptr || data.empty() || data.size() > e3ap_maximum_fragment_bytes) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(state->cross_thread_mutex);
+  if (state->pending_xapp_controls.size() >= implementation::maximum_pending_xapp_controls) {
+    return false;
+  }
+  const uint64_t association_id = state->dapp_associations[dapp_identifier];
+  if (expected_association_id != 0 && expected_association_id != association_id) {
+    return false;
+  }
+  try {
+    state->pending_xapp_controls.push_back({dapp_identifier, ran_function_identifier, std::move(data), association_id});
+  } catch (...) {
+    return false;
+  }
+  state->pending_xapp_count.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }

@@ -579,6 +579,50 @@ cuda pdsch issue 1 regression:
 # Keep the dApp/E3 lifecycle and process-security boundary green in clean GCC,
 # Clang, and sanitizer trees. The SDK repository owns its full reference-suite
 # matrix; these jobs protect the host side of that interface.
+dapp interoperability release gate:
+  extends: .build_and_unit_template
+  stage: build and unit tests
+  # Required for every MR/default-branch/tag pipeline, not an opt-in/manual job.
+  rules:
+    - if: '$ON_MR || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_TAG'
+  variables:
+    OS: ubuntu-24.04
+    OCUDU_BUILD_DIR: build-dapp-interop-ci
+    GIT_SUBMODULE_STRATEGY: recursive
+    OCUDU_DAPP_SDK_URL: https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-sdk.git
+    OCUDU_DAPP_SDK_REF: c38255585991ad7005737a4308cd433dee5bcfea
+  script:
+    - apt-get update
+    - apt-get install --no-install-recommends -y autoconf automake libtool bison flex libsctp-dev flatbuffers-compiler libflatbuffers-dev clang
+    - python3 -m pip install --break-system-packages 'asn1tools>=0.166,<1' numpy h5py flatbuffers
+    - >-
+      builder.sh -b "${OCUDU_BUILD_DIR}" -c gcc
+      -m "-j${CPU_JOBS} dapp_runtime_test dapp_telemetry_allocation_test e3ap_test_server libe3_interop_dapp libe3_interop_vectors ocudu-dappctl"
+      -DCMAKE_BUILD_TYPE=Release -DENABLE_DAPP=ON -DENABLE_E3=ON
+      -DENABLE_E3_ASN1_CODEC=ON -DOCUDU_DAPP_LIBE3_INTEROP=ON -DENABLE_UHD=OFF .
+    - python3 scripts/check_dapp_interop_gate.py --build "${OCUDU_BUILD_DIR}"
+    - cmake --install "${OCUDU_BUILD_DIR}" --prefix "${CI_PROJECT_DIR}/interop-install" --component dapp_sdk
+    - git clone --no-checkout "${OCUDU_DAPP_SDK_URL}" interop-sdk
+    - git -C interop-sdk checkout --detach "${OCUDU_DAPP_SDK_REF}"
+    - >-
+      cmake -S interop-sdk -B interop-sdk-build
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="${CI_PROJECT_DIR}/interop-install"
+      -DOCUDU_DAPP_BUILD_CUDA_EXAMPLES=OFF -DOCUDU_DAPP_BUILD_PYTHON_CLASS_C=OFF
+      -DOCUDU_DAPP_REF_EXTRAS=ON -DOCUDU_DAPP_REQUIRE_ABI_COMPILER_MATRIX=ON
+      -DOCUDU_DAPP_REQUIRE_PYTHON_EXAMPLES=ON
+    - cmake --build interop-sdk-build --parallel "${CPU_JOBS}"
+    - OCUDU_E3AP_TEST_SERVER="${CI_PROJECT_DIR}/${OCUDU_BUILD_DIR}/tests/unittests/dapp/e3ap_test_server" python3 scripts/check_dapp_interop_gate.py --profile sdk --build interop-sdk-build
+  artifacts:
+    when: always
+    reports:
+      junit:
+        - build-dapp-interop-ci/dapp-interop.xml
+        - interop-sdk-build/dapp-interop.xml
+    paths:
+      - build-dapp-interop-ci/dapp-interop.log
+      - interop-sdk-build/dapp-interop.log
+    expire_in: 30 days
+
 dapp host cpu matrix:
   extends: .build_and_unit_template
   stage: build and unit tests

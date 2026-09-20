@@ -12,10 +12,15 @@ from __future__ import annotations
 
 import errno
 import socket
+import struct
 from typing import Optional
 
 MSG_NOTIFICATION = 0x8000
 IPPROTO_SCTP = getattr(socket, "IPPROTO_SCTP", 132)
+# linux/sctp.h: SCTP_DELAYED_SACK (alias SCTP_DELAYED_ACK_TIME) = 16 with
+# struct sctp_sack_info { sctp_assoc_t sack_assoc_id; uint32 sack_delay; uint32 sack_freq; }.
+SCTP_DELAYED_SACK = 16
+_SCTP_SACK_INFO = struct.Struct("iII")
 
 
 class SctpTransportError(OSError):
@@ -40,9 +45,19 @@ class SctpAssociation:
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         self._socket: Optional[socket.socket] = socket.socket(family, socket.SOCK_STREAM, IPPROTO_SCTP)
         try:
-            # Best effort; the kernel clamps to net.core.{r,w}mem_max.
+            # Before connect(): the receive window is fixed from SO_RCVBUF at
+            # association setup and the default 16 KiB send buffer keeps one
+            # chunk in flight, which with delayed SACK costs seconds per large
+            # indication. Best effort; the kernel clamps to net.core.{r,w}mem_max.
             self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, socket_buffer_bytes)
             self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, socket_buffer_bytes)
+            # Acknowledge every chunk immediately: with the 200 ms delayed-SACK
+            # default the agent's sender stalls on every multi-fragment
+            # indication (seconds per full-band grid over loopback).
+            try:
+                self._socket.setsockopt(IPPROTO_SCTP, SCTP_DELAYED_SACK, _SCTP_SACK_INFO.pack(0, 0, 1))
+            except OSError:
+                pass  # best effort: an older kernel without the option still works, slowly
             self._socket.settimeout(timeout)
             self._socket.connect((host, port))
         except OSError as error:

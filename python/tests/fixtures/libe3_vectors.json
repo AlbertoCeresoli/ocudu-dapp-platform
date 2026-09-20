@@ -1,0 +1,159 @@
+{
+ "source": "libe3 0.1.3 (wineslab/libe3 6f44b6f) Asn1E3Encoder via tests/interop/libe3/libe3_interop_vectors encode; asn1c mouse07410 844f9ca",
+ "message_id": 42,
+ "timestamp": 1756800000123456789,
+ "vectors": [
+  {
+   "name": "SetupRequest",
+   "hex": "400029081861684accc3cd150100312e302e3028766563746f722d6461707040302e312e331c77696e65736c6162",
+   "fields": {
+    "name": "SetupRequest",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "e3apProtocolVersion": "1.0.0",
+    "dAppName": "vector-dapp",
+    "dAppVersion": "0.1.3",
+    "vendor": "wineslab"
+   }
+  },
+  {
+   "name": "SetupResponse",
+   "hex": "400029081861684accc3cd150b80002912766563746f722d72616e40312e302e300c010004000810000001dead",
+   "fields": {
+    "name": "SetupResponse",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "requestId": 42,
+    "responseCode": "positive",
+    "ranIdentifier": "vector-ran",
+    "e3apProtocolVersion": "1.0.0",
+    "dAppIdentifier": 7,
+    "ranFunctionList": [
+     {
+      "ranFunctionIdentifier": 1,
+      "telemetryIdentifierList": [
+       1,
+       2
+      ],
+      "controlIdentifierList": [
+       1
+      ],
+      "ranFunctionData": "dead"
+     }
+    ]
+   }
+  },
+  {
+   "name": "SubscriptionRequest",
+   "hex": "400029081861684accc3cd15130c0010002000003c0064",
+   "fields": {
+    "name": "SubscriptionRequest",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 7,
+    "ranFunctionIdentifier": 1,
+    "telemetryIdentifierList": [
+     1,
+     2
+    ],
+    "controlIdentifierList": [],
+    "subscriptionTime": 60,
+    "periodicity": 100
+   }
+  },
+  {
+   "name": "SubscriptionDelete",
+   "hex": "400029081861684accc3cd15183000",
+   "fields": {
+    "name": "SubscriptionDelete",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 7,
+    "subscriptionId": 1
+   }
+  },
+  {
+   "name": "SubscriptionResponse",
+   "hex": "400029081861684accc3cd15220000290c00",
+   "fields": {
+    "name": "SubscriptionResponse",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "requestId": 42,
+    "dAppIdentifier": 7,
+    "responseCode": "positive",
+    "subscriptionId": 1
+   }
+  },
+  {
+   "name": "IndicationMessage",
+   "hex": "400029081861684accc3cd15283000000f0102030405060708090a0b0c0d0e0f10",
+   "fields": {
+    "name": "IndicationMessage",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 7,
+    "ranFunctionIdentifier": 1,
+    "protocolData": "0102030405060708090a0b0c0d0e0f10"
+   }
+  },
+  {
+   "name": "DAppControlAction",
+   "hex": "400029081861684accc3cd15303000000001aabb",
+   "fields": {
+    "name": "DAppControlAction",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 7,
+    "ranFunctionIdentifier": 1,
+    "controlIdentifier": 1,
+    "actionData": "aabb"
+   }
+  },
+  {
+   "name": "DAppReport",
+   "hex": "400029081861684accc3cd153830000000cc",
+   "fields": {
+    "name": "DAppReport",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 7,
+    "ranFunctionIdentifier": 1,
+    "reportData": "cc"
+   }
+  },
+  {
+   "name": "XAppControlAction",
+   "hex": "400029081861684accc3cd154030000001eeff",
+   "fields": {
+    "name": "XAppControlAction",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 7,
+    "ranFunctionIdentifier": 1,
+    "xAppControlData": "eeff"
+   }
+  },
+  {
+   "name": "ReleaseMessage",
+   "hex": "400029081861684accc3cd154830",
+   "fields": {
+    "name": "ReleaseMessage",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 7
+   }
+  },
+  {
+   "name": "MessageAck",
+   "hex": "400029081861684accc3cd1550002980",
+   "fields": {
+    "name": "MessageAck",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "requestId": 42,
+    "responseCode": "negative"
+   }
+  }
+ ]
+}

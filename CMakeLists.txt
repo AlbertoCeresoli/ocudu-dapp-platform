@@ -78,6 +78,7 @@ option(ENABLE_PLUGINS        "Compile plugins in the plugin folder"         ON)
 option(ENABLE_DAPP           "Enable the stable OCUDU dApp SDK and runtime"  ON)
 option(ENABLE_E3             "Enable the embedded E3 dApp management agent" ON)
 option(ENABLE_E3_ASN1_CODEC  "Generate the E3 dApp management APER codec"    ON)
+option(OCUDU_DAPP_LIBE3_INTEROP "Build upstream libe3 and the OCUDU <-> libe3 end-to-end interoperability tests" OFF)
 option(DISABLE_MBEDTLS       "Disable MBEDTLS library and related apps"     OFF)
 option(DISABLE_SCTP          "Disable SCTP library and related apps"        OFF)
 option(BUILD_TESTING         "Compile tests"                                ON)
@@ -786,6 +787,7 @@ if(ENABLE_DAPP)
     install(TARGETS
       ocudu_dapp_management
       ocudu_dapp_e3sm_asn1
+      ocudu_dapp_libe3_asn1
       ocudu_dapp_e3_codec
       ocudu_dapp_e3_client
       ocudu_dapp_e3ap_codec
@@ -804,6 +806,7 @@ if(ENABLE_DAPP)
     install(FILES
       ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/aper_codec.h
       ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/e3ap_codec.h
+      ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/e3ap_libe3_codec.h
       ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/e3ap_protocol.h
       ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/local_client.h
       ${PROJECT_SOURCE_DIR}/include/ocudu/dapp/e3/management_protocol.h
@@ -819,6 +822,9 @@ if(ENABLE_DAPP)
       ${PROJECT_SOURCE_DIR}/schemas/e3/e3sm-ocudu-dapp-mgmt-carrier-v1.asn1
       ${PROJECT_SOURCE_DIR}/schemas/dapp/e3-data-profile-v1.fbs
       DESTINATION ${OCUDU_DAPP_SCHEMA_DIR}
+      COMPONENT dapp_sdk)
+    install(FILES ${PROJECT_SOURCE_DIR}/schemas/e3/interop/libe3/e3ap-1.0.0.asn1
+      DESTINATION ${OCUDU_DAPP_SCHEMA_DIR}/interop/libe3
       COMPONENT dapp_sdk)
     # Python E3 client: independent dApps import it from
     # <prefix>/share/ocudu/dapp/python and find the schemas one level up.

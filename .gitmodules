@@ -1,0 +1,6 @@
+[submodule "third_party/asn1c"]
+	path = third_party/asn1c
+	url = https://github.com/mouse07410/asn1c.git
+[submodule "third_party/libe3"]
+	path = third_party/libe3
+	url = https://github.com/wineslab/libe3.git

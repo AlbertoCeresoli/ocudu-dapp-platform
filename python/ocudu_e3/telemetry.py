@@ -250,6 +250,10 @@ class TelemetryIndication:
     monotonic_ns: int
     dropped_objects: int
     record: TelemetryRecord
+    # Present when the record's bulk field arrived by reference; the client
+    # fills the bulk field from the shared region, and keeps the descriptor
+    # for callers that want a zero-copy view instead.
+    by_reference: Optional[object] = None
 
     @property
     def stream(self) -> str:
@@ -399,6 +403,22 @@ def _grant_from_asn(body: dict) -> PuschGrantParameters:
         beta_offset_csi_part1=float(body["betaOffsetCsiPart1"]),
         beta_offset_csi_part2=float(body["betaOffsetCsiPart2"]),
     )
+
+
+def attach_bulk(record: TelemetryRecord, data: bytes) -> None:
+    """Fill the bulk field of a record delivered by reference."""
+    if isinstance(record, PuschSymbolsRecord):
+        record.equalized_symbols = data
+    elif isinstance(record, PuschGridRecord):
+        record.resource_elements = data
+    elif isinstance(record, SrsChannelRecord):
+        record.coefficients = data
+    elif isinstance(record, PuschDmrsChannelRecord):
+        record.estimates = data
+    elif isinstance(record, GnbMetricsJsonRecord):
+        record.json_bytes = data
+    elif isinstance(record, ClassCPortableRecord):
+        record.tensor = data
 
 
 def decode_indication(codec: E3Codec, payload: bytes) -> TelemetryIndication:

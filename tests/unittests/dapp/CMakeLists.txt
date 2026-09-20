@@ -72,12 +72,19 @@ add_executable(dapp_runtime_test
   $<TARGET_OBJECTS:dapp_c_abi_compile_test>)
 if (ENABLE_E3)
   target_sources(dapp_runtime_test PRIVATE embedded_agent_test.cpp portable_data_store_test.cpp)
+  # Separate executable: allocator instrumentation must not affect unrelated
+  # runtime/lifecycle tests or dynamically loaded fixtures.
+  add_executable(dapp_telemetry_allocation_test telemetry_allocation_test.cpp)
+  target_link_libraries(dapp_telemetry_allocation_test ocudu_dapp_runtime ocudu_gtest_main)
+  add_test(NAME dapp_telemetry_isolation.no_producer_allocation COMMAND dapp_telemetry_allocation_test)
+  set_tests_properties(dapp_telemetry_isolation.no_producer_allocation PROPERTIES TIMEOUT 30 LABELS "dapp;e3;isolation")
   target_compile_definitions(dapp_runtime_test PRIVATE OCUDU_DAPP_TEST_E3=1)
   if (ENABLE_E3_ASN1_CODEC)
     target_sources(dapp_runtime_test PRIVATE
       e3_aper_codec_test.cpp
       local_connector_test.cpp
       e3ap_codec_test.cpp
+      e3ap_libe3_codec_test.cpp
       telemetry_publisher_test.cpp
       e3ap_sctp_server_test.cpp)
     target_link_libraries(dapp_runtime_test
@@ -94,6 +101,9 @@ if (ENABLE_E3)
 
     find_program(DAPP_TEST_PYTHON_EXECUTABLE python3)
     if (DAPP_TEST_PYTHON_EXECUTABLE)
+      add_test(NAME dapp_e3_shared_region.validation
+        COMMAND ${DAPP_TEST_PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/tests/test_shared_region.py)
+      set_tests_properties(dapp_e3_shared_region.validation PROPERTIES TIMEOUT 30 LABELS "dapp;e3;python")
       execute_process(
         COMMAND ${DAPP_TEST_PYTHON_EXECUTABLE} -c "import asn1tools"
         RESULT_VARIABLE DAPP_TEST_ASN1TOOLS_RESULT
@@ -116,8 +126,17 @@ if (ENABLE_E3)
           ENVIRONMENT "OCUDU_E3_SCHEMA_DIR=${PROJECT_SOURCE_DIR}/schemas/e3"
           TIMEOUT 120
           LABELS "dapp;e3;python")
+        # Structural and byte-level gate against the vendored upstream libe3 E3AP module.
+        add_test(NAME dapp_e3ap_libe3.interop
+          COMMAND ${DAPP_TEST_PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/tests/test_libe3_interop.py)
+        set_tests_properties(dapp_e3ap_libe3.interop PROPERTIES
+          ENVIRONMENT "OCUDU_E3_SCHEMA_DIR=${PROJECT_SOURCE_DIR}/schemas/e3"
+          TIMEOUT 120
+          LABELS "dapp;e3;python;interop")
       endif ()
     endif ()
+    # End-to-end tests against the real upstream libe3 (opt-in, see the README there).
+    add_subdirectory(${PROJECT_SOURCE_DIR}/tests/interop/libe3 ${CMAKE_CURRENT_BINARY_DIR}/interop/libe3)
   endif ()
 endif ()
 if (OCUDU_DAPP_CLASS_C_METADATA)

@@ -34,13 +34,18 @@ public:
   /// Converts one reassembled portable publication (metadata + tensor) into a
   /// telemetry indication. Telemetry streams decode the packed metadata
   /// record; Class-C portable interfaces are forwarded verbatim.
+  /// Builds the telemetry record for a store publication. With \c include_bulk
+  /// false the record's bulk field is left empty (the bytes travel by
+  /// reference) while \c tensor is still used for validation, so no copy of
+  /// the tensor is made.
   static codec_result<telemetry_indication> from_publication(uint32_t                   interface_id,
                                                              uint32_t                   cell_id,
                                                              uint64_t                   sequence,
                                                              uint64_t                   route_epoch,
                                                              uint64_t                   dropped_objects,
                                                              ocudu::span<const uint8_t> metadata,
-                                                             ocudu::span<const uint8_t> tensor) noexcept;
+                                                             ocudu::span<const uint8_t> tensor,
+                                                             bool                       include_bulk = true) noexcept;
 
   /// Splits an encoded payload into fragments no larger than the bound.
   static std::vector<ocudu::span<const uint8_t>> fragment(ocudu::span<const uint8_t> payload,

@@ -39,7 +39,8 @@ from .schema import (
     u64,
 )
 from .sctp import SctpAssociation, SctpTransportError
-from .telemetry import TelemetryIndication, decode_indication
+from .shared_region import SharedRegion, SharedRegionReader, TensorDescriptor
+from .telemetry import TelemetryIndication, attach_bulk, decode_indication
 
 
 class E3Error(Exception):
@@ -142,6 +143,9 @@ class E3Subscription:
     subscription_id: int
     ran_function_id: int
     telemetry_ids: List[int]
+    # Present when the agent granted by-reference delivery.
+    shared_region: Optional[SharedRegion] = None
+    region_reader: Optional[SharedRegionReader] = None
 
 
 def _text(value) -> str:
@@ -223,6 +227,8 @@ class E3Client:
         self.dapp_version = dapp_version
         self.vendor = vendor
         self.timeout = timeout
+        self.host = host
+        self.port = port
         try:
             self._association = SctpAssociation(host, port, timeout=timeout)
         except SctpTransportError as error:
@@ -241,6 +247,15 @@ class E3Client:
         self._fragment_bytes = E3AP_MAX_FRAGMENT_BYTES
         self.subscriptions: Dict[int, E3Subscription] = {}
         self.on_ack: Optional[Callable[[int, dict], None]] = None
+        # Called with (ranFunctionIdentifier, xAppControlData) for xApp control
+        # actions relayed by the agent (E2SM-DAPP path).
+        self.on_xapp_control: Optional[Callable[[int, bytes], None]] = None
+        # Stamp every outbound E3-PDU with the realtime clock (libe3 envelope field).
+        self.stamp_timestamps = True
+        # Realtime timestamp of the last PDU received from the agent, when present.
+        self.last_agent_timestamp_ns: Optional[int] = None
+        # Indications whose by-reference row was overwritten before it was read.
+        self.torn_reads = 0
 
     # ------------------------------------------------------------------
     def close(self) -> None:
@@ -263,8 +278,11 @@ class E3Client:
             return value
 
     def _send(self, pdu_id: int, name: str, body: dict) -> None:
+        import time
+
+        timestamp = time.time_ns() if self.stamp_timestamps else None
         try:
-            self._association.send(self.codec.encode_pdu(pdu_id, name, body))
+            self._association.send(self.codec.encode_pdu(pdu_id, name, body, timestamp))
         except SctpTransportError as error:
             raise E3TransportError(str(error)) from error
 
@@ -276,9 +294,16 @@ class E3Client:
         if message is None:
             return None
         try:
-            return self.codec.decode_pdu(message)
+            pdu_id, timestamp, name, body = self.codec.decode_pdu_with_timestamp(message)
         except Exception as error:  # asn1tools raises its own hierarchy
             raise E3ProtocolError(f"malformed E3-PDU from the agent: {error}") from error
+        if timestamp is not None:
+            self.last_agent_timestamp_ns = timestamp
+        return pdu_id, name, body
+
+    def _dispatch_xapp_control(self, body: dict) -> None:
+        if self.on_xapp_control is not None:
+            self.on_xapp_control(int(body["ranFunctionIdentifier"]), bytes(body["xAppControlData"]))
 
     def _dispatch_indication(self, body: dict) -> None:
         subscription_id = body.get("subscriptionId")
@@ -292,9 +317,20 @@ class E3Client:
             body.get("payloadBytes"),
         )
         if payload is not None:
+            indication = decode_indication(self.codec, payload)
+            if "byReference" in body:
+                descriptor = TensorDescriptor.from_asn(body["byReference"])
+                indication.by_reference = descriptor
+                subscription = self.subscriptions.get(subscription_id) if subscription_id is not None else None
+                reader = subscription.region_reader if subscription is not None else None
+                data = reader.read(descriptor) if reader is not None else None
+                if data is None:
+                    self.torn_reads += 1
+                    return
+                attach_bulk(indication.record, data)
             if len(self._pending_indications) == self._pending_indications.maxlen:
                 self.pending_indication_drops += 1
-            self._pending_indications.append(decode_indication(self.codec, payload))
+            self._pending_indications.append(indication)
 
     def _wait_for(self, predicate: Callable[[int, str, dict], bool], timeout: Optional[float]) -> Tuple[int, str, dict]:
         """Receive PDUs until one satisfies the predicate; indications are queued."""
@@ -312,6 +348,9 @@ class E3Client:
             if name == "indicationMessage":
                 self._dispatch_indication(body)
                 continue
+            if name == "xAppControlAction" and not predicate(pdu_id, name, body):
+                self._dispatch_xapp_control(body)
+                continue
             if name == "messageAck" and self.on_ack is not None and not predicate(pdu_id, name, body):
                 self.on_ack(pdu_id, body)
                 continue
@@ -323,6 +362,40 @@ class E3Client:
     # Procedures
     # ------------------------------------------------------------------
     def setup(self) -> SetupResult:
+        """Complete E3 setup.
+
+        The request is stamped with the envelope timestamp by default. An agent
+        built before the field existed cannot decode a stamped PDU and answers
+        with a protocol error (or closes the association); in that case the
+        client reconnects once and repeats the setup unstamped, and stays
+        unstamped for the life of the client.
+        """
+        try:
+            return self._setup_once()
+        except (E3ProtocolError, E3TransportError) as error:
+            legacy_agent = self.stamp_timestamps and (
+                isinstance(error, E3TransportError) or getattr(error, "cause", None) == "protocolError"
+            )
+            if not legacy_agent:
+                raise
+        self.stamp_timestamps = False
+        self._reconnect()
+        return self._setup_once()
+
+    def _reconnect(self) -> None:
+        try:
+            self._association.close()
+        except Exception:  # noqa: BLE001 - best effort before reconnecting
+            pass
+        try:
+            self._association = SctpAssociation(self.host, self.port, timeout=self.timeout)
+        except SctpTransportError as error:
+            raise E3TransportError(str(error)) from error
+        self._next_id = 1
+        self._indication_assembly = _FragmentAssembly(E3AP_MAX_PAYLOAD_BYTES)
+        self._control_assembly = _FragmentAssembly(E3AP_MAX_PAYLOAD_BYTES)
+
+    def _setup_once(self) -> SetupResult:
         """Run E3 Setup and learn the RAN functions the agent offers."""
         pdu_id = self._take_id()
         self._send(
@@ -395,8 +468,16 @@ class E3Client:
         configs: Sequence[SubscriptionConfig] = (),
         periodicity_ms: Optional[int] = None,
         subscription_time_s: Optional[int] = None,
+        by_reference: bool = False,
+        minimum_by_reference_bytes: Optional[int] = None,
     ) -> E3Subscription:
-        """Subscribe to telemetry streams of RAN function 10."""
+        """Subscribe to telemetry streams of RAN function 10.
+
+        With ``by_reference`` the agent maps a shared-memory region for this
+        subscription and delivers large tensors through it; the client maps the
+        region read-only and fills each record's bulk field from it (a torn
+        row is counted in ``torn_reads`` and skipped).
+        """
         dapp_id = self._require_setup()
         ids = [_telemetry_id(item) for item in telemetries]
         if not ids:
@@ -415,6 +496,10 @@ class E3Client:
             body["subscriptionData"] = self.codec.encode(
                 "Telemetry-SubscriptionData", {"configs": [config.to_asn() for config in configs]}
             )
+        if by_reference:
+            body["deliveryMode"] = "byReference"
+            if minimum_by_reference_bytes is not None:
+                body["minimumByReferenceBytes"] = int(minimum_by_reference_bytes)
         pdu_id = self._take_id()
         self._send(pdu_id, "subscriptionRequest", body)
         _, _, response = self._wait_for(
@@ -427,8 +512,34 @@ class E3Client:
             ran_function_id=RAN_FUNCTION_TELEMETRY,
             telemetry_ids=list(response.get("telemetryIdentifierList", ids)),
         )
+        if "sharedRegion" in response:
+            subscription.shared_region = SharedRegion.from_asn(response["sharedRegion"])
+            try:
+                subscription.region_reader = SharedRegionReader(subscription.shared_region)
+            except OSError as error:
+                self.unsubscribe(subscription.subscription_id)
+                raise E3TransportError(f"cannot map the agent's shared region: {error}") from error
+        elif by_reference:
+            raise E3ProtocolError("agent granted the subscription without a shared region")
         self.subscriptions[subscription.subscription_id] = subscription
         return subscription
+
+    def report(self, ran_function_id: int, data: bytes, timeout: Optional[float] = None) -> None:
+        """Send an E3 dApp Report (northbound, for the agent's E2SM-DAPP bridge) and wait for its ack."""
+        dapp_id = self._require_setup()
+        if not data:
+            raise ValueError("report data must not be empty")
+        pdu_id = self._take_id()
+        self._send(
+            pdu_id,
+            "dAppReport",
+            {"dAppIdentifier": dapp_id, "ranFunctionIdentifier": int(ran_function_id), "reportData": bytes(data)},
+        )
+        _, _, ack = self._wait_for(
+            lambda i, n, b: n == "messageAck" and b.get("requestId") == pdu_id, timeout or self.timeout
+        )
+        if ack.get("responseCode") != "positive":
+            raise E3ProtocolError("E3 report refused", ack.get("cause"), _text(ack.get("detail")))
 
     def unsubscribe(self, subscription: Union[int, E3Subscription]) -> None:
         dapp_id = self._require_setup()
@@ -438,7 +549,9 @@ class E3Client:
         _, _, ack = self._wait_for(lambda i, n, b: n == "messageAck" and b.get("requestId") == pdu_id, self.timeout)
         if ack.get("responseCode") != "positive":
             raise E3ProtocolError("E3 subscription delete refused", ack.get("cause"), _text(ack.get("detail")))
-        self.subscriptions.pop(subscription_id, None)
+        removed = self.subscriptions.pop(subscription_id, None)
+        if removed is not None and removed.region_reader is not None:
+            removed.region_reader.close()
 
     def release(self) -> None:
         """Send E3 Release; the agent removes every subscription and closes the association."""
@@ -474,6 +587,8 @@ class E3Client:
                 self._dispatch_indication(body)
                 if self._pending_indications:
                     return self._pending_indications.popleft()
+            elif name == "xAppControlAction":
+                self._dispatch_xapp_control(body)
             elif name == "messageAck" and self.on_ack is not None:
                 self.on_ack(pdu_id, body)
             # Other procedure PDUs outside a pending request are ignored.

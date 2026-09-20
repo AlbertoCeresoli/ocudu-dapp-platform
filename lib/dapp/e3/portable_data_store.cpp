@@ -11,6 +11,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <thread>
 #include <utility>
 
 using namespace ocudu::dapp::e3;
@@ -110,11 +111,47 @@ struct portable_data_store::implementation {
     std::size_t                   count{};
   };
 
-  explicit implementation(portable_data_store_config config_) : config(config_), slots(config.maximum_subscriptions)
+  struct publication_slot {
+    std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    subscription*    borrowed{};
+  };
+
+  struct publication_guard {
+    publication_slot& slot;
+    bool              acquired;
+    explicit publication_guard(publication_slot& slot_) noexcept :
+      slot(slot_), acquired(!slot.busy.test_and_set(std::memory_order_acquire))
+    {
+    }
+    ~publication_guard()
+    {
+      if (acquired) {
+        slot.busy.clear(std::memory_order_release);
+      }
+    }
+  };
+
+  explicit implementation(portable_data_store_config config_) :
+    config(config_),
+    slots(config.maximum_subscriptions),
+    publication_slots(std::make_unique<publication_slot[]>(config.maximum_subscriptions))
   {
     for (auto& value : fastest_requested_us) {
       value.store(portable_interval_unspecified, std::memory_order_relaxed);
     }
+  }
+
+  /// Management only, under control_mutex. Producers borrow without acquiring
+  /// shared ownership. Removal/reclamation always runs on a non-radio caller.
+  void replace_slot(std::size_t index, std::shared_ptr<subscription> replacement) noexcept
+  {
+    auto& publication = publication_slots[index];
+    while (publication.busy.test_and_set(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    publication.borrowed = replacement.get();
+    std::atomic_store_explicit(&slots[index], std::move(replacement), std::memory_order_release);
+    publication.busy.clear(std::memory_order_release);
   }
 
   uint64_t retained_bytes(const portable_subscription_request& request) const noexcept
@@ -163,19 +200,21 @@ struct portable_data_store::implementation {
     }
   }
 
-  bool expire_if_due(const std::shared_ptr<subscription>& item, uint64_t now) noexcept
+  bool expire_if_due(subscription* item, uint64_t now, bool refresh = true) noexcept
   {
     uint64_t observed = item->lease_expiry_ns.load(std::memory_order_acquire);
-    while (observed != 0 && observed <= now) {
-      if (item->lease_expiry_ns.compare_exchange_weak(
+    if (observed != 0 && observed <= now) {
+      if (item->lease_expiry_ns.compare_exchange_strong(
               observed, 0, std::memory_order_acq_rel, std::memory_order_acquire)) {
         const auto index = *interface_index(item->request.interface_id);
         active_counts[index].fetch_sub(1, std::memory_order_release);
-        refresh_demand(index);
+        if (refresh) {
+          refresh_demand(index);
+        }
         return true;
       }
     }
-    return observed == 0;
+    return observed == 0 || observed <= now;
   }
 
   portable_subscription_result subscribe(const portable_subscription_request& request) noexcept
@@ -196,8 +235,8 @@ struct portable_data_store::implementation {
           continue;
         }
         const uint64_t now = monotonic_ns();
-        if (current->lease_expiry_ns.load(std::memory_order_acquire) == 0 || expire_if_due(current, now)) {
-          std::atomic_store_explicit(&slots[index], std::shared_ptr<subscription>{}, std::memory_order_release);
+        if (current->lease_expiry_ns.load(std::memory_order_acquire) == 0 || expire_if_due(current.get(), now)) {
+          replace_slot(index, {});
           if (empty == slots.size()) {
             empty = index;
           }
@@ -220,7 +259,7 @@ struct portable_data_store::implementation {
         return {portable_subscription_code::resource_exhausted, {}, "portable E3 subscription storage exhausted"};
       }
       auto created = std::make_shared<subscription>(request, config.maximum_metadata_bytes, expiry(request.lease_us));
-      std::atomic_store_explicit(&slots[empty], created, std::memory_order_release);
+      replace_slot(empty, created);
       const auto index = *interface_index(request.interface_id);
       active_counts[index].fetch_add(1, std::memory_order_release);
       refresh_demand(index);
@@ -244,7 +283,7 @@ struct portable_data_store::implementation {
         if (current && current->request.subscription_id == id) {
           deactivate(current);
           const auto snapshot = current->snapshot();
-          std::atomic_store_explicit(&slot, std::shared_ptr<subscription>{}, std::memory_order_release);
+          replace_slot(static_cast<std::size_t>(&slot - slots.data()), {});
           return {portable_subscription_code::ok, {snapshot}, {}};
         }
       }
@@ -294,7 +333,7 @@ struct portable_data_store::implementation {
       return {portable_subscription_code::not_found, {}, {}, "portable E3 subscription does not exist"};
     }
     const uint64_t now = monotonic_ns();
-    if (current->lease_expiry_ns.load(std::memory_order_acquire) == 0 || expire_if_due(current, now)) {
+    if (current->lease_expiry_ns.load(std::memory_order_acquire) == 0 || expire_if_due(current.get(), now)) {
       return {portable_subscription_code::not_found, {}, current->snapshot(), "portable E3 subscription expired"};
     }
     try {
@@ -382,14 +421,18 @@ struct portable_data_store::implementation {
     }
   }
 
-  portable_publish_result publish_one(const std::shared_ptr<subscription>& item,
-                                      const portable_publication_source&   source,
-                                      uint64_t                             now) noexcept
+  portable_publish_result publish_one(subscription*                      item,
+                                      const portable_publication_source& source,
+                                      uint64_t                           now,
+                                      uint64_t&                          remaining_copy_bytes) noexcept
   {
     if (item->lease_expiry_ns.load(std::memory_order_acquire) == 0) {
       return portable_publish_result::no_subscription;
     }
-    if (expire_if_due(item, now)) {
+    // Update active count, but never scan shared_ptr ownership on this path.
+    // Cached demand can remain conservatively fast until the next control update;
+    // producer hard floors and this copy budget still apply.
+    if (expire_if_due(item, now, false)) {
       return portable_publish_result::no_subscription;
     }
     if (item->request.interface_id != source.interface_id ||
@@ -406,6 +449,11 @@ struct portable_data_store::implementation {
     if (chunks == 0 || chunks > item->queue.size()) {
       item->dropped_objects.fetch_add(1, std::memory_order_relaxed);
       return portable_publish_result::object_too_large;
+    }
+    const uint64_t copy_bytes = source.tensor.size() + source.metadata.size();
+    if (copy_bytes > remaining_copy_bytes) {
+      item->dropped_objects.fetch_add(1, std::memory_order_relaxed);
+      return portable_publish_result::full;
     }
     std::unique_lock<std::mutex> lock(item->queue_mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
@@ -451,13 +499,14 @@ struct portable_data_store::implementation {
     item->queued_chunks.store(item->count, std::memory_order_relaxed);
     item->published_objects.fetch_add(1, std::memory_order_relaxed);
     item->published_tensor_bytes.fetch_add(source.tensor.size(), std::memory_order_relaxed);
+    remaining_copy_bytes -= copy_bytes;
     return portable_publish_result::published;
   }
 
   portable_publish_result publish(const portable_publication_source& source) noexcept
   {
-    const auto index = interface_index(source.interface_id);
-    if (!index || source.publication_sequence == 0 || source.route_epoch == 0 || source.metadata.empty() ||
+    const auto interface_slot = interface_index(source.interface_id);
+    if (!interface_slot || source.publication_sequence == 0 || source.route_epoch == 0 || source.metadata.empty() ||
         source.metadata.data() == nullptr || source.tensor.data() == nullptr ||
         source.metadata.size() > config.maximum_metadata_bytes || source.tensor.empty()) {
       return portable_publish_result::invalid;
@@ -465,14 +514,24 @@ struct portable_data_store::implementation {
     if (source.tensor.size() > config.maximum_object_bytes) {
       return portable_publish_result::object_too_large;
     }
-    portable_publish_result aggregate = portable_publish_result::no_subscription;
-    const uint64_t          now       = monotonic_ns();
-    for (const auto& slot : slots) {
-      auto current = std::atomic_load_explicit(&slot, std::memory_order_acquire);
+    portable_publish_result aggregate            = portable_publish_result::no_subscription;
+    const uint64_t          now                  = monotonic_ns();
+    uint64_t                remaining_copy_bytes = config.maximum_publication_copy_bytes;
+    const std::size_t       first = next_publication_slot.fetch_add(1, std::memory_order_relaxed) % slots.size();
+    for (std::size_t visited = 0; visited != slots.size(); ++visited) {
+      const std::size_t index = (first + visited) % slots.size();
+      publication_guard guard(publication_slots[index]);
+      if (!guard.acquired) {
+        if (aggregate != portable_publish_result::published) {
+          aggregate = portable_publish_result::busy;
+        }
+        continue;
+      }
+      auto* current = publication_slots[index].borrowed;
       if (!current) {
         continue;
       }
-      const auto result = publish_one(current, source, now);
+      const auto result = publish_one(current, source, now, remaining_copy_bytes);
       if (result == portable_publish_result::published) {
         aggregate = result;
       } else if (aggregate != portable_publish_result::published &&
@@ -488,6 +547,8 @@ struct portable_data_store::implementation {
   portable_data_store_config                              config;
   mutable std::mutex                                      control_mutex;
   std::vector<std::shared_ptr<subscription>>              slots;
+  std::unique_ptr<publication_slot[]>                     publication_slots;
+  std::atomic<uint64_t>                                   next_publication_slot{0};
   std::array<std::atomic<uint32_t>, nof_store_interfaces> active_counts{};
   /// Cached per-interface demand so the real-time gate (telemetry_publisher::should_collect)
   /// reads three atomics instead of scanning shared_ptr slots (whose atomic loads take a
@@ -522,14 +583,15 @@ struct portable_data_store::implementation {
 std::pair<std::shared_ptr<portable_data_store>, std::string>
 portable_data_store::create(portable_data_store_config config) noexcept
 {
-  const bool valid = config.maximum_subscriptions != 0 && config.maximum_subscriptions <= 32 &&
-                     config.maximum_retained_bytes >= 1024 * 1024 &&
-                     config.maximum_retained_bytes <= 1024ULL * 1024 * 1024 && config.maximum_object_bytes != 0 &&
-                     config.maximum_object_bytes <= 64 * 1024 * 1024 && config.maximum_metadata_bytes >= 1024 &&
-                     config.maximum_metadata_bytes <= 1024 * 1024 && config.minimum_chunk_bytes >= 1024 &&
-                     config.minimum_chunk_bytes <= config.maximum_chunk_bytes &&
-                     config.maximum_chunk_bytes <= 1024 * 1024 && config.minimum_lease_us != 0 &&
-                     config.minimum_lease_us <= config.maximum_lease_us && config.maximum_lease_us <= 60'000'000;
+  const bool valid =
+      config.maximum_subscriptions != 0 && config.maximum_subscriptions <= 32 &&
+      config.maximum_retained_bytes >= 1024 * 1024 && config.maximum_retained_bytes <= 1024ULL * 1024 * 1024 &&
+      config.maximum_object_bytes != 0 && config.maximum_object_bytes <= 64 * 1024 * 1024 &&
+      config.maximum_metadata_bytes >= 1024 && config.maximum_metadata_bytes <= 1024 * 1024 &&
+      config.minimum_chunk_bytes >= 1024 && config.minimum_chunk_bytes <= config.maximum_chunk_bytes &&
+      config.maximum_chunk_bytes <= 1024 * 1024 && config.minimum_lease_us != 0 &&
+      config.minimum_lease_us <= config.maximum_lease_us && config.maximum_lease_us <= 60'000'000 &&
+      config.maximum_publication_copy_bytes != 0 && config.maximum_publication_copy_bytes <= 64ULL * 1024 * 1024;
   if (!valid) {
     return {{}, "invalid portable E3 data-store bounds"};
   }
