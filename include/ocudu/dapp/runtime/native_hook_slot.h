@@ -41,6 +41,12 @@ public:
                                   ocudu_dapp_equalizer_output_v1&      output) noexcept;
   native_invocation_result invoke(const ocudu_dapp_receiver_input_v1& input,
                                   ocudu_dapp_receiver_output_v1&      output) noexcept;
+  /// Retains the exact issuing worker before releasing publication protection.
+  /// owner must be empty and remains set for any nonempty ticket, even on an uncertain enqueue error.
+  native_invocation_result invoke_receiver_deferred(const ocudu_dapp_receiver_input_v1& input,
+                                                     ocudu_dapp_receiver_output_v1& output,
+                                                     native_receiver_ticket& ticket,
+                                                     std::shared_ptr<native_worker>& owner) noexcept;
   native_invocation_result invoke(const ocudu_dapp_scheduler_input_v1& input,
                                   ocudu_dapp_scheduler_output_v1&      output) noexcept;
   void report_failure(const ocudu_dapp_invocation_v1& invocation, ocudu_dapp_status_v1 status) noexcept;
@@ -65,10 +71,12 @@ private:
     explicit reader_guard(native_hook_slot& owner_) noexcept;
     ~reader_guard();
     native_worker* get() const noexcept;
+    std::shared_ptr<native_worker> retain() const noexcept;
 
   private:
     native_hook_slot& owner;
     native_worker*    worker;
+    published_target* publication{};
   };
 
   const uint32_t                             required_interface_id;

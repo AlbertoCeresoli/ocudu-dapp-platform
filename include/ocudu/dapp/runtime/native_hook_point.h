@@ -4,6 +4,7 @@
 #pragma once
 
 #include "native_hook_slot.h"
+#include "native_control_context.h"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -50,6 +51,10 @@ public:
   uint32_t lane_count() const noexcept { return static_cast<uint32_t>(lanes.size()); }
   uint32_t worker_id(uint32_t lane) const noexcept { return first_worker + lane; }
   uint32_t backend_id() const noexcept { return selected_backend.load(std::memory_order_acquire); }
+  bool receiver_completion_required() const noexcept
+  {
+    return selected_receiver_completion.load(std::memory_order_acquire);
+  }
   /// Bitmask of ocudu_dapp_backend_v1 values this hook's L1 data path may drive.
   /// Zero means unrestricted (tests / unset topology). Non-zero → stage() rejects
   /// packages whose selected backend is outside the mask.
@@ -59,6 +64,8 @@ public:
     allowed_backends.store(mask, std::memory_order_release);
   }
   bool set_completion_barrier(uint32_t lane, std::shared_ptr<native_completion_barrier> barrier) noexcept;
+  /// Cold topology setup only, before staging. Retained through instance quiescence even if staging fails.
+  bool set_control_context(uint32_t lane, std::shared_ptr<native_control_context> context) noexcept;
 
   native_invocation_result invoke(uint32_t                                     lane,
                                   const ocudu_dapp_channel_estimator_input_v1& input,
@@ -67,6 +74,9 @@ public:
   invoke(uint32_t lane, const ocudu_dapp_equalizer_input_v1& input, ocudu_dapp_equalizer_output_v1& output) noexcept;
   native_invocation_result
   invoke(uint32_t lane, const ocudu_dapp_receiver_input_v1& input, ocudu_dapp_receiver_output_v1& output) noexcept;
+  native_invocation_result invoke_receiver_deferred(uint32_t lane, const ocudu_dapp_receiver_input_v1& input,
+      ocudu_dapp_receiver_output_v1& output, native_receiver_ticket& ticket,
+      std::shared_ptr<native_worker>& owner) noexcept;
   native_invocation_result
   invoke(uint32_t lane, const ocudu_dapp_scheduler_input_v1& input, ocudu_dapp_scheduler_output_v1& output) noexcept;
   void report_failure(uint32_t lane, const ocudu_dapp_invocation_v1& invocation, ocudu_dapp_status_v1 status) noexcept;
@@ -82,6 +92,7 @@ public:
 
 private:
   native_hook_point(uint32_t interface_id_, uint32_t first_worker_id_, uint32_t nof_lanes);
+  std::vector<std::shared_ptr<native_control_context>> control_contexts;
   ocudu_dapp_status_v1 stage_locked(native_instance& instance, std::shared_ptr<native_activation_gate> gate);
   ocudu_dapp_status_v1 clear_locked(const std::shared_ptr<native_activation_gate>& gate,
                                     std::chrono::steady_clock::time_point          deadline);
@@ -101,6 +112,7 @@ private:
   std::shared_ptr<native_activation_gate>        activation;
   std::atomic<bool>                              is_bound{};
   std::atomic<uint32_t>                          selected_backend{OCUDU_DAPP_BACKEND_HOST_V1};
+  std::atomic<bool>                              selected_receiver_completion{};
   /// 0 = unrestricted; else (1u << OCUDU_DAPP_BACKEND_*) bits allowed for bind.
   std::atomic<uint32_t>                          allowed_backends{0};
   std::mutex                                     control_mutex;

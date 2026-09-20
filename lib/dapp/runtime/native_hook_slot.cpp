@@ -11,7 +11,7 @@ native_hook_slot::reader_guard::reader_guard(native_hook_slot& owner_) noexcept 
   // Sequential consistency establishes this order against clear(): either clear observes this reader, or this reader
   // observes the null target. This prevents a load-before-drain use-after-free window without a hot-path lock.
   owner.readers.fetch_add(1, std::memory_order_seq_cst);
-  published_target* publication = owner.target.load(std::memory_order_seq_cst);
+  publication                  = owner.target.load(std::memory_order_seq_cst);
   worker                        = publication != nullptr && publication->gate->enabled.load(std::memory_order_acquire)
                                       ? publication->worker.get()
                                       : nullptr;
@@ -25,6 +25,11 @@ native_hook_slot::reader_guard::~reader_guard()
 native_worker* native_hook_slot::reader_guard::get() const noexcept
 {
   return worker;
+}
+
+std::shared_ptr<native_worker> native_hook_slot::reader_guard::retain() const noexcept
+{
+  return worker ? publication->worker : nullptr;
 }
 
 native_hook_slot::~native_hook_slot()
@@ -126,6 +131,22 @@ native_invocation_result native_hook_slot::invoke(const ocudu_dapp_scheduler_inp
   reader_guard   guard(*this);
   native_worker* worker = guard.get();
   return worker != nullptr ? worker->invoke(input, output) : native_invocation_result{OCUDU_DAPP_BYPASS_V1, true};
+}
+
+native_invocation_result native_hook_slot::invoke_receiver_deferred(
+    const ocudu_dapp_receiver_input_v1& input, ocudu_dapp_receiver_output_v1& output,
+    native_receiver_ticket& ticket, std::shared_ptr<native_worker>& owner) noexcept
+{
+  if (owner || ticket.sequence || ticket.worker_generation)
+    return {OCUDU_DAPP_INVALID_INPUT_V1, true};
+  reader_guard guard(*this);
+  auto issuing = guard.retain();
+  if (!issuing)
+    return {OCUDU_DAPP_BYPASS_V1, true};
+  auto result = issuing->invoke_receiver_deferred(input, output, ticket);
+  if (ticket.sequence)
+    owner = std::move(issuing);
+  return result;
 }
 
 void native_hook_slot::report_failure(const ocudu_dapp_invocation_v1& invocation, ocudu_dapp_status_v1 status) noexcept

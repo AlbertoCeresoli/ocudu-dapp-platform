@@ -7,6 +7,7 @@
 #include "ocudu/dapp/use_cases/v1/channel_estimator.h"
 #include "ocudu/dapp/use_cases/v1/equalizer.h"
 #include "ocudu/dapp/use_cases/v1/receiver.h"
+#include "ocudu/dapp/use_cases/v1/receiver_completion.h"
 #include "ocudu/dapp/use_cases/v1/scheduler.h"
 #include "ocudu/dapp/use_cases/v1/spectrum.h"
 #include "ocudu/dapp/use_cases/v1/srs_isac.h"
@@ -32,6 +33,15 @@ struct native_invocation_result {
   explicit             operator bool() const noexcept { return status == OCUDU_DAPP_OK_V1; }
 };
 
+/// Host-owned lookup key, meaningful only on the ORIGINAL retained native_worker.
+struct native_receiver_ticket {
+  uint64_t worker_generation{};
+  uint64_t sequence{};
+};
+
+/// Number of worker states intentionally retained after unsafe destruction with pending receiver work.
+std::size_t quarantined_native_receiver_worker_count() noexcept;
+
 /// One host-owned module context bound to one PHY worker and one interface.
 class native_worker
 {
@@ -43,6 +53,23 @@ public:
   uint32_t interface_id() const noexcept;
   uint32_t worker_id() const noexcept;
   uint32_t backend_id() const noexcept;
+  bool receiver_completion_required() const noexcept;
+  unsigned pending_receiver_completions() const noexcept;
+
+  /// Caller retains this worker, its module and authentic global tensor loans through all consumers.
+  /// A nonempty ticket on failure still needs release/retirement; invoke_fallback=false forbids overwriting
+  /// a possibly queued output. Empty ticket storage is required on entry. Four fixed outstanding slots.
+  native_invocation_result invoke_receiver_deferred(const ocudu_dapp_receiver_input_v1& input,
+                                                     ocudu_dapp_receiver_output_v1& output,
+                                                     native_receiver_ticket& ticket) noexcept;
+  /// Only OK/ready/valid admits the grant. Does not release it. Works after admission closes.
+  ocudu_dapp_status_v1 inspect_receiver(const native_receiver_ticket& ticket,
+                                        ocudu_dapp_receiver_completion_result_v1& result) noexcept;
+  /// Call after every consumer finishes/fences. Success retires this exact ticket, never another worker's.
+  ocudu_dapp_status_v1 release_receiver(const native_receiver_ticket& ticket) noexcept;
+  /// Control-only, all consumers withdrawn/fenced. Try-based cleanup, including partial/invalid receipts;
+  /// backend destruction has no real-time wall-clock guarantee.
+  ocudu_dapp_status_v1 retire_receiver() noexcept;
 
   native_invocation_result invoke(const ocudu_dapp_channel_estimator_input_v1& input,
                                   ocudu_dapp_channel_estimator_output_v1&      output) noexcept;
@@ -71,6 +98,9 @@ private:
   struct implementation;
   explicit native_worker(std::unique_ptr<implementation> implementation_);
   static native_worker_create_result create(native_instance& owner, uint32_t interface_id, uint32_t worker_id);
+  native_invocation_result invoke_receiver_impl(const ocudu_dapp_receiver_input_v1& input,
+                                                ocudu_dapp_receiver_output_v1& output,
+                                                native_receiver_ticket* ticket) noexcept;
 
   std::unique_ptr<implementation> state;
 };

@@ -15,14 +15,16 @@ std::mutex quarantine_mutex;
 struct quarantine_entry {
   std::shared_ptr<native_module_library> library;
   std::shared_ptr<quiescence_tracker>    activity;
+  std::shared_ptr<native_control_context> control_context;
 };
 std::vector<quarantine_entry> resident_quarantine;
 
 void retain_until_process_exit(std::shared_ptr<native_module_library> library,
-                               std::shared_ptr<quiescence_tracker>    activity)
+                               std::shared_ptr<quiescence_tracker>    activity,
+                               std::shared_ptr<native_control_context> control_context)
 {
   std::lock_guard<std::mutex> lock(quarantine_mutex);
-  resident_quarantine.push_back({std::move(library), std::move(activity)});
+  resident_quarantine.push_back({std::move(library), std::move(activity), std::move(control_context)});
 }
 
 uint64_t deadline_to_ns(std::chrono::steady_clock::time_point deadline)
@@ -48,7 +50,7 @@ native_instance::~native_instance()
 {
   activity->close_admission();
   if (library != nullptr && lifecycle_state.state() != OCUDU_DAPP_STATE_UNLOADED_V1) {
-    retain_until_process_exit(std::move(library), std::move(activity));
+    retain_until_process_exit(std::move(library), std::move(activity), std::move(control_context));
   }
 }
 
@@ -237,6 +239,7 @@ instance_operation_result native_instance::unload()
   lifecycle_state.transition_to(OCUDU_DAPP_STATE_UNLOADED_V1);
   module.management = nullptr;
   library.reset();
+  control_context.reset();
   return result(OCUDU_DAPP_OK_V1);
 }
 
@@ -397,11 +400,25 @@ management_call_result native_instance::manage_model(const ocudu_dapp_model_requ
   return {called, 0, generation};
 }
 
-native_worker_create_result native_instance::create_worker(uint32_t interface_id, uint32_t worker_id)
+native_worker_create_result native_instance::create_worker(uint32_t interface_id, uint32_t worker_id,
+                                                          std::shared_ptr<native_control_context> context)
 {
   std::lock_guard<std::mutex> lock(management_mutex);
   if (lifecycle_state.state() != OCUDU_DAPP_STATE_SHADOW_V1 && lifecycle_state.state() != OCUDU_DAPP_STATE_ACTIVE_V1) {
     return {OCUDU_DAPP_INVALID_INPUT_V1, "worker creation requires shadow or active state", {}};
+  }
+  const auto* descriptor = std::find_if(module.interfaces, module.interfaces + module.nof_interfaces,
+      [interface_id](const auto& item) { return item.interface_id == interface_id; });
+  const bool needs_context = descriptor != module.interfaces + module.nof_interfaces &&
+      interface_id == OCUDU_DAPP_INTERFACE_RECEIVER_V1 && selected_backend_id == OCUDU_DAPP_BACKEND_CUDA_V1 &&
+      (descriptor->capability_bits & OCUDU_DAPP_RECEIVER_CAP_COMPLETION_V1);
+  if (needs_context) {
+    if (!context || !context->identity() || context->backend_id() != selected_backend_id)
+      return {OCUDU_DAPP_UNSUPPORTED_V1, "completion receiver needs a retained host control context", {}};
+    if (control_context && control_context->identity() != context->identity())
+      return {OCUDU_DAPP_CONFLICT_V1, "one instance cannot mix CUDA contexts", {}};
+    // Retain BEFORE creation: a failed module callback can leave private GPU allocations for quiescence.
+    if (!control_context) control_context = std::move(context);
   }
   return native_worker::create(*this, interface_id, worker_id);
 }
@@ -420,7 +437,9 @@ instance_operation_result native_instance::call_locked(incident_phase phase,
   incident_context context{};
   context            = incident_identity;
   context.phase      = phase;
-  const auto guarded = guarded_call(callback, lifecycle_breaker, incidents, context, cleanup);
+  const auto guarded = guarded_call([&] {
+    return control_context && phase != incident_phase::report ? control_context->call(callback) : callback();
+  }, lifecycle_breaker, incidents, context, cleanup);
   return result(guarded.status);
 }
 

@@ -11,9 +11,12 @@
 #include "ocudu/dapp/runtime/prepared_output.h"
 #include "ocudu/ran/gnb_constants.h"
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <optional>
@@ -23,6 +26,44 @@ using namespace ocudu::dapp::native_worker_detail;
 
 namespace {
 
+std::atomic<uint64_t> next_receiver_generation{1};
+std::atomic<std::size_t> quarantined_receiver_workers{};
+
+uint64_t allocate_receiver_generation() noexcept
+{
+  auto value = next_receiver_generation.load(std::memory_order_relaxed);
+  while (value != UINT64_MAX) {
+    if (next_receiver_generation.compare_exchange_weak(value, value + 1, std::memory_order_relaxed))
+      return value;
+  }
+  return 0;
+}
+
+class receiver_gate_guard
+{
+  std::atomic_flag* flag;
+  bool acquired;
+public:
+  explicit receiver_gate_guard(std::atomic_flag* flag_) noexcept :
+    flag(flag_), acquired(!flag || !flag->test_and_set(std::memory_order_acquire)) {}
+  ~receiver_gate_guard() { if (flag && acquired) flag->clear(std::memory_order_release); }
+  explicit operator bool() const noexcept { return acquired; }
+};
+
+bool valid_receiver_receipt(const ocudu_dapp_receiver_receipt_v1& receipt) noexcept
+{
+  return receipt.struct_size == sizeof(receipt) && receipt.abi_major == OCUDU_DAPP_ABI_MAJOR_V1 &&
+         receipt.abi_minor == 0 && std::any_of(std::begin(receipt.opaque), std::end(receipt.opaque),
+                                              [](uint64_t value) { return value != 0; });
+}
+
+bool same_receiver_receipt(const ocudu_dapp_receiver_receipt_v1& a,
+                           const ocudu_dapp_receiver_receipt_v1& b) noexcept
+{
+  return a.struct_size == b.struct_size && a.abi_major == b.abi_major && a.abi_minor == b.abi_minor &&
+         std::equal(std::begin(a.opaque), std::end(a.opaque), std::begin(b.opaque));
+}
+
 const ocudu_dapp_receiver_metrics_v1* read_receiver_metrics(const ocudu_dapp_typed_metadata_v1& wrapper) noexcept
 {
   constexpr uint32_t wrapper_minimum =
@@ -31,11 +72,44 @@ const ocudu_dapp_receiver_metrics_v1* read_receiver_metrics(const ocudu_dapp_typ
       offsetof(ocudu_dapp_receiver_metrics_v1, post_equalization_noise) + sizeof(ocudu_dapp_tensor_view_v1);
   if (wrapper.struct_size < wrapper_minimum || wrapper.abi_major != OCUDU_DAPP_ABI_MAJOR_V1 ||
       wrapper.metadata_schema_id != OCUDU_DAPP_METADATA_RECEIVER_METRICS_V1 || wrapper.metadata_schema_version != 1 ||
-      wrapper.metadata.data == nullptr || wrapper.metadata.size < metrics_minimum) {
+      wrapper.metadata.data == nullptr || wrapper.metadata.size < metrics_minimum ||
+      reinterpret_cast<uintptr_t>(wrapper.metadata.data) % alignof(ocudu_dapp_receiver_metrics_v1) != 0) {
     return nullptr;
   }
   const auto* metrics = static_cast<const ocudu_dapp_receiver_metrics_v1*>(wrapper.metadata.data);
-  return metrics->struct_size >= metrics_minimum && metrics->abi_major == OCUDU_DAPP_ABI_MAJOR_V1 ? metrics : nullptr;
+  return metrics->struct_size >= metrics_minimum && metrics->struct_size <= wrapper.metadata.size &&
+                 metrics->abi_major == OCUDU_DAPP_ABI_MAJOR_V1
+             ? metrics
+             : nullptr;
+}
+
+const ocudu_dapp_tensor_view_v1* receiver_symbols(const ocudu_dapp_receiver_metrics_v1* metrics) noexcept
+{
+  return metrics != nullptr && metrics->struct_size >= OCUDU_DAPP_RECEIVER_EQUALIZED_SYMBOLS_MIN_SIZE_V1 &&
+                 metrics->equalized_symbols.struct_size != 0
+             ? &metrics->equalized_symbols
+             : nullptr;
+}
+
+bool disjoint_receiver_symbols(const ocudu_dapp_tensor_view_v1& symbols,
+                               const ocudu_dapp_tensor_view_v1& other) noexcept
+{
+  const auto interval = [](const ocudu_dapp_tensor_view_v1& view, uintptr_t& begin, uintptr_t& end) {
+    constexpr auto maximum = std::numeric_limits<uintptr_t>::max();
+    if (view.native_handle == 0 || view.native_handle > maximum || view.byte_offset > maximum - view.native_handle) {
+      return false;
+    }
+    begin = view.native_handle + view.byte_offset;
+    if (view.byte_length == 0 || view.byte_length > maximum - begin) {
+      return false;
+    }
+    end = begin + view.byte_length;
+    return true;
+  };
+  uintptr_t begin{}, end{}, other_begin{}, other_end{};
+  const uintptr_t alignment = symbols.domain == OCUDU_DAPP_MEM_ACCELERATOR_DEVICE_V1 ? 2 * sizeof(float) : alignof(float);
+  return interval(symbols, begin, end) && begin % alignment == 0 &&
+         interval(other, other_begin, other_end) && (end <= other_begin || other_end <= begin);
 }
 
 bool same_metadata_storage(const ocudu_dapp_typed_metadata_v1& expected,
@@ -132,6 +206,12 @@ class_b_policy_snapshot native_worker_incident_source::class_b_snapshot() const 
 }
 
 struct native_worker::implementation {
+  struct receiver_record {
+    native_receiver_ticket key;
+    ocudu_dapp_invocation_v1 invocation{};
+    ocudu_dapp_receiver_receipt_v1 receipt{};
+    bool eligible{}, checked{};
+  };
   std::shared_ptr<native_module_library>         library;
   std::shared_ptr<quiescence_tracker>            activity;
   std::shared_ptr<native_worker_incident_source> incident_source;
@@ -146,8 +226,39 @@ struct native_worker::implementation {
   std::optional<ocudu_dapp_pusch_profile_v1>     pusch_profile;
   uint32_t                                       selected_backend{};
   void*                                          host_context{};
+  std::shared_ptr<native_control_context>         control_context;
   uint64_t (*monotonic_ns)(void*){};
   std::unique_ptr<prepared_output_transaction> prepared_outputs;
+  const ocudu_dapp_receiver_completion_api_v1* completion_api{};
+  std::array<receiver_record, 4> receiver_records{};
+  std::atomic_flag receiver_gate = ATOMIC_FLAG_INIT;
+  std::atomic<unsigned> receiver_pending{};
+  uint64_t receiver_generation{}, receiver_sequence{};
+  bool receiver_poisoned{}, receiver_retired{};
+
+  receiver_record* find_receiver(const native_receiver_ticket& key) noexcept
+  {
+    if (!key.sequence || key.worker_generation != receiver_generation)
+      return nullptr;
+    for (auto& record : receiver_records)
+      if (record.key.sequence == key.sequence)
+        return &record;
+    return nullptr;
+  }
+
+  template <typename Callback>
+  ocudu_dapp_status_v1 completion_call(const ocudu_dapp_invocation_v1& invocation, Callback&& callback) noexcept
+  {
+    auto context = make_context(invocation);
+    context.phase = incident_phase::completion;
+    auto status = OCUDU_DAPP_INTERNAL_ERROR_V1;
+    auto result = guarded_call([&] {
+      status = callback();
+      // A not-ready poll is expected, not a new circuit-breaker incident.
+      return status == OCUDU_DAPP_RESOURCE_V1 ? OCUDU_DAPP_OK_V1 : status;
+    }, incident_source->breaker, incident_source->incidents, context, true);
+    return result.status == OCUDU_DAPP_OK_V1 ? status : result.status;
+  }
 
   uint64_t now_ns() const noexcept
   {
@@ -235,17 +346,34 @@ native_worker::~native_worker()
   if (state == nullptr || state->worker_context == nullptr) {
     return;
   }
+  if (state->receiver_pending.load(std::memory_order_acquire) != 0) {
+    // Misuse must not destroy a context/library still referenced by GPU work.
+    // The already allocated state retains the instance lifetime and library;
+    // no allocation or CUDA cleanup occurs here. Explicit control retirement
+    // is required in the normal path. This quarantine lasts until process exit.
+    static_cast<void>(state.release());
+    quarantined_receiver_workers.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   incident_context context = state->incident_source->context();
   context.phase            = incident_phase::completion;
-  guarded_call(
+  const auto destroyed = guarded_call(
       [&]() {
-        state->worker_api.destroy_worker_context(state->module_instance, state->worker_context);
-        return OCUDU_DAPP_OK_V1;
+        const auto destroy = [&] {
+          state->worker_api.destroy_worker_context(state->module_instance, state->worker_context);
+          return OCUDU_DAPP_OK_V1;
+        };
+        return state->control_context ? state->control_context->call(destroy) : destroy();
       },
       state->incident_source->breaker,
       state->incident_source->incidents,
       context,
       true);
+  if (destroyed.status != OCUDU_DAPP_OK_V1) {
+    static_cast<void>(state.release());
+    quarantined_receiver_workers.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   state->worker_context = nullptr;
   state->lifetime.reset();
 }
@@ -263,6 +391,17 @@ uint32_t native_worker::worker_id() const noexcept
 uint32_t native_worker::backend_id() const noexcept
 {
   return state->selected_backend;
+}
+
+std::size_t ocudu::dapp::quarantined_native_receiver_worker_count() noexcept
+{
+  return quarantined_receiver_workers.load(std::memory_order_relaxed);
+}
+
+bool native_worker::receiver_completion_required() const noexcept { return state->completion_api != nullptr; }
+unsigned native_worker::pending_receiver_completions() const noexcept
+{
+  return state->receiver_pending.load(std::memory_order_acquire);
 }
 
 native_worker_create_result native_worker::create(native_instance& owner, uint32_t interface_id, uint32_t worker_id)
@@ -339,11 +478,19 @@ native_worker_create_result native_worker::create(native_instance& owner, uint32
     implementation_->bound_interface_id     = interface_id;
     implementation_->bound_worker_id        = worker_id;
     implementation_->interface_capabilities = descriptor->capability_bits;
+    if (interface_id == OCUDU_DAPP_INTERFACE_RECEIVER_V1 &&
+        (descriptor->capability_bits & OCUDU_DAPP_RECEIVER_CAP_COMPLETION_V1) != 0) {
+      implementation_->completion_api = owner.library->receiver_completion();
+      implementation_->receiver_generation = allocate_receiver_generation();
+      if (!implementation_->completion_api || !implementation_->receiver_generation)
+        return {OCUDU_DAPP_UNSUPPORTED_V1, "required receiver completion service unavailable", {}};
+    }
     if (descriptor->use_case_profile != nullptr) {
       implementation_->pusch_profile = *static_cast<const ocudu_dapp_pusch_profile_v1*>(descriptor->use_case_profile);
     }
     implementation_->selected_backend = owner.backend_id();
     implementation_->host_context     = owner.host_api.host_context;
+    implementation_->control_context = owner.control_context;
     implementation_->monotonic_ns     = owner.host_api.monotonic_ns;
     if (owner.host_api.publish_prepared != nullptr &&
         (interface_id == OCUDU_DAPP_INTERFACE_SPECTRUM_V1 || interface_id == OCUDU_DAPP_INTERFACE_SRS_ISAC_V1)) {
@@ -359,8 +506,12 @@ native_worker_create_result native_worker::create(native_instance& owner, uint32
   void* worker_context = nullptr;
   auto  created        = guarded_call(
       [&]() {
-        const auto status = worker_api->create_worker_context(owner.module_instance, worker_id, &worker_context);
-        return status == OCUDU_DAPP_OK_V1 && worker_context == nullptr ? OCUDU_DAPP_INVALID_OUTPUT_V1 : status;
+        const auto create = [&] {
+          const auto status = worker_api->create_worker_context(owner.module_instance, worker_id, &worker_context);
+          if (status == OCUDU_DAPP_OK_V1 && worker_context) worker->state->worker_context = worker_context;
+          return status == OCUDU_DAPP_OK_V1 && worker_context == nullptr ? OCUDU_DAPP_INVALID_OUTPUT_V1 : status;
+        };
+        return owner.control_context ? owner.control_context->call(create) : create();
       },
       source->breaker,
       source->incidents,
@@ -450,6 +601,32 @@ native_invocation_result native_worker::invoke(const ocudu_dapp_equalizer_input_
 native_invocation_result native_worker::invoke(const ocudu_dapp_receiver_input_v1& input,
                                                ocudu_dapp_receiver_output_v1&      output) noexcept
 {
+  return invoke_receiver_impl(input, output, nullptr);
+}
+
+native_invocation_result native_worker::invoke_receiver_deferred(const ocudu_dapp_receiver_input_v1& input,
+                                                                 ocudu_dapp_receiver_output_v1& output,
+                                                                 native_receiver_ticket& ticket) noexcept
+{
+  if (ticket.sequence || ticket.worker_generation)
+    return {OCUDU_DAPP_INVALID_INPUT_V1, true};
+  return invoke_receiver_impl(input, output, &ticket);
+}
+
+native_invocation_result native_worker::invoke_receiver_impl(const ocudu_dapp_receiver_input_v1& input,
+                                                             ocudu_dapp_receiver_output_v1& output,
+                                                             native_receiver_ticket* ticket) noexcept
+{
+  if ((ticket != nullptr) != (state->completion_api != nullptr))
+    return {OCUDU_DAPP_UNSUPPORTED_V1, true};
+  receiver_gate_guard lock(ticket ? &state->receiver_gate : nullptr);
+  if (!lock)
+    return {OCUDU_DAPP_RESOURCE_V1, true};
+  if (ticket && (state->receiver_retired || state->receiver_poisoned))
+    return {OCUDU_DAPP_BYPASS_V1, true};
+  if (ticket && (!input.invocation.invocation_id || !input.invocation.input_generation ||
+                 !input.invocation.output_generation || !input.invocation.execution_stream))
+    return {OCUDU_DAPP_INVALID_INPUT_V1, true};
   if (state->bound_interface_id != OCUDU_DAPP_INTERFACE_RECEIVER_V1) {
     return {OCUDU_DAPP_INVALID_INPUT_V1, true};
   }
@@ -467,8 +644,22 @@ native_invocation_result native_worker::invoke(const ocudu_dapp_receiver_input_v
   }
   const bool  metrics_requested = !empty_typed_metadata(output.metrics);
   const auto* requested_metrics = metrics_requested ? read_receiver_metrics(output.metrics) : nullptr;
+  const auto* requested_symbols = receiver_symbols(requested_metrics);
   if (metrics_requested &&
-      (requested_metrics == nullptr || !valid_output_tensor(requested_metrics->post_equalization_noise))) {
+      (requested_metrics == nullptr || !valid_output_tensor(requested_metrics->post_equalization_noise) ||
+       (requested_symbols != nullptr &&
+        (!valid_output_tensor(*requested_symbols) || requested_symbols->element_type != OCUDU_DAPP_ELEMENT_CF32_V1 ||
+         requested_symbols->rank != 2 ||
+         requested_symbols->layout_id != OCUDU_DAPP_LAYOUT_PUSCH_EQUALIZED_DATA_RE_LAYER_V1 ||
+         requested_symbols->layout_version != 1 ||
+         requested_symbols->domain != output.llrs.domain ||
+         requested_symbols->backend_id != output.llrs.backend_id ||
+         requested_symbols->device_ordinal != output.llrs.device_ordinal ||
+         !disjoint_receiver_symbols(*requested_symbols, output.llrs) ||
+         !disjoint_receiver_symbols(*requested_symbols, input.rx_grid) ||
+         !disjoint_receiver_symbols(*requested_symbols, requested_metrics->post_equalization_noise) ||
+         requested_symbols->dimensions[0] != requested_metrics->post_equalization_noise.dimensions[0] ||
+         requested_symbols->dimensions[1] != requested_metrics->post_equalization_noise.dimensions[1])))) {
     state->incident_source->record(class_a_fallback_reason::invalid_input);
     return {OCUDU_DAPP_INVALID_INPUT_V1, true};
   }
@@ -476,23 +667,165 @@ native_invocation_result native_worker::invoke(const ocudu_dapp_receiver_input_v
   const auto metrics_storage = output.metrics;
   const auto noise_storage =
       requested_metrics != nullptr ? requested_metrics->post_equalization_noise : ocudu_dapp_tensor_view_v1{};
+  const auto symbol_storage = requested_symbols != nullptr ? *requested_symbols : ocudu_dapp_tensor_view_v1{};
+  const auto metric_size = requested_metrics != nullptr ? requested_metrics->struct_size : 0U;
   const auto* api = static_cast<const ocudu_dapp_receiver_interface_v1*>(state->interface_vtable);
-  return state->call(
+  implementation::receiver_record* pending = nullptr;
+  if (ticket) {
+    if (state->receiver_sequence == UINT64_MAX)
+      return {OCUDU_DAPP_RESOURCE_V1, true};
+    for (auto& record : state->receiver_records) {
+      if (record.key.sequence && record.invocation.invocation_id == input.invocation.invocation_id &&
+          record.invocation.cell_id == input.invocation.cell_id)
+        return {OCUDU_DAPP_INVALID_INPUT_V1, true};
+      if (!record.key.sequence && !pending)
+        pending = &record;
+    }
+    if (!pending)
+      return {OCUDU_DAPP_RESOURCE_V1, true};
+    pending->key = {state->receiver_generation, ++state->receiver_sequence};
+    pending->invocation = input.invocation;
+    pending->receipt.struct_size = sizeof(pending->receipt);
+    pending->receipt.abi_major = OCUDU_DAPP_ABI_MAJOR_V1;
+  }
+  bool entered = false;
+  auto module_status = OCUDU_DAPP_INTERNAL_ERROR_V1;
+  auto result = state->call(
       input.invocation,
-      [&]() { return api->invoke(state->worker_context, &input, &output); },
       [&]() {
+        entered = true;
+        module_status = pending ? state->completion_api->invoke(state->worker_context, &input, &output, &pending->receipt)
+                                : api->invoke(state->worker_context, &input, &output);
+        return module_status;
+      },
+      [&]() {
+        if (pending && !valid_receiver_receipt(pending->receipt))
+          return false;
+        // Do not follow a module-substituted metadata pointer, even to inspect
+        // its header. The original caller-owned descriptor is immutable.
+        if (!same_metadata_storage(metrics_storage, output.metrics)) {
+          return false;
+        }
         const auto* returned_metrics = metrics_requested ? read_receiver_metrics(output.metrics) : nullptr;
+        const auto* returned_symbols = receiver_symbols(returned_metrics);
         const bool  valid_metrics =
             !metrics_requested
                  ? empty_typed_metadata(output.metrics)
                  : returned_metrics != nullptr && same_metadata_storage(metrics_storage, output.metrics) &&
+                      returned_metrics->struct_size == metric_size &&
                       valid_output_tensor(returned_metrics->post_equalization_noise) &&
                       same_tensor_storage(noise_storage, returned_metrics->post_equalization_noise);
+        const bool valid_symbols = requested_symbols == nullptr
+                                       ? returned_symbols == nullptr &&
+                                             (output.reserved0 & OCUDU_DAPP_RECEIVER_EQUALIZED_SYMBOLS_VALID_V1) == 0
+                                       : returned_symbols != nullptr && valid_output_tensor(*returned_symbols) &&
+                                             same_tensor_storage(symbol_storage, *returned_symbols);
         return valid_output_tensor(output.llrs) && same_tensor_storage(llr_storage, output.llrs) &&
-               empty_typed_metadata(output.uci) && valid_metrics && output.confidence_q16 <= (1U << 16U) &&
+               empty_typed_metadata(output.uci) && valid_metrics && valid_symbols && output.confidence_q16 <= (1U << 16U) &&
                (output.reserved0 & ~OCUDU_DAPP_RECEIVER_KNOWN_OUTPUT_FLAGS_V1) == 0 &&
                (metrics_requested || output.reserved0 == 0);
       });
+  if (!pending)
+    return result;
+  const bool declined_without_enqueue = module_status == OCUDU_DAPP_BYPASS_V1 ||
+      module_status == OCUDU_DAPP_UNSUPPORTED_V1 || module_status == OCUDU_DAPP_INVALID_INPUT_V1 ||
+      module_status == OCUDU_DAPP_RESOURCE_V1;
+  if (!entered || (declined_without_enqueue && result.status == module_status)) {
+    *pending = {};
+    return result;
+  }
+  pending->eligible = result.status == OCUDU_DAPP_OK_V1;
+  state->receiver_poisoned |= !pending->eligible;
+  state->receiver_pending.fetch_add(1, std::memory_order_release);
+  *ticket = pending->key;
+  // A real callback may have queued work even if output validation/deadline
+  // checking failed. Do not overwrite its buffers with fallback.
+  result.invoke_fallback = false;
+  return result;
+}
+
+ocudu_dapp_status_v1 native_worker::inspect_receiver(const native_receiver_ticket& ticket,
+                                                    ocudu_dapp_receiver_completion_result_v1& result) noexcept
+{
+  result = {};
+  result.struct_size = sizeof(result);
+  result.abi_major = OCUDU_DAPP_ABI_MAJOR_V1;
+  receiver_gate_guard lock(&state->receiver_gate);
+  if (!lock)
+    return OCUDU_DAPP_RESOURCE_V1;
+  auto* record = state->find_receiver(ticket);
+  if (!state->completion_api || !record || !record->eligible || record->checked || state->receiver_poisoned)
+    return OCUDU_DAPP_INVALID_INPUT_V1;
+  auto invocation = record->invocation;
+  auto receipt = record->receipt;
+  ocudu_dapp_receiver_completion_result_v1 candidate{};
+  candidate.struct_size = sizeof(candidate);
+  candidate.abi_major = OCUDU_DAPP_ABI_MAJOR_V1;
+  const auto status = state->completion_call(record->invocation, [&] {
+    auto value = state->completion_api->inspect(state->worker_context, &invocation, &receipt, &candidate);
+    if (!same_receiver_receipt(receipt, record->receipt) || candidate.struct_size != sizeof(candidate) ||
+        candidate.abi_major != OCUDU_DAPP_ABI_MAJOR_V1 || candidate.abi_minor != 0 ||
+        candidate.ready > 1 || candidate.valid > candidate.ready ||
+        (value != OCUDU_DAPP_OK_V1 && candidate.valid != 0) ||
+        std::any_of(std::begin(candidate.reserved), std::end(candidate.reserved), [](uint64_t v) { return v != 0; }))
+      return OCUDU_DAPP_INVALID_OUTPUT_V1;
+    return value;
+  });
+  if (status == OCUDU_DAPP_RESOURCE_V1)
+    return status;
+  record->checked = true;
+  if (status != OCUDU_DAPP_OK_V1 || !candidate.ready || !candidate.valid) {
+    record->eligible = false;
+    state->receiver_poisoned = true;
+    return status == OCUDU_DAPP_OK_V1 ? OCUDU_DAPP_INVALID_OUTPUT_V1 : status;
+  }
+  result = candidate;
+  return OCUDU_DAPP_OK_V1;
+}
+
+ocudu_dapp_status_v1 native_worker::release_receiver(const native_receiver_ticket& ticket) noexcept
+{
+  receiver_gate_guard lock(&state->receiver_gate);
+  if (!lock)
+    return OCUDU_DAPP_RESOURCE_V1;
+  auto* record = state->find_receiver(ticket);
+  if (!state->completion_api || !record || !valid_receiver_receipt(record->receipt))
+    return OCUDU_DAPP_INVALID_INPUT_V1;
+  auto invocation = record->invocation;
+  auto receipt = record->receipt;
+  const auto status = state->completion_call(record->invocation, [&] {
+    auto value = state->completion_api->release(state->worker_context, &invocation, &receipt);
+    return same_receiver_receipt(receipt, record->receipt) ? value : OCUDU_DAPP_INVALID_OUTPUT_V1;
+  });
+  if (status == OCUDU_DAPP_OK_V1) {
+    *record = {};
+    state->receiver_pending.fetch_sub(1, std::memory_order_release);
+  }
+  return status;
+}
+
+ocudu_dapp_status_v1 native_worker::retire_receiver() noexcept
+{
+  receiver_gate_guard lock(&state->receiver_gate);
+  if (!lock)
+    return OCUDU_DAPP_RESOURCE_V1;
+  if (!state->completion_api)
+    return OCUDU_DAPP_UNSUPPORTED_V1;
+  if (state->receiver_retired)
+    return OCUDU_DAPP_OK_V1;
+  state->receiver_poisoned = true;
+  ocudu_dapp_invocation_v1 context{};
+  context.worker_id = state->bound_worker_id;
+  const auto status = state->completion_call(context, [&] {
+    const auto retire = [&] { return state->completion_api->retire(state->worker_context); };
+    return state->control_context ? state->control_context->call(retire) : retire();
+  });
+  if (status == OCUDU_DAPP_OK_V1) {
+    state->receiver_records = {};
+    state->receiver_pending.store(0, std::memory_order_release);
+    state->receiver_retired = true;
+  }
+  return status;
 }
 
 native_invocation_result native_worker::invoke(const ocudu_dapp_scheduler_input_v1& input,

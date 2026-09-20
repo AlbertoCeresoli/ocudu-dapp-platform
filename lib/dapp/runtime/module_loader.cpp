@@ -3,10 +3,12 @@
 
 #include "ocudu/dapp/runtime/module_loader.h"
 #include "ocudu/dapp/runtime/abi_validation.h"
+#include <algorithm>
 #include <cstring>
 #include <dlfcn.h>
 #include <exception>
 #include <fcntl.h>
+#include <iterator>
 #include <mutex>
 #include <sstream>
 #include <unistd.h>
@@ -145,9 +147,48 @@ module_load_result ocudu::dapp::load_native_module(approved_artifact&& artifact,
     return {module_load_error::invalid_descriptor, nullptr, to_string(validation)};
   }
 
+  std::optional<ocudu_dapp_receiver_completion_api_v1> completion;
+  for (uint32_t i = 0; i != module.nof_interfaces; ++i) {
+    const auto& interface = module.interfaces[i];
+    if (interface.interface_id != OCUDU_DAPP_INTERFACE_RECEIVER_V1 ||
+        (interface.capability_bits & OCUDU_DAPP_RECEIVER_CAP_COMPLETION_V1) == 0) {
+      continue;
+    }
+    if ((host.host_capabilities & OCUDU_DAPP_HOST_CAP_RECEIVER_COMPLETION_V1) == 0 ||
+        (interface.capability_bits & OCUDU_DAPP_PUSCH_CAP_RESIDENT_ACCELERATOR_V1) == 0) {
+      return {module_load_error::query_rejected, nullptr, "receiver completion consumer is not supported"};
+    }
+    ::dlerror();
+    void* extension_symbol = ::dlsym(handle, OCUDU_DAPP_RECEIVER_COMPLETION_QUERY_SYMBOL_V1);
+    if (::dlerror() != nullptr || extension_symbol == nullptr) {
+      return {module_load_error::missing_query_symbol, nullptr, "required receiver completion query is missing"};
+    }
+    ocudu_dapp_query_receiver_completion_v1_fn extension_query = nullptr;
+    static_assert(sizeof(extension_query) == sizeof(extension_symbol), "POSIX pointer size mismatch");
+    std::memcpy(&extension_query, &extension_symbol, sizeof(extension_query));
+    ocudu_dapp_receiver_completion_api_v1 api{};
+    api.struct_size = sizeof(api);
+    api.abi_major = OCUDU_DAPP_ABI_MAJOR_V1;
+    try {
+      status = extension_query(&host, &api);
+    } catch (...) {
+      return {module_load_error::query_exception, nullptr, "exception escaped receiver completion query"};
+    }
+    if (status != OCUDU_DAPP_OK_V1) {
+      return {module_load_error::query_rejected, nullptr, "receiver completion query rejected host"};
+    }
+    if (api.struct_size != sizeof(api) || api.abi_major != OCUDU_DAPP_ABI_MAJOR_V1 || api.abi_minor != 0 ||
+        !api.invoke || !api.inspect || !api.release || !api.retire ||
+        std::any_of(std::begin(api.reserved), std::end(api.reserved), [](uint64_t value) { return value != 0; })) {
+      return {module_load_error::invalid_descriptor, nullptr, "invalid receiver completion table"};
+    }
+    completion = api;
+  }
+
   guard.value  = nullptr;
   auto library = std::shared_ptr<native_module_library>(
       new native_module_library(handle, module, artifact.digest(), artifact.canonical_path()));
+  library->completion = completion;
   return {module_load_error::none, std::move(library), {}};
 }
 

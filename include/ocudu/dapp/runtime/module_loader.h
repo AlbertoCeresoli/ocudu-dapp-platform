@@ -5,7 +5,9 @@
 
 #include "artifact_verifier.h"
 #include "ocudu/dapp/abi/v1/module.h"
+#include "ocudu/dapp/use_cases/v1/receiver_completion.h"
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace ocudu::dapp {
@@ -31,6 +33,10 @@ public:
   const ocudu_dapp_module_v1& descriptor() const noexcept { return module; }
   const artifact_digest&      content_digest() const noexcept { return digest; }
   const std::string&          source_path() const noexcept { return path; }
+  const ocudu_dapp_receiver_completion_api_v1* receiver_completion() const noexcept
+  {
+    return completion ? &*completion : nullptr;
+  }
 
 private:
   friend struct module_load_result;
@@ -44,6 +50,7 @@ private:
   ocudu_dapp_module_v1 module{};
   artifact_digest      digest{};
   std::string          path;
+  std::optional<ocudu_dapp_receiver_completion_api_v1> completion;
 };
 
 struct module_load_result {

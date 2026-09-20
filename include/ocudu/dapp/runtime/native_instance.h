@@ -8,6 +8,7 @@
 #include "lifecycle.h"
 #include "module_loader.h"
 #include "native_worker.h"
+#include "native_control_context.h"
 #include "quiescence_tracker.h"
 #include <chrono>
 #include <functional>
@@ -58,7 +59,8 @@ public:
   management_call_result   describe_metrics(ocudu_dapp_metric_descriptor_v1* descriptors, uint32_t capacity) override;
   management_call_result   read_metrics(ocudu_dapp_metric_sample_v1* samples, uint32_t capacity) override;
   management_call_result   manage_model(const ocudu_dapp_model_request_v1& request) override;
-  native_worker_create_result create_worker(uint32_t interface_id, uint32_t worker_id);
+  native_worker_create_result create_worker(uint32_t interface_id, uint32_t worker_id,
+                                           std::shared_ptr<native_control_context> context = {});
   uint32_t                    backend_id() const noexcept { return selected_backend_id; }
 
   activity_token try_enter(activity_kind kind = activity_kind::invocation) noexcept
@@ -91,6 +93,7 @@ private:
   std::shared_ptr<native_module_library>                      library;
   ocudu_dapp_module_v1                                        module{};
   ocudu_dapp_host_api_v1                                      host_api{};
+  std::shared_ptr<native_control_context>                     control_context;
   void*                                                       module_instance{};
   lifecycle                                                   lifecycle_state;
   std::shared_ptr<quiescence_tracker>                         activity;

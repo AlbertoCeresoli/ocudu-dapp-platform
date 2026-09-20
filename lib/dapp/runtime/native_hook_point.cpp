@@ -35,6 +35,7 @@ native_hook_point::create(uint32_t interface_id, uint32_t first_worker_id, uint3
 native_hook_point::native_hook_point(uint32_t interface_id_, uint32_t first_worker_id_, uint32_t nof_lanes) :
   required_interface_id(interface_id_), first_worker(first_worker_id_)
 {
+  control_contexts.resize(nof_lanes);
   lanes.reserve(nof_lanes);
   for (uint32_t lane = 0; lane != nof_lanes; ++lane) {
     lanes.push_back(std::make_unique<native_hook_slot>(required_interface_id));
@@ -88,7 +89,7 @@ ocudu_dapp_status_v1 native_hook_point::stage_locked(native_instance&           
     return OCUDU_DAPP_RESOURCE_V1;
   }
   for (uint32_t lane = 0; lane != lanes.size(); ++lane) {
-    auto created = instance.create_worker(required_interface_id, worker_id(lane));
+    auto created = instance.create_worker(required_interface_id, worker_id(lane), control_contexts[lane]);
     if (!created) {
       return created.status;
     }
@@ -96,8 +97,11 @@ ocudu_dapp_status_v1 native_hook_point::stage_locked(native_instance&           
   }
 
   const uint32_t backend = workers.front()->backend_id();
+  const bool receiver_completion = workers.front()->receiver_completion_required();
   if (std::any_of(
-          workers.begin(), workers.end(), [backend](const auto& worker) { return worker->backend_id() != backend; })) {
+          workers.begin(), workers.end(), [backend, receiver_completion](const auto& worker) {
+            return worker->backend_id() != backend || worker->receiver_completion_required() != receiver_completion;
+          })) {
     return OCUDU_DAPP_CONFLICT_V1;
   }
   // Gate package backend against the L1 data path this hook is wired into
@@ -111,6 +115,7 @@ ocudu_dapp_status_v1 native_hook_point::stage_locked(native_instance&           
 
   activation = gate;
   selected_backend.store(backend, std::memory_order_release);
+  selected_receiver_completion.store(receiver_completion, std::memory_order_release);
   is_bound.store(true, std::memory_order_release);
   for (uint32_t lane = 0; lane != lanes.size(); ++lane) {
     const auto status = lanes[lane]->bind(std::move(workers[lane]), gate);
@@ -160,6 +165,7 @@ ocudu_dapp_status_v1 native_hook_point::clear_locked(const std::shared_ptr<nativ
   if (!draining) {
     is_bound.store(false, std::memory_order_release);
     selected_backend.store(OCUDU_DAPP_BACKEND_HOST_V1, std::memory_order_release);
+    selected_receiver_completion.store(false, std::memory_order_release);
     activation.reset();
   }
   return status;
@@ -168,6 +174,15 @@ ocudu_dapp_status_v1 native_hook_point::clear_locked(const std::shared_ptr<nativ
 bool native_hook_point::active() const noexcept
 {
   return !lanes.empty() && lanes.front()->active();
+}
+
+bool native_hook_point::set_control_context(uint32_t lane, std::shared_ptr<native_control_context> context) noexcept
+{
+  std::lock_guard<std::mutex> lock(control_mutex);
+  if (!context || !context->identity() || lane >= control_contexts.size() || activation || draining || control_contexts[lane])
+    return false;
+  control_contexts[lane] = std::move(context);
+  return true;
 }
 
 bool native_hook_point::set_completion_barrier(uint32_t                                   lane,
@@ -202,6 +217,13 @@ native_invocation_result native_hook_point::invoke(uint32_t                     
                                                    ocudu_dapp_scheduler_output_v1&      output) noexcept
 {
   return dispatch(lane, [&](native_hook_slot& slot) { return slot.invoke(input, output); });
+}
+
+native_invocation_result native_hook_point::invoke_receiver_deferred(
+    uint32_t lane, const ocudu_dapp_receiver_input_v1& input, ocudu_dapp_receiver_output_v1& output,
+    native_receiver_ticket& ticket, std::shared_ptr<native_worker>& owner) noexcept
+{
+  return dispatch(lane, [&](native_hook_slot& slot) { return slot.invoke_receiver_deferred(input, output, ticket, owner); });
 }
 
 void native_hook_point::report_failure(uint32_t                        lane,
