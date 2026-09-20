@@ -9,6 +9,7 @@
 #include "cuda_rt_utils.h"
 #include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/support/ocudu_assert.h"
+#include "ocudu/support/error_handling.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -137,7 +138,9 @@ static crc_type_t to_crc_type(crc_generator_poly poly)
 pusch_codeblock_decoder_cuda_batch::pusch_codeblock_decoder_cuda_batch(
     std::unique_ptr<ldpc_rate_dematcher> rate_dematcher,
     sch_crc                              crcs,
-    int                                  nvcuda_device_id) :
+    int                                  nvcuda_device_id,
+    unsigned                             max_nof_prb,
+    unsigned                             max_nof_layers) :
   dematcher_(std::move(rate_dematcher)),
   crc_set_({std::move(crcs.crc16), std::move(crcs.crc24A), std::move(crcs.crc24B)})
 {
@@ -145,6 +148,11 @@ pusch_codeblock_decoder_cuda_batch::pusch_codeblock_decoder_cuda_batch(
   ocudu_assert(crc_set_.crc16, "Invalid CRC16 calculator.");
   ocudu_assert(crc_set_.crc24A, "Invalid CRC24A calculator.");
   ocudu_assert(crc_set_.crc24B, "Invalid CRC24B calculator.");
+
+  const auto capacity = make_pusch_decoder_capacity(max_nof_prb, max_nof_layers);
+  report_fatal_error_if_not(capacity.has_value(), "Invalid CUDA PUSCH decoder capacity: {} PRBs, {} layers",
+                           max_nof_prb, max_nof_layers);
+  capacity_ = *capacity;
 
   // Bind to the configured device so all decoder allocations land on the right GPU, independent of thread state.
   (void)cudaSetDevice(nvcuda_device_id);
@@ -173,7 +181,7 @@ pusch_codeblock_decoder_cuda_batch::pusch_codeblock_decoder_cuda_batch(
   ocudu_assert(status == NR_LDPC_SUCCESS, "Failed to create CUDA scrambler: {}", nr_ldpc_get_error_string(status));
 
   // Allocate device memory for received LLRs (rate-matched, before dematching).
-  size_t received_batch_size = MAX_BATCH_SIZE * MAX_RM_LLRS * sizeof(float);
+  size_t received_batch_size = capacity_.codeword_llrs * sizeof(float);
   cuda_status                = cudaMalloc(&d_received_llr_batch_, received_batch_size);
   ocudu_assert(
       cuda_status == cudaSuccess, "Failed to allocate device received LLR memory: {}", cudaGetErrorString(cuda_status));
@@ -185,13 +193,13 @@ pusch_codeblock_decoder_cuda_batch::pusch_codeblock_decoder_cuda_batch(
                cudaGetErrorString(cuda_status));
 
   // Allocate device memory for dematched LLRs (full codeblock size, fp32).
-  size_t llr_batch_size = MAX_BATCH_SIZE * MAX_CB_LLRS * sizeof(float);
+  size_t llr_batch_size = capacity_.codeblocks * MAX_CB_LLRS * sizeof(float);
   cuda_status           = cudaMalloc(&d_llr_batch_, llr_batch_size);
   ocudu_assert(
       cuda_status == cudaSuccess, "Failed to allocate device LLR batch memory: {}", cudaGetErrorString(cuda_status));
 
   // Allocate device memory for dematched LLRs (fp16, triple-buffered for GPU-resident pipeline).
-  size_t llr_batch_half_size = MAX_BATCH_SIZE * MAX_CB_LLRS * sizeof(uint16_t);
+  size_t llr_batch_half_size = capacity_.codeblocks * MAX_CB_LLRS * sizeof(uint16_t);
   for (int i = 0; i < NUM_DECODE_BUFFERS; i++) {
     cuda_status = cudaMalloc(&d_llr_batch_half_[i], llr_batch_half_size);
     ocudu_assert(cuda_status == cudaSuccess,
@@ -201,23 +209,23 @@ pusch_codeblock_decoder_cuda_batch::pusch_codeblock_decoder_cuda_batch(
   }
 
   // Allocate device memory for batched output bits.
-  size_t output_batch_size = MAX_BATCH_SIZE * MAX_CB_OUTPUT_WORDS * sizeof(uint32_t);
+  size_t output_batch_size = capacity_.codeblocks * MAX_CB_OUTPUT_WORDS * sizeof(uint32_t);
   cuda_status              = cudaMalloc(&d_output_batch_, output_batch_size);
   ocudu_assert(
       cuda_status == cudaSuccess, "Failed to allocate device output batch memory: {}", cudaGetErrorString(cuda_status));
 
   // Allocate device memory for CRC check results.
-  cuda_status = cudaMalloc(&d_crc_results_, MAX_BATCH_SIZE * sizeof(int));
+  cuda_status = cudaMalloc(&d_crc_results_, capacity_.codeblocks * sizeof(int));
   ocudu_assert(
       cuda_status == cudaSuccess, "Failed to allocate device CRC results memory: {}", cudaGetErrorString(cuda_status));
 
   // Allocate device memory for per-CB bit counts.
-  cuda_status = cudaMalloc(&d_bits_per_cb_, MAX_BATCH_SIZE * sizeof(int));
+  cuda_status = cudaMalloc(&d_bits_per_cb_, capacity_.codeblocks * sizeof(int));
   ocudu_assert(
       cuda_status == cudaSuccess, "Failed to allocate device bits per CB memory: {}", cudaGetErrorString(cuda_status));
 
   // Allocate device memory for reassembled TB output.
-  cuda_status = cudaMalloc(&d_tb_output_, MAX_TB_BYTES);
+  cuda_status = cudaMalloc(&d_tb_output_, capacity_.tb_bytes);
   ocudu_assert(
       cuda_status == cudaSuccess, "Failed to allocate device TB output memory: {}", cudaGetErrorString(cuda_status));
 
@@ -232,20 +240,20 @@ pusch_codeblock_decoder_cuda_batch::pusch_codeblock_decoder_cuda_batch(
                cudaGetErrorString(cuda_status));
 
   // Allocate device memory for gather kernel source offsets (non-uniform CB path).
-  cuda_status = cudaMalloc(&d_gather_offsets_, MAX_BATCH_SIZE * sizeof(unsigned int));
+  cuda_status = cudaMalloc(&d_gather_offsets_, capacity_.codeblocks * sizeof(unsigned int));
   ocudu_assert(
       cuda_status == cudaSuccess, "Failed to allocate device gather offsets: {}", cudaGetErrorString(cuda_status));
 
   // Allocate pinned host memory for gather kernel source offsets.
-  cuda_status = cudaMallocHost(&h_gather_offsets_, MAX_BATCH_SIZE * sizeof(unsigned int));
+  cuda_status = cudaMallocHost(&h_gather_offsets_, capacity_.codeblocks * sizeof(unsigned int));
   ocudu_assert(
       cuda_status == cudaSuccess, "Failed to allocate pinned gather offsets: {}", cudaGetErrorString(cuda_status));
 
   // Allocate host memory.
-  h_received_llr_batch_.resize(MAX_BATCH_SIZE * MAX_RM_LLRS);
-  h_llr_batch_.resize(MAX_BATCH_SIZE * MAX_CB_LLRS);
-  h_output_batch_.resize(MAX_BATCH_SIZE * MAX_CB_OUTPUT_WORDS);
-  h_bits_per_cb_.resize(MAX_BATCH_SIZE);
+  h_received_llr_batch_.resize(capacity_.codeword_llrs);
+  h_llr_batch_.resize(capacity_.codeblocks * MAX_CB_LLRS);
+  h_output_batch_.resize(capacity_.codeblocks * MAX_CB_OUTPUT_WORDS);
+  h_bits_per_cb_.resize(capacity_.codeblocks);
 
   // Create CUDA event for async completion tracking (no timing for minimum overhead).
   cuda_status = cudaEventCreateWithFlags(&completion_event_, cudaEventDisableTiming);
@@ -257,13 +265,13 @@ pusch_codeblock_decoder_cuda_batch::pusch_codeblock_decoder_cuda_batch(
       cuda_status == cudaSuccess, "Failed to allocate pinned TB CRC result: {}", cudaGetErrorString(cuda_status));
 
   // Allocate pinned host memory for per-CB CRC results.
-  cuda_status = cudaMallocHost(&h_crc_results_pinned_, MAX_BATCH_SIZE * sizeof(int));
+  cuda_status = cudaMallocHost(&h_crc_results_pinned_, capacity_.codeblocks * sizeof(int));
   ocudu_assert(
       cuda_status == cudaSuccess, "Failed to allocate pinned CB CRC results: {}", cudaGetErrorString(cuda_status));
 
   // Allocate pinned host memory for TB output staging (required for true async D2H).
   // Without this, cudaMemcpyAsync to unpinned memory blocks internally, defeating async.
-  cuda_status = cudaMallocHost(&h_tb_output_pinned_, MAX_TB_BYTES);
+  cuda_status = cudaMallocHost(&h_tb_output_pinned_, capacity_.tb_bytes);
   ocudu_assert(cuda_status == cudaSuccess, "Failed to allocate pinned TB output: {}", cudaGetErrorString(cuda_status));
 
   // Keep detailed CUDA timing instrumentation opt-in for the production latency path.
@@ -314,20 +322,20 @@ pusch_codeblock_decoder_cuda_batch::pusch_codeblock_decoder_cuda_batch(
   }
 
   // Pre-allocate LDPC decoder workspace for max batch size with worst-case configuration.
-  status = ldpc_decoder_preallocate_workspace(decoder_handle_, MAX_BATCH_SIZE);
+  status = ldpc_decoder_preallocate_workspace(decoder_handle_, capacity_.codeblocks);
   if (status != NR_LDPC_SUCCESS) {
     ocudulog::fetch_basic_logger("PHY").warning("Failed to pre-allocate LDPC decoder workspace for {} CBs: {}",
-                                                MAX_BATCH_SIZE,
+                                                capacity_.codeblocks,
                                                 nr_ldpc_get_error_string(status));
   } else {
     ocudulog::fetch_basic_logger("PHY").debug(
-        "Pre-allocated LDPC decoder workspace for {} CBs (BG1, Z={})", MAX_BATCH_SIZE, WORST_CASE_Z);
+        "Pre-allocated LDPC decoder workspace for {} CBs (BG1, Z={})", capacity_.codeblocks, WORST_CASE_Z);
   }
 
   // Configure rate matcher with worst-case parameters for pre-allocation
   nr_rate_match_config_t worst_case_rm_cfg = {};
   // Set worst-case rate matching parameters (maximum E for max capacity)
-  worst_case_rm_cfg.E              = 15000; // Max rate matched output size
+  worst_case_rm_cfg.E              = static_cast<int>(capacity_.codeword_llrs); // Also bounds a single repeated CB.
   worst_case_rm_cfg.Q_m            = 8;     // 256QAM modulation order
   worst_case_rm_cfg.rv             = 0;     // Redundancy version
   worst_case_rm_cfg.N_cb           = 25344; // BG1 circular buffer (N=66*Z=66*384)
@@ -344,14 +352,14 @@ pusch_codeblock_decoder_cuda_batch::pusch_codeblock_decoder_cuda_batch(
   }
 
   // Pre-allocate scrambler sequence buffer for max LLR count.
-  status = scrambler_preallocate_sequence(scrambler_handle_, MAX_BATCH_SIZE * MAX_RM_LLRS);
+  status = scrambler_preallocate_sequence(scrambler_handle_, capacity_.codeword_llrs);
   if (status != NR_LDPC_SUCCESS) {
     ocudulog::fetch_basic_logger("PHY").warning("Failed to pre-allocate scrambler sequence for {} LLRs: {}",
-                                                MAX_BATCH_SIZE * MAX_RM_LLRS,
+                                                capacity_.codeword_llrs,
                                                 nr_ldpc_get_error_string(status));
   } else {
     ocudulog::fetch_basic_logger("PHY").debug("Pre-allocated scrambler sequence for {} LLRs",
-                                              MAX_BATCH_SIZE * MAX_RM_LLRS);
+                                              capacity_.codeword_llrs);
   }
 
   // Initialize CRC tables (one-time constant memory write).
@@ -896,11 +904,27 @@ pusch_codeblock_decoder_cuda_batch::decode_batch(span<const described_rx_codeblo
 {
   unsigned nof_cbs = codeblock_llrs.size();
 
-  ocudu_assert(nof_cbs > 0 && nof_cbs <= MAX_BATCH_SIZE, "Invalid number of codeblocks: {}", nof_cbs);
+  report_fatal_error_if_not(nof_cbs <= MAX_BATCH_SIZE, "Invalid number of codeblocks: {}", nof_cbs);
   ocudu_assert(cb_data_buffers.size() == nof_cbs, "Mismatched cb_data_buffers size");
   ocudu_assert(rm_buffers.size() == nof_cbs, "Mismatched rm_buffers size");
 
   std::vector<codeblock_result> results(nof_cbs);
+
+  resident_export_.valid = false;
+  std::size_t received_llrs = 0;
+  bool bounded = nof_cbs > 0 && nof_cbs <= capacity_.codeblocks;
+  for (const auto& cb : codeblock_llrs) {
+    if (cb.first.size() != cb.second.cb_specific.rm_length || cb.first.empty() ||
+        cb.first.size() > capacity_.codeword_llrs - received_llrs) {
+      bounded = false;
+      break;
+    }
+    received_llrs += cb.first.size();
+  }
+  if (!bounded || !capacity_.accepts(nof_cbs, received_llrs)) {
+    ocudulog::fetch_basic_logger("PHY").error("PUSCH batch exceeds configured CUDA decoder capacity");
+    return results;
+  }
 
   // Get common parameters from first codeblock (all CBs share tb_common).
   const auto& tb_common    = codeblock_llrs[0].second.tb_common;
@@ -1133,7 +1157,25 @@ pusch_codeblock_decoder_cuda_batch::tb_decode_result pusch_codeblock_decoder_cud
     int                                                  buffer_index)
 {
   unsigned nof_cbs = cb_specific.size();
-  ocudu_assert(nof_cbs > 0 && nof_cbs <= MAX_BATCH_SIZE, "Invalid number of codeblocks: {}", nof_cbs);
+  report_fatal_error_if_not(nof_cbs <= MAX_BATCH_SIZE, "Invalid number of codeblocks: {}", nof_cbs);
+
+  // Reject before reconfiguration, copies, sequence generation or GPU work.
+  // Never grow a buffer on a grant or silently select a different decoder.
+  resident_export_.valid = false;
+  std::size_t described_llrs = 0;
+  bool bounded = capacity_.accepts(nof_cbs, num_llrs, tb_output.size()) &&
+                 tb_output.size() <= capacity_.tb_bytes - 3;
+  for (const auto& cb : cb_specific) {
+    if (cb.rm_length == 0 || cb.rm_length > capacity_.codeword_llrs - described_llrs) {
+      bounded = false;
+      break;
+    }
+    described_llrs += cb.rm_length;
+  }
+  if (!bounded || described_llrs != num_llrs) {
+    ocudulog::fetch_basic_logger("PHY").error("Resident PUSCH exceeds configured CUDA decoder capacity or LLR extent");
+    return {};
+  }
 
   // Select buffer index for triple-buffering.
   int buf_idx;
@@ -1317,7 +1359,7 @@ pusch_codeblock_decoder_cuda_batch::tb_decode_result pusch_codeblock_decoder_cud
     ldpc_fused_tb_output_t        fused_tb_desc = {};
     const ldpc_fused_tb_output_t* fused_tb_ptr  = nullptr;
     const bool fused_tb_eligible = (tb_crc_bits == 24) && (cb_crc_bits == 24) && ((cb_info_bits & 7) == 0) &&
-                                   (((payload_bits + tb_crc_bits) & 7) == 0) && (tb_with_crc_bytes <= MAX_TB_BYTES);
+                                   (((payload_bits + tb_crc_bits) & 7) == 0) && (tb_with_crc_bytes <= capacity_.tb_bytes);
     if (fused_tb_eligible) {
       fused_tb_desc.d_tb_output  = d_tb_output_;
       fused_tb_desc.tb_bits      = static_cast<int>(payload_bits + tb_crc_bits);
@@ -1491,14 +1533,14 @@ pusch_codeblock_decoder_cuda_batch::tb_decode_result pusch_codeblock_decoder_cud
                  cb_specific[cb_idx].nof_filler_bits);
   }
 
-  ocudu_assert(payload_bytes <= MAX_TB_BYTES,
+  ocudu_assert(payload_bytes <= capacity_.tb_bytes,
                "TB output span has {} bytes, exceeding staging capacity {}.",
                payload_bytes,
-               MAX_TB_BYTES);
-  ocudu_assert(tb_with_crc_bytes <= MAX_TB_BYTES,
+               capacity_.tb_bytes);
+  ocudu_assert(tb_with_crc_bytes <= capacity_.tb_bytes,
                "TB output plus CRC has {} bytes, exceeding staging capacity {}.",
                tb_with_crc_bytes,
-               MAX_TB_BYTES);
+               capacity_.tb_bytes);
 
   tb_desegment_config_t deseg_cfg = {};
   deseg_cfg.num_code_blocks       = static_cast<int>(nof_cbs);

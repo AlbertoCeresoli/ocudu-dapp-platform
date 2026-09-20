@@ -15,6 +15,13 @@ add_executable(gpu_demod_llr_sign_test gpu_demod_llr_sign_test.cpp)
 target_link_libraries(gpu_demod_llr_sign_test gtest gtest_main)
 add_test(gpu_demod_llr_sign_test gpu_demod_llr_sign_test)
 
+# Pure capacity arithmetic/admission: available even in a CPU-only build.
+add_executable(pusch_decoder_capacity_test pusch_decoder_capacity_test.cpp)
+target_include_directories(pusch_decoder_capacity_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc/cuda)
+target_link_libraries(pusch_decoder_capacity_test gtest gtest_main)
+add_test(pusch_decoder_capacity_test pusch_decoder_capacity_test)
+
 if(CUDA_ACCEL_FOUND)
     add_executable(ldpc_encoder_gpu_cpu_test ldpc_encoder_gpu_cpu_test.cpp)
     target_include_directories(ldpc_encoder_gpu_cpu_test PRIVATE
@@ -59,5 +66,6 @@ if (CUDA_ACCEL_FOUND)
     set_tests_properties(
             ldpc_encoder_gpu_cpu_test
             ldpc_decoder_gpu_cpu_test
+            pusch_codeblock_decoder_cuda_batch_test
             PROPERTIES RESOURCE_LOCK ocudu_cuda_device)
 endif ()

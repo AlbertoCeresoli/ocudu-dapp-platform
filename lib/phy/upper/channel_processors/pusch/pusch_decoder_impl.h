@@ -159,6 +159,9 @@ public:
 #endif
 
   // See interface for the documentation.
+  bool discard_unsubmitted_input() override;
+
+  // See interface for the documentation.
   pusch_decoder_buffer& new_data(span<uint8_t>           transport_block,
                                  unique_rx_buffer        rm_buffer,
                                  pusch_decoder_notifier& notifier,
@@ -216,7 +219,7 @@ public:
   }
 
   // See interface for the documentation.
-  void set_pre_join_callback(std::function<void()> callback) override { pre_join_callback_ = std::move(callback); }
+  void set_pre_join_callback(resident_completion_callback callback) override { pre_join_callback_ = std::move(callback); }
 #endif
 
 private:
@@ -293,7 +296,8 @@ private:
   float decode_call_us_        = 0;
   float sinr_readback_us_      = 0;
   /// Callback invoked after GPU sync but before join_and_notify (for deferred SINR).
-  std::function<void()> pre_join_callback_;
+  resident_completion_callback pre_join_callback_;
+  bool                         resident_input_valid_ = true;
   /// GPU TB CRC result from resident decode with TB reassembly.
   /// When set, join_and_notify() uses this instead of CPU TB concatenation + CRC check.
   std::optional<bool> gpu_tb_crc_result_;

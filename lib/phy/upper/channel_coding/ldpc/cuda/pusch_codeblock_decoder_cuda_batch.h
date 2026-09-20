@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "pusch_decoder_capacity.h"
 #include "ocudu/phy/upper/channel_coding/crc_calculator.h"
 #include "ocudu/phy/upper/channel_coding/ldpc/ldpc_decoder.h"
 #include "ocudu/phy/upper/channel_coding/ldpc/ldpc_rate_dematcher.h"
@@ -67,9 +68,14 @@ public:
   /// \brief Constructor - creates CUDA resources for batch processing.
   /// \param[in] rate_dematcher CPU rate dematcher for LLR combining.
   /// \param[in] crcs CRC calculators.
+  /// \param[in] nvcuda_device_id CUDA device for all decoder resources.
+  /// \param[in] max_nof_prb Configured carrier capacity, not the current grant width.
+  /// \param[in] max_nof_layers Maximum supported PUSCH layers for this decoder instance.
   pusch_codeblock_decoder_cuda_batch(std::unique_ptr<ldpc_rate_dematcher> rate_dematcher,
                                      sch_crc                              crcs,
-                                     int                                  nvcuda_device_id = 0);
+                                     int                                  nvcuda_device_id = 0,
+                                     unsigned                             max_nof_prb = MAX_NOF_PRBS,
+                                     unsigned                             max_nof_layers = pusch_constants::MAX_NOF_LAYERS);
 
   /// \brief Destructor - releases CUDA resources.
   ~pusch_codeblock_decoder_cuda_batch();
@@ -306,17 +312,16 @@ private:
   /// Maximum number of codeblocks we can batch.
   static constexpr unsigned MAX_BATCH_SIZE = MAX_NOF_SEGMENTS;
 
-  /// Maximum rate-matched LLRs per codeblock (max E).
-  static constexpr unsigned MAX_RM_LLRS = 156000;
+  /// Immutable configured capacity. Uniform CB batches pack at their actual E
+  /// stride, so the received/deinterleaved buffers need one codeword, not a
+  /// cross-product of independent worst-case CB and E limits.
+  pusch_decoder_capacity capacity_{};
 
   /// Maximum LLRs per codeblock (BG1: 68*384 = 26112).
   static constexpr unsigned MAX_CB_LLRS = 68 * 384;
 
   /// Maximum output words per codeblock (BG1: 22*384/32 = 264).
   static constexpr unsigned MAX_CB_OUTPUT_WORDS = (22 * 384 + 31) / 32;
-
-  /// Maximum TB bytes (max TB size is ~1.3M bits = ~165KB).
-  static constexpr unsigned MAX_TB_BYTES = 200000;
 
   /// Cached decoder configuration.
   ldpc_base_graph_type cached_base_graph_   = ldpc_base_graph_type::BG1;

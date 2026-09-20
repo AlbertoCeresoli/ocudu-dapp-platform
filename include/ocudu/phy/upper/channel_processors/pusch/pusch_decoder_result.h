@@ -52,6 +52,10 @@ struct pusch_decoder_result {
     float avg_iters_query_us    = 0; ///< Host query for average LDPC iterations.
   };
   acceleration_timing acceleration_pipeline_timing;
+  /// False for a software-invalid resident input, not a measured radio CRC failure. Such a result must not deliver
+  /// payload, CSI or radio CRC diagnostics. FAPI suppresses its CRC/RX indications; normal HARQ timeout handles the
+  /// missing transmission. This does not add a private meaning to any standardized FAPI wire field.
+  bool input_valid = true;
 };
 
 } // namespace ocudu

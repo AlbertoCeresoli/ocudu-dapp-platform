@@ -8,11 +8,11 @@
 #pragma once
 
 #include "ocudu/adt/span.h"
+#include "ocudu/adt/unique_function.h"
 #include "ocudu/phy/upper/acceleration/phy_acceleration.h"
 #include "ocudu/phy/upper/log_likelihood_ratio.h"
 #include "ocudu/ran/sch/ldpc_base_graph.h"
 #include "ocudu/ran/sch/modulation_scheme.h"
-#include <functional>
 
 namespace ocudu {
 
@@ -81,6 +81,14 @@ public:
   /// \param[in] nof_softbits Number of codeword softbits, parameter \f$G^\textup{UL-SCH}\f$ in TS38.212 Section 6.2.7.
   virtual void set_nof_softbits(units::bits nof_softbits) = 0;
 
+  /// Discards a configured input before ANY softbits or decoder tasks have been submitted.
+  /// Caller has already stopped/fenced the failed producer and settled pending UCI/diagnostics.
+  /// Does not fence GPU work or invoke the post-decode callback. Preserves existing HARQ softbits,
+  /// clears the undeliverable TB, unlocks its buffer and notifies input_valid=false exactly once.
+  /// Returns false without changing state if unsupported, idle or any softbits were submitted.
+  /// Like new_data/on_new_softbits, this is an exclusive producer operation, not concurrent cancellation.
+  virtual bool discard_unsubmitted_input() { return false; }
+
   /// \brief Attempts to decode a resident accelerator softbit buffer.
   virtual bool try_decode_resident(const resident_softbit_buffer& codeword)
   {
@@ -125,11 +133,15 @@ public:
     (void)sinr_readback_us;
   }
 
-  /// \brief Set a callback to be invoked after resident decode completion but before join_and_notify.
+  /// Allocation-free notification of completed resident-input acceptance. Captures must fit the fixed capacity.
+  using resident_completion_callback = unique_function<void(bool accepted), 128, true>;
+
+  /// \brief Set a callback to be invoked after resident input acceptance, before committing HARQ state or notifying.
   ///
   /// Used for deferred metric readback: after the resident backend synchronizes the demodulation work, metric memory is
-  /// valid. The callback reads the metrics and sets them on the notifier before join_and_notify() consumes CSI data.
-  virtual void set_pre_join_callback(std::function<void()> callback) { (void)callback; }
+  /// valid. Only an accepted input may publish metrics, UCI or symbols. Rejection must settle pending control
+  /// notifications without reading candidate outputs. The caller's captures must outlive try_decode_resident().
+  virtual void set_pre_join_callback(resident_completion_callback callback) { (void)callback; }
 };
 
 } // namespace ocudu

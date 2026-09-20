@@ -99,6 +99,7 @@ pusch_decoder_buffer& pusch_decoder_impl::new_data(span<uint8_t>                
   resident_decode_enabled      = false;
   collect_acceleration_timing_ = false;
   gpu_tb_crc_result_.reset();
+  resident_input_valid_ = true;
   last_acceleration_timing_stats_ = {};
   demod_grid_staging_us_          = 0;
   demod_sync_us_                  = 0;
@@ -107,7 +108,7 @@ pusch_decoder_buffer& pusch_decoder_impl::new_data(span<uint8_t>                
   demod_call_us_                  = 0;
   decode_call_us_                 = 0;
   sinr_readback_us_               = 0;
-  pre_join_callback_              = nullptr;
+  pre_join_callback_              = {};
 #endif
 
   // Unset the expected number of UL-SCH softbits.
@@ -142,6 +143,34 @@ pusch_decoder_buffer& pusch_decoder_impl::new_data(span<uint8_t>                
   }
 
   return *this;
+}
+
+bool pusch_decoder_impl::discard_unsubmitted_input()
+{
+  if (current_state.load() != internal_states::collecting || softbits_count != 0 || available_cb_counter != 0) {
+    return false;
+  }
+  // No decoder work has touched the TB or HARQ state. Keep valid prior-transmission combining information;
+  // this differs from rejecting an already-decoded candidate that may have changed the decoder's staging state.
+  pusch_decoder_result result;
+  result.input_valid          = false;
+  result.tb_crc_ok            = false;
+  result.nof_codeblocks_total = 0;
+  result.ldpc_decoder_stats.reset();
+  ocuduvec::zero(transport_block);
+#ifdef ENABLE_CUDA
+  // This callback assumes a completed resident decode; it must not read candidate metrics on this path.
+  pre_join_callback_ = {};
+  gpu_tb_crc_result_.reset();
+#endif
+  codeblock_llrs.clear();
+  nof_ulsch_softbits.reset();
+  auto* notifier = std::exchange(result_notifier, nullptr);
+  unique_rm_buffer.unlock();
+  current_state.store(internal_states::idle);
+  notifier->on_sch_data(result);
+  // The notifier can arrange the next transmission. Do not touch members after notification.
+  return true;
 }
 
 span<log_likelihood_ratio> pusch_decoder_impl::get_next_block_view(unsigned block_size)
@@ -605,6 +634,7 @@ void pusch_decoder_impl::join_and_notify()
   std::for_each_n(cb_stats.begin(), nof_cbs, [&stats](unsigned element) { stats.ldpc_decoder_stats.update(element); });
 
 #ifdef ENABLE_CUDA
+  stats.input_valid = resident_input_valid_;
   if (gpu_tb_crc_result_.has_value()) {
     // GPU TB reassembly path: TB bytes already written to transport_block, TB CRC already checked on GPU.
     stats.tb_crc_ok = gpu_tb_crc_result_.value();
@@ -817,43 +847,48 @@ bool pusch_decoder_impl::try_decode_resident(const resident_softbit_buffer& code
                                             codeword.execution_context,
                                             codeword.buffer_index);
 
-  // Store GPU TB CRC result for join_and_notify() to use.
-  gpu_tb_crc_result_              = tb_result.tb_crc_ok;
+  // Backend completion fences the input and any host-owned acceptance receipt. Do not commit CRCs or import
+  // candidate HARQ softbits before checking it. A failed receipt is a software discard, even if the GPU CRC passed.
+  resident_input_valid_ = codeword.accept_completed_input();
+  if (!pre_join_callback_.is_empty()) {
+    // Consume the callback before invoking it: a later transmission cannot accidentally reuse old captures.
+    auto callback = std::move(pre_join_callback_);
+    callback(resident_input_valid_);
+  }
+
+  gpu_tb_crc_result_              = resident_input_valid_ && tb_result.tb_crc_ok;
   last_acceleration_timing_stats_ = gpu_decoder->get_last_timing_stats();
 
   // A resident decode never touches the host rate-matching buffers, but a retransmission of this transport block is
   // decoded on the host path and soft-combines with them (rate_dematch with new_data=false). Seed them with the
   // dematched first-transmission LLRs so HARQ combining works; if the backend cannot export them, reset the buffers so
   // the retransmission at least decodes on its own instead of against stale soft bits of an unrelated TB.
-  if (!tb_result.tb_crc_ok) {
+  if (!resident_input_valid_ || !tb_result.tb_crc_ok) {
     static_vector<span<log_likelihood_ratio>, MAX_NOF_SEGMENTS> rm_buffers;
     for (unsigned cb_id = 0; cb_id != nof_codeblocks; ++cb_id) {
       const unsigned cb_length = codeblock_llrs[cb_id].second.cb_specific.full_length;
       rm_buffers.push_back(unique_rm_buffer->get_codeblock_soft_bits(cb_id, cb_length));
     }
-    if (!gpu_decoder->export_resident_softbits(rm_buffers)) {
+    if (!resident_input_valid_ || !gpu_decoder->export_resident_softbits(rm_buffers)) {
       for (span<log_likelihood_ratio> rm_buffer : rm_buffers) {
         ocuduvec::zero(rm_buffer);
       }
     }
   }
+  if (!resident_input_valid_) {
+    ocuduvec::zero(transport_block);
+  }
 
   // Update per-CB CRC status and stats.
   span<bool> cb_crcs = unique_rm_buffer->get_codeblocks_crc();
   for (unsigned cb_id = 0; cb_id < nof_codeblocks; ++cb_id) {
-    cb_crcs[cb_id]  = tb_result.all_cb_crcs_ok;
+    cb_crcs[cb_id]  = resident_input_valid_ && tb_result.all_cb_crcs_ok;
     cb_stats[cb_id] = tb_result.nof_iterations;
   }
 
   // Set task counter to trigger join.
   cb_task_counter = 1;
   cb_task_counter.fetch_sub(1);
-
-  // Invoke pre-join callback (e.g., deferred SINR readback) after GPU sync but before notification.
-  if (pre_join_callback_) {
-    pre_join_callback_();
-    pre_join_callback_ = nullptr;
-  }
 
   // GPU decoding complete - notify results.
   if (collect_acceleration_timing_) {
