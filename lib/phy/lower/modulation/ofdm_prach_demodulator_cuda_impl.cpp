@@ -4,6 +4,7 @@
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 #include "ofdm_prach_demodulator_cuda_impl.h"
+#include "fmt/format.h"
 #include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/ran/prach/prach_frequency_mapping.h"
 #include "ocudu/ran/prach/prach_preamble_information.h"
@@ -97,7 +98,18 @@ void ofdm_prach_demodulator_cuda_impl::demodulate(prach_buffer&        buffer,
     return;
   }
 
-  report_fatal_error_if_not(!force_gpu_path, "Accelerated lower-PHY PRACH demodulation failed.");
+  if (last_failure_transient) {
+    last_failure_transient = false;
+    const unsigned k = transient_buffer_failures.fetch_add(1, std::memory_order_relaxed);
+    if (k < 32) {
+      fmt::print(stderr,
+                 "OCUDU WARNING: Lower-PHY PRACH GPU path skipped ({}): CUDA-visible PRACH buffer busy past its "
+                 "bounded wait; this occasion takes the fallback path.\n",
+                 k);
+    }
+  } else {
+    report_fatal_error_if_not(!force_gpu_path, "Accelerated lower-PHY PRACH demodulation failed.");
+  }
   fallback->demodulate(buffer, input, config);
 }
 
@@ -115,6 +127,17 @@ bool ofdm_prach_demodulator_cuda_impl::demodulate_ci16(prach_buffer&        buff
     return true;
   }
 
+  if (last_failure_transient) {
+    last_failure_transient = false;
+    const unsigned k = transient_buffer_failures.fetch_add(1, std::memory_order_relaxed);
+    if (k < 32) {
+      fmt::print(stderr,
+                 "OCUDU WARNING: Lower-PHY PRACH GPU path skipped ({}): CUDA-visible PRACH buffer busy past its "
+                 "bounded wait; this occasion takes the fallback path.\n",
+                 k);
+    }
+    return false;
+  }
   report_fatal_error_if_not(!force_gpu_path, "Accelerated lower-PHY PRACH demodulation failed.");
   return false;
 }
@@ -161,6 +184,7 @@ bool ofdm_prach_demodulator_cuda_impl::demodulate_gpu(prach_buffer&        buffe
 
   void* stream = ocudu_lowphy_prach_rx_get_stream(handle);
   if (!buffer.prepare_device_prach_buffer_mapping(stream)) {
+    last_failure_transient = true;  // bounded wait inside the PRACH buffer expired: one occasion, not a broken path
     return false;
   }
 
@@ -268,6 +292,7 @@ bool ofdm_prach_demodulator_cuda_impl::demodulate_gpu_ci16(prach_buffer&        
 
   void* stream = ocudu_lowphy_prach_rx_get_stream(handle);
   if (!buffer.prepare_device_prach_buffer_mapping(stream)) {
+    last_failure_transient = true;  // bounded wait inside the PRACH buffer expired: one occasion, not a broken path
     return false;
   }
 

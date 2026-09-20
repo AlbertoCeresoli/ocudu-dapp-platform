@@ -4,6 +4,7 @@
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 #include "ofdm_demodulator_cuda_impl.h"
+#include "fmt/format.h"
 #include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/phy/support/resource_grid_writer.h"
 #include "ocudu/ran/subcarrier_spacing.h"
@@ -149,6 +150,28 @@ ofdm_symbol_demodulator_cuda_impl::~ofdm_symbol_demodulator_cuda_impl()
   }
 }
 
+/// A transient CUDA-visible grid contention on the GPU path: consume the flag, log the first
+/// occurrences, and tell the caller to fall back to the next demodulation path (or drop the
+/// symbols for this slot via the host writer's own refusal) instead of aborting. The grid's
+/// waits are bounded at 5 ms on purpose ("failing the access for one slot is better than
+/// stalling the UL-PHY thread"); escalating that one-slot failure to report_fatal_error when
+/// the GPU path is forced is what took the cell down on 2026-09-20 after 2.6 days up.
+bool ofdm_symbol_demodulator_cuda_impl::transient_gpu_failure() const
+{
+  if (!last_failure_transient) {
+    return false;
+  }
+  last_failure_transient = false;
+  const unsigned k = transient_grid_failures.fetch_add(1, std::memory_order_relaxed);
+  if (k < 32) {
+    fmt::print(stderr,
+               "OCUDU WARNING: Lower-PHY RX GPU path skipped ({}): CUDA-visible grid busy (device mapping or "
+               "reader held past its bounded wait); symbols take the fallback path for this slot.\n",
+               k);
+  }
+  return true;
+}
+
 unsigned ofdm_symbol_demodulator_cuda_impl::get_max_ci16_symbol_batch_size() const
 {
   if (!gpu_available || lowphy_puxch_demodulation_disabled_by_env() || lowphy_puxch_symbol_batching_disabled_by_env()) {
@@ -181,6 +204,9 @@ bool ofdm_symbol_demodulator_cuda_impl::demodulate_ci16(resource_grid_writer& gr
     return true;
   }
 
+  if (transient_gpu_failure()) {
+    return false;
+  }
   report_fatal_error_if_not(!force_gpu_path, "Accelerated lower-PHY RX demodulation failed.");
   return false;
 }
@@ -201,6 +227,9 @@ bool ofdm_symbol_demodulator_cuda_impl::demodulate_ci16_ports(resource_grid_writ
     return true;
   }
 
+  if (transient_gpu_failure()) {
+    return false;
+  }
   report_fatal_error_if_not(!force_gpu_path, "Accelerated lower-PHY RX demodulation failed.");
   return false;
 }
@@ -224,6 +253,9 @@ bool ofdm_symbol_demodulator_cuda_impl::demodulate_ci16_symbol_batch_ports(resou
     return true;
   }
 
+  if (transient_gpu_failure()) {
+    return false;
+  }
   report_fatal_error_if_not(!force_gpu_path, "Accelerated lower-PHY RX demodulation failed.");
   return false;
 }
@@ -304,11 +336,22 @@ bool ofdm_symbol_demodulator_cuda_impl::demodulate_gpu_ci16_ports(resource_grid_
         "ensure_handle", std::chrono::steady_clock::now() - stage_start, inputs.size(), nof_samples, symbol_index);
   }
 
+  last_failure_transient = false;
+  if (std::chrono::steady_clock::now() < transient_skip_until) {
+    // The fallback chain retries the GPU path per symbol and per port after a batch failure; each
+    // retry would spin the grid's bounded wait again. Answer them from here for a short window.
+    last_failure_transient = true;
+    return false;
+  }
   void* stream = ocudu_lowphy_puxch_rx_get_stream(handle);
   if (timing_enabled) {
     stage_start = std::chrono::steady_clock::now();
   }
   if (!grid.prepare_device_grid_mapping(stream)) {
+    // Bounded wait inside the grid expired (device mapping still active or a device reader still
+    // holding): a one-slot contention, not a broken accelerator. See transient_gpu_failure().
+    last_failure_transient = true;
+    transient_skip_until   = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
     return false;
   }
   if (timing_enabled) {
@@ -481,11 +524,22 @@ bool ofdm_symbol_demodulator_cuda_impl::demodulate_gpu_ci16_symbol_batch_ports(
                                 first_symbol_index);
   }
 
+  last_failure_transient = false;
+  if (std::chrono::steady_clock::now() < transient_skip_until) {
+    // The fallback chain retries the GPU path per symbol and per port after a batch failure; each
+    // retry would spin the grid's bounded wait again. Answer them from here for a short window.
+    last_failure_transient = true;
+    return false;
+  }
   void* stream = ocudu_lowphy_puxch_rx_get_stream(handle);
   if (timing_enabled) {
     stage_start = std::chrono::steady_clock::now();
   }
   if (!grid.prepare_device_grid_mapping(stream)) {
+    // Bounded wait inside the grid expired (device mapping still active or a device reader still
+    // holding): a one-slot contention, not a broken accelerator. See transient_gpu_failure().
+    last_failure_transient = true;
+    transient_skip_until   = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
     return false;
   }
   if (timing_enabled) {

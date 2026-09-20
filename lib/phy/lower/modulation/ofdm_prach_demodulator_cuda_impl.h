@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "ocudu/phy/lower/modulation/ofdm_prach_demodulator.h"
 #include "ocudu/phy/lower/sampling_rate.h"
 #include <low_phy_prach_rx.h>
@@ -60,6 +62,9 @@ private:
   sampling_rate srate;
   /// True when failure to use the CUDA path is fatal.
   bool force_gpu_path = false;
+  /// Last GPU-path failure was a transient PRACH-buffer contention (see the .cpp); never fatal.
+  mutable bool                  last_failure_transient = false;
+  mutable std::atomic<unsigned> transient_buffer_failures{0};
   /// True when a CUDA device was detected during construction.
   bool gpu_available = false;
   /// CUDA PRACH backend handle.

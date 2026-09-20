@@ -9,6 +9,7 @@
 #include "phase_compensation_lut.h"
 #include "ocudu/phy/lower/modulation/ofdm_demodulator.h"
 #include <atomic>
+#include <chrono>
 #include <low_phy_puxch_rx.h>
 #include <memory>
 #include <mutex>
@@ -65,6 +66,9 @@ public:
                                           unsigned                  nof_symbols) override;
 
 private:
+  /// See the definition: consumes last_failure_transient and logs the first occurrences.
+  bool transient_gpu_failure() const;
+
   bool demodulate_gpu_ci16_ports(resource_grid_writer&     grid,
                                  span<const ci16_t* const> inputs,
                                  unsigned                  nof_samples,
@@ -96,6 +100,16 @@ private:
   double                                   current_center_freq_Hz;
   bool                                     force_gpu_path = false;
   bool                                     gpu_available  = false;
+  /// Set when the last GPU-path failure was a transient CUDA-visible grid contention (the grid's
+  /// bounded wait for an active device mapping or an outstanding device reader expired), as
+  /// opposed to the accelerated path being unavailable or a CUDA error. A transient failure
+  /// loses at most this batch of symbols and must not abort the process even when the GPU path
+  /// is forced (2026-09-20 01:03 abort: "unknown stage failed: cudaSuccess" -> fatal).
+  mutable bool                             last_failure_transient = false;
+  /// Rate-limited accounting of transient grid failures (first 32 are logged).
+  mutable std::atomic<unsigned>            transient_grid_failures{0};
+  /// After a transient failure, GPU attempts inside this window fail fast without touching the grid.
+  mutable std::chrono::steady_clock::time_point transient_skip_until{};
   ocudu_lowphy_puxch_rx_handle_t*          handle         = nullptr;
   std::mutex                               demodulator_mutex;
 };

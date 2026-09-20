@@ -653,7 +653,10 @@ private:
       return managed_data != nullptr;
     }
     for (void* event : pending_grid_ready_events) {
-      if (cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), static_cast<cudaEvent_t>(event), 0) != cudaSuccess) {
+      const cudaError_t status =
+          cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), static_cast<cudaEvent_t>(event), 0);
+      if (status != cudaSuccess) {
+        record_host_access_error(status, "cudaStreamWaitEvent on pending grid-ready events");
         return false;
       }
     }
@@ -668,6 +671,9 @@ private:
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
     while (device_mapping_active) {
       if (std::chrono::steady_clock::now() >= deadline) {
+        // Not a CUDA error: name the condition so the diagnostic is not "unknown stage: cudaSuccess"
+        // (2026-09-20 abort). The producer between prepare_device_mapping and its record never came.
+        record_host_access_error(cudaSuccess, "bounded wait for an active device mapping (5 ms)");
         return false;
       }
       lock.unlock();
@@ -826,6 +832,7 @@ private:
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
     while (device_read_holds > 0) {
       if (std::chrono::steady_clock::now() >= deadline) {
+        record_host_access_error(cudaSuccess, "bounded wait for outstanding device readers (5 ms)");
         return false;
       }
       lock.unlock();
