@@ -142,6 +142,29 @@ public:
   /// Gets the PUSCH demodulator notifier.
   pusch_demodulator_notifier& get_demodulator_notifier() { return pusch_demod_notifier; }
 
+  /// Settle a rejected resident grant without reading or publishing its CSI/symbol/UCI outputs. Resident mode
+  /// supports HARQ-ACK and CSI Part 1 only. Unknown UCI has the configured length, never candidate payload bits.
+  void discard_resident_outputs(unsigned nof_harq_ack, unsigned nof_csi_part1)
+  {
+    ocudu_assert(!pending_csi_part2, "Resident CSI Part 2 rejection is unsupported.");
+    uci_payload.csi = channel_state_information();
+    crc_sink_ = nullptr;
+    sym_sink_ = nullptr;
+    sym_buffer_.clear();
+    const bool notify = pending_harq_ack || pending_csi_part1;
+    if (pending_harq_ack) {
+      uci_payload.harq_ack = {uci_payload_type(nof_harq_ack), uci_status::unknown};
+      pending_harq_ack = false;
+    }
+    if (pending_csi_part1) {
+      uci_payload.csi_part1 = {uci_payload_type(nof_csi_part1), uci_status::unknown};
+      pending_csi_part1 = false;
+    }
+    if (notify) {
+      check_and_notify_uci();
+    }
+  }
+
   /// Gets the SCH data notifier.
   pusch_decoder_notifier& get_sch_data_notifier() { return sch_data_notifier; }
 
@@ -189,7 +212,9 @@ private:
     {
       if (stats.sinr_dB.has_value()) {
         csi.set_sinr_dB(channel_state_information::sinr_type::post_equalization, *stats.sinr_dB);
-        csi.set_sinr_dB(channel_state_information::sinr_type::channel_estimator, *stats.sinr_dB);
+      }
+      if (stats.channel_estimator_sinr_dB.has_value()) {
+        csi.set_sinr_dB(channel_state_information::sinr_type::channel_estimator, *stats.channel_estimator_sinr_dB);
       }
       if (stats.evm.has_value()) {
         csi.set_symbol_evm(i_symbol, *stats.evm);
@@ -214,7 +239,9 @@ private:
     {
       if (stats.sinr_dB.has_value()) {
         csi.set_sinr_dB(channel_state_information::sinr_type::post_equalization, *stats.sinr_dB);
-        csi.set_sinr_dB(channel_state_information::sinr_type::channel_estimator, *stats.sinr_dB);
+      }
+      if (stats.channel_estimator_sinr_dB.has_value()) {
+        csi.set_sinr_dB(channel_state_information::sinr_type::channel_estimator, *stats.channel_estimator_sinr_dB);
       }
       if (stats.evm.has_value()) {
         csi.set_total_evm(*stats.evm);
@@ -310,10 +337,20 @@ private:
 
   void on_sch_data(const pusch_decoder_result& result) override
   {
+    // A terminal MAC result does not end the diagnostic tail below. Retain the originating pool entry
+    // through this entire method, even when an intermediate metrics notifier clears its forward pointer.
+    auto processing = notifier->acquire_processing_activity();
     // MAC first — diagnostics never delay CRC/TB delivery.
     pusch_processor_result_data result_data;
     result_data.data = result;
     result_data.csi  = uci_payload.csi;
+    if (!result.input_valid) {
+      result_data.data.tb_crc_ok = false;
+      result_data.csi = channel_state_information();
+      crc_sink_ = nullptr;
+      sym_sink_ = nullptr;
+      sym_buffer_.clear();
+    }
     notifier->on_sch(result_data);
 
     if (crc_sink_ != nullptr) {

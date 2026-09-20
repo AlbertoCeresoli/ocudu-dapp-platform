@@ -6,9 +6,13 @@
 
 #include "ocudu/adt/mpmc_queue.h"
 #include "ocudu/ocudulog/logger.h"
+#include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/phy/upper/channel_processors/pusch/formatters.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_processor.h"
+#include "ocudu/phy/upper/unique_rx_buffer.h"
 #include "ocudu/support/memory_pool/bounded_object_pool.h"
+#include <atomic>
+#include <limits>
 
 namespace ocudu {
 
@@ -27,8 +31,12 @@ public:
 
   /// Creates a PUSCH processor wrapper from another PUSCH processor wrapper.
   pusch_processor_wrapper(pusch_processor_wrapper&& other) :
-    unique_pool_ptr(std::move(other.unique_pool_ptr)), notifier(other.notifier), processor(std::move(other.processor))
+    unique_pool_ptr(std::move(other.unique_pool_ptr)),
+    upstream_activity(std::move(other.upstream_activity)),
+    notifier(other.notifier),
+    processor(std::move(other.processor))
   {
+    ocudu_assert(other.activities.load(std::memory_order_relaxed) == 0, "Cannot move an active PUSCH processor.");
     other.notifier = nullptr;
   }
 
@@ -39,6 +47,12 @@ public:
                const resource_grid_reader&      grid,
                const pdu_t&                     pdu) override
   {
+    ocudu_assert(activities.load(std::memory_order_relaxed) == 0, "PUSCH processing activity is still in use.");
+    // One implicit reference remains until terminal SCH notification, even if process() returns asynchronously.
+    activities.store(1, std::memory_order_relaxed);
+    auto processing = acquire_processing_activity();
+    // Retain the original uplink slot/grid/task while ANY of this wrapper's consumers is still active.
+    upstream_activity = notifier_.acquire_processing_activity();
     // Save original notifier.
     [[maybe_unused]] pusch_processor_result_notifier* prev_notifier = std::exchange(notifier, &notifier_);
     ocudu_assert(prev_notifier == nullptr, "PUSCH processor is in use.");
@@ -51,9 +65,31 @@ public:
   void set_unique_ptr(pool::ptr unique_token_) { unique_pool_ptr = std::move(unique_token_); }
 
 private:
+  pusch_processing_activity acquire_processing_activity() noexcept override
+  {
+    const auto previous = activities.fetch_add(1, std::memory_order_relaxed);
+    ocudu_assert(previous != 0 && previous != std::numeric_limits<unsigned>::max(), "Invalid PUSCH activity count.");
+    return {this, &release_activity};
+  }
+
+  static void release_activity(void* context) noexcept
+  {
+    auto& owner = *static_cast<pusch_processor_wrapper*>(context);
+    const auto previous = owner.activities.fetch_sub(1, std::memory_order_acq_rel);
+    ocudu_assert(previous != 0, "Unbalanced PUSCH activity release.");
+    if (previous == 1) {
+      // Empty both members before publishing the pool entry. Return the inner pool entry BEFORE releasing
+      // the original slot: slot completion can permit destruction/reuse of the surrounding uplink processor.
+      auto upstream = std::move(owner.upstream_activity);
+      auto lease = std::move(owner.unique_pool_ptr);
+      // Destruction order is lease then upstream. Do not access owner after lease destruction.
+    }
+  }
+
   // See pusch_processor_result_notifier for documentation.
   void on_uci(const pusch_processor_result_control& uci) override
   {
+    auto processing = acquire_processing_activity();
     ocudu_assert(notifier != nullptr, "Invalid notifier.");
     notifier->on_uci(uci);
   }
@@ -61,17 +97,22 @@ private:
   // See pusch_processor_result_notifier for documentation.
   void on_sch(const pusch_processor_result_data& sch) override
   {
+    auto processing = acquire_processing_activity();
     // Notify the completion of the processing.
     pusch_processor_result_notifier* current_notifier = std::exchange(notifier, nullptr);
     ocudu_assert(current_notifier != nullptr, "Invalid notifier.");
     current_notifier->on_sch(sch);
 
-    // Return the pusch processor identifier to the free list.
-    unique_pool_ptr = nullptr;
+    // Result delivery closes the implicit reference, not the whole processing lifetime. Caller activities
+    // keep the wrapper occupied through decoder/diagnostic tails and asynchronous consumers.
+    release_activity(this);
   }
 
   /// Processor identifier within the pool.
   pool::ptr unique_pool_ptr;
+  pusch_processing_activity upstream_activity;
+  std::atomic<unsigned> activities{};
+  static_assert(std::atomic<unsigned>::is_always_lock_free, "PUSCH activity must not introduce a hidden lock.");
   /// Current PUSCH processor notifier.
   pusch_processor_result_notifier* notifier = nullptr;
   /// Wrapped PUSCH processor.

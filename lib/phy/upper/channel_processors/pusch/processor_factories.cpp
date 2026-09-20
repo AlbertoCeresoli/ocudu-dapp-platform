@@ -15,6 +15,7 @@
 #include "ocudu/phy/upper/diagnostics/phy_diagnostics.h"
 #include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/phy/upper/channel_processors/pusch/factories.h"
+#include "ocudu/support/error_handling.h"
 #include <algorithm>
 #include <condition_variable>
 #include <mutex>
@@ -38,16 +39,22 @@ public:
                                        std::shared_ptr<crc_calculator_factory>      crc_factory_,
                                        std::string                                  ldpc_decoder_algorithm_,
                                        unsigned                                     max_decoders_,
-                                       int                                          cuda_device_id_) :
+                                       int                                          cuda_device_id_,
+                                       unsigned                                     max_nof_prb_,
+                                       unsigned                                     max_nof_layers_) :
     dematcher_factory(std::move(dematcher_factory_)),
     crc_factory(std::move(crc_factory_)),
     ldpc_decoder_algorithm(std::move(ldpc_decoder_algorithm_)),
     max_decoders(max_decoders_),
-    nvcuda_device_id(cuda_device_id_)
+    nvcuda_device_id(cuda_device_id_),
+    max_nof_prb(max_nof_prb_),
+    max_nof_layers(max_nof_layers_)
   {
     ocudu_assert(dematcher_factory, "Invalid LDPC dematcher factory.");
     ocudu_assert(crc_factory, "Invalid CRC calculator factory.");
     ocudu_assert(max_decoders > 0, "Invalid maximum number of batch GPU decoders.");
+    report_fatal_error_if_not(make_pusch_decoder_capacity(max_nof_prb, max_nof_layers).has_value(),
+                             "Invalid configured PUSCH decoder dimensions");
     entries.reserve(max_decoders);
   }
 
@@ -119,7 +126,7 @@ private:
     batch_crcs.crc24B = crc_factory->create(crc_generator_poly::CRC24B);
 
     auto decoder = std::make_unique<pusch_codeblock_decoder_cuda_batch>(
-        dematcher_factory->create(), std::move(batch_crcs), nvcuda_device_id);
+        dematcher_factory->create(), std::move(batch_crcs), nvcuda_device_id, max_nof_prb, max_nof_layers);
     decoder->set_ldpc_decoder_algorithm(ldpc_decoder_algorithm);
     return decoder;
   }
@@ -145,6 +152,8 @@ private:
   std::string                                  ldpc_decoder_algorithm;
   unsigned                                     max_decoders;
   int                                          nvcuda_device_id;
+  unsigned                                     max_nof_prb;
+  unsigned                                     max_nof_layers;
   bool                                         saturation_warning_logged = false;
   std::mutex                                   mutex;
   std::condition_variable                      available;
@@ -228,7 +237,8 @@ public:
         nof_resident_acceleration_decoders = MAX_BATCH_GPU_DECODERS;
       }
       batch_gpu_decoder_pool = std::make_shared<bounded_pusch_batch_gpu_decoder_pool>(
-          dematcher_factory, crc_factory, ldpc_decoder_algorithm, nof_resident_acceleration_decoders, nvcuda_device_id);
+          dematcher_factory, crc_factory, ldpc_decoder_algorithm, nof_resident_acceleration_decoders,
+          nvcuda_device_id, nof_prb, nof_layers);
     } else if (enable_resident_acceleration_decoder) {
       ocudulog::fetch_basic_logger("PHY").warning("PUSCH resident GPU decoder disabled because CUDA is not available.");
     }

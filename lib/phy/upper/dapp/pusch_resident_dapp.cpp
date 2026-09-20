@@ -6,6 +6,8 @@
 #include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/phy/upper/dapp/pusch_dapp_channel_estimator.h"
 #include "ocudu/phy/upper/dapp/pusch_dapp_demodulator.h"
+#include "ocudu/phy/upper/dapp/native_receiver_resident_adapter.h"
+#include "ocudu/phy/upper/acceleration/resident_receiver_handoff.h"
 #include "ocudu/phy/upper/sequence_generators/pseudo_random_generator.h"
 #include "ocudu/ran/pusch/pusch_constants.h"
 #include "ocudu/support/math/math_utils.h"
@@ -305,6 +307,10 @@ public:
 
   ~cuda_resident_dapp() override
   {
+    // Check BEFORE destroying any buffer/event: the member adapter's destructor runs after this body.
+    if (receiver_pending.load(std::memory_order_acquire)) {
+      std::terminate();
+    }
     for (auto& timing : timings) {
       if (timing.start != nullptr) {
         cudaEventDestroy(timing.start);
@@ -377,6 +383,11 @@ public:
     }
   }
 
+  bool bind_control_context(std::shared_ptr<dapp::native_control_context> context) noexcept override
+  {
+    return context && target->set_receiver_control_context(lane, std::move(context));
+  }
+
   pusch_resident_dapp_mode mode() const noexcept override
   {
     const auto demodulator_mode = target->active_mode();
@@ -422,6 +433,7 @@ public:
                                                  const pusch_demodulator::configuration& config) noexcept override
   {
     receiver_noise_valid = false;
+    receiver_symbols_valid = false;
     try {
       return invoke_receiver_impl(buffers, config);
     } catch (...) {
@@ -430,7 +442,35 @@ public:
     }
   }
 
+  bool begin_grant() noexcept override
+  {
+    if (receiver_pending.load(std::memory_order_acquire)) {
+      return false;
+    }
+    // Reset at the grant boundary, not only in invoke_receiver(): the next grant may use baseline, CE or EQ.
+    // finish_receiver() publishes pending=false only after all consumers and retained owners are finished.
+    receiver_completion_selected = false;
+    receiver_codeword            = {};
+    receiver_noise_valid         = false;
+    receiver_symbols_valid       = false;
+    return true;
+  }
+
   bool receiver_post_eq_noise_valid() const noexcept override { return receiver_noise_valid; }
+  bool receiver_equalized_symbols_valid() const noexcept override { return receiver_symbols_valid; }
+
+  resident_softbit_buffer receiver_softbits(const resident_softbit_buffer& current) const noexcept override
+  {
+    return receiver_completion_selected ? forward_receiver_completion(receiver_codeword, current) : current;
+  }
+
+  void receiver_consumers_returned() noexcept override
+  {
+    if (receiver_pending.load(std::memory_order_acquire)) {
+      receiver_consumers_done.store(true, std::memory_order_release);
+      static_cast<void>(finish_receiver(false));
+    }
+  }
 
   void on_completion(void* completion_token) noexcept override
   {
@@ -539,6 +579,17 @@ public:
       }
       std::this_thread::yield();
     }
+    // Native hook clear has withdrawn publication and waited for its invocation readers. Keep its original
+    // worker alive until decoder/CPU diagnostics return AND all borrowed host streams complete.
+    while (receiver_pending.load(std::memory_order_acquire)) {
+      if (finish_receiver(true)) {
+        break;
+      }
+      if (std::chrono::steady_clock::now() >= deadline_) {
+        return false;
+      }
+      std::this_thread::yield();
+    }
     auto event = static_cast<cudaEvent_t>(latest_completion.load(std::memory_order_acquire));
     if (event == nullptr) {
       return true;
@@ -560,6 +611,51 @@ public:
   }
 
 private:
+  bool finish_receiver(bool control) noexcept
+  {
+    if (receiver_reclaim_gate.test_and_set(std::memory_order_acquire)) {
+      return false;
+    }
+    struct unlock {
+      std::atomic_flag& gate;
+      ~unlock() { gate.clear(std::memory_order_release); }
+    } unlock_guard{receiver_reclaim_gate};
+    if (!receiver_pending.load(std::memory_order_acquire)) {
+      return true;
+    }
+    if (!receiver_consumers_done.load(std::memory_order_acquire)) {
+      return false;
+    }
+    for (void* value : receiver_streams) {
+      if (value && cudaStreamQuery(static_cast<cudaStream_t>(value)) != cudaSuccess) {
+        return false; // A deadline or error does not return uncertain buffer ownership.
+      }
+    }
+    if (receiver_codeword.valid) {
+      native_receiver_reclaimed reclaimed;
+      if (receiver_adapter.release_after_consumers(receiver_codeword, reclaimed) != OCUDU_DAPP_OK_V1) {
+        return false;
+      }
+      // L1 caller still owns its actual dependency and original processing activity. Native hook clear is
+      // waiting on receiver_pending and still owns the native worker. These releases cannot be final GPU/
+      // dependency destruction on that path. Control callers may perform final destruction here.
+      reclaimed.tensors.reset();
+      reclaimed.worker.reset();
+    } else {
+      if (!control) {
+        return false; // Partial submission requires control-only backend retirement.
+      }
+      std::array<native_receiver_reclaimed, native_receiver_resident_adapter::capacity> reclaimed;
+      if (receiver_adapter.retire(reclaimed) != OCUDU_DAPP_OK_V1) {
+        return false;
+      }
+      // Destruction occurs on this control path before allowing the native hook to clear its original worker.
+    }
+    receiver_codeword = {};
+    receiver_pending.store(false, std::memory_order_release);
+    return true;
+  }
+
   struct timing_record {
     cudaEvent_t              start{};
     cudaEvent_t              module_end{};
@@ -629,7 +725,7 @@ private:
     static_cast<void>(cudaGetLastError());
   }
 
-  void report_fallback(pusch_resident_dapp_mode mode, dapp::class_a_fallback_reason reason) noexcept
+  void report_fallback(pusch_resident_dapp_mode mode, dapp::class_a_fallback_reason reason) noexcept override
   {
     if (mode == pusch_resident_dapp_mode::channel_estimator) {
       channel_estimator->report_fallback(lane, reason);
@@ -997,6 +1093,11 @@ private:
   dapp::native_invocation_result invoke_receiver_impl(const pusch_resident_dapp_buffers&      buffers,
                                                       const pusch_demodulator::configuration& config)
   {
+    if (receiver_pending.load(std::memory_order_acquire)) {
+      // The previous invocation still owns this adapter's staging buffers. Never permit overwrite.
+      return {OCUDU_DAPP_DEVICE_ERROR_V1, false};
+    }
+    receiver_completion_selected = false;
     if (target->active_mode() != pusch_dapp_demodulator_mode::receiver ||
         target->backend_id(pusch_dapp_demodulator_mode::receiver) != OCUDU_DAPP_BACKEND_CUDA_V1) {
       return {OCUDU_DAPP_BYPASS_V1, true};
@@ -1010,7 +1111,21 @@ private:
       target->report_fallback(lane, pusch_dapp_demodulator_mode::receiver, *reason);
       return {OCUDU_DAPP_UNSUPPORTED_V1, true};
     }
-    prepared_invocation prepared;
+    const bool deferred = target->receiver_completion_required();
+    pusch_resource_loan tensors;
+    if (deferred) {
+      if (!config.resource_owner || !buffers.codeword.valid ||
+          buffers.consumer_streams[0] != reinterpret_cast<void*>(static_cast<uintptr_t>(buffers.execution_stream))) {
+        return {OCUDU_DAPP_UNSUPPORTED_V1, true};
+      }
+      tensors = config.resource_owner->acquire();
+      if (!tensors) {
+        return {OCUDU_DAPP_RESOURCE_V1, true};
+      }
+    }
+    // Stable dependency-owned metadata, retained together with tensors during deferred dispatch.
+    receiver_prepared = {};
+    auto& prepared = receiver_prepared;
     const auto          status = prepare(buffers,
                                 config,
                                 target->worker_id(lane, pusch_dapp_demodulator_mode::receiver),
@@ -1023,13 +1138,15 @@ private:
                                                                : dapp::class_a_fallback_reason::unsupported_dmrs);
       return {status, true};
     }
-    ocudu_dapp_receiver_input_v1 input{};
+    receiver_input = {};
+    auto& input = receiver_input;
     input.invocation = prepared.invocation;
     input.rx_grid    = prepared.grid;
     input.pusch      = prepared.pusch_view;
     input.dmrs       = prepared.dmrs_view;
 
-    ocudu_dapp_receiver_output_v1 output{};
+    receiver_output = {};
+    auto& output = receiver_output;
     output.llrs = make_device_tensor(
         static_cast<uint16_t*>(buffers.llrs_f16),
         OCUDU_DAPP_ELEMENT_F16_V1,
@@ -1039,7 +1156,8 @@ private:
         prepared.generation,
         {buffers.nof_data_re, config.nof_tx_layers, static_cast<uint64_t>(prepared.pusch.modulation)},
         OCUDU_DAPP_LAYOUT_PUSCH_LLR_DATA_RE_LAYER_BIT_V1);
-    ocudu_dapp_receiver_metrics_v1 metrics{};
+    receiver_metrics = {};
+    auto& metrics = receiver_metrics;
     if (buffers.post_eq_noise_f32 != nullptr) {
       metrics.struct_size             = sizeof(metrics);
       metrics.abi_major               = OCUDU_DAPP_ABI_MAJOR_V1;
@@ -1052,6 +1170,16 @@ private:
                                                            prepared.generation,
                                                            {buffers.nof_data_re, config.nof_tx_layers},
                                                            OCUDU_DAPP_LAYOUT_PUSCH_POST_EQ_NOISE_DATA_RE_LAYER_V1);
+      if (buffers.equalized_cf32 != nullptr) {
+        metrics.equalized_symbols = make_device_tensor(static_cast<cf_t*>(buffers.equalized_cf32),
+                                                       OCUDU_DAPP_ELEMENT_CF32_V1,
+                                                       OCUDU_DAPP_ACCESS_WRITE_V1,
+                                                       buffers.device_ordinal,
+                                                       prepared.allocation_base + 7,
+                                                       prepared.generation,
+                                                       {buffers.nof_data_re, config.nof_tx_layers},
+                                                       OCUDU_DAPP_LAYOUT_PUSCH_EQUALIZED_DATA_RE_LAYER_V1);
+      }
       output.metrics                  = make_metadata(OCUDU_DAPP_METADATA_RECEIVER_METRICS_V1, metrics);
     }
     if (!begin_timing(buffers.completion_slot, pusch_resident_dapp_mode::receiver, prepared.invocation)) {
@@ -1059,9 +1187,32 @@ private:
       return {OCUDU_DAPP_DEVICE_ERROR_V1, true};
     }
     pending_callbacks.fetch_add(1, std::memory_order_acq_rel);
-    const auto result    = target->invoke(lane, input, output);
+    dapp::native_invocation_result result;
+    if (deferred) {
+      receiver_streams = buffers.consumer_streams;
+      receiver_codeword = buffers.codeword;
+      receiver_consumers_done.store(false, std::memory_order_relaxed);
+      receiver_pending.store(true, std::memory_order_release);
+      result = receiver_adapter.submit(*target, lane, input, output, receiver_codeword, tensors);
+      if (tensors) {
+        // Before-dispatch rejection: no native owner escaped and original caller still owns the dependency.
+        tensors.reset();
+        receiver_codeword = {};
+        receiver_pending.store(false, std::memory_order_release);
+      } else {
+        receiver_completion_selected = true;
+        if (result.status != OCUDU_DAPP_OK_V1) {
+          receiver_codeword = {}; // Unpublished partial work must be retired, never consumed.
+        }
+      }
+    } else {
+      result = target->invoke(lane, input, output);
+    }
     receiver_noise_valid = result.status == OCUDU_DAPP_OK_V1 && !result.invoke_fallback &&
                            (output.reserved0 & OCUDU_DAPP_RECEIVER_METRICS_VALID_V1) != 0;
+    receiver_symbols_valid = buffers.equalized_cf32 != nullptr && result.status == OCUDU_DAPP_OK_V1 &&
+                             !result.invoke_fallback &&
+                             (output.reserved0 & OCUDU_DAPP_RECEIVER_EQUALIZED_SYMBOLS_VALID_V1) != 0;
     record_module_end(buffers.completion_slot, result);
     return result;
   }
@@ -1143,11 +1294,22 @@ private:
   void*                                                           device_channel_scheduler_noise{};
   bool                                                            scheduler_noise_valid{};
   bool                                                            receiver_noise_valid{};
+  bool                                                            receiver_symbols_valid{};
   uint64_t                                                        invocation_sequence{};
   std::atomic<uint32_t>                                           pending_callbacks{};
   std::atomic<void*>                                              latest_completion{};
   std::atomic<bool>                                               diagnostic_timing_enabled{};
   std::array<timing_record, pusch_resident_dapp_completion_slots> timings{};
+  prepared_invocation receiver_prepared{};
+  ocudu_dapp_receiver_input_v1 receiver_input{};
+  ocudu_dapp_receiver_output_v1 receiver_output{};
+  ocudu_dapp_receiver_metrics_v1 receiver_metrics{};
+  native_receiver_resident_adapter receiver_adapter;
+  resident_softbit_buffer receiver_codeword{};
+  std::array<void*, 3> receiver_streams{};
+  std::atomic<bool> receiver_pending{}, receiver_consumers_done{};
+  std::atomic_flag receiver_reclaim_gate = ATOMIC_FLAG_INIT;
+  bool receiver_completion_selected{};
 };
 
 } // namespace

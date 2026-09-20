@@ -11,6 +11,15 @@ style as other OCUDU architecture notes.
 
 ## Start here
 
+Receiver authors: see the [optional full-receiver symbol-output contract](receiver_symbol_output.md)
+for constellation capture without requiring every receiver to produce symbols.
+For asynchronous output validation and original-worker retention, see the
+[opt-in receiver completion extension](receiver_completion.md); production
+PHY/resource integration is still required before advertising that capability.
+The [CUDA control-context boundary](receiver_control_context.md) describes
+exact PHY-stream binding, cold lifecycle ownership and its remaining device
+qualification requirements.
+
 **Read the papers first?** The quickstart repository ships two preview papers: the [architecture and tutorial paper](https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-quickstart/-/blob/main/papers/ocudu_dapp_tutorial.pdf) and the [measured interface study](https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-quickstart/-/blob/main/papers/ocudu_dapp_interface_study.pdf).
 
 **New to the platform? Follow the step-by-step tutorials** — a guided path
@@ -21,7 +30,7 @@ a loopback E3 agent the tutorial commands can target.
 ```bash
 # clone the set side by side; the platform repo must be cloned as ocudu/
 mkdir ocudu-workspace && cd ocudu-workspace
-git clone https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-platform.git ocudu
+git clone --recurse-submodules https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-platform.git ocudu   # third_party/asn1c and third_party/libe3 are submodules
 git clone https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-sdk.git
 git clone https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-quickstart.git ocudu-docker
 ```

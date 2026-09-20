@@ -107,11 +107,31 @@ add_executable(pusch_e2e_pipeline_test pusch_e2e_pipeline_test.cpp)
 target_link_libraries(pusch_e2e_pipeline_test ocudu_pxsch_bler_test_helpers)
 if(CUDA_ACCEL_FOUND)
   target_compile_definitions(pusch_e2e_pipeline_test PRIVATE ENABLE_CUDA)
+  target_sources(pusch_e2e_pipeline_test PRIVATE pusch_test_pilot_admission_trace.cpp)
+  target_link_options(pusch_e2e_pipeline_test PRIVATE -Wl,--wrap=pusch_e2e_validate_pilot_metrics)
   target_include_directories(pusch_e2e_pipeline_test PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc
   )
-  target_link_libraries(pusch_e2e_pipeline_test ocudu_ldpc_cuda CUDA::cudart)
+  target_link_libraries(pusch_e2e_pipeline_test ocudu_ldpc_cuda CUDA::cudart CUDA::cuda_driver)
+  if(TARGET ocudu_dapp_app_service AND TARGET ocudu-dapp-preflight)
+    # Test-only receipt/query diagnostics. Internal C++ symbols are pinned to
+    # this host build; an ABI name drift fails the link, never changes dispatch.
+    target_sources(pusch_e2e_pipeline_test PRIVATE pusch_test_receiver_retirement_trace.cpp pusch_test_receiver_capture.cpp)
+    target_link_options(pusch_e2e_pipeline_test PRIVATE
+      -Wl,--wrap=cudaStreamQuery
+      -Wl,--wrap=_ZN5ocudu4dapp17native_hook_point24invoke_receiver_deferredEjRK28ocudu_dapp_receiver_input_v1R29ocudu_dapp_receiver_output_v1RNS0_22native_receiver_ticketERSt10shared_ptrINS0_13native_workerEE
+      -Wl,--wrap=scrambler_descramble_llr_half_inplace
+      -Wl,--wrap=rate_matcher_deinterleave_and_dematch_batch_half
+      -Wl,--wrap=ldpc_decoder_decode_batch_half_from_rate_matched
+      -Wl,--wrap=_ZN5ocudu4dapp13native_worker16inspect_receiverERKNS0_22native_receiver_ticketER40ocudu_dapp_receiver_completion_result_v1
+      -Wl,--wrap=_ZN5ocudu4dapp13native_worker16release_receiverERKNS0_22native_receiver_ticketE)
+    target_link_libraries(pusch_e2e_pipeline_test ocudu_dapp_app_service ocudu_phy_dapp_adapters)
+    target_compile_definitions(pusch_e2e_pipeline_test PRIVATE
+      OCUDU_PUSCH_TEST_DAPP
+      OCUDU_DAPP_PREFLIGHT_HELPER="$<TARGET_FILE:ocudu-dapp-preflight>")
+    add_dependencies(pusch_e2e_pipeline_test ocudu-dapp-preflight)
+  endif()
 endif()
 add_test(pusch_e2e_pipeline_test pusch_e2e_pipeline_test)
 

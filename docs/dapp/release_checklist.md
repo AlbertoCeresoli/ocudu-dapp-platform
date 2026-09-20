@@ -15,11 +15,21 @@
 
 A required failing gate blocks the tag. A waiver records its owner, risk, rationale, and follow-up issue in the release evidence.
 
+The required cross-repository jobs run `scripts/check_dapp_interop_gate.py`:
+real patched-libe3 E2E, native/Python wire compatibility, SHM validation,
+telemetry isolation, and the SDK built against that host's installed SDK.
+Missing or skipped required tests fail the job. Record both full commit IDs.
+The SDK job requires a paired host commit containing this gate; update its host
+lock (or explicitly set `OCUDU_HOST_REF`) after the host changes are committed
+and published. Never waive the job merely because the old host pin lacks it.
+Run the comparative delivery benchmark separately under a controlled load;
+functional conformance does not certify timing, CUDA, or OTA performance.
+
 ## E3 SCTP carriers and telemetry
 
 | Gate | Evidence |
 |------|----------|
-| ASN.1 modules validate with both toolchains | `asn1tools parse` at configure time; asn1c APER generation for `E3-PDU`, `Telemetry-*`, `Mgmt-RanFunctionData` |
+| ASN.1 modules validate with both toolchains | `asn1tools parse` at configure time; asn1c APER generation for `E3-PDU`, `Telemetry-*`, `Mgmt-RanFunctionData` and the libe3 `E3-PDU` with the pinned `third_party/asn1c` (bumping that submodule regenerates the codecs and requires re-pinning `python/tests/fixtures/libe3_vectors.json` and the golden vectors) |
 | Codec round trips and cross-language golden vectors | `dapp_runtime_test --gtest_filter='dapp_e3ap_codec.*'` and `python/tests/test_e3ap_client.py` pin identical setup bytes |
 | Producer never blocks | `dapp_telemetry_publisher.*` (gate before capture, per-RNTI floors, drop accounting) |
 | E3AP procedures | `dapp_e3ap_sctp_server.*`: setup/refusal, fragmented indications with RNTI filter, management as control action, setup-required, garbage close, idle/setup timeouts |

@@ -214,6 +214,12 @@ public:
 class resident_receiver_spy final : public pusch_resident_dapp
 {
 public:
+  bool bind_control_context(std::shared_ptr<dapp::native_control_context> context) noexcept override
+  {
+    control_context = std::move(context);
+    return bool(control_context);
+  }
+  std::shared_ptr<dapp::native_control_context> control_context;
   pusch_resident_dapp_mode mode() const noexcept override { return pusch_resident_dapp_mode::receiver; }
 
   dapp::native_invocation_result invoke_equalizer(const pusch_resident_dapp_buffers&,
@@ -252,6 +258,12 @@ public:
 class resident_equalizer_spy final : public pusch_resident_dapp
 {
 public:
+  bool bind_control_context(std::shared_ptr<dapp::native_control_context> context) noexcept override
+  {
+    control_context = std::move(context);
+    return bool(control_context);
+  }
+  std::shared_ptr<dapp::native_control_context> control_context;
   pusch_resident_dapp_mode mode() const noexcept override { return pusch_resident_dapp_mode::equalizer; }
 
   dapp::native_invocation_result invoke_equalizer(const pusch_resident_dapp_buffers& buffers,
@@ -973,6 +985,7 @@ TEST(pusch_resident_dapp_adapter, accelerated_receiver_uses_dapp_output_and_exis
   auto dapp = std::make_shared<resident_receiver_spy>();
   ASSERT_TRUE(demodulator->install_resident_dapp(dapp));
   demodulator->enable_resident_mode();
+  demodulator->enable_symbol_capture();
 
   auto config    = make_config();
   config.rb_mask = crb_bitmap(nof_prb);
@@ -999,6 +1012,10 @@ TEST(pusch_resident_dapp_adapter, accelerated_receiver_uses_dapp_output_and_exis
   for (uint16_t value : llrs) {
     EXPECT_EQ(value & 0x7fffU, 0U);
   }
+  // This full receiver intentionally returns LLRs only. A noise-reduction
+  // extent is not evidence that d_symbols_ was filled for this invocation.
+  demodulator->wait_captured_symbols();
+  EXPECT_TRUE(demodulator->get_captured_symbols().empty());
   EXPECT_EQ(codeword.blocks, 0U);
   EXPECT_EQ(codeword.end_calls, 0U);
   demodulator->report_deferred_sinr(notifier);

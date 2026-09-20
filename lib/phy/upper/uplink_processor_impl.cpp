@@ -350,6 +350,7 @@ void uplink_processor_impl::process_pusch(const uplink_pdu_slot_repository::pusc
 
   // Try to enqueue asynchronous processing.
   bool success = task_executors.pusch_executor.defer([this, data, rm_buffer2 = std::move(rm_buffer), &pdu]() mutable {
+    pusch_processing_activity slot_activity;
     auto task_scope = make_scoped_trace(l1_ul_tracer, "L1.UL.PUSCH.task");
 
     // Select and configure notifier adaptor.
@@ -359,6 +360,9 @@ void uplink_processor_impl::process_pusch(const uplink_pdu_slot_repository::pusc
         notifier, pdu.pdu.rnti, pdu.pdu.slot, pdu.pdu.harq_id, data, pdu.pdu.n_rapid, [this]() {
           state_machine.on_finish_processing_pdu();
         });
+
+    // Retain the real slot/grid/PDU owner through this task's return, not merely terminal SCH delivery.
+    slot_activity = processor_notifier.acquire_processing_activity();
 
     trace_point tp = l1_ul_tracer.now();
 

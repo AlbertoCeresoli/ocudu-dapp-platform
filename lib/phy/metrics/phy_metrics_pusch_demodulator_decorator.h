@@ -62,13 +62,21 @@ public:
 
   resident_softbit_buffer get_resident_softbits() const override { return base->get_resident_softbits(); }
 
+  void finish_resident_consumers() override { base->finish_resident_consumers(); }
+
   bool used_host_codeword_fallback() const override { return base->used_host_codeword_fallback(); }
+
+  bool discarded_inline_input() const override { return base->discarded_inline_input(); }
 
   resident_uci_buffer get_resident_uci() const override { return base->get_resident_uci(); }
 
   void finalize_resident_uci() override { base->finalize_resident_uci(); }
 
   float get_last_grid_staging_us() const override { return base->get_last_grid_staging_us(); }
+
+  bool used_device_grid() const override { return base->used_device_grid(); }
+
+  bool used_owned_device_grid() const override { return base->used_owned_device_grid(); }
 
   float get_last_demod_sync_us() const override { return base->get_last_demod_sync_us(); }
 

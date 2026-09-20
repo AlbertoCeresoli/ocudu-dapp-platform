@@ -249,6 +249,70 @@ nr_ldpc_status_t pusch_e2e_process_full_gpu_with_deprecoding(pusch_e2e_handle_t 
  */
 const float* pusch_e2e_get_noise_vars(pusch_e2e_handle_t handle);
 
+/**
+ * Enqueue only the conventional optimized receiver's pilot measurements.
+ *
+ * Experimental SISO CP-OFDM path: 30 kHz, normal CP (14 grid symbols), type-1
+ * DM-RS, exactly two complete pilot symbols and 1..273 contiguous PRBs. The
+ * caller must not use this entry point for punctured/missing pilots (including
+ * a nulled DC pilot). Unsupported or insufficiently preallocated configurations
+ * fail before submission; there is no allocation, H2D transfer, synchronization,
+ * CPU fallback, equalization, demapping or graph construction in this call.
+ * Configure/precompute the handle before real-time use. As with other process
+ * calls, grid ownership and lifetime extend through stream completion, and a
+ * handle is exclusive to one ordered processing stream at a time.
+ *
+ * On successful completion the normal pilot getters expose channel-estimator
+ * SINR, EPRE, RSRP, TA and CFO. Queue the checked SINR readback and cover it with
+ * the caller's completion fence before reading. Submission/completion failure
+ * means NO metrics may be reported; previous pinned values may still exist.
+ * Equalizer/EVM accumulators are reset, not fabricated: their getters report
+ * unavailable. Never label these pilot measurements as neural post-EQ SINR.
+ * This reuses baseline estimator arithmetic, including its limitations; it
+ * does not certify absolute physical calibration or neural receiver gain.
+ */
+nr_ldpc_status_t pusch_e2e_process_pilot_metrics(pusch_e2e_handle_t handle,
+                                              const void* d_grid_cbf16,
+                                              cudaStream_t stream);
+
+/**
+ * Pilot measurements with one explicitly known erased DC subcarrier.
+ *
+ * Same profile, preallocation and completion contract as the entry above.
+ * dc_subcarrier is an absolute grid index, or -1 when absent. A DC outside
+ * the grant, or between Type-1 pilot positions, does not remove a pilot.
+ * A missing pilot is never read, never included in FIR normalization, and
+ * never counted in EPRE/RSRP/residual-noise/TA/CFO measurements. Its filtered
+ * estimate stays zero, rather than fabricating a reference observation.
+ * Arbitrary missing pilots are not supported. This corrects puncture handling,
+ * not the conventional estimator's noise-calibration/model assumptions.
+ * No neural post-EQ SINR, decoded gain or physical-noise calibration is implied.
+ */
+nr_ldpc_status_t pusch_e2e_process_pilot_metrics_with_dc(pusch_e2e_handle_t handle,
+                                                      const void* d_grid_cbf16,
+                                                      int dc_subcarrier,
+                                                      cudaStream_t stream);
+
+/** Validate pilot-stage admission without CUDA calls, allocation or mutation.
+ * A successful check is valid only while the caller retains this same handle,
+ * configuration and grid. It is not a completion or measurement-validity token.
+ */
+nr_ldpc_status_t pusch_e2e_validate_pilot_metrics(pusch_e2e_handle_t handle,
+                                                const void* d_grid_cbf16,
+                                                int dc_subcarrier);
+
+/** Refresh pilot measurements after conventional data processing on the SAME
+ * stream, preserving its post-EQ/EVM accumulators. All other pilot-stage state
+ * is refreshed. Decoder/constellation outputs are untouched. Call only after
+ * the current grant produced those data metrics; this does not validate them.
+ * Keep the grid alive through this stage and fence checked readback before
+ * reporting. Any submission/completion failure invalidates ALL reported CSI.
+ */
+nr_ldpc_status_t pusch_e2e_refresh_pilot_metrics_with_dc(pusch_e2e_handle_t handle,
+                                                      const void* d_grid_cbf16,
+                                                      int dc_subcarrier,
+                                                      cudaStream_t stream);
+
 // Superseded by the async SINR path (pusch_e2e_sinr_async_launch + pusch_e2e_sinr_get_result).
 float pusch_e2e_get_sinr_db(pusch_e2e_handle_t handle, cudaStream_t stream);
 
@@ -266,6 +330,40 @@ float pusch_e2e_get_sinr_db(pusch_e2e_handle_t handle, cudaStream_t stream);
 void pusch_e2e_sinr_async_launch(pusch_e2e_handle_t handle, cudaStream_t stream);
 
 /**
+ * Checked metric readback submission. Success means enqueued, not completed.
+ * On any failure the caller must suppress all current-grant metric getters.
+ * A failed second copy may leave the first copy in flight: retain storage and
+ * drain/order the stream before reuse. Never clear host buffers while it runs.
+ * The legacy void entry point remains for source compatibility only.
+ */
+nr_ldpc_status_t pusch_e2e_sinr_async_launch_checked(pusch_e2e_handle_t handle, cudaStream_t stream);
+
+/**
+ * Reduce qualified dApp post-EQ noise and enqueue an eight-byte pinned readback.
+ * Uses only existing context scratch/accumulators; no allocation or synchronization.
+ * Finite positive values below 1e5 contribute, matching the dApp host convention.
+ * A zero count (with null input allowed) clears the result and warms both kernels.
+ * Count is bounded by 273 PRBs * 12 subcarriers * 14 symbols * 4 layers.
+ *
+ * The caller owns a contiguous device input of at least count floats, disjoint
+ * from context storage, on the context device. Input and context must remain
+ * alive until stream completion. Serialize use with all other context work.
+ * On failure, do not consume the result; already enqueued work still needs draining.
+ * Managed readback uses the existing aliases and needs the same completion fence.
+ * This does not estimate noise or authorize an unqualified receiver metric.
+ */
+nr_ldpc_status_t pusch_e2e_dapp_noise_async(pusch_e2e_handle_t handle,
+                                         const float* d_noise,
+                                         unsigned count,
+                                         cudaStream_t stream);
+
+/**
+ * Read mean noise ONLY after successful dapp_noise_async and its completion fence.
+ * Empty/erased/malformed results return NAN; never falls back to prior DMRS CSI.
+ */
+float pusch_e2e_dapp_noise_get_mean(pusch_e2e_handle_t handle);
+
+/**
  * Read SINR from previously launched async D2H transfer.
  *
  * Returns post-equalization SINR from averaged equalizer noise variance,
@@ -279,6 +377,12 @@ void pusch_e2e_sinr_async_launch(pusch_e2e_handle_t handle, cudaStream_t stream)
  * @return SINR in dB, or -INFINITY if no valid data
  */
 float pusch_e2e_sinr_get_result(pusch_e2e_handle_t handle);
+
+/** Read post-EQ SINR only; no DM-RS/EVM fallback. Same completion requirements as above. */
+float pusch_e2e_post_eq_sinr_get_result(pusch_e2e_handle_t handle);
+
+/** Read reference-signal SINR only; no post-EQ/EVM fallback. Same completion requirements as above. */
+float pusch_e2e_channel_estimator_sinr_get_result(pusch_e2e_handle_t handle);
 
 /**
  * Read EPRE from previously launched async D2H transfer.

@@ -26,7 +26,7 @@ if(CUDA_ACCEL_FOUND)
     endif()
     target_include_directories(ocudu_pusch_demodulator PRIVATE
         ${CMAKE_SOURCE_DIR}/lib/phy/upper/channel_coding/ldpc)
-    target_link_libraries(ocudu_pusch_demodulator PRIVATE ocudu_ldpc_cuda)
+    target_link_libraries(ocudu_pusch_demodulator PRIVATE ocudu_ldpc_cuda ocudu_native_control_context)
     target_compile_definitions(ocudu_pusch_demodulator PRIVATE ENABLE_CUDA)
 endif()
 

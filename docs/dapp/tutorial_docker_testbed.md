@@ -14,7 +14,7 @@ minutes to your first live subscription.
 
 ```bash
 mkdir ocudu-workspace && cd ocudu-workspace
-git clone https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-platform.git ocudu
+git clone --recurse-submodules https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-platform.git ocudu
 git clone https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-sdk.git
 git clone https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-quickstart.git ocudu-docker
 ocudu-docker/scripts/build.sh          # or: OCUDU_BUILD_VARIANT=cpu ...

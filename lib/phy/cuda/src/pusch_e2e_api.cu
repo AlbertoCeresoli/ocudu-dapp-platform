@@ -13,7 +13,10 @@
  */
 
 #include "pusch_e2e.h"
+#include "pusch_pilot_mask.h"
+#include "pusch_sinr_readback.h"
 #include "pusch_e2e_internal.cuh"
+#include "pusch_e2e_preallocation.h"
 #include "pusch_e2e_launch.cuh"
 #include "pusch_e2e_low_papr.cuh"   // NOF_LOW_PAPR_GROUPS
 #include "scrambling.h"
@@ -31,6 +34,13 @@
 #include <cstdlib>
 #ifdef OCUDU_PHY_CUDA_ENABLE_VKFFT
     #include "vkFFT.h"
+
+struct pusch_vkfft_deprecoder_plan {
+    VkFFTApplication app;
+    pfUINT buffer_size;
+    int dft_size;
+    bool initialized;
+};
 #endif
 
 /* Forward decls: defined later in this TU, used by pusch_e2e_create(). */
@@ -175,19 +185,13 @@ nr_ldpc_status_t pusch_e2e_create(pusch_e2e_handle_t* handle)
     ctx->deprecode_symbols_capacity = 0;
     ctx->deprecode_noise_capacity = 0;
 #ifdef OCUDU_PHY_CUDA_ENABLE_VKFFT
-    ctx->transform_deprecoder_backend = PUSCH_DEPRECODER_AUTO;
+    constexpr bool vkfft_compiled = true;
 #else
-    ctx->transform_deprecoder_backend = PUSCH_DEPRECODER_CUSTOM;
+    constexpr bool vkfft_compiled = false;
 #endif
+    ctx->transform_deprecoder_backend =
+        pusch_select_transform_deprecoder(std::getenv(PUSCH_TRANSFORM_DEPRECODER_ENV), vkfft_compiled);
     ctx->vkfft_auto_min_dft_size = 864;  /* 72 PRB measured crossover on DGX Spark. */
-    const char* deprecoder_env = std::getenv("OCUDU_PHY_CUDA_PUSCH_TRANSFORM_DEPRECODER");
-    if (deprecoder_env) {
-        if (std::strcmp(deprecoder_env, "vkfft") == 0) {
-            ctx->transform_deprecoder_backend = PUSCH_DEPRECODER_VKFFT;
-        } else if (std::strcmp(deprecoder_env, "auto") == 0) {
-            ctx->transform_deprecoder_backend = PUSCH_DEPRECODER_AUTO;
-        }
-    }
     const char* vkfft_min_env = std::getenv("OCUDU_PHY_CUDA_PUSCH_VKFFT_MIN_DFT_SIZE");
     if (vkfft_min_env) {
         int threshold = std::atoi(vkfft_min_env);
@@ -365,6 +369,15 @@ nr_ldpc_status_t pusch_e2e_create(pusch_e2e_handle_t* handle)
             return fail_prealloc();
         }
         ctx->ch_estimates_capacity = ch_bytes;
+
+        // The common-pilot admission query runs before any receiver kernels.
+        // Its FP16 scratch must exist even when the first PUSCH is neural;
+        // depending on a prior conventional decode rejects that first grant
+        // and leaves a grow-to-fit allocation in the baseline hot path.
+        if (pusch_preallocate_fp16_estimates(*ctx) != NR_LDPC_SUCCESS ||
+            pusch_preallocate_dmrs_c_inits(*ctx) != NR_LDPC_SUCCESS) {
+            return fail_prealloc();
+        }
 
         // Noise vars / partials
         const size_t noise_bytes = static_cast<size_t>(k_max_ports) * sizeof(float);
@@ -1474,45 +1487,71 @@ const float* pusch_e2e_get_noise_vars(pusch_e2e_handle_t handle)
 
 void pusch_e2e_sinr_async_launch(pusch_e2e_handle_t handle, cudaStream_t stream)
 {
-    if (!handle || !handle->d_eq_noise_var_sum || !handle->d_eq_noise_var_count) {
-        return;
+    (void)pusch_e2e_sinr_async_launch_checked(handle, stream);
+}
+
+nr_ldpc_status_t pusch_e2e_sinr_async_launch_checked(pusch_e2e_handle_t handle, cudaStream_t stream)
+{
+    if (!handle || !handle->d_eq_noise_var_sum || !handle->d_eq_noise_var_count ||
+        !handle->h_sinr_eq_block || !handle->h_sinr_noise_var_sum || !handle->h_sinr_count) {
+        return NR_LDPC_ERROR_INVALID_CONFIG;
     }
-    if (!handle->h_sinr_noise_var_sum || !handle->h_sinr_count) {
-        return;
+    // These are owned allocations with fixed contiguous accumulator layouts.
+    // Check aliases before either copy; do not accept a valid-looking sum with
+    // a stale/mismatched count or an unpaired pilot-result buffer.
+    if (reinterpret_cast<uintptr_t>(handle->d_eq_noise_var_count) !=
+            reinterpret_cast<uintptr_t>(handle->d_eq_noise_var_sum) + sizeof(float) ||
+        handle->h_sinr_eq_block != handle->h_sinr_noise_var_sum ||
+        reinterpret_cast<uintptr_t>(handle->h_sinr_count) !=
+            reinterpret_cast<uintptr_t>(handle->h_sinr_noise_var_sum) + sizeof(float) ||
+        (handle->d_sinr_epre_result == nullptr) != (handle->h_sinr_epre_result == nullptr)) {
+        return NR_LDPC_ERROR_INVALID_CONFIG;
     }
     if (handle->sinr_managed) {
         /* Host readback pointers alias managed device memory; results are directly
          * readable after the caller's completion sync. No copies to enqueue. */
-        return;
+        return handle->h_sinr_eq_block == handle->d_eq_noise_var_sum &&
+               handle->h_sinr_count == handle->d_eq_noise_var_count &&
+               handle->h_sinr_epre_result == handle->d_sinr_epre_result
+                   ? NR_LDPC_SUCCESS : NR_LDPC_ERROR_INVALID_CONFIG;
     }
 
     /* Single 16-byte D2H copy for adjacent SINR and EVM accumulators in d_accum_block. */
-    cudaMemcpyAsync(handle->h_sinr_eq_block, handle->d_eq_noise_var_sum,
-                    2 * sizeof(float) + 2 * sizeof(unsigned int), cudaMemcpyDeviceToHost, stream);
+    if (cudaMemcpyAsync(handle->h_sinr_eq_block, handle->d_eq_noise_var_sum,
+                        2 * sizeof(float) + 2 * sizeof(unsigned int), cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        return NR_LDPC_ERROR_CUDA_FAILED;
+    }
 
     /* Launch async D2H copy of DMRS-based SINR/EPRE/RSRP/TA/CFO result (20 bytes) */
     if (handle->d_sinr_epre_result && handle->h_sinr_epre_result) {
-        cudaMemcpyAsync(handle->h_sinr_epre_result, handle->d_sinr_epre_result,
-                        5 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+        if (cudaMemcpyAsync(handle->h_sinr_epre_result, handle->d_sinr_epre_result,
+                            5 * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+            return NR_LDPC_ERROR_CUDA_FAILED;
+        }
     }
+    return NR_LDPC_SUCCESS;
 }
 
 float pusch_e2e_sinr_get_result(pusch_e2e_handle_t handle)
 {
-    /* Primary: post-equalization SINR = -10*log10(mean(eq_noise_var))
-     * Matches CPU demodulator SINR. Per-RE eq_noise_var captures both
-     * thermal noise and channel estimation error at data positions,
-     * giving accurate SINR under frequency-selective fading. */
-    if (handle && handle->h_sinr_noise_var_sum && handle->h_sinr_count) {
-        float noise_var_sum = *handle->h_sinr_noise_var_sum;
-        unsigned int count = *handle->h_sinr_count;
-        if (count > 0 && noise_var_sum > 0.0f) {
-            float mean_noise_var = noise_var_sum / static_cast<float>(count);
-            return -10.0f * log10f(mean_noise_var);
-        }
-    }
+    // Compatibility accessor for callers that explicitly accept mixed provenance.
+    const float post_eq = pusch_e2e_post_eq_sinr_get_result(handle);
+    return std::isfinite(post_eq) ? post_eq : pusch_e2e_channel_estimator_sinr_get_result(handle);
+}
 
-    /* Fallback: DMRS pilot-ratio SINR (may over-report under fading) */
+float pusch_e2e_post_eq_sinr_get_result(pusch_e2e_handle_t handle)
+{
+    if (handle && handle->h_sinr_noise_var_sum && handle->h_sinr_count) {
+        return ocudu::detail::pusch_post_eq_sinr_from_accumulator(*handle->h_sinr_noise_var_sum,
+                                                                 *handle->h_sinr_count);
+    }
+    return -INFINITY;
+}
+
+float pusch_e2e_channel_estimator_sinr_get_result(pusch_e2e_handle_t handle)
+{
+    // DM-RS pilot-ratio estimate. Its calibration limitations remain independent
+    // of equalizer noise or decoding performance; this accessor does not fix them.
     if (handle && handle->h_sinr_epre_result) {
         float sinr_db = handle->h_sinr_epre_result[0];
         if (std::isfinite(sinr_db)) {
@@ -2007,16 +2046,19 @@ nr_ldpc_status_t pusch_e2e_warmup_transform_deprecoding(pusch_e2e_handle_t handl
     return NR_LDPC_SUCCESS;
 }
 
-nr_ldpc_status_t pusch_e2e_process_full_gpu_optimized(
+static nr_ldpc_status_t pusch_e2e_process_optimized_impl(
     pusch_e2e_handle_t handle,
     const void* d_grid_cbf16,
     void* d_llrs_half,
     const int* d_re_indices,
     int nof_data_re,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    bool pilot_metrics_only,
+    int erased_sc = -1,
+    bool preserve_data_metrics = false)
 {
     if (!handle || !handle->configured) return NR_LDPC_ERROR_INVALID_CONFIG;
-    if (!d_grid_cbf16 || !d_llrs_half || !d_re_indices) {
+    if (!d_grid_cbf16 || (!pilot_metrics_only && (!d_llrs_half || !d_re_indices))) {
         return NR_LDPC_ERROR_INVALID_CONFIG;
     }
 
@@ -2086,7 +2128,7 @@ nr_ldpc_status_t pusch_e2e_process_full_gpu_optimized(
         handle->dmrs_indices_capacity = dmrs_indices_needed;
         handle->cached_dmrs_symbol_mask = -1;  /* Force re-upload after realloc */
     }
-    if (cfg.dmrs_symbol_mask != handle->cached_dmrs_symbol_mask) {
+    if (!pilot_metrics_only && cfg.dmrs_symbol_mask != handle->cached_dmrs_symbol_mask) {
         cudaMemcpyAsync(handle->d_dmrs_indices, dmrs_symbol_indices,
                         nof_dmrs_symbols * sizeof(int), cudaMemcpyHostToDevice, stream);
         handle->cached_dmrs_symbol_mask = cfg.dmrs_symbol_mask;
@@ -2106,7 +2148,19 @@ nr_ldpc_status_t pusch_e2e_process_full_gpu_optimized(
      * d_sinr_rsrp_accum, d_eq_noise_var_sum, d_eq_noise_var_count.
      * d_noise_vars is NOT in this block — it needs a separate mid-processing re-zero
      * before the CV kernel (line ~9955). */
-    cudaMemsetAsync(handle->d_accum_block, 0, handle->accum_block_size, stream);
+    if (preserve_data_metrics) {
+        // Admission has checked this owned contiguous layout. Preserve only
+        // [post-EQ sum/count, EVM sum/count]; never reuse pilot accumulators.
+        constexpr size_t data_begin = sizeof(unsigned) + 4 * 8 * sizeof(float);
+        constexpr size_t data_end = data_begin + 2 * (sizeof(float) + sizeof(unsigned));
+        err = cudaMemsetAsync(handle->d_accum_block, 0, data_begin, stream);
+        if (err != cudaSuccess) return NR_LDPC_ERROR_CUDA_FAILED;
+        err = cudaMemsetAsync(static_cast<char*>(handle->d_accum_block) + data_end, 0,
+                              handle->accum_block_size - data_end, stream);
+    } else {
+        err = cudaMemsetAsync(handle->d_accum_block, 0, handle->accum_block_size, stream);
+    }
+    if (pilot_metrics_only && err != cudaSuccess) return NR_LDPC_ERROR_CUDA_FAILED;
 
     /* Allocate d_dmrs_c_inits buffer if needed (small: MAX_DMRS_SYMBOLS × 4 bytes) */
     if (!handle->d_dmrs_c_inits) {
@@ -2122,9 +2176,17 @@ nr_ldpc_status_t pusch_e2e_process_full_gpu_optimized(
             int dmrs_sym = dmrs_symbol_indices[d];
             h_dmrs_c_inits[d] = dmrs_compute_c_init(slot_in_frame, dmrs_sym, cfg.scrambling_id, cfg.n_scid);
         }
-        cudaMemcpyAsync(handle->d_dmrs_c_inits, h_dmrs_c_inits,
+        if (pilot_metrics_only) {
+            launch_kernel_prepare_pilot_metrics(stream, handle->d_dmrs_indices, handle->d_dmrs_c_inits,
+                dmrs_symbol_indices[0], dmrs_symbol_indices[1], h_dmrs_c_inits[0], h_dmrs_c_inits[1]);
+            if (cudaGetLastError() != cudaSuccess) return NR_LDPC_ERROR_CUDA_FAILED;
+            handle->cached_dmrs_symbol_mask = cfg.dmrs_symbol_mask;
+            handle->cached_nof_dmrs_symbols = nof_dmrs_symbols;
+        } else {
+            cudaMemcpyAsync(handle->d_dmrs_c_inits, h_dmrs_c_inits,
                          nof_dmrs_symbols * sizeof(uint32_t),
                          cudaMemcpyHostToDevice, stream);
+        }
 
         /* Single 2D launch for all DMRS symbols — eliminates per-symbol launch overhead */
         dim3 lse_grid(cfg.nof_prb, nof_dmrs_symbols);
@@ -2144,7 +2206,8 @@ nr_ldpc_status_t pusch_e2e_process_full_gpu_optimized(
             symbol_stride,
             cfg.start_prb,
             cfg.dmrs_scaling,
-            (int)cfg.dmrs_type);
+            (int)cfg.dmrs_type,
+            erased_sc);
     }
 
     /* ================================================================
@@ -2162,7 +2225,8 @@ nr_ldpc_status_t pusch_e2e_process_full_gpu_optimized(
             cfg.nof_prb,
             cfg.nof_rx_ports,
             nof_dmrs_symbols,
-            (int)cfg.dmrs_type);
+            (int)cfg.dmrs_type,
+            erased_sc);
     }
 
     /* ================================================================
@@ -2345,7 +2409,8 @@ nr_ldpc_status_t pusch_e2e_process_full_gpu_optimized(
             sinr_pilot_bits ? handle->d_epre_accum : nullptr,
             sinr_pilot_bits ? handle->d_sinr_epre_result : nullptr,
             cfg.noise_mode,
-            (int)cfg.dmrs_type);
+            (int)cfg.dmrs_type,
+            erased_sc);
     } else {
         /* Single DMRS symbol — cannot cross-validate across time. Match the CPU
          * estimator by computing pilot-residual noise from the smoothed channel
@@ -2389,6 +2454,12 @@ nr_ldpc_status_t pusch_e2e_process_full_gpu_optimized(
                 cfg.dmrs_scaling,
                 nof_dmrs_symbols);
         }
+    }
+
+    if (pilot_metrics_only) {
+        // No data-RE outputs are touched. Accumulators were cleared above, so
+        // a pilot-only transaction cannot resurrect old post-EQ SINR or EVM.
+        return cudaGetLastError() == cudaSuccess ? NR_LDPC_SUCCESS : NR_LDPC_ERROR_CUDA_FAILED;
     }
 
     /* ================================================================
@@ -2455,6 +2526,117 @@ nr_ldpc_status_t pusch_e2e_process_full_gpu_optimized(
 
     err = cudaGetLastError();
     return (err == cudaSuccess) ? NR_LDPC_SUCCESS : NR_LDPC_ERROR_CUDA_FAILED;
+}
+
+nr_ldpc_status_t pusch_e2e_process_full_gpu_optimized(
+    pusch_e2e_handle_t handle, const void* d_grid_cbf16, void* d_llrs_half,
+    const int* d_re_indices, int nof_data_re, cudaStream_t stream)
+{
+    return pusch_e2e_process_optimized_impl(handle, d_grid_cbf16, d_llrs_half, d_re_indices,
+                                           nof_data_re, stream, false);
+}
+
+nr_ldpc_status_t pusch_e2e_process_pilot_metrics(pusch_e2e_handle_t handle,
+                                              const void* d_grid_cbf16, cudaStream_t stream)
+{
+    return pusch_e2e_process_pilot_metrics_with_dc(handle, d_grid_cbf16, -1, stream);
+}
+
+nr_ldpc_status_t pusch_e2e_process_pilot_metrics_with_dc(pusch_e2e_handle_t handle,
+                                                      const void* d_grid_cbf16,
+                                                      int dc_subcarrier, cudaStream_t stream)
+{
+    if (pusch_e2e_validate_pilot_metrics(handle, d_grid_cbf16, dc_subcarrier) != NR_LDPC_SUCCESS)
+        return NR_LDPC_ERROR_INVALID_CONFIG;
+    const auto& cfg = handle->config;
+    const int erased_sc = ocudu::cuda::pilot_mask::erased_type1_pilot(dc_subcarrier,
+                                                                   cfg.start_prb * 12, cfg.nof_prb * 12);
+    return pusch_e2e_process_optimized_impl(handle, d_grid_cbf16, nullptr, nullptr, 0, stream, true, erased_sc);
+}
+
+nr_ldpc_status_t pusch_e2e_refresh_pilot_metrics_with_dc(pusch_e2e_handle_t handle,
+                                                      const void* d_grid_cbf16,
+                                                      int dc_subcarrier, cudaStream_t stream)
+{
+    if (pusch_e2e_validate_pilot_metrics(handle, d_grid_cbf16, dc_subcarrier) != NR_LDPC_SUCCESS)
+        return NR_LDPC_ERROR_INVALID_CONFIG;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(handle->d_accum_block);
+    constexpr size_t data_begin = sizeof(unsigned) + 4 * 8 * sizeof(float);
+    // A corrupt layout must not turn the preserving reset into an out-of-bounds
+    // write or accidentally clear/read an unrelated allocation.
+    if (handle->accum_block_size != 208 || base > UINTPTR_MAX - handle->accum_block_size ||
+        reinterpret_cast<uintptr_t>(handle->d_eq_noise_var_sum) != base + data_begin ||
+        reinterpret_cast<uintptr_t>(handle->d_eq_noise_var_count) != base + data_begin + sizeof(float) ||
+        reinterpret_cast<uintptr_t>(handle->d_evm_error_sum) != base + data_begin + sizeof(float) + sizeof(unsigned) ||
+        reinterpret_cast<uintptr_t>(handle->d_evm_symbol_count) != base + data_begin + 2 * sizeof(float) + sizeof(unsigned) ||
+        reinterpret_cast<uintptr_t>(handle->d_ta_cfo_accum) != base + data_begin + 2 * (sizeof(float) + sizeof(unsigned)))
+        return NR_LDPC_ERROR_INVALID_CONFIG;
+    const auto& cfg = handle->config;
+    const int erased_sc = ocudu::cuda::pilot_mask::erased_type1_pilot(dc_subcarrier,
+                                                                   cfg.start_prb * 12, cfg.nof_prb * 12);
+    return pusch_e2e_process_optimized_impl(handle, d_grid_cbf16, nullptr, nullptr, 0, stream, true, erased_sc, true);
+}
+
+nr_ldpc_status_t pusch_e2e_validate_pilot_metrics(pusch_e2e_handle_t handle,
+                                                const void* d_grid_cbf16,
+                                                int dc_subcarrier)
+{
+    // All admission checks precede the first CUDA call or handle mutation.
+    if (!handle || !handle->configured || !d_grid_cbf16 ||
+        reinterpret_cast<uintptr_t>(d_grid_cbf16) % alignof(uint32_t) != 0) {
+        return NR_LDPC_ERROR_INVALID_CONFIG;
+    }
+    const auto& cfg = handle->config;
+    // The host resource grid may span 275 RB (3300 subcarriers), independently
+    // of this backend's 273-RB grant/pilot-cache capacity. Keep those bounds
+    // separate: later checks still require the complete allocation to fit the
+    // prepared pilots. Never reject a small supported grant just because its
+    // producer supplies the full legal host grid.
+    constexpr int max_input_grid_subcarriers = 275 * 12;
+    int symbols[MAX_DMRS_SYMBOLS];
+    const int count = pusch_e2e_get_dmrs_symbol_indices_checked(cfg.dmrs_symbol_mask, symbols);
+    if (cfg.nof_rx_ports != 1 || cfg.nof_tx_layers != 1 || cfg.use_low_papr_dmrs != 0 ||
+        cfg.dmrs_type != DMRS_TYPE_1 || cfg.scs_khz != 30 || count != 2 ||
+        cfg.grid_nof_symbols != MAX_SYMBOLS || cfg.grid_nof_subcarriers < 12 ||
+        cfg.grid_nof_subcarriers > max_input_grid_subcarriers || cfg.grid_nof_subcarriers % 12 != 0 ||
+        dc_subcarrier < -1 || dc_subcarrier >= cfg.grid_nof_subcarriers ||
+        cfg.nof_prb < 1 || cfg.nof_prb > MAX_PRB || cfg.start_prb < 0 ||
+        cfg.start_prb > cfg.grid_nof_subcarriers / 12 - cfg.nof_prb ||
+        cfg.start_symbol < 0 || cfg.start_symbol >= MAX_SYMBOLS || cfg.nof_symbols < 1 ||
+        cfg.nof_symbols > MAX_SYMBOLS - cfg.start_symbol || symbols[0] < cfg.start_symbol ||
+        symbols[1] >= cfg.start_symbol + cfg.nof_symbols || cfg.slot_idx < 0 ||
+        !std::isfinite(cfg.dmrs_scaling) || cfg.dmrs_scaling <= 0 ||
+        cfg.scrambling_id > 65535 || (cfg.n_scid != 0 && cfg.n_scid != 1) ||
+        (cfg.noise_mode != 0 && cfg.noise_mode != 1) ||
+        (cfg.compensate_cfo != 0 && cfg.compensate_cfo != 1)) {
+        return NR_LDPC_ERROR_INVALID_CONFIG;
+    }
+    const int words = handle->precomputed_words_per_sym;
+    const int slot = cfg.slot_idx % MAX_SLOTS_PER_FRAME;
+    if (!handle->dmrs_pilots_precomputed || words < 1 || words > (MAX_PRB * 12 + 31) / 32 ||
+        handle->precomputed_words_per_slot != MAX_SYMBOLS * words ||
+        handle->precomputed_nof_slots < 1 || handle->precomputed_nof_slots > MAX_SLOTS_PER_FRAME ||
+        slot >= handle->precomputed_nof_slots ||
+        handle->precomputed_pilots_per_symbol < (cfg.start_prb + cfg.nof_prb) * 6 ||
+        handle->precomputed_pilots_per_symbol > MAX_PRB * 6 ||
+        words * 16 < handle->precomputed_pilots_per_symbol ||
+        handle->cached_dmrs_scrambling_id != cfg.scrambling_id || handle->cached_dmrs_n_scid != cfg.n_scid ||
+        handle->cached_dmrs_type != static_cast<int>(cfg.dmrs_type) ||
+        !handle->d_precomputed_dmrs_pilots || !handle->d_dmrs_pilot_bits ||
+        handle->precomputed_dmrs_pilots_capacity <
+            static_cast<size_t>(handle->precomputed_nof_slots) * MAX_SYMBOLS * words * sizeof(uint32_t) ||
+        handle->dmrs_pilot_bits_capacity < 2 * words * sizeof(uint32_t) ||
+        !handle->d_estimates_fp16 || handle->estimates_fp16_capacity < 2 * cfg.nof_prb * 12 * sizeof(__half2) ||
+        !handle->d_noise_vars || handle->noise_vars_capacity < sizeof(float) ||
+        !handle->d_dmrs_indices || handle->dmrs_indices_capacity < 2 * sizeof(int) ||
+        !handle->d_dmrs_c_inits || !handle->d_accum_block || handle->accum_block_size < 208 ||
+        !handle->d_noise_count || !handle->d_rsrp_accum || !handle->d_epre_accum ||
+        !handle->d_sinr_noise_accum || !handle->d_sinr_rsrp_accum || !handle->d_sinr_epre_result ||
+        !handle->d_ta_cfo_accum || !handle->d_cv_noise_accum || !handle->d_cv_done_counter ||
+        !handle->d_symbol_start_times || !handle->d_mimo_cfo_phasors) {
+        return NR_LDPC_ERROR_INVALID_CONFIG;
+    }
+    return NR_LDPC_SUCCESS;
 }
 
 nr_ldpc_status_t pusch_e2e_process_full_gpu_optimized_mimo_half(

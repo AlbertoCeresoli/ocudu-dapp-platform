@@ -104,6 +104,13 @@ void phy_to_fapi_results_event_fastpath_translator::on_new_pusch_results_control
 
 void phy_to_fapi_results_event_fastpath_translator::on_new_pusch_results_data(const ul_pusch_results_data& result)
 {
+  if (!result.decoder_result.input_valid) {
+    // A software discard is not a radio CRC observation. Withhold both standardized indications so no payload or
+    // fabricated NACK enters link adaptation; normal missing-CRC/HARQ timeout handling remains in force.
+    logger.warning("Sector#{}: Discarding software-invalid PUSCH result slot={} rnti={}",
+                   sector_id, result.slot, result.rnti);
+    return;
+  }
   notify_crc_indication(result);
   notify_rx_data_indication(result);
 }

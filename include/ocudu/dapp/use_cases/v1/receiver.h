@@ -4,6 +4,7 @@
 #define OCUDU_DAPP_USE_CASES_V1_RECEIVER_H
 #include "common.h"
 #include "pusch_metadata.h"
+#include <stddef.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -12,9 +13,12 @@ extern "C" {
 
 /// The receiver filled the requested post-equalization-noise tensor.
 #define OCUDU_DAPP_RECEIVER_METRICS_VALID_V1 (1u << 0)
-#define OCUDU_DAPP_RECEIVER_KNOWN_OUTPUT_FLAGS_V1 OCUDU_DAPP_RECEIVER_METRICS_VALID_V1
+/// The receiver filled the optional caller-owned equalized-symbol tensor.
+#define OCUDU_DAPP_RECEIVER_EQUALIZED_SYMBOLS_VALID_V1 (1u << 1)
+#define OCUDU_DAPP_RECEIVER_KNOWN_OUTPUT_FLAGS_V1 \
+  (OCUDU_DAPP_RECEIVER_METRICS_VALID_V1 | OCUDU_DAPP_RECEIVER_EQUALIZED_SYMBOLS_VALID_V1)
 
-/// Optional receiver metric storage supplied and owned by the caller.
+/// Optional receiver auxiliary-output storage supplied and owned by the caller.
 ///
 /// post_equalization_noise is F32 [data_re, layer], using
 /// OCUDU_DAPP_LAYOUT_PUSCH_POST_EQ_NOISE_DATA_RE_LAYER_V1. A module that fills
@@ -27,7 +31,27 @@ typedef struct {
   uint16_t                  abi_minor;
   ocudu_dapp_tensor_view_v1 post_equalization_noise;
   uint64_t                  reserved[4];
+  /// Optional append-only extension: CF32 [data_re, layer], using
+  /// OCUDU_DAPP_LAYOUT_PUSCH_EQUALIZED_DATA_RE_LAYER_V1, in the same RE/layer
+  /// order as llrs and post_equalization_noise. A zero struct_size means no
+  /// request. Access only when both the metadata extent and this struct_size
+  /// cover the complete field. Older prefix-only objects remain valid.
+  ///
+  /// The caller owns storage, stream and completion lifetime. A receiver may
+  /// leave this unfilled even when requested (for example, direct-bit neural
+  /// receivers without an explicit symbol estimate). Set EQUALIZED_SYMBOLS_VALID
+  /// only after enqueueing the complete output on the invocation stream; it
+  /// does not assert completion or physical noise/SINR authority. The host must
+  /// not consume missing/invalid output or substitute stale baseline symbols.
+  /// Symbols are unsliced estimates in the transmitted QAM symbol domain,
+  /// not hard decisions or variance-normalized neural features. Invalid REs
+  /// may be represented by finite zero erasures. Storage must not overlap
+  /// inputs, LLRs, noise, metadata or the receiver's private workspace.
+  ocudu_dapp_tensor_view_v1 equalized_symbols;
 } ocudu_dapp_receiver_metrics_v1;
+
+#define OCUDU_DAPP_RECEIVER_EQUALIZED_SYMBOLS_MIN_SIZE_V1 \
+  (offsetof(ocudu_dapp_receiver_metrics_v1, equalized_symbols) + sizeof(ocudu_dapp_tensor_view_v1))
 
 typedef struct {
   ocudu_dapp_invocation_v1     invocation;

@@ -92,6 +92,11 @@ public:
   }
 
 private:
+  pusch_processing_activity acquire_processing_activity() noexcept override
+  {
+    return notifier ? notifier->acquire_processing_activity() : pusch_processing_activity{};
+  }
+
   void on_uci(const pusch_processor_result_control& uci) override
   {
     ocudu_assert(notifier, "Invalid notifier");

@@ -10,6 +10,7 @@
  */
 
 #include "pusch_e2e.h"
+#include "pusch_pilot_mask.h"
 #include "scrambling.h"
 #include "ocudu_phy_cuda_mimo_math.cuh"
 #include <cuda_runtime.h>
@@ -1090,6 +1091,7 @@ __global__ void kernel_gather_dmrs_pilot_bits_reset(
  * Grid: (nof_prb, nof_dmrs_symbols), Threads: nof_ports
  * Output: FP16 estimates + atomically accumulated noise variance
  */
+template<bool MASK_DC>
 __global__ void kernel_fused_lse_freq_interp_noise_fp16(
     const unsigned int* __restrict__ d_grid_cbf16,
     const uint32_t* __restrict__ d_dmrs_c_inits,  /* Per-DMRS-symbol c_init array */
@@ -1106,7 +1108,8 @@ __global__ void kernel_fused_lse_freq_interp_noise_fp16(
     int symbol_stride,
     int start_prb,
     float dmrs_scaling,
-    int dmrs_type)
+    int dmrs_type,
+    int erased_sc)
 {
     int prb_idx = blockIdx.x;
     int dmrs_sym_idx = blockIdx.y;
@@ -1141,12 +1144,19 @@ __global__ void kernel_fused_lse_freq_interp_noise_fp16(
     #pragma unroll
     for (int d = 0; d < nof_pilots; d++) {
         int sc = prb_start_sc + pusch_dmrs_sc_offset(dmrs_type, 0, d);
-        int grid_idx = port * grid_stride + dmrs_symbol * symbol_stride + sc;
-        cuFloatComplex y = cbf16_to_fp32(d_grid_cbf16[grid_idx]);
-
         /* Generate DMRS pilot bits inline from LFSR */
         int c_real = (x1 ^ x2) & 1; x1 = step_x1_local(x1); x2 = step_x2_local(x2);
         int c_imag = (x1 ^ x2) & 1; x1 = step_x1_local(x1); x2 = step_x2_local(x2);
+
+        if constexpr (MASK_DC) {
+            if (!ocudu::cuda::pilot_mask::observed(sc - start_prb * 12, erased_sc)) {
+                // Still advance Gold bits, but never read a known erased RE.
+                h_dmrs[d] = __floats2half2_rn(0.F, 0.F);
+                continue;
+            }
+        }
+        int grid_idx = port * grid_stride + dmrs_symbol * symbol_stride + sc;
+        cuFloatComplex y = cbf16_to_fp32(d_grid_cbf16[grid_idx]);
 
         float p_real = (1 - 2 * c_real) * pilot_amp;
         float p_imag = (1 - 2 * c_imag) * pilot_amp;
@@ -1194,7 +1204,8 @@ __global__ void kernel_fused_lse_freq_interp_noise_fp16(
 
     /* Count total DMRS REs (only one thread per port needs to do this) */
     if (prb_idx == 0 && dmrs_sym_idx == 0) {
-        atomicAdd(d_noise_count, nof_prb * nof_dmrs_symbols * nof_pilots);
+        const int observed_pilots = nof_prb * nof_pilots - (MASK_DC ? 1 : 0);
+        atomicAdd(d_noise_count, observed_pilots * nof_dmrs_symbols);
     }
 }
 
@@ -1251,6 +1262,7 @@ __global__ void kernel_finalize_noise_variance(
  * Grid: (nof_prb, 1), Threads: 12 * nof_ports
  * Each thread handles one (prb, port, sc) triplet, sums over DMRS symbols.
  */
+template<bool MASK_DC>
 __global__ void kernel_cross_validation_noise_variance(
     const __half2* __restrict__ d_estimates_fp16,
     float* __restrict__ d_noise_var_accum,
@@ -1276,7 +1288,8 @@ __global__ void kernel_cross_validation_noise_variance(
     const float* __restrict__ d_epre_accum,
     float* __restrict__ d_sinr_epre_result,
     int noise_mode,  /* 0=cross-validation (default), 1=pilot-residual */
-    int dmrs_type)
+    int dmrs_type,
+    int erased_sc)
 {
     int prb_idx = blockIdx.x;
     int local_idx = threadIdx.x;  /* 0..12*nof_ports-1 */
@@ -1313,7 +1326,7 @@ __global__ void kernel_cross_validation_noise_variance(
     int base_idx = prb_idx * (nof_ports * 12) + port * 12 + sc;
 
     /* FAST PATH: 2 DMRS symbols (most common case) */
-    if (nof_dmrs_symbols == 2) {
+    if (nof_dmrs_symbols == 2 && (!MASK_DC || ocudu::cuda::pilot_mask::observed(prb_idx * 12 + sc, erased_sc))) {
         __half2 h0 = d_estimates_fp16[0 * re_per_dmrs_sym + base_idx];
         __half2 h1 = d_estimates_fp16[1 * re_per_dmrs_sym + base_idx];
 
@@ -1399,7 +1412,7 @@ __global__ void kernel_cross_validation_noise_variance(
         }
     }
     /* GENERAL PATH: N DMRS symbols */
-    else if (nof_dmrs_symbols > 2) {
+    else if (nof_dmrs_symbols > 2 && (!MASK_DC || ocudu::cuda::pilot_mask::observed(prb_idx * 12 + sc, erased_sc))) {
         /* First pass: compute de-rotated mean */
         float sum_real = 0.0f, sum_imag = 0.0f;
         for (int d = 0; d < nof_dmrs_symbols; d++) {
@@ -1497,10 +1510,10 @@ __global__ void kernel_cross_validation_noise_variance(
         if (done == (unsigned int)nof_prb) {
             /* Last block: all CV accumulations are globally visible.
              * Normalize per-port noise variance and write to output. */
-            int nof_sc = nof_prb * 12;
+            int nof_sc = nof_prb * 12 - (MASK_DC ? 1 : 0);
             int nof_pilots = pusch_dmrs_pilots_per_cdm(dmrs_type);
-            int nof_pilot_positions = nof_prb * nof_pilots;
-            int nof_dmrs_re_per_port = nof_prb * nof_dmrs_symbols * nof_pilots;
+            int nof_pilot_positions = nof_prb * nof_pilots - (MASK_DC ? 1 : 0);
+            int nof_dmrs_re_per_port = nof_pilot_positions * nof_dmrs_symbols;
 
             if (noise_mode == 1 && d_sinr_noise_accum != nullptr && nof_dmrs_re_per_port > 1) {
                 /* Pilot-residual noise: σ² = Σ|y - H_avg*pilot|² / (N-1)
@@ -4207,358 +4220,111 @@ __global__ void kernel_freq_interpolate_type1(
 }
 
 /**
- * Frequency-domain smoothing kernel (FP16 in-place).
+ * Snapshot-safe frequency smoothing. Each block owns one complete
+ * (DMRS symbol, port, layer) frequency row. All pilot reads finish before any
+ * in-place global writes, so no block can read another block's filtered data.
  *
- * Applies a 15-tap raised cosine FIR filter to denoise LSE channel estimates
- * across frequency, matching the CPU port_channel_estimator_helpers filter.
- *
- * The filter operates on DMRS pilot positions (6 per PRB for Type 1), then
- * re-interpolates to all 12 subcarriers per PRB.
- *
- * Grid:  (nof_prb, nof_dmrs_symbols)
- * Block: (nof_ports)
- *
- * Each thread handles one (prb, port) pair for one DMRS symbol, applying
- * the filter across 6 pilot positions and writing 12 smoothed subcarriers.
+ * This preserves the existing FIR, edge normalization and output rounding:
+ * SISO interpolates in FP32; MIMO rounds pilots and interpolates in FP16;
+ * the separate FP32 path keeps its port-major layout and Type-1 interpolation.
+ * No workspace allocation, extra kernel launch or device-wide barrier is needed.
  */
-__global__ void kernel_fd_smoothing_fp16(
-    __half2* __restrict__ d_estimates,  /* [dmrs_sym, prb, port, 12] in-place */
-    int nof_prb,
-    int nof_ports,
-    int nof_dmrs_symbols,
-    int dmrs_type)
+template<bool FP32, bool MIMO, bool MASK_DC = false>
+__global__ void kernel_fd_smoothing_snapshot(
+    void* estimates, int nof_prb, int nof_ports, int nof_layers, int dmrs_type, int erased_sc = -1)
 {
-    int prb_idx = blockIdx.x;
-    int dmrs_sym_idx = blockIdx.y;
-    int port = threadIdx.x;
+    const int port = blockIdx.x;
+    const int dmrs_symbol = blockIdx.y;
+    const int layer = blockIdx.z;
+    const int nof_pilots = pusch_dmrs_pilots_per_cdm(dmrs_type);
+    const int total_pilots = nof_prb * nof_pilots;
+    const int cdm_offset = layer / 2;
+    const int re_per_prb = nof_ports * nof_layers * 12;
+    const int row_base = FP32 ? (dmrs_symbol * nof_ports + port) * nof_prb * 12 :
+        dmrs_symbol * nof_prb * re_per_prb + port * nof_layers * 12 + layer * 12;
+    const int prb_stride = FP32 ? 12 : re_per_prb;
+    extern __shared__ float2 snapshot[];
 
-    if (prb_idx >= nof_prb || dmrs_sym_idx >= nof_dmrs_symbols || port >= nof_ports) return;
-
-    const int HALF_FILTER = FD_SMOOTH_FILTER_LEN / 2;  /* 7 */
-    int re_per_dmrs_sym = nof_prb * nof_ports * 12;
-    int base = dmrs_sym_idx * re_per_dmrs_sym + prb_idx * (nof_ports * 12) + port * 12;
-    int nof_pilots = pusch_dmrs_pilots_per_cdm(dmrs_type);
-    int total_pilots = nof_prb * nof_pilots;
-    int pilot_base = prb_idx * nof_pilots;
-
-    /* Apply FIR filter to each of the 6 pilot positions */
-    float smoothed_re[6], smoothed_im[6];
-
-    #pragma unroll
-    for (int p = 0; p < 6; p++) {
-        if (p >= nof_pilots) break;
-        float sum_re = 0.0f;
-        float sum_im = 0.0f;
-        float coef_sum = 0.0f;
-        int global_pilot = pilot_base + p;
-
-        for (int t = 0; t < FD_SMOOTH_FILTER_LEN; t++) {
-            int src_pilot = global_pilot + (t - HALF_FILTER);
-
-            /* Skip out-of-range taps (don't clamp) */
-            if (src_pilot < 0 || src_pilot >= total_pilots) continue;
-
-            /* Read from the appropriate PRB's estimates */
-            int src_prb = src_pilot / nof_pilots;
-            int src_pos = src_pilot % nof_pilots;
-            int src_idx = dmrs_sym_idx * re_per_dmrs_sym +
-                          src_prb * (nof_ports * 12) + port * 12 +
-                          pusch_dmrs_sc_offset(dmrs_type, 0, src_pos);
-
-            __half2 h_src = d_estimates[src_idx];
-            float r = __half2float(__low2half(h_src));
-            float i = __half2float(__high2half(h_src));
-
-            sum_re += d_rc_filter[t] * r;
-            sum_im += d_rc_filter[t] * i;
-            coef_sum += d_rc_filter[t];
-        }
-
-        /* Renormalize to compensate for truncated taps at band edges */
-        if (coef_sum > 1e-6f) {
-            float inv_coef = 1.0f / coef_sum;
-            sum_re *= inv_coef;
-            sum_im *= inv_coef;
-        }
-
-        smoothed_re[p] = sum_re;
-        smoothed_im[p] = sum_im;
-    }
-
-    /* Write back smoothed estimates for all 12 subcarriers */
-    #pragma unroll
-    for (int sc = 0; sc < 12; sc++) {
-        float r, i_val;
-        int left = 0;
-        int right = 0;
-        int left_sc = pusch_dmrs_sc_offset(dmrs_type, 0, 0);
-        int right_sc = left_sc;
-        bool exact = false;
-        for (int p = 0; p < nof_pilots; ++p) {
-            int pilot_sc = pusch_dmrs_sc_offset(dmrs_type, 0, p);
-            if (pilot_sc == sc) {
-                left = right = p;
-                exact = true;
-                break;
-            }
-            if (pilot_sc < sc) {
-                left = p;
-                left_sc = pilot_sc;
-            } else {
-                right = p;
-                right_sc = pilot_sc;
-                break;
-            }
-        }
-        if (exact || sc <= left_sc || right_sc <= left_sc) {
-            r = smoothed_re[left];
-            i_val = smoothed_im[left];
+    for (int p = threadIdx.x; p < total_pilots; p += blockDim.x) {
+        const int at = row_base + (p / nof_pilots) * prb_stride +
+                       pusch_dmrs_sc_offset(dmrs_type, cdm_offset, p % nof_pilots);
+        if constexpr (FP32) {
+            snapshot[p] = static_cast<const float2*>(estimates)[at];
         } else {
-            float alpha = (float)(sc - left_sc) / (float)(right_sc - left_sc);
-            r = (1.0f - alpha) * smoothed_re[left] + alpha * smoothed_re[right];
-            i_val = (1.0f - alpha) * smoothed_im[left] + alpha * smoothed_im[right];
+            snapshot[p] = __half22float2(static_cast<const __half2*>(estimates)[at]);
         }
-        d_estimates[base + sc] = __halves2half2(__float2half(r), __float2half(i_val));
     }
-}
-
-__global__ void kernel_mimo_fd_smoothing_fp16(
-    __half2* __restrict__ d_estimates,  /* [dmrs_sym, prb, port, layer, 12] in-place */
-    int nof_prb,
-    int nof_ports,
-    int nof_layers,
-    int nof_dmrs_symbols,
-    int dmrs_type)
-{
-    int prb_idx = blockIdx.x;
-    int dmrs_sym_idx = blockIdx.y;
-    int layer = blockIdx.z;
-    int port = threadIdx.x;
-
-    if (prb_idx >= nof_prb || dmrs_sym_idx >= nof_dmrs_symbols || port >= nof_ports || layer >= nof_layers) return;
-
-    const int HALF_FILTER = FD_SMOOTH_FILTER_LEN / 2;
-    int re_per_layer = 12;
-    int re_per_port = nof_layers * re_per_layer;
-    int re_per_prb = nof_ports * re_per_port;
-    int re_per_dmrs_sym = nof_prb * re_per_prb;
-    int base = dmrs_sym_idx * re_per_dmrs_sym + prb_idx * re_per_prb + port * re_per_port + layer * re_per_layer;
-    int nof_pilots = pusch_dmrs_pilots_per_cdm(dmrs_type);
-    int total_pilots = nof_prb * nof_pilots;
-    int pilot_base = prb_idx * nof_pilots;
-    int cdm_offset = layer / 2;
-
-    float smoothed_re[6], smoothed_im[6];
-
-    #pragma unroll
-    for (int p = 0; p < 6; p++) {
-        if (p >= nof_pilots) break;
-        float sum_re = 0.0f;
-        float sum_im = 0.0f;
-        float coef_sum = 0.0f;
-        int global_pilot = pilot_base + p;
-
-        for (int t = 0; t < FD_SMOOTH_FILTER_LEN; t++) {
-            int src_pilot = global_pilot + (t - HALF_FILTER);
-            if (src_pilot < 0 || src_pilot >= total_pilots) continue;
-
-            int src_prb = src_pilot / nof_pilots;
-            int src_pos = src_pilot % nof_pilots;
-            int src_sc = pusch_dmrs_sc_offset(dmrs_type, cdm_offset, src_pos);
-            int src_idx = dmrs_sym_idx * re_per_dmrs_sym +
-                          src_prb * re_per_prb + port * re_per_port + layer * re_per_layer + src_sc;
-
-            __half2 h_src = d_estimates[src_idx];
-            sum_re += d_rc_filter[t] * __half2float(__low2half(h_src));
-            sum_im += d_rc_filter[t] * __half2float(__high2half(h_src));
-            coef_sum += d_rc_filter[t];
-        }
-
-        if (coef_sum > 1e-6f) {
-            float inv_coef = 1.0f / coef_sum;
-            sum_re *= inv_coef;
-            sum_im *= inv_coef;
-        }
-
-        smoothed_re[p] = sum_re;
-        smoothed_im[p] = sum_im;
-    }
-
-    __half2 smoothed_pilots[6];
-    #pragma unroll
-    for (int p = 0; p < 6; p++) {
-        if (p >= nof_pilots) break;
-        smoothed_pilots[p] = __halves2half2(__float2half(smoothed_re[p]), __float2half(smoothed_im[p]));
-    }
-
-    #pragma unroll
-    for (int sc = 0; sc < 12; sc++) {
-        d_estimates[base + sc] =
-            interpolate_dmrs_pilots_half2(smoothed_pilots, nof_pilots, dmrs_type, cdm_offset, sc);
-    }
-}
-
-/**
- * Wide-block variant of kernel_mimo_fd_smoothing_fp16 (OCUDU_MIMO_FD_SMOOTH_OPT).
- *
- * The baseline launches (prb, dmrs_sym, layer) blocks of only nof_ports (<=8)
- * threads, wasting most of every warp and serializing 6 pilot smoothings plus
- * 12 interpolations per thread. This variant covers one (prb, dmrs_sym) per
- * block with (12, ports, layers) threads: pilot smoothing is computed once per
- * (pilot, port, layer) by the sc<nof_pilots threads into shared memory, then
- * every thread interpolates exactly one output RE. Arithmetic per pilot/RE is
- * identical to the baseline; only the thread mapping changes.
- *
- * Grid:  (nof_prb, nof_dmrs_symbols)
- * Block: (12, nof_ports, nof_layers)
- * Shmem: nof_layers * nof_ports * 6 * sizeof(__half2)
- */
-__global__ void kernel_mimo_fd_smoothing_fp16_wide(
-    __half2* __restrict__ d_estimates,  /* [dmrs_sym, prb, port, layer, 12] in-place */
-    int nof_prb,
-    int nof_ports,
-    int nof_layers,
-    int nof_dmrs_symbols,
-    int dmrs_type)
-{
-    int prb_idx = blockIdx.x;
-    int dmrs_sym_idx = blockIdx.y;
-    int sc = threadIdx.x;
-    int port = threadIdx.y;
-    int layer = threadIdx.z;
-
-    if (prb_idx >= nof_prb || dmrs_sym_idx >= nof_dmrs_symbols) return;
-
-    const int HALF_FILTER = FD_SMOOTH_FILTER_LEN / 2;
-    int re_per_layer = 12;
-    int re_per_port = nof_layers * re_per_layer;
-    int re_per_prb = nof_ports * re_per_port;
-    int re_per_dmrs_sym = nof_prb * re_per_prb;
-    int base = dmrs_sym_idx * re_per_dmrs_sym + prb_idx * re_per_prb + port * re_per_port + layer * re_per_layer;
-    int nof_pilots = pusch_dmrs_pilots_per_cdm(dmrs_type);
-    int total_pilots = nof_prb * nof_pilots;
-    int pilot_base = prb_idx * nof_pilots;
-    int cdm_offset = layer / 2;
-
-    extern __shared__ __half2 s_smoothed[]; /* [layer][port][6] */
-    __half2* s_pilots = s_smoothed + (layer * nof_ports + port) * 6;
-
-    if (sc < nof_pilots) {
-        int p = sc;
-        float sum_re = 0.0f;
-        float sum_im = 0.0f;
-        float coef_sum = 0.0f;
-        int global_pilot = pilot_base + p;
-
-        for (int t = 0; t < FD_SMOOTH_FILTER_LEN; t++) {
-            int src_pilot = global_pilot + (t - HALF_FILTER);
-            if (src_pilot < 0 || src_pilot >= total_pilots) continue;
-
-            int src_prb = src_pilot / nof_pilots;
-            int src_pos = src_pilot % nof_pilots;
-            int src_sc = pusch_dmrs_sc_offset(dmrs_type, cdm_offset, src_pos);
-            int src_idx = dmrs_sym_idx * re_per_dmrs_sym +
-                          src_prb * re_per_prb + port * re_per_port + layer * re_per_layer + src_sc;
-
-            __half2 h_src = d_estimates[src_idx];
-            sum_re += d_rc_filter[t] * __half2float(__low2half(h_src));
-            sum_im += d_rc_filter[t] * __half2float(__high2half(h_src));
-            coef_sum += d_rc_filter[t];
-        }
-
-        if (coef_sum > 1e-6f) {
-            float inv_coef = 1.0f / coef_sum;
-            sum_re *= inv_coef;
-            sum_im *= inv_coef;
-        }
-
-        s_pilots[p] = __halves2half2(__float2half(sum_re), __float2half(sum_im));
-    }
-
     __syncthreads();
 
-    d_estimates[base + sc] = interpolate_dmrs_pilots_half2(s_pilots, nof_pilots, dmrs_type, cdm_offset, sc);
-}
-
-/**
- * Frequency-domain smoothing kernel (FP32 cuFloatComplex, in-place).
- *
- * Same algorithm as kernel_fd_smoothing_fp16 but for the separate-kernel path
- * which uses cuFloatComplex with layout [dmrs_sym][port][prb * 12].
- *
- * Grid:  (nof_prb, nof_dmrs_symbols)
- * Block: (nof_ports)
- */
-__global__ void kernel_fd_smoothing_fp32(
-    cuFloatComplex* __restrict__ d_estimates,  /* [dmrs_sym][port][nof_prb * 12] in-place */
-    int nof_prb,
-    int nof_ports,
-    int nof_dmrs_symbols)
-{
-    int prb_idx = blockIdx.x;
-    int dmrs_sym_idx = blockIdx.y;
-    int port = threadIdx.x;
-
-    if (prb_idx >= nof_prb || dmrs_sym_idx >= nof_dmrs_symbols || port >= nof_ports) return;
-
-    const int HALF_FILTER = FD_SMOOTH_FILTER_LEN / 2;  /* 7 */
-    int re_per_sym = nof_ports * nof_prb * 12;
-    int port_base = dmrs_sym_idx * re_per_sym + port * (nof_prb * 12) + prb_idx * 12;
-    int total_pilots = nof_prb * 6;
-    int pilot_base = prb_idx * 6;
-
-    /* Apply FIR filter to each of the 6 pilot positions */
-    float smoothed_re[6], smoothed_im[6];
-
-    #pragma unroll
-    for (int p = 0; p < 6; p++) {
-        float sum_re = 0.0f;
-        float sum_im = 0.0f;
-        float coef_sum = 0.0f;
-        int global_pilot = pilot_base + p;
-
-        for (int t = 0; t < FD_SMOOTH_FILTER_LEN; t++) {
-            int src_pilot = global_pilot + (t - HALF_FILTER);
-
-            /* Skip out-of-range taps (don't clamp) */
-            if (src_pilot < 0 || src_pilot >= total_pilots) continue;
-
-            int src_prb = src_pilot / 6;
-            int src_pos = src_pilot % 6;
-            int src_idx = dmrs_sym_idx * re_per_sym +
-                          port * (nof_prb * 12) + src_prb * 12 + src_pos * 2;
-
-            cuFloatComplex h_src = d_estimates[src_idx];
-            sum_re += d_rc_filter[t] * h_src.x;
-            sum_im += d_rc_filter[t] * h_src.y;
-            coef_sum += d_rc_filter[t];
+    for (int prb = threadIdx.x; prb < nof_prb; prb += blockDim.x) {
+        float smoothed_re[6], smoothed_im[6];
+        for (int p = 0; p < nof_pilots; ++p) {
+            if constexpr (MASK_DC) {
+                if (!ocudu::cuda::pilot_mask::observed(2 * (prb * nof_pilots + p), erased_sc)) {
+                    // TA/CFO correlations must not treat an imputed pilot as observed.
+                    smoothed_re[p] = smoothed_im[p] = 0.F;
+                    continue;
+                }
+            }
+            float sum_re = 0.F, sum_im = 0.F, coefficient_sum = 0.F;
+            for (int t = 0; t < FD_SMOOTH_FILTER_LEN; ++t) {
+                const int source = prb * nof_pilots + p + t - FD_SMOOTH_FILTER_LEN / 2;
+                if (source < 0 || source >= total_pilots) continue;
+                if constexpr (MASK_DC) {
+                    if (!ocudu::cuda::pilot_mask::observed(2 * source, erased_sc)) continue;
+                }
+                const float2 value = snapshot[source];
+                sum_re += d_rc_filter[t] * value.x;
+                sum_im += d_rc_filter[t] * value.y;
+                coefficient_sum += d_rc_filter[t];
+            }
+            if (coefficient_sum > 1e-6F) {
+                const float inverse = 1.F / coefficient_sum;
+                sum_re *= inverse;
+                sum_im *= inverse;
+            }
+            smoothed_re[p] = sum_re;
+            smoothed_im[p] = sum_im;
         }
 
-        /* Renormalize to compensate for truncated taps at band edges */
-        if (coef_sum > 1e-6f) {
-            float inv_coef = 1.0f / coef_sum;
-            sum_re *= inv_coef;
-            sum_im *= inv_coef;
-        }
-
-        smoothed_re[p] = sum_re;
-        smoothed_im[p] = sum_im;
-    }
-
-    /* Write back smoothed estimates for all 12 subcarriers */
-    #pragma unroll
-    for (int sc = 0; sc < 12; sc++) {
-        float r, i_val;
-        if (sc % 2 == 0) {
-            r = smoothed_re[sc / 2];
-            i_val = smoothed_im[sc / 2];
+        const int base = row_base + prb * prb_stride;
+        if constexpr (MIMO) {
+            __half2 pilots[6];
+            for (int p = 0; p < nof_pilots; ++p)
+                pilots[p] = __floats2half2_rn(smoothed_re[p], smoothed_im[p]);
+            for (int sc = 0; sc < 12; ++sc)
+                static_cast<__half2*>(estimates)[base + sc] =
+                    interpolate_dmrs_pilots_half2(pilots, nof_pilots, dmrs_type, cdm_offset, sc);
+        } else if constexpr (FP32) {
+            for (int sc = 0; sc < 12; ++sc) {
+                const int left = sc / 2;
+                const int right = min(left + 1, 5);
+                static_cast<float2*>(estimates)[base + sc] = (sc % 2 == 0) ?
+                    make_float2(smoothed_re[left], smoothed_im[left]) :
+                    make_float2(.5F * (smoothed_re[left] + smoothed_re[right]),
+                                .5F * (smoothed_im[left] + smoothed_im[right]));
+            }
         } else {
-            int left = sc / 2;
-            int right = (left + 1 < 6) ? left + 1 : 5;
-            r = 0.5f * (smoothed_re[left] + smoothed_re[right]);
-            i_val = 0.5f * (smoothed_im[left] + smoothed_im[right]);
+            for (int sc = 0; sc < 12; ++sc) {
+                int left = 0, right = 0;
+                int left_sc = pusch_dmrs_sc_offset(dmrs_type, 0, 0);
+                int right_sc = left_sc;
+                bool exact = false;
+                for (int p = 0; p < nof_pilots; ++p) {
+                    const int pilot_sc = pusch_dmrs_sc_offset(dmrs_type, 0, p);
+                    if (pilot_sc == sc) { left = right = p; exact = true; break; }
+                    if (pilot_sc < sc) { left = p; left_sc = pilot_sc; }
+                    else { right = p; right_sc = pilot_sc; break; }
+                }
+                float re = smoothed_re[left], im = smoothed_im[left];
+                if (!exact && sc > left_sc && right_sc > left_sc) {
+                    const float alpha = float(sc - left_sc) / float(right_sc - left_sc);
+                    re = (1.F - alpha) * smoothed_re[left] + alpha * smoothed_re[right];
+                    im = (1.F - alpha) * smoothed_im[left] + alpha * smoothed_im[right];
+                }
+                static_cast<__half2*>(estimates)[base + sc] = __floats2half2_rn(re, im);
+            }
         }
-        d_estimates[port_base + sc] = make_cuFloatComplex(r, i_val);
     }
 }
 
@@ -5381,8 +5147,12 @@ void launch_kernel_compute_ta_and_cfo(dim3 grid, dim3 block, size_t shmem, cudaS
     kernel_compute_ta_and_cfo<<<grid, block, shmem, stream>>>(d_estimates_fp16, d_ta_result, d_cfo_result, d_accum, nof_prb, nof_ports, nof_dmrs_symbols, pilot_spacing_hz, delta_t_s, d_symbol_start_times, d_dmrs_symbol_indices, d_cfo_phasors, start_symbol, dmrs_type);
 }
 
-void launch_kernel_cross_validation_noise_variance(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, const __half2* __restrict__ d_estimates_fp16, float* __restrict__ d_noise_var_accum, const unsigned int* __restrict__ d_grid_cbf16, const uint32_t* __restrict__ d_dmrs_pilot_bits, const int* __restrict__ d_dmrs_symbol_indices, float* __restrict__ d_sinr_noise_accum, float* __restrict__ d_sinr_rsrp_accum, int nof_prb, int nof_ports, int nof_dmrs_symbols, int grid_stride, int symbol_stride, int start_prb, float dmrs_scaling, int words_per_dmrs_sym, const float* __restrict__ d_cfo_hz_ptr, const float* __restrict__ d_symbol_start_times, const float2* __restrict__ d_cfo_phasors, float* __restrict__ d_noise_vars_out, unsigned int* __restrict__ d_cv_done_counter, const float* __restrict__ d_epre_accum, float* __restrict__ d_sinr_epre_result, int noise_mode, int dmrs_type) {
-    kernel_cross_validation_noise_variance<<<grid, block, shmem, stream>>>(d_estimates_fp16, d_noise_var_accum, d_grid_cbf16, d_dmrs_pilot_bits, d_dmrs_symbol_indices, d_sinr_noise_accum, d_sinr_rsrp_accum, nof_prb, nof_ports, nof_dmrs_symbols, grid_stride, symbol_stride, start_prb, dmrs_scaling, words_per_dmrs_sym, d_cfo_hz_ptr, d_symbol_start_times, d_cfo_phasors, d_noise_vars_out, d_cv_done_counter, d_epre_accum, d_sinr_epre_result, noise_mode, dmrs_type);
+void launch_kernel_cross_validation_noise_variance(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, const __half2* __restrict__ d_estimates_fp16, float* __restrict__ d_noise_var_accum, const unsigned int* __restrict__ d_grid_cbf16, const uint32_t* __restrict__ d_dmrs_pilot_bits, const int* __restrict__ d_dmrs_symbol_indices, float* __restrict__ d_sinr_noise_accum, float* __restrict__ d_sinr_rsrp_accum, int nof_prb, int nof_ports, int nof_dmrs_symbols, int grid_stride, int symbol_stride, int start_prb, float dmrs_scaling, int words_per_dmrs_sym, const float* __restrict__ d_cfo_hz_ptr, const float* __restrict__ d_symbol_start_times, const float2* __restrict__ d_cfo_phasors, float* __restrict__ d_noise_vars_out, unsigned int* __restrict__ d_cv_done_counter, const float* __restrict__ d_epre_accum, float* __restrict__ d_sinr_epre_result, int noise_mode, int dmrs_type, int erased_sc) {
+    if (erased_sc >= 0) {
+kernel_cross_validation_noise_variance<true><<<grid, block, shmem, stream>>>(d_estimates_fp16, d_noise_var_accum, d_grid_cbf16, d_dmrs_pilot_bits, d_dmrs_symbol_indices, d_sinr_noise_accum, d_sinr_rsrp_accum, nof_prb, nof_ports, nof_dmrs_symbols, grid_stride, symbol_stride, start_prb, dmrs_scaling, words_per_dmrs_sym, d_cfo_hz_ptr, d_symbol_start_times, d_cfo_phasors, d_noise_vars_out, d_cv_done_counter, d_epre_accum, d_sinr_epre_result, noise_mode, dmrs_type, erased_sc);
+    } else {
+kernel_cross_validation_noise_variance<false><<<grid, block, shmem, stream>>>(d_estimates_fp16, d_noise_var_accum, d_grid_cbf16, d_dmrs_pilot_bits, d_dmrs_symbol_indices, d_sinr_noise_accum, d_sinr_rsrp_accum, nof_prb, nof_ports, nof_dmrs_symbols, grid_stride, symbol_stride, start_prb, dmrs_scaling, words_per_dmrs_sym, d_cfo_hz_ptr, d_symbol_start_times, d_cfo_phasors, d_noise_vars_out, d_cv_done_counter, d_epre_accum, d_sinr_epre_result, noise_mode, dmrs_type, -1);
+    }
 }
 
 void launch_kernel_dmrs_lse_type1(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, const unsigned int* __restrict__ d_grid_cbf16, const unsigned int* __restrict__ d_dmrs_seq, cuFloatComplex* __restrict__ d_lse_estimates, int nof_prb, int nof_ports, int grid_stride, int symbol_stride, int start_prb, int dmrs_symbol_idx, int start_symbol, float dmrs_scaling) {
@@ -5393,12 +5163,21 @@ void launch_kernel_dmrs_lse_type1_low_papr(dim3 grid, dim3 block, size_t shmem, 
     kernel_dmrs_lse_type1_low_papr<<<grid, block, shmem, stream>>>(d_grid_cbf16, d_pilots, d_lse_estimates, nof_prb, nof_ports, grid_stride, symbol_stride, start_prb, dmrs_symbol_idx, start_symbol, dmrs_scaling);
 }
 
-void launch_kernel_fd_smoothing_fp16(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, __half2* __restrict__ d_estimates, int nof_prb, int nof_ports, int nof_dmrs_symbols, int dmrs_type) {
-    kernel_fd_smoothing_fp16<<<grid, block, shmem, stream>>>(d_estimates, nof_prb, nof_ports, nof_dmrs_symbols, dmrs_type);
+void launch_kernel_fd_smoothing_fp16(dim3, dim3, size_t, cudaStream_t stream, __half2* __restrict__ d_estimates, int nof_prb, int nof_ports, int nof_dmrs_symbols, int dmrs_type, int erased_sc) {
+    const size_t shared_bytes = size_t(nof_prb) * pusch_dmrs_pilots_per_cdm(dmrs_type) * sizeof(float2);
+    if (erased_sc >= 0) {
+        kernel_fd_smoothing_snapshot<false, false, true><<<dim3(nof_ports, nof_dmrs_symbols), 128, shared_bytes, stream>>>(
+            d_estimates, nof_prb, nof_ports, 1, dmrs_type, erased_sc);
+        return;
+    }
+    kernel_fd_smoothing_snapshot<false, false><<<dim3(nof_ports, nof_dmrs_symbols), 128, shared_bytes, stream>>>(
+        d_estimates, nof_prb, nof_ports, 1, dmrs_type);
 }
 
-void launch_kernel_fd_smoothing_fp32(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, cuFloatComplex* __restrict__ d_estimates, int nof_prb, int nof_ports, int nof_dmrs_symbols) {
-    kernel_fd_smoothing_fp32<<<grid, block, shmem, stream>>>(d_estimates, nof_prb, nof_ports, nof_dmrs_symbols);
+void launch_kernel_fd_smoothing_fp32(dim3, dim3, size_t, cudaStream_t stream, cuFloatComplex* __restrict__ d_estimates, int nof_prb, int nof_ports, int nof_dmrs_symbols) {
+    const size_t shared_bytes = size_t(nof_prb) * 6 * sizeof(float2);
+    kernel_fd_smoothing_snapshot<true, false><<<dim3(nof_ports, nof_dmrs_symbols), 128, shared_bytes, stream>>>(
+        d_estimates, nof_prb, nof_ports, 1, DMRS_TYPE_1);
 }
 
 void launch_kernel_finalize_noise_variance(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, float* __restrict__ d_noise_var_accum, const unsigned int* __restrict__ d_noise_count, int nof_ports, float dmrs_scaling, int nof_dmrs_symbols) {
@@ -5413,8 +5192,12 @@ void launch_kernel_freq_interpolate_type1(dim3 grid, dim3 block, size_t shmem, c
     kernel_freq_interpolate_type1<<<grid, block, shmem, stream>>>(d_lse_estimates, d_full_estimates, nof_prb, nof_ports);
 }
 
-void launch_kernel_fused_lse_freq_interp_noise_fp16(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, const unsigned int* __restrict__ d_grid_cbf16, const uint32_t* __restrict__ d_dmrs_c_inits, const int* __restrict__ dmrs_symbol_indices, __half2* __restrict__ d_estimates_fp16, float* __restrict__ d_noise_var_accum, unsigned int* __restrict__ d_noise_count, float* __restrict__ d_rsrp_accum, float* __restrict__ d_epre_accum, int nof_prb, int nof_ports, int nof_dmrs_symbols, int grid_stride, int symbol_stride, int start_prb, float dmrs_scaling, int dmrs_type) {
-    kernel_fused_lse_freq_interp_noise_fp16<<<grid, block, shmem, stream>>>(d_grid_cbf16, d_dmrs_c_inits, dmrs_symbol_indices, d_estimates_fp16, d_noise_var_accum, d_noise_count, d_rsrp_accum, d_epre_accum, nof_prb, nof_ports, nof_dmrs_symbols, grid_stride, symbol_stride, start_prb, dmrs_scaling, dmrs_type);
+void launch_kernel_fused_lse_freq_interp_noise_fp16(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, const unsigned int* __restrict__ d_grid_cbf16, const uint32_t* __restrict__ d_dmrs_c_inits, const int* __restrict__ dmrs_symbol_indices, __half2* __restrict__ d_estimates_fp16, float* __restrict__ d_noise_var_accum, unsigned int* __restrict__ d_noise_count, float* __restrict__ d_rsrp_accum, float* __restrict__ d_epre_accum, int nof_prb, int nof_ports, int nof_dmrs_symbols, int grid_stride, int symbol_stride, int start_prb, float dmrs_scaling, int dmrs_type, int erased_sc) {
+    if (erased_sc >= 0) {
+    kernel_fused_lse_freq_interp_noise_fp16<true><<<grid, block, shmem, stream>>>(d_grid_cbf16, d_dmrs_c_inits, dmrs_symbol_indices, d_estimates_fp16, d_noise_var_accum, d_noise_count, d_rsrp_accum, d_epre_accum, nof_prb, nof_ports, nof_dmrs_symbols, grid_stride, symbol_stride, start_prb, dmrs_scaling, dmrs_type, erased_sc);
+    } else {
+    kernel_fused_lse_freq_interp_noise_fp16<false><<<grid, block, shmem, stream>>>(d_grid_cbf16, d_dmrs_c_inits, dmrs_symbol_indices, d_estimates_fp16, d_noise_var_accum, d_noise_count, d_rsrp_accum, d_epre_accum, nof_prb, nof_ports, nof_dmrs_symbols, grid_stride, symbol_stride, start_prb, dmrs_scaling, dmrs_type, -1);
+    }
 }
 
 void launch_kernel_gather_dmrs_pilot_bits(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, uint32_t* __restrict__ d_dst, const uint32_t* __restrict__ d_src, const int* __restrict__ d_symbol_indices, int words_per_sym) {
@@ -5453,15 +5236,17 @@ void launch_kernel_mimo_dmrs_residual_noise_variance_wide(cudaStream_t stream, c
     kernel_mimo_dmrs_residual_noise_variance_wide<<<grid, block, 0, stream>>>(d_grid_cbf16, d_dmrs_pilot_bits, d_dmrs_symbol_indices, d_estimates_fp16, d_noise_var_accum, nof_prb, nof_ports, nof_layers, nof_dmrs_symbols, grid_stride, symbol_stride, start_prb, dmrs_scaling, words_per_dmrs_sym, d_noise_vars_out, d_done_counter, d_cfo_hz_ptr, d_symbol_start_times, d_cfo_phasors, dmrs_type);
 }
 
-void launch_kernel_mimo_fd_smoothing_fp16(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, __half2* __restrict__ d_estimates, int nof_prb, int nof_ports, int nof_layers, int nof_dmrs_symbols, int dmrs_type) {
-    kernel_mimo_fd_smoothing_fp16<<<grid, block, shmem, stream>>>(d_estimates, nof_prb, nof_ports, nof_layers, nof_dmrs_symbols, dmrs_type);
+void launch_kernel_mimo_fd_smoothing_fp16(dim3, dim3, size_t, cudaStream_t stream, __half2* __restrict__ d_estimates, int nof_prb, int nof_ports, int nof_layers, int nof_dmrs_symbols, int dmrs_type) {
+    const size_t shared_bytes = size_t(nof_prb) * pusch_dmrs_pilots_per_cdm(dmrs_type) * sizeof(float2);
+    kernel_fd_smoothing_snapshot<false, true><<<dim3(nof_ports, nof_dmrs_symbols, nof_layers), 128, shared_bytes, stream>>>(
+        d_estimates, nof_prb, nof_ports, nof_layers, dmrs_type);
 }
 
 void launch_kernel_mimo_fd_smoothing_fp16_wide(cudaStream_t stream, __half2* __restrict__ d_estimates, int nof_prb, int nof_ports, int nof_layers, int nof_dmrs_symbols, int dmrs_type) {
-    dim3 grid(nof_prb, nof_dmrs_symbols);
-    dim3 block(12, nof_ports, nof_layers);
-    size_t shmem = static_cast<size_t>(nof_layers) * nof_ports * 6 * sizeof(__half2);
-    kernel_mimo_fd_smoothing_fp16_wide<<<grid, block, shmem, stream>>>(d_estimates, nof_prb, nof_ports, nof_layers, nof_dmrs_symbols, dmrs_type);
+    // Keep the legacy selector callable; both routes now use the same
+    // cooperative frequency-row snapshot rather than racing across PRB blocks.
+    launch_kernel_mimo_fd_smoothing_fp16(dim3{}, dim3{}, 0, stream, d_estimates,
+        nof_prb, nof_ports, nof_layers, nof_dmrs_symbols, dmrs_type);
 }
 
 void launch_kernel_mimo_lse_2layer_fp16(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, const unsigned int* __restrict__ d_grid_cbf16, const uint32_t* __restrict__ d_dmrs_seq, const int* __restrict__ dmrs_symbol_indices, __half2* __restrict__ d_estimates_fp16, int nof_prb, int nof_ports, int nof_dmrs_symbols, int grid_stride, int symbol_stride, int start_prb, float dmrs_scaling, int words_per_dmrs_sym_stride, int dmrs_type) {

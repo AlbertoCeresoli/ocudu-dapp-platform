@@ -83,7 +83,7 @@ public:
   };
 
   /// Dependencies pool class.
-  using concurrent_dependencies_pool_type = bounded_unique_object_pool<concurrent_dependencies>;
+  using concurrent_dependencies_pool_type = bounded_rc_object_pool<concurrent_dependencies>;
 
   /// Collects the necessary parameters for creating a PUSCH processor.
   struct configuration {

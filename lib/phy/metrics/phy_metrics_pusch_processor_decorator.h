@@ -61,6 +61,11 @@ public:
   }
 
 private:
+  pusch_processing_activity acquire_processing_activity() noexcept override
+  {
+    return notifier ? notifier->acquire_processing_activity() : pusch_processing_activity{};
+  }
+
   // See pusch_processor_result_notifier for documentation.
   void on_uci(const pusch_processor_result_control& uci) override
   {
@@ -126,7 +131,8 @@ private:
                                    .elapsed_uci       = elapsed_uci,
                                    .cpu_time_usage_ns = cpu_time_usage_ns.load(std::memory_order_relaxed),
                                    .sinr_dB           = sinr_dB,
-                                   .evm               = evm});
+                                   .evm               = evm,
+                                   .input_valid       = sch_result.data.input_valid});
 
     // Notify the completion of the PUSCH processing. From now on, the processor might become available.
     pusch_processor_result_notifier* current_proc_notifier = std::exchange(notifier, nullptr);

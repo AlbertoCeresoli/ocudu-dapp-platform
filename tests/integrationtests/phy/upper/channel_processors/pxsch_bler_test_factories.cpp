@@ -3,6 +3,8 @@
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 #include "pxsch_bler_test_factories.h"
+#include "pusch_test_cold_trace.h"
+#include "ocudu/support/error_handling.h"
 #if defined(HWACC_PDSCH_ENABLED) && defined(HWACC_PUSCH_ENABLED)
 #include "ocudu/hal/dpdk/bbdev/bbdev_acc.h"
 #include "ocudu/hal/dpdk/bbdev/bbdev_acc_factory.h"
@@ -180,8 +182,27 @@ ocudu::create_sw_pusch_processor_factory(task_executor&                         
                                          bool                                             dec_enable_early_stop,
                                          const std::string&                               pxsch_type,
                                          port_channel_estimator_td_interpolation_strategy td_interpolation_strategy,
-                                         channel_equalizer_algorithm_type                 equalizer_algorithm_type)
+                                         channel_equalizer_algorithm_type                 equalizer_algorithm_type,
+                                         const pxsch_test_dapp_config&                    dapps,
+                                         unsigned                                        decoder_max_prb,
+                                         unsigned                                        decoder_max_layers,
+                                         channel_state_information::sinr_type             sinr_method,
+                                         unsigned                                        receiver_max_ports,
+                                         test_support::pusch_cold_trace*                  cold_trace)
 {
+  report_fatal_error_if_not(decoder_max_prb > 0 && decoder_max_prb <= MAX_NOF_PRBS &&
+                           decoder_max_layers > 0 && decoder_max_layers <= pusch_constants::MAX_NOF_LAYERS &&
+                           receiver_max_ports > 0 && receiver_max_ports <= pusch_constants::MAX_NOF_RX_PORTS &&
+                           receiver_max_ports >= decoder_max_layers,
+                           "Invalid configured test decoder capacity");
+  // Offline-harness cold path only. A flushed subphase survives cancellation
+  // inside runtime initialization; no callbacks/instrumentation on L1 grants.
+  auto measure = [cold_trace](const char* phase, auto&& operation) {
+    if (cold_trace) {
+      return cold_trace->measure(phase, std::forward<decltype(operation)>(operation));
+    }
+    return std::forward<decltype(operation)>(operation)();
+  };
   std::shared_ptr<dft_processor_factory> dft_proc_factory = create_dft_processor_factory_fftw_slow();
   report_fatal_error_if_not(dft_proc_factory, "Failed to create factory.");
 
@@ -219,11 +240,13 @@ ocudu::create_sw_pusch_processor_factory(task_executor&                         
     pusch_decoder_factory_sw_config.segmenter_factory         = segmenter_rx_factory;
     pusch_decoder_factory_sw_config.nof_pusch_decoder_threads = max_nof_threads;
     pusch_decoder_factory_sw_config.executor                  = &executor;
-    pusch_decoder_factory_sw_config.nof_prb                   = MAX_NOF_PRBS;
-    pusch_decoder_factory_sw_config.nof_layers                = pusch_constants::MAX_NOF_LAYERS;
+    pusch_decoder_factory_sw_config.nof_prb                   = decoder_max_prb;
+    pusch_decoder_factory_sw_config.nof_layers                = decoder_max_layers;
     bool enable_gpu_decoder = (pxsch_type == "gpu") || (pxsch_type.find("gpu-decoder") != std::string::npos);
     pusch_decoder_factory_sw_config.enable_resident_acceleration_decoder = enable_gpu_decoder;
-    pusch_dec_factory = create_pusch_decoder_factory_sw(pusch_decoder_factory_sw_config);
+    pusch_dec_factory = measure("decoder_factory_create", [&] {
+      return create_pusch_decoder_factory_sw(pusch_decoder_factory_sw_config);
+    });
 #if defined(HWACC_PDSCH_ENABLED) && defined(HWACC_PUSCH_ENABLED)
   }
 #endif // HWACC_PDSCH_ENABLED && HWACC_PUSCH_ENABLED
@@ -253,7 +276,7 @@ ocudu::create_sw_pusch_processor_factory(task_executor&                         
                                              low_papr_sequence_gen_factory,
                                              chan_estimator_factory,
                                              executor,
-                                             pusch_constants::MAX_NOF_RX_PORTS,
+                                             receiver_max_ports,
                                              port_channel_estimator_fd_smoothing_strategy::filter,
                                              td_interpolation_strategy,
                                              compensate_cfo);
@@ -270,19 +293,21 @@ ocudu::create_sw_pusch_processor_factory(task_executor&                         
   report_fatal_error_if_not(evm_calc_factory, "Failed to create factory.");
 
   std::shared_ptr<transform_precoder_factory> precoding_factory =
-      create_dft_transform_precoder_factory(dft_proc_factory, MAX_NOF_PRBS);
+      create_dft_transform_precoder_factory(dft_proc_factory, decoder_max_prb);
   report_fatal_error_if_not(precoding_factory, "Invalid transform precoding factory.");
 
   std::shared_ptr<pusch_demodulator_factory> pusch_demod_factory = nullptr;
   bool enable_gpu_demodulator = (pxsch_type == "gpu") || (pxsch_type.find("gpu-demod") != std::string::npos);
-  if (enable_gpu_demodulator && is_pusch_demodulator_acceleration_available()) {
+  if (enable_gpu_demodulator && measure("demodulator_availability", [] {
+        return is_pusch_demodulator_acceleration_available();
+      })) {
     pusch_demodulator_factory_accelerated_configuration gpu_demod_config;
     gpu_demod_config.equalizer_factory    = eq_factory;
     gpu_demod_config.precoder_factory     = precoding_factory;
     gpu_demod_config.demodulation_factory = chan_demod_factory;
     gpu_demod_config.evm_calc_factory     = evm_calc_factory;
     gpu_demod_config.prg_factory          = pseudo_random_gen_factory;
-    gpu_demod_config.max_nof_prb          = MAX_NOF_PRBS;
+    gpu_demod_config.max_nof_prb          = decoder_max_prb;
     gpu_demod_config.enable_post_eq_sinr  = true;
     gpu_demod_config.equalizer_algorithm  = equalizer_algorithm_type;
     pusch_demod_factory                   = create_pusch_demodulator_factory_accelerated(gpu_demod_config);
@@ -294,10 +319,18 @@ ocudu::create_sw_pusch_processor_factory(task_executor&                         
                                                               chan_demod_factory,
                                                               evm_calc_factory,
                                                               pseudo_random_gen_factory,
-                                                              MAX_NOF_PRBS,
+                                                              decoder_max_prb,
                                                               true);
   }
   report_fatal_error_if_not(pusch_demod_factory, "Failed to create factory.");
+
+  if (dapps.hooks) {
+    report_fatal_error_if_not(dapps.limits.nof_lanes == max_nof_threads,
+                              "dApp lane count must cover the dependency pool.");
+    chan_est_factory    = dapps.hooks->decorate_pusch_channel_estimator(chan_est_factory, dapps.limits);
+    pusch_demod_factory = dapps.hooks->decorate_pusch_demodulator(pusch_demod_factory, dapps.limits);
+    report_fatal_error_if_not(chan_est_factory && pusch_demod_factory, "Failed to create dApp PHY adapters.");
+  }
 
   std::shared_ptr<ulsch_demultiplex_factory> demux_factory = create_ulsch_demultiplex_factory_sw();
   report_fatal_error_if_not(demux_factory, "Failed to create factory.");
@@ -318,17 +351,18 @@ ocudu::create_sw_pusch_processor_factory(task_executor&                         
   pusch_proc_factory_config.demux_factory              = demux_factory;
   pusch_proc_factory_config.decoder_factory            = pusch_dec_factory;
   pusch_proc_factory_config.uci_dec_factory            = uci_dec_factory;
-  pusch_proc_factory_config.ch_estimate_dimensions     = {.nof_prb       = MAX_NOF_PRBS,
+  pusch_proc_factory_config.ch_estimate_dimensions     = {.nof_prb       = decoder_max_prb,
                                                           .nof_symbols   = MAX_NSYMB_PER_SLOT,
-                                                          .nof_rx_ports  = pusch_constants::MAX_NOF_RX_PORTS,
-                                                          .nof_tx_layers = pusch_constants::MAX_NOF_LAYERS};
+                                                          .nof_rx_ports  = receiver_max_ports,
+                                                          .nof_tx_layers = decoder_max_layers};
   pusch_proc_factory_config.dec_nof_iterations         = nof_ldpc_iterations;
   pusch_proc_factory_config.dec_enable_early_stop      = dec_enable_early_stop;
   pusch_proc_factory_config.max_nof_concurrent_threads = max_nof_threads;
-  pusch_proc_factory_config.csi_sinr_calc_method       = channel_state_information::sinr_type::post_equalization;
+  pusch_proc_factory_config.csi_sinr_calc_method       = sinr_method;
 
-  std::shared_ptr<pusch_processor_factory> pusch_proc_factory =
-      create_pusch_processor_factory_sw(pusch_proc_factory_config);
+  std::shared_ptr<pusch_processor_factory> pusch_proc_factory = measure("processor_factory_dependencies_and_warmup", [&] {
+    return create_pusch_processor_factory_sw(pusch_proc_factory_config);
+  });
   report_fatal_error_if_not(pusch_proc_factory, "Failed to create factory.");
 
   return pusch_proc_factory;

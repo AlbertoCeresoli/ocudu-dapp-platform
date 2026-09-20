@@ -4,7 +4,9 @@
 #pragma once
 
 #include "ocudu/dapp/runtime/native_worker.h"
+#include "ocudu/dapp/runtime/native_control_context.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_demodulator.h"
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +34,10 @@ struct pusch_resident_dapp_buffers {
   uint32_t        device_ordinal{};
   uint32_t        completion_slot{};
   uint64_t        execution_stream{};
+  /// Complete, untransformed codeword and every host stream that may consume this grant's buffers.
+  /// Required only for completion-aware receivers; ordinary receivers ignore these appended fields.
+  resident_softbit_buffer codeword{};
+  std::array<void*, 3> consumer_streams{};
 };
 
 /// Per-lane adapter from OCUDU's accelerated receiver storage to the stable Class-A ABI.
@@ -40,7 +46,34 @@ class pusch_resident_dapp
 public:
   virtual ~pusch_resident_dapp() = default;
 
+  /// Cold installation only: the GPU demodulator supplies an owner validated
+  /// against its actual execution stream, before a native receiver is staged.
+  virtual bool bind_control_context(std::shared_ptr<dapp::native_control_context>) noexcept { return false; }
+
+  /// Start a serialized grant before reusing any host or device staging buffers, including baseline/CE/EQ grants.
+  /// False means a previous receiver still owns those buffers: do not enqueue, reset its state, or fall back.
+  /// This does not fence or reclaim pending work; the caller must retain its original dependency/processor.
+  virtual bool begin_grant() noexcept { return true; }
+
   virtual pusch_resident_dapp_mode       mode() const noexcept = 0;
+  /// Host admission may reject a grant before invoking the module. Account it
+  /// through the same bounded host counters as adapter preflight failures.
+  virtual void report_fallback(pusch_resident_dapp_mode, dapp::class_a_fallback_reason) noexcept {}
+
+  /// Snapshot selection once. Unsupported common-feedback profiles use the
+  /// conventional CUDA receiver, with exactly one accounted admission skip.
+  /// This is not module invocation and must not increment invocation counters.
+  pusch_resident_dapp_mode mode_with_pilot_admission(bool common_feedback_required,
+                                                   bool pilot_profile_supported) noexcept
+  {
+    const auto selected = mode();
+    if (selected == pusch_resident_dapp_mode::receiver && common_feedback_required && !pilot_profile_supported) {
+      report_fallback(selected, dapp::class_a_fallback_reason::unsupported_metadata);
+      return pusch_resident_dapp_mode::inactive;
+    }
+    return selected;
+  }
+
   virtual dapp::native_invocation_result invoke_channel_estimator(const pusch_resident_dapp_buffers&,
                                                                   const pusch_demodulator::configuration&) noexcept
   {
@@ -56,6 +89,16 @@ public:
   virtual const float* channel_scheduler_noise_f32() const noexcept { return nullptr; }
   /// True when the most recent receiver invocation filled buffers.post_eq_noise_f32.
   virtual bool receiver_post_eq_noise_valid() const noexcept { return false; }
+  /// True only when the most recent successful receiver invocation filled its optional symbol output.
+  virtual bool receiver_equalized_symbols_valid() const noexcept { return false; }
+  /// Called by the real GPU demodulator when passing its final descriptor to the resident decoder.
+  virtual resident_softbit_buffer receiver_softbits(const resident_softbit_buffer& current) const noexcept
+  {
+    return current;
+  }
+  /// Decoder has returned and every CPU diagnostic consumer has finished. GPU side streams still need fencing.
+  /// Caller retains the original dependency/processor while this returns; no arbitrary owner destruction on L1.
+  virtual void receiver_consumers_returned() noexcept {}
   /// Publishes the host-recorded event covering the most recent attempted module enqueue.
   virtual void on_completion(void* completion_token) noexcept = 0;
   /// Records the replacement boundary after the module and required continuation are enqueued.

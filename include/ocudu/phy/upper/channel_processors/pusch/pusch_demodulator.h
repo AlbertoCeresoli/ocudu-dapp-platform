@@ -22,6 +22,8 @@
 
 namespace ocudu {
 
+class pusch_resource_loan_provider;
+
 class pusch_codeword_buffer;
 class pusch_demodulator_notifier;
 class resource_grid_reader;
@@ -97,6 +99,8 @@ public:
     std::optional<unsigned> n_rapid;
     /// Resident accelerator handoff options.
     pusch_resident_demodulation_config resident;
+    /// Borrowed only during demodulate(); acquire a loan before any deferred use of host-owned resources.
+    pusch_resource_loan_provider* resource_owner = nullptr;
   };
 
   /// Default destructor.
@@ -140,9 +144,16 @@ public:
 
   /// \brief Gets resident softbit buffer information from the last demodulation.
   virtual resident_softbit_buffer get_resident_softbits() const { return {}; }
+  /// After synchronous resident decoder return and CPU diagnostics; retain the originating dependency through this call.
+  virtual void finish_resident_consumers() {}
 
   /// \brief Returns true if the last resident-mode demodulation recovered through the host codeword buffer.
   virtual bool used_host_codeword_fallback() const { return false; }
+
+  /// True only for a failed inline replacement whose producer/side streams were successfully drained.
+  /// No softbits were submitted to the decoder. Caller must settle UCI/diagnostics and discard the configured TB.
+  /// Not permission to retire a native completion ticket or release independently owned resources.
+  virtual bool discarded_inline_input() const { return false; }
 
   /// Gets compact UCI LLRs from the last demodulation.
   virtual resident_uci_buffer get_resident_uci() const { return {}; }

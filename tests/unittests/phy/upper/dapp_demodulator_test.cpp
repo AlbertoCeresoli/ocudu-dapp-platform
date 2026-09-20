@@ -93,6 +93,8 @@ public:
 struct fallback_state {
   unsigned calls{};
   bool     resident{};
+  bool     device_grid{};
+  bool     owned_device_grid{};
 };
 
 class fallback_demodulator final : public pusch_demodulator
@@ -120,6 +122,8 @@ public:
   void enable_resident_mode() override { state->resident = true; }
   void disable_resident_mode() override { state->resident = false; }
   bool is_resident_mode_enabled() const override { return state->resident; }
+  bool used_device_grid() const override { return state->device_grid; }
+  bool used_owned_device_grid() const override { return state->owned_device_grid; }
 
 private:
   std::shared_ptr<fallback_state> state;
@@ -194,6 +198,15 @@ public:
       if (publish_receiver_metrics) {
         output.reserved0 |= OCUDU_DAPP_RECEIVER_METRICS_VALID_V1;
       }
+      requested_receiver_symbols = metrics->equalized_symbols.struct_size != 0;
+      if (requested_receiver_symbols && publish_receiver_symbols) {
+        auto* symbols = reinterpret_cast<cf_t*>(metrics->equalized_symbols.native_handle);
+        std::fill_n(symbols, metrics->equalized_symbols.dimensions[0], cf_t{0.31F, -0.57F});
+        if (invalid_receiver_symbols) {
+          symbols[0] = {std::numeric_limits<float>::quiet_NaN(), 0.0F};
+        }
+        output.reserved0 |= OCUDU_DAPP_RECEIVER_EQUALIZED_SYMBOLS_VALID_V1;
+      }
     }
     if (invalid_content) {
       llrs[0] = std::numeric_limits<int8_t>::min();
@@ -244,6 +257,9 @@ public:
   bool                                                          invalid_content{};
   bool                                                          invalid_receiver_noise{};
   bool                                                          publish_receiver_metrics{true};
+  bool                                                          publish_receiver_symbols{true};
+  bool                                                          requested_receiver_symbols{};
+  bool                                                          invalid_receiver_symbols{};
   bool                                                          replace_output{};
   unsigned                                                      equalizer_calls{};
   unsigned                                                      receiver_calls{};
@@ -357,6 +373,40 @@ void run(pusch_demodulator&                      demodulator,
 
 } // namespace
 
+TEST(dapp_demodulator, forwards_current_grid_provenance_without_caching_or_inventing_it)
+{
+  auto target      = std::make_shared<target_spy>(2);
+  auto fallback    = std::make_shared<fallback_state>();
+  auto demodulator = make_factory(target, fallback)->create();
+  target->backend  = OCUDU_DAPP_BACKEND_CUDA_V1;
+  EXPECT_FALSE(demodulator->used_device_grid());
+  EXPECT_FALSE(demodulator->used_owned_device_grid());
+  for (auto mode : {pusch_dapp_demodulator_mode::inactive,
+                    pusch_dapp_demodulator_mode::receiver,
+                    pusch_dapp_demodulator_mode::equalizer}) {
+    target->mode = mode;
+    for (const auto& flags :
+         {std::pair{false, false}, std::pair{true, false}, std::pair{true, true}, std::pair{false, false}}) {
+      fallback->device_grid       = flags.first;
+      fallback->owned_device_grid = flags.second;
+      codeword_spy codeword;
+      notifier_spy notifier;
+      run(*demodulator, make_config(), codeword, notifier);
+      EXPECT_EQ(demodulator->used_device_grid(), flags.first);
+      EXPECT_EQ(demodulator->used_owned_device_grid(), flags.second);
+    }
+  }
+  // A successful CPU receiver must not inherit a previous CUDA grant's flags.
+  fallback->device_grid = fallback->owned_device_grid = true;
+  target->backend                                     = OCUDU_DAPP_BACKEND_HOST_V1;
+  target->mode                                        = pusch_dapp_demodulator_mode::receiver;
+  codeword_spy codeword;
+  notifier_spy notifier;
+  run(*demodulator, make_config(), codeword, notifier);
+  EXPECT_FALSE(demodulator->used_device_grid());
+  EXPECT_FALSE(demodulator->used_owned_device_grid());
+}
+
 TEST(dapp_demodulator, receiver_publishes_typed_inputs_and_rejoins_the_codeword_pipeline)
 {
   auto         target      = std::make_shared<target_spy>(2);
@@ -377,8 +427,7 @@ TEST(dapp_demodulator, receiver_publishes_typed_inputs_and_rejoins_the_codeword_
   EXPECT_EQ(target->pusch.nof_symbols, 2U);
   EXPECT_EQ(target->pusch.nof_subcarriers, NOF_SUBCARRIERS_PER_RB);
   EXPECT_EQ(target->pusch.reserved[OCUDU_DAPP_PUSCH_RESERVED_SUBCARRIER_SPACING_HZ_V1], 30000U);
-  EXPECT_EQ(target->pusch.reserved[OCUDU_DAPP_PUSCH_RESERVED_GRID_NOF_SUBCARRIERS_V1],
-            NOF_SUBCARRIERS_PER_RB);
+  EXPECT_EQ(target->pusch.reserved[OCUDU_DAPP_PUSCH_RESERVED_GRID_NOF_SUBCARRIERS_V1], NOF_SUBCARRIERS_PER_RB);
   EXPECT_EQ(target->pusch.flags, OCUDU_DAPP_PUSCH_DATA_RE_SELECTION_COMPLETE_V1);
   EXPECT_EQ(std::count(target->data_mask.begin(), target->data_mask.end(), uint8_t{1}), 18);
   EXPECT_EQ(target->pusch.data_re_mask.layout_id, OCUDU_DAPP_LAYOUT_PUSCH_DATA_RE_MASK_U8_V1);
@@ -425,6 +474,95 @@ TEST(dapp_demodulator, receiver_does_not_reuse_stale_sinr_when_metrics_are_not_p
   EXPECT_EQ(target->receiver_calls, 2U);
   EXPECT_EQ(second_codeword.data.size(), 36U);
   EXPECT_FALSE(second_notifier.final.sinr_dB.has_value());
+}
+
+TEST(dapp_demodulator, receiver_symbol_capture_is_optional_and_never_reuses_stale_symbols)
+{
+  auto target = std::make_shared<target_spy>(1);
+  auto fallback = std::make_shared<fallback_state>();
+  auto demodulator = make_factory(target, fallback, 1)->create();
+  codeword_spy first;
+  notifier_spy first_stats;
+  run(*demodulator, make_config(), first, first_stats);
+  EXPECT_FALSE(target->requested_receiver_symbols);
+  EXPECT_TRUE(demodulator->get_captured_symbols().empty());
+  demodulator->enable_symbol_capture();
+  codeword_spy second;
+  notifier_spy second_stats;
+  run(*demodulator, make_config(), second, second_stats);
+  ASSERT_TRUE(target->requested_receiver_symbols);
+  auto symbols = demodulator->get_captured_symbols();
+  ASSERT_EQ(symbols.size(), 18U);
+  for (cf_t value : symbols) EXPECT_EQ(value, cf_t(0.31F, -0.57F));
+  EXPECT_EQ(first.data, second.data);
+  EXPECT_EQ(first_stats.final.sinr_dB, second_stats.final.sinr_dB);
+  target->publish_receiver_symbols = false; // A direct-bit receiver may decline.
+  codeword_spy third;
+  notifier_spy third_stats;
+  run(*demodulator, make_config(), third, third_stats);
+  EXPECT_TRUE(demodulator->get_captured_symbols().empty());
+  EXPECT_EQ(third.data, first.data);
+  EXPECT_EQ(fallback->calls, 0U);
+  demodulator->disable_symbol_capture();
+  codeword_spy fourth;
+  notifier_spy fourth_stats;
+  run(*demodulator, make_config(), fourth, fourth_stats);
+  EXPECT_FALSE(target->requested_receiver_symbols);
+  EXPECT_TRUE(demodulator->get_captured_symbols().empty());
+}
+
+TEST(dapp_demodulator, receiver_rejects_claimed_nonfinite_symbol_output)
+{
+  auto target = std::make_shared<target_spy>(1);
+  auto fallback = std::make_shared<fallback_state>();
+  auto demodulator = make_factory(target, fallback, 1)->create();
+  demodulator->enable_symbol_capture();
+  target->invalid_receiver_symbols = true;
+  codeword_spy codeword;
+  notifier_spy stats;
+  run(*demodulator, make_config(), codeword, stats);
+  EXPECT_EQ(fallback->calls, 1U);
+  EXPECT_EQ(target->invalid_outputs.size(), 1U);
+  EXPECT_TRUE(demodulator->get_captured_symbols().empty());
+}
+
+TEST(dapp_demodulator, receiver_symbol_delivery_and_scheduler_metrics_are_independent)
+{
+  auto target = std::make_shared<target_spy>(1);
+  auto fallback = std::make_shared<fallback_state>();
+  auto demodulator = make_factory(target, fallback, 1)->create();
+  demodulator->enable_symbol_capture();
+  std::vector<int> expected_llrs;
+
+  // Reuse the same lane and buffers through all validity combinations. In
+  // particular, direct-bit receivers may decline both auxiliary outputs, and
+  // a receiver may expose symbols without asserting physical noise authority.
+  for (const auto& flags : {std::make_pair(true, true), std::make_pair(true, false),
+                           std::make_pair(false, true), std::make_pair(false, false)}) {
+    target->publish_receiver_symbols = flags.first;
+    target->publish_receiver_metrics = flags.second;
+    // Unpublished storage is not authoritative, even if it contains NaNs.
+    target->invalid_receiver_noise = !flags.second;
+    codeword_spy codeword;
+    notifier_spy stats;
+    run(*demodulator, make_config(), codeword, stats);
+
+    EXPECT_TRUE(target->requested_receiver_symbols);
+    EXPECT_EQ(stats.final.sinr_dB.has_value(), flags.second);
+    const auto symbols = demodulator->get_captured_symbols();
+    EXPECT_EQ(symbols.size(), flags.first ? 18U : 0U);
+    for (cf_t value : symbols) {
+      EXPECT_EQ(value, cf_t(0.31F, -0.57F));
+    }
+    if (expected_llrs.empty()) {
+      expected_llrs = codeword.data;
+    }
+    EXPECT_EQ(codeword.data.size(), 36U);
+    EXPECT_EQ(codeword.data, expected_llrs);
+    EXPECT_EQ(codeword.end_calls, 1U);
+    EXPECT_EQ(fallback->calls, 0U);
+    EXPECT_TRUE(target->invalid_outputs.empty());
+  }
 }
 
 TEST(dapp_demodulator, receiver_rejects_claimed_nonfinite_noise_metrics)

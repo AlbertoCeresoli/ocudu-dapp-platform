@@ -135,6 +135,8 @@ set(LDPC_SOURCES
     src/scrambling.cu
     src/pusch_e2e.cu
     src/pusch_e2e_api.cu
+    src/pusch_pilot_metrics.cu
+    src/pusch_dapp_noise.cu
     src/srs_estimator.cu
     src/pdsch_fused.cu
     src/polar.cu
@@ -226,6 +228,22 @@ function(ocudu_phy_cuda_add_explicit_cuda_tool target source)
 endfunction()
 
 ocudu_phy_cuda_add_explicit_cuda_tool(test_polar tests/unittests/test_polar.cu)
+ocudu_phy_cuda_add_explicit_cuda_tool(pusch_dapp_noise_test tests/unittests/pusch_dapp_noise_test.cu)
+ocudu_phy_cuda_add_explicit_cuda_tool(pusch_metric_readback_test tests/unittests/pusch_metric_readback_test.cu)
+ocudu_phy_cuda_add_explicit_cuda_tool(pusch_pilot_metrics_fault_test tests/unittests/pusch_pilot_metrics_fault_test.cpp)
+ocudu_phy_cuda_add_explicit_cuda_tool(pusch_pilot_metrics_test tests/unittests/pusch_pilot_metrics_test.cu)
+target_link_options(pusch_pilot_metrics_fault_test PRIVATE
+    -Wl,--wrap=cudaMemsetAsync -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaFree
+    -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaStreamSynchronize)
+ocudu_phy_cuda_add_explicit_cuda_tool(pusch_fd_smoothing_test tests/unittests/pusch_fd_smoothing_test.cu)
+ocudu_phy_cuda_add_explicit_cuda_tool(pusch_metric_readback_fault_test tests/unittests/pusch_metric_readback_fault_test.cpp)
+target_link_options(pusch_metric_readback_fault_test PRIVATE
+    -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaEventQuery -Wl,--wrap=cudaStreamQuery)
+ocudu_phy_cuda_add_explicit_cuda_tool(pusch_dapp_noise_fault_test tests/unittests/pusch_dapp_noise_fault_test.cpp)
+target_link_options(pusch_dapp_noise_fault_test PRIVATE
+    -Wl,--wrap=cudaLaunchKernel -Wl,--wrap=cudaGetLastError -Wl,--wrap=cudaMemcpyAsync
+    -Wl,--wrap=__cudaPushCallConfiguration -Wl,--wrap=__cudaPopCallConfiguration
+    -Wl,--wrap=__cudaGetKernel -Wl,--wrap=__cudaLaunchKernel)
 ocudu_phy_cuda_add_explicit_cuda_tool(polar_benchmark tests/benchmarks/polar_benchmark.cu)
 ocudu_phy_cuda_add_explicit_cuda_tool(polar_sensitivity tests/benchmarks/polar_sensitivity.cu)
 ocudu_phy_cuda_add_explicit_cuda_tool(low_phy_tx_smoke_test tests/unittests/low_phy_tx_smoke_test.cu)
@@ -257,6 +275,21 @@ if(BUILD_OCUDU_PHY_CUDA_TESTS)
         enable_testing()
     endif()
     include(GoogleTest)
+
+    # Host admission/submission checks are safe on CPU-only CI runners. GPU
+    # numerical execution remains explicit (pusch_dapp_noise_test --execute).
+    set_target_properties(pusch_dapp_noise_test pusch_dapp_noise_fault_test pusch_metric_readback_test
+        pusch_metric_readback_fault_test pusch_fd_smoothing_test pusch_pilot_metrics_fault_test
+        PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME pusch_dapp_noise_precheck COMMAND pusch_dapp_noise_test --precheck)
+    add_test(NAME pusch_dapp_noise_submission_faults COMMAND pusch_dapp_noise_fault_test)
+    add_test(NAME pusch_metric_readback_precheck COMMAND pusch_metric_readback_test)
+    add_test(NAME pusch_metric_readback_faults COMMAND pusch_metric_readback_fault_test)
+    add_test(NAME pusch_pilot_metrics_admission COMMAND pusch_pilot_metrics_fault_test)
+    add_test(NAME pusch_fd_smoothing_precheck COMMAND pusch_fd_smoothing_test)
+    set_tests_properties(pusch_dapp_noise_precheck pusch_dapp_noise_submission_faults pusch_metric_readback_precheck
+        pusch_metric_readback_faults pusch_fd_smoothing_precheck pusch_pilot_metrics_admission
+        PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=" LABELS "cuda;dapp;no-gpu")
 
     # ============================================================================
     # E2E Integration Tests (active modules only)

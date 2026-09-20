@@ -4,11 +4,15 @@
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 #include "pusch_demodulator_gpu_impl.h"
+#include "../../dapp/native_cuda_control_context.h"
 #include "../../channel_coding/ldpc/cuda/cuda_rt_utils.h"
 #include "../../dapp/pusch_resident_dapp_cuda.h"
 #include "../../phy_acceleration_runtime_options.h"
 #include "cuda/pusch_sch_llr_compactor.h"
 #include "pusch_acceleration_runtime_options.h"
+#include "pusch_demodulation_metrics.h"
+#include "pusch_inline_replacement.h"
+#include "pusch_metric_readback_completion.h"
 #include "ocudu/ocudulog/ocudulog.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_codeword_buffer.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_demodulator_notifier.h"
@@ -154,6 +158,14 @@ inline float sanitize_sinr_db(float value, uint16_t rnti)
 
 inline void sanitize_stats_in_place(pusch_demodulator_notifier::demodulation_stats& stats, uint16_t rnti)
 {
+  if (stats.channel_estimator_sinr_dB.has_value()) {
+    float v = sanitize_sinr_db(*stats.channel_estimator_sinr_dB, rnti);
+    if (std::isnan(v)) {
+      stats.channel_estimator_sinr_dB.reset();
+    } else {
+      stats.channel_estimator_sinr_dB = v;
+    }
+  }
   if (stats.sinr_dB.has_value()) {
     float v = sanitize_sinr_db(stats.sinr_dB.value(), rnti);
     if (std::isnan(v)) {
@@ -194,7 +206,7 @@ inline void sanitize_stats_in_place(pusch_demodulator_notifier::demodulation_sta
 /// the inflated SINR as excess link margin and repeatedly commands the UE down.
 /// Keep an explicit override for legacy/vendor modules with a documented noise
 /// convention, but never apply an empirical offset to every Class-A module.
-inline bool mean_post_eq_sinr_db_from_noise(span<const float> noise, float& sinr_db)
+inline bool post_eq_sinr_db_from_mean_noise(float mean, float& sinr_db)
 {
   static const float host_convention_cal_db = []() {
     if (const char* env = std::getenv("OCUDU_DAPP_UL_SINR_CAL_DB")) {
@@ -207,61 +219,13 @@ inline bool mean_post_eq_sinr_db_from_noise(span<const float> noise, float& sinr
     return 0.0f;
   }();
 
-  // Class-A modules report an erasure (DC subcarrier, singular channel) as a huge post-equalization noise so the
-  // demapper yields zero LLRs. Such REs carry no information about the link and must not enter the SINR that drives
-  // link adaptation and power control: one erased RE per symbol would otherwise pull a 20 dB link to -10 dB.
-  constexpr float erasure_noise_threshold = 1.0e5f;
-  double          sum                     = 0.0;
-  size_t          count                   = 0;
-  for (float var : noise) {
-    if (std::isfinite(var) && var > 0.0f && var < erasure_noise_threshold) {
-      sum += static_cast<double>(var);
-      ++count;
-    }
-  }
-  if (count == 0) {
+  // Per-RE erasure filtering is performed on device before reduction. Do not
+  // filter the rounded mean again: a mean near 1e5 may round to that boundary.
+  if (!std::isfinite(mean) || mean <= 0.0f) {
     return false;
   }
-  const float mean = static_cast<float>(sum / static_cast<double>(count));
   sinr_db          = -convert_power_to_dB(mean) + host_convention_cal_db;
   return std::isfinite(sinr_db);
-}
-
-inline pusch_demodulator_notifier::demodulation_stats build_e2e_final_stats(float gpu_sinr_db,
-                                                                            float gpu_epre_db,
-                                                                            float gpu_rsrp_db,
-                                                                            float gpu_ta_s,
-                                                                            float gpu_cfo_hz,
-                                                                            float gpu_evm)
-{
-  pusch_demodulator_notifier::demodulation_stats stats;
-
-  // Match the host-facing CPU goodness metric by preferring the
-  // post-equalization EVM-derived SINR whenever the kernel provides it.
-  if (std::isfinite(gpu_evm) && gpu_evm > 0.0f) {
-    stats.sinr_dB.emplace(-20.0f * std::log10(gpu_evm));
-  } else if (std::isfinite(gpu_sinr_db)) {
-    stats.sinr_dB.emplace(gpu_sinr_db);
-  } else {
-    stats.sinr_dB.emplace(MAX_SINR_DB);
-  }
-  if (std::isfinite(gpu_evm)) {
-    stats.evm.emplace(gpu_evm);
-  }
-  if (std::isfinite(gpu_epre_db)) {
-    stats.epre_dB.emplace(gpu_epre_db);
-  }
-  if (std::isfinite(gpu_rsrp_db)) {
-    stats.rsrp_dB.emplace(gpu_rsrp_db);
-  }
-  if (std::isfinite(gpu_ta_s)) {
-    stats.time_alignment_s.emplace(gpu_ta_s);
-  }
-  if (std::isfinite(gpu_cfo_hz)) {
-    stats.cfo_Hz.emplace(gpu_cfo_hz);
-  }
-
-  return stats;
 }
 
 static unsigned pusch_gpu_e2e_timing_warn_us()
@@ -1176,6 +1140,12 @@ pusch_demodulator_gpu_impl::pusch_demodulator_gpu_impl(std::unique_ptr<channel_e
     } else {
       ocudulog::fetch_basic_logger("PHY").debug("E2E Msg3 transform warmup complete");
     }
+    // Resolve the dApp metric kernels at setup, using an empty input. Never read
+    // uninitialized data and never defer first-launch setup to a live grant.
+    if (pusch_e2e_dapp_noise_async(e2e_handle_, nullptr, 0, stream_) != NR_LDPC_SUCCESS) {
+      ocudulog::fetch_basic_logger("PHY").warning("PUSCH dApp noise reduction warmup failed");
+    }
+    cudaStreamSynchronizeYielding(stream_);
   } else if (gpu_available_) {
     cudaStreamSynchronizeYielding(stream_);
   }
@@ -1248,15 +1218,10 @@ void pusch_demodulator_gpu_impl::configure_e2e_eq_tap(bool enable)
 
 void pusch_demodulator_gpu_impl::enable_symbol_capture()
 {
+  // Request capture for the next demodulation only. The previous grant's diagnostic storage remains owned
+  // until begin_grant() succeeds in demodulate(), where all per-grant capture state is reset together.
   capture_symbols_enabled_ = true;
   capture_requested_slot_  = true;
-  eq_diag_queued_          = false;
-  eq_diag_host_valid_      = false;
-  eq_diag_count_           = 0;
-  last_e2e_eq_count_       = 0;
-  last_capture_src_        = nullptr;
-  last_capture_n_          = 0;
-  captured_eq_host_.clear();
   ocudulog::fetch_basic_logger("PHY").debug(
       "constellation capture enable pinned={} cap={}", h_eq_diag_pinned_ != nullptr, eq_diag_capacity_);
 }
@@ -1268,14 +1233,13 @@ void pusch_demodulator_gpu_impl::disable_symbol_capture()
 
 bool pusch_demodulator_gpu_impl::force_eq_diag_host_copy()
 {
-  // Prefer the device source recorded at queue time, else NeuralEq d_symbols_, else E2E tap.
+  // Only actual symbol producers may advertise a source. last_nof_eq_re_ is
+  // also the noise-reduction extent: a full receiver can set it without
+  // supplying symbols, so it is NOT permission to read d_symbols_.
   const void* src = last_capture_src_;
   std::size_t n   = last_capture_n_;
   if (src == nullptr || n == 0) {
-    if (last_nof_eq_re_ > 0 && d_symbols_ != nullptr) {
-      src = d_symbols_;
-      n   = last_nof_eq_re_;
-    } else if (last_e2e_eq_count_ > 0 && d_eq_diag_ != nullptr) {
+    if (last_e2e_eq_count_ > 0 && d_eq_diag_ != nullptr) {
       src = d_eq_diag_;
       n   = last_e2e_eq_count_;
     }
@@ -1662,6 +1626,16 @@ void pusch_demodulator_gpu_impl::demodulate(pusch_codeword_buffer&              
                                             const dmrs_pusch_estimator_results& est_results,
                                             const configuration&                config)
 {
+  // Admission precedes even host-vector resets: an earlier receiver or diagnostic stream may still own them.
+  // The dependency loan normally prevents reentry. Fail closed here as well; never overwrite pending tensors
+  // or carry a completed neural acceptance descriptor into a later baseline/CE/EQ grant.
+  if (resident_dapp_ && !resident_dapp_->begin_grant()) {
+    gpu_llrs_valid_         = false;
+    host_codeword_written_  = false;
+    inline_input_discarded_ = true;
+    return;
+  }
+
   unsigned nof_rx_ports = static_cast<unsigned>(config.rx_ports.size());
 
   // Reset GPU LLR state from previous demodulation.
@@ -1670,7 +1644,15 @@ void pusch_demodulator_gpu_impl::demodulate(pusch_codeword_buffer&              
   last_owned_device_grid_used_       = false;
   last_dapp_inline_                  = false;
   last_dapp_post_eq_noise_valid_     = false;
+  last_common_pilot_csi_             = false;
   last_nof_eq_re_                    = 0;
+  last_capture_src_                  = nullptr;
+  last_capture_n_                    = 0;
+  last_e2e_eq_count_                  = 0;
+  eq_diag_queued_                    = false;
+  eq_diag_host_valid_                = false;
+  eq_diag_count_                     = 0;
+  captured_eq_host_.clear();
   gpu_uci_llrs_valid_                = false;
   gpu_uci_decoded_valid_             = false;
   gpu_harq_ack_decoded_              = false;
@@ -1678,6 +1660,7 @@ void pusch_demodulator_gpu_impl::demodulate(pusch_codeword_buffer&              
   gpu_uci_demux_pending_             = false;
   gpu_uci_device_decode_requested_   = false;
   host_codeword_written_             = false;
+  inline_input_discarded_            = false;
   last_resident_llrs_                = nullptr;
   h_harq_ack_payload_size_           = 0;
   h_csi_part1_payload_size_          = 0;
@@ -1998,6 +1981,11 @@ void pusch_demodulator_gpu_impl::demodulate(pusch_codeword_buffer&              
         accumulated_count_,
         raw_accumulated_re_,
         can_use_gpu_eq);
+  }
+
+  if (inline_input_discarded_) {
+    // No host softbits/end marker or synthetic "clean" stats may escape a failed inline submission.
+    return;
   }
 
   // Report final stats (only for CPU equalization paths).
@@ -2903,8 +2891,9 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   }
 
   // Give a resident full-receiver dApp first authority over the prepared grid, RE indices,
-  // inherited stream and caller-owned FP16 output. A returned failure leaves any already
-  // enqueued work ordered before the conventional overwrite on this same stream.
+  // inherited stream and caller-owned FP16 output. Overwrite permission is independent of
+  // successful output: a partial/uncertain submission can fail AND forbid conventional recovery.
+  pusch_inline_replacement replacement;
   bool dapp_inline_used         = false;
   bool dapp_post_eq_noise_valid = false;
   auto demodulate_equalized     = [&]() {
@@ -2936,10 +2925,27 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
     status                 = demod_status == 0 ? NR_LDPC_SUCCESS : NR_LDPC_ERROR_CUDA_FAILED;
     return demod_status == 0;
   };
-  if (resident_dapp_) {
+  // Opt-in common feedback for controlled baseline/full-receiver comparisons.
+  // Select channel_estimator SINR explicitly in the sector configuration; never
+  // relabel pilot SINR as post-EQ. Unsupported receiver grants remain conventional.
+  static const bool common_pilot_csi =
+      phy_acceleration_env_flag_enabled("OCUDU_PUSCH_COMMON_PILOT_CSI", false);
+  const int pilot_dc = config.dc_position.has_value() &&
+                               *config.dc_position <= static_cast<unsigned>(std::numeric_limits<int>::max())
+                           ? static_cast<int>(*config.dc_position)
+                           : config.dc_position.has_value() ? -2 : -1;
+  const bool common_pilot_admitted = common_pilot_csi &&
+      pusch_e2e_validate_pilot_metrics(e2e_handle_, d_grid_cbf16_, pilot_dc) == NR_LDPC_SUCCESS;
+  const pusch_resident_dapp_mode resident_mode =
+      resident_dapp_ ? resident_dapp_->mode_with_pilot_admission(common_pilot_csi, common_pilot_admitted)
+                     : pusch_resident_dapp_mode::inactive;
+  if (resident_mode != pusch_resident_dapp_mode::inactive) {
     const pusch_resident_dapp_buffers buffers{.grid_cbf16           = d_grid_cbf16_,
                                               .data_re_indices      = reinterpret_cast<const uint32_t*>(d_re_indices_),
-                                              .equalized_cf32       = d_symbols_,
+                                              .equalized_cf32       = resident_mode != pusch_resident_dapp_mode::receiver ||
+                                                                              capture_symbols_enabled_ || capture_requested_slot_
+                                                                          ? d_symbols_
+                                                                          : nullptr,
                                               .post_eq_noise_f32    = d_noise_vars_,
                                               .llrs_f16             = d_llrs_half_[buf_idx],
                                               .nof_grid_ports       = nof_rx_ports,
@@ -2948,10 +2954,21 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
                                               .nof_data_re          = static_cast<uint32_t>(nof_re),
                                               .device_ordinal       = 0,
                                               .completion_slot      = static_cast<uint32_t>(buf_idx),
-                                              .execution_stream     = reinterpret_cast<uintptr_t>(stream_)};
-    const pusch_resident_dapp_mode    resident_mode = resident_dapp_->mode();
+                                              .execution_stream     = reinterpret_cast<uintptr_t>(stream_),
+                                              .codeword = {.data = d_llrs_half_[buf_idx],
+                                                           .nof_softbits = num_llrs,
+                                                           .execution_context = static_cast<void*>(stream_),
+                                                           .completion_token = static_cast<void*>(kernel_complete_[buf_idx]),
+                                                           .valid = gpu_resident_mode_ && !compact_sch_llrs,
+                                                           .n_id = config.n_id,
+                                                           .rnti = static_cast<uint16_t>(config.rnti),
+                                                           .buffer_index = buf_idx},
+                                              .consumer_streams = {static_cast<void*>(stream_),
+                                                                   static_cast<void*>(h2d_stream_),
+                                                                   static_cast<void*>(d2h_stream_)}};
     if (resident_mode == pusch_resident_dapp_mode::channel_estimator) {
       const auto invoked = resident_dapp_->invoke_channel_estimator(buffers, config);
+      replacement.invoked(invoked);
       if (invoked.status == OCUDU_DAPP_OK_V1 && !invoked.invoke_fallback) {
         if (config.nof_tx_layers <= 2) {
           const bool eq_ok =
@@ -3003,6 +3020,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
       }
     } else if (resident_mode == pusch_resident_dapp_mode::equalizer) {
       const auto invoked = resident_dapp_->invoke_equalizer(buffers, config);
+      replacement.invoked(invoked);
       if (invoked.status == OCUDU_DAPP_OK_V1 && !invoked.invoke_fallback) {
         // Stash EQ availability even if soft-demod later fails — pre-join force-D2H needs this.
         last_nof_eq_re_   = static_cast<std::size_t>(nof_re) * static_cast<std::size_t>(nof_tx_layers);
@@ -3015,6 +3033,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
       }
     } else if (resident_mode == pusch_resident_dapp_mode::receiver) {
       const auto invoked = resident_dapp_->invoke_receiver(buffers, config);
+      replacement.invoked(invoked);
       if (invoked.status == OCUDU_DAPP_OK_V1 && !invoked.invoke_fallback) {
         // Same PUSCH data c_init as demodulate_equalized / GPU E2E (n_s must be 0).
         nr_scrambling_config_t scr_cfg{};
@@ -3029,12 +3048,66 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
         }
         dapp_inline_used         = status == NR_LDPC_SUCCESS;
         dapp_post_eq_noise_valid = dapp_inline_used && resident_dapp_->receiver_post_eq_noise_valid();
+        if (dapp_inline_used && resident_dapp_->receiver_equalized_symbols_valid()) {
+          last_nof_eq_re_   = static_cast<std::size_t>(nof_re) * static_cast<std::size_t>(nof_tx_layers);
+          last_capture_src_ = d_symbols_;
+          last_capture_n_   = last_nof_eq_re_;
+          // Existing bounded optional diagnostic tap: stream-ordered, caller-owned
+          // symbols, no synchronous telemetry work or stale baseline constellation.
+          queue_eq_symbol_d2h(d_symbols_, last_nof_eq_re_);
+        }
       }
     }
   }
 
+  if (!dapp_inline_used) {
+    replacement.continuation_failed();
+  }
   if (resident_dapp_ && !resident_dapp_->on_inline_output_enqueued(static_cast<uint32_t>(buf_idx), dapp_inline_used)) {
+    replacement.continuation_failed();
     dapp_inline_used = false;
+    // Any accepted constellation must follow the receiver that supplied the
+    // final LLRs. Invalidate the failed tap; selected replacement failures are drained/discarded below.
+    last_capture_src_ = nullptr;
+    last_capture_n_ = 0;
+    eq_diag_queued_ = false;
+    eq_diag_host_valid_ = false;
+    eq_diag_count_ = 0;
+  }
+
+  if (replacement.must_discard()) {
+    // Exceptional path only. Module work, staging and optional constellation copies must all finish
+    // before returning the direct-grid hold or allowing this demodulator's storage to be reused.
+    const bool drained = drain_inline_streams(std::array<cudaStream_t, 3>{stream_, h2d_stream_, d2h_stream_},
+                                               [](cudaStream_t stream) {
+                                                 return cudaStreamSynchronizeYielding(stream) == cudaSuccess;
+                                               });
+    if (!drained) {
+      // No production quarantine/resource-retirement owner is installed yet. Do not unwind/recycle
+      // uncertain storage or manufacture a completion event. Completion-required modules remain disabled.
+      report_fatal_error("PUSCH failed inline receiver could not be fenced; refusing unsafe buffer reuse.");
+    }
+    resident_dapp_->on_completion(nullptr);
+    resident_dapp_->receiver_consumers_returned();
+    grid_hold.drop();
+    gpu_llrs_valid_ = false;
+    host_codeword_written_ = false;
+    last_metrics_submission_ok_ = false;
+    last_dapp_inline_ = false;
+    last_dapp_post_eq_noise_valid_ = false;
+    last_resident_llrs_ = nullptr;
+    last_num_llrs_ = 0;
+    last_capture_src_ = nullptr;
+    last_capture_n_ = 0;
+    eq_diag_queued_ = false;
+    eq_diag_host_valid_ = false;
+    eq_diag_count_ = 0;
+    captured_eq_host_.clear();
+    inline_input_discarded_ = true;
+    ocudulog::fetch_basic_logger("PHY").warning(
+        "PUSCH inline receiver input discarded for rnti=0x{:04x}; no conventional overwrite or decode.",
+        static_cast<unsigned>(config.rnti));
+    return;
   }
 
   // Conventional GPU E2E: optionally mirror equalized symbols for constellation (ai-ran set_eq_output tap).
@@ -3091,6 +3164,19 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
     grid_hold.drop();
     process_cpu_grid_fallback(codeword_buffer, notifier, grid, est_results, config);
     return;
+  }
+
+  bool common_pilot_failed = false;
+  if (common_pilot_admitted) {
+    // This must precede grid_hold.commit(): its completion event is the grid's
+    // lifetime boundary. Refreshing after it would read an already-reusable grid.
+    const auto pilot_status = dapp_inline_used
+        ? pusch_e2e_process_pilot_metrics_with_dc(e2e_handle_, d_grid_cbf16_, pilot_dc, stream_)
+        : pusch_e2e_refresh_pilot_metrics_with_dc(e2e_handle_, d_grid_cbf16_, pilot_dc, stream_);
+    last_common_pilot_csi_ = pilot_status == NR_LDPC_SUCCESS;
+    common_pilot_failed = !last_common_pilot_csi_;
+    // No CPU rerun, invented SINR, or overwriting already-produced LLRs on a
+    // measurement failure. Suppress all CSI and retain the existing completion fence.
   }
 
   if (use_device_grid_reader) {
@@ -3337,29 +3423,60 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   const bool resident_skip_sync =
       gpu_resident_mode_ && !resident_host_uci_demux_enabled(config) && !compact_uci_on_device;
   last_sinr_on_side_stream_ = false;
-  if (!dapp_inline_used) {
-    if (resident_skip_sync && sinr_side_stream && (d2h_stream_ != nullptr) && kernel_complete_[buf_idx]) {
-      cudaEventRecord(kernel_complete_[buf_idx], stream_);
-      cudaStreamWaitEvent(d2h_stream_, kernel_complete_[buf_idx], 0);
-      pusch_e2e_sinr_async_launch(e2e_handle_, d2h_stream_);
-      last_sinr_on_side_stream_ = true;
-    } else {
-      pusch_e2e_sinr_async_launch(e2e_handle_, stream_);
+  last_metrics_submission_ok_  = false;
+  last_metrics_fence_recorded_ = false;
+  bool producer_event_recorded = false;
+  bool noise_metrics_failed = false;
+  if (dapp_inline_used && dapp_post_eq_noise_valid) {
+    // Same compute stream as the producer: the existing completion fence covers
+    // reduction and eight-byte readback for both immediate and deferred stats.
+    // No reporting-time allocation, full tensor D2H or additional synchronization.
+    const unsigned noise_count = nof_re * nof_tx_layers;
+    if (pusch_e2e_dapp_noise_async(e2e_handle_, static_cast<const float*>(d_noise_vars_), noise_count, stream_) !=
+        NR_LDPC_SUCCESS) {
+      dapp_post_eq_noise_valid = false;
+      noise_metrics_failed = true;
+      static_cast<void>(cudaGetLastError());
     }
+    last_metrics_submission_ok_ = dapp_post_eq_noise_valid;
+  }
+  if (!dapp_inline_used || last_common_pilot_csi_) {
+    last_metrics_submission_ok_ = false;
+    if (resident_skip_sync && sinr_side_stream && (d2h_stream_ != nullptr) && kernel_complete_[buf_idx] &&
+        d2h_complete_[buf_idx]) {
+      producer_event_recorded = cudaEventRecord(kernel_complete_[buf_idx], stream_) == cudaSuccess;
+      if (producer_event_recorded && cudaStreamWaitEvent(d2h_stream_, kernel_complete_[buf_idx], 0) == cudaSuccess) {
+        // A failed second copy can leave the first pending. Keep the side-stream
+        // completion path even on submission failure, but never report its values.
+        last_sinr_on_side_stream_ = true;
+        last_metrics_submission_ok_ =
+            pusch_e2e_sinr_async_launch_checked(e2e_handle_, d2h_stream_) == NR_LDPC_SUCCESS;
+      }
+    } else {
+      last_metrics_submission_ok_ =
+          pusch_e2e_sinr_async_launch_checked(e2e_handle_, stream_) == NR_LDPC_SUCCESS;
+    }
+  }
+  if (common_pilot_failed || noise_metrics_failed) {
+    last_metrics_submission_ok_ = false;
   }
 
   // PHASE 2.2: Record kernel completion event for async D2H / dApp coordination.
   // Side-stream SINR path already recorded kernel_complete_ above.
   if (kernel_complete_[buf_idx]) {
-    bool event_ok = last_sinr_on_side_stream_;
+    bool event_ok = producer_event_recorded;
     if (!event_ok) {
       if (cudaEventRecord(kernel_complete_[buf_idx], stream_) != cudaSuccess) {
+        last_metrics_submission_ok_ = false;
         static_cast<void>(cudaGetLastError());
         cudaStreamSynchronizeYielding(stream_);
         event_ok = false;
       } else {
         event_ok = true;
       }
+    }
+    if (!last_sinr_on_side_stream_) {
+      last_metrics_fence_recorded_ = event_ok;
     }
     if (resident_dapp_) {
       resident_dapp_->on_completion(event_ok ? static_cast<void*>(kernel_complete_[buf_idx]) : nullptr);
@@ -3408,7 +3525,14 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
     if (d2h_complete_[buf_idx]) {
       // When the SINR readback was routed to the side stream, the completion event must
       // cover those copies (it transitively covers the demod kernels via kernel_complete_).
-      cudaEventRecord(d2h_complete_[buf_idx], last_sinr_on_side_stream_ ? d2h_stream_ : stream_);
+      last_metrics_fence_recorded_ =
+          cudaEventRecord(d2h_complete_[buf_idx], last_sinr_on_side_stream_ ? d2h_stream_ : stream_) == cudaSuccess;
+      if (!last_metrics_fence_recorded_) {
+        last_metrics_submission_ok_ = false;
+        // Exceptional path only: an old event must not permit reuse while a
+        // partial readback still writes the single host result buffer.
+        static_cast<void>(cudaStreamSynchronizeYielding(last_sinr_on_side_stream_ ? d2h_stream_ : stream_));
+      }
     }
     us_post = us_since(t_post0);
     // Host wall breakdown for the resident async path (kernels still in flight).
@@ -3433,11 +3557,14 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   // Non-GPU-resident mode: sync and report SINR immediately.
   {
     auto sync_start = std::chrono::steady_clock::now();
+    cudaError_t metrics_completion;
     if (kernel_complete_[buf_idx]) {
-      cudaEventSynchronizeYielding(kernel_complete_[buf_idx]);
+      metrics_completion = last_metrics_fence_recorded_ ? cudaEventSynchronizeYielding(kernel_complete_[buf_idx])
+                                                       : cudaStreamSynchronizeYielding(stream_);
     } else {
-      cudaStreamSynchronizeYielding(stream_);
+      metrics_completion = cudaStreamSynchronizeYielding(stream_);
     }
+    last_metrics_submission_ok_ = last_metrics_submission_ok_ && metrics_completion == cudaSuccess;
     auto sync_end       = std::chrono::steady_clock::now();
     last_demod_sync_us_ = std::chrono::duration<float, std::micro>(sync_end - sync_start).count();
 
@@ -3448,37 +3575,23 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
     // Read SINR/EPRE/RSRP/TA from pinned memory (async D2H already complete after event sync).
     // Class-A dApp inline: derive post-EQ SINR from d_noise_vars_ (E2E SINR path skipped).
     if (dapp_inline_used) {
-      pusch_demodulator_notifier::demodulation_stats stats;
-      float                                          sinr_db = 0.0f;
-      if (last_dapp_post_eq_noise_valid_ && d_noise_vars_ != nullptr && last_nof_eq_re_ != 0) {
-        if (dapp_post_eq_noise_host_.size() < last_nof_eq_re_) {
-          dapp_post_eq_noise_host_.resize(last_nof_eq_re_);
-        }
-        if (cudaMemcpy(dapp_post_eq_noise_host_.data(),
-                       d_noise_vars_,
-                       last_nof_eq_re_ * sizeof(float),
-                       cudaMemcpyDeviceToHost) == cudaSuccess &&
-            mean_post_eq_sinr_db_from_noise(span<const float>(dapp_post_eq_noise_host_.data(), last_nof_eq_re_),
-                                            sinr_db)) {
-          stats.sinr_dB.emplace(sinr_db);
-        } else {
-          static_cast<void>(cudaGetLastError());
-        }
-      }
+      notifier.on_end_stats(read_completed_inline_stats());
+    } else if (last_metrics_submission_ok_) {
+      float gpu_sinr_db    = pusch_e2e_post_eq_sinr_get_result(e2e_handle_);
+      float gpu_ch_sinr_db = pusch_e2e_channel_estimator_sinr_get_result(e2e_handle_);
+      float gpu_epre_db    = pusch_e2e_epre_get_result(e2e_handle_);
+      float gpu_rsrp_db    = pusch_e2e_rsrp_get_result(e2e_handle_);
+      float gpu_ta_s       = pusch_e2e_ta_get_result(e2e_handle_);
+      float gpu_cfo_hz     = pusch_e2e_cfo_get_result(e2e_handle_);
+      float gpu_evm        = pusch_e2e_evm_get_result(e2e_handle_);
+
+      pusch_demodulator_notifier::demodulation_stats stats =
+          make_pusch_e2e_demodulation_stats(
+              gpu_sinr_db, gpu_ch_sinr_db, gpu_epre_db, gpu_rsrp_db, gpu_ta_s, gpu_cfo_hz, gpu_evm);
       sanitize_stats_in_place(stats, static_cast<uint16_t>(config.rnti));
       notifier.on_end_stats(stats);
     } else {
-      float gpu_sinr_db = pusch_e2e_sinr_get_result(e2e_handle_);
-      float gpu_epre_db = pusch_e2e_epre_get_result(e2e_handle_);
-      float gpu_rsrp_db = pusch_e2e_rsrp_get_result(e2e_handle_);
-      float gpu_ta_s    = pusch_e2e_ta_get_result(e2e_handle_);
-      float gpu_cfo_hz  = pusch_e2e_cfo_get_result(e2e_handle_);
-      float gpu_evm     = pusch_e2e_evm_get_result(e2e_handle_);
-
-      pusch_demodulator_notifier::demodulation_stats stats =
-          build_e2e_final_stats(gpu_sinr_db, gpu_epre_db, gpu_rsrp_db, gpu_ta_s, gpu_cfo_hz, gpu_evm);
-      sanitize_stats_in_place(stats, static_cast<uint16_t>(config.rnti));
-      notifier.on_end_stats(stats);
+      notifier.on_end_stats({});
     }
   }
 
@@ -3829,31 +3942,38 @@ void pusch_demodulator_gpu_impl::finalize_resident_uci()
   }
 }
 
+bool pusch_demodulator_gpu_impl::install_resident_dapp(std::shared_ptr<pusch_resident_dapp> dapp)
+{
+  if (!dapp || resident_dapp_ || !stream_) return false;
+  auto context = capture_native_cuda_control_context(reinterpret_cast<uintptr_t>(stream_));
+  if (!context || !dapp->bind_control_context(std::move(context))) return false;
+  resident_dapp_ = std::move(dapp);
+  return true;
+}
+
 float pusch_demodulator_gpu_impl::report_deferred_sinr(pusch_demodulator_notifier& notifier)
 {
+  // Test the current fence even after a failed submission: the first of two
+  // readbacks may still be queued. Never inspect stale host results on failure.
+  const bool valid_buffer = last_buf_ >= 0 && last_buf_ < NUM_BUFFERS;
+  cudaEvent_t completion_event = valid_buffer ? d2h_complete_[last_buf_] : nullptr;
+  if (completion_event == nullptr && valid_buffer && !last_sinr_on_side_stream_) {
+    completion_event = kernel_complete_[last_buf_];
+  }
+  last_metrics_submission_ok_ =
+      pusch_metric_readback_completed(last_metrics_submission_ok_ && valid_buffer,
+                                     last_metrics_fence_recorded_,
+                                     last_sinr_on_side_stream_,
+                                     completion_event,
+                                     last_sinr_on_side_stream_ ? d2h_stream_ : stream_);
+  if (!last_metrics_submission_ok_) {
+    notifier.on_end_stats({});
+    return 0.0F;
+  }
   // Class-A equalizer dApp inline: E2E SINR D2H was skipped; after decoder
   // stream sync, derive CSI from post-EQ noise for CRC / scheduler feedback.
   if (last_dapp_inline_) {
-    pusch_demodulator_notifier::demodulation_stats stats;
-    float                                          sinr_db = 0.0f;
-    if (last_dapp_post_eq_noise_valid_ && d_noise_vars_ != nullptr && last_nof_eq_re_ != 0) {
-      if (dapp_post_eq_noise_host_.size() < last_nof_eq_re_) {
-        dapp_post_eq_noise_host_.resize(last_nof_eq_re_);
-      }
-      // Decoder pre-join already synchronized the demod stream.
-      if (cudaMemcpy(dapp_post_eq_noise_host_.data(),
-                     d_noise_vars_,
-                     last_nof_eq_re_ * sizeof(float),
-                     cudaMemcpyDeviceToHost) == cudaSuccess &&
-          mean_post_eq_sinr_db_from_noise(span<const float>(dapp_post_eq_noise_host_.data(), last_nof_eq_re_),
-                                          sinr_db)) {
-        stats.sinr_dB.emplace(sinr_db);
-      } else {
-        static_cast<void>(cudaGetLastError());
-      }
-    }
-    sanitize_stats_in_place(stats, last_rnti_);
-    notifier.on_end_stats(stats);
+    notifier.on_end_stats(read_completed_inline_stats());
     return 0.0F;
   }
   // Read SINR from pinned memory. The async D2H was launched before kernel_complete_
@@ -3863,41 +3983,42 @@ float pusch_demodulator_gpu_impl::report_deferred_sinr(pusch_demodulator_notifie
   // If the SINR readback was routed to the side D2H stream (OCUDU_PUSCH_SINR_SIDE_STREAM),
   // the decoder's compute-stream sync does not order it; wait on the recorded completion
   // event (the tiny copies finish during decode, so this is effectively a no-op query).
-  if (last_sinr_on_side_stream_ && (last_buf_ >= 0) && d2h_complete_[last_buf_]) {
-    cudaEventSynchronizeYielding(d2h_complete_[last_buf_]);
-  }
-  float gpu_sinr_db = pusch_e2e_sinr_get_result(e2e_handle_);
-  float gpu_epre_db = pusch_e2e_epre_get_result(e2e_handle_);
-  float gpu_rsrp_db = pusch_e2e_rsrp_get_result(e2e_handle_);
-  float gpu_ta_s    = pusch_e2e_ta_get_result(e2e_handle_);
-  float gpu_cfo_hz  = pusch_e2e_cfo_get_result(e2e_handle_);
-  float gpu_evm     = pusch_e2e_evm_get_result(e2e_handle_);
+  float gpu_sinr_db    = pusch_e2e_post_eq_sinr_get_result(e2e_handle_);
+  float gpu_ch_sinr_db = pusch_e2e_channel_estimator_sinr_get_result(e2e_handle_);
+  float gpu_epre_db    = pusch_e2e_epre_get_result(e2e_handle_);
+  float gpu_rsrp_db    = pusch_e2e_rsrp_get_result(e2e_handle_);
+  float gpu_ta_s       = pusch_e2e_ta_get_result(e2e_handle_);
+  float gpu_cfo_hz     = pusch_e2e_cfo_get_result(e2e_handle_);
+  float gpu_evm        = pusch_e2e_evm_get_result(e2e_handle_);
 
-  pusch_demodulator_notifier::demodulation_stats stats;
-  if (std::isfinite(gpu_sinr_db)) {
-    stats.sinr_dB.emplace(gpu_sinr_db);
-  } else {
-    stats.sinr_dB.emplace(MAX_SINR_DB);
-  }
-  if (std::isfinite(gpu_evm)) {
-    stats.evm.emplace(gpu_evm);
-  }
-  if (std::isfinite(gpu_epre_db)) {
-    stats.epre_dB.emplace(gpu_epre_db);
-  }
-  if (std::isfinite(gpu_rsrp_db)) {
-    stats.rsrp_dB.emplace(gpu_rsrp_db);
-  }
-  if (std::isfinite(gpu_ta_s)) {
-    stats.time_alignment_s.emplace(gpu_ta_s);
-  }
-  if (std::isfinite(gpu_cfo_hz)) {
-    stats.cfo_Hz.emplace(gpu_cfo_hz);
-  }
+  auto stats = make_pusch_e2e_demodulation_stats(
+      gpu_sinr_db, gpu_ch_sinr_db, gpu_epre_db, gpu_rsrp_db, gpu_ta_s, gpu_cfo_hz, gpu_evm);
   sanitize_stats_in_place(stats, last_rnti_);
   notifier.on_end_stats(stats);
 
   return 0.0F;
+}
+
+pusch_demodulator_notifier::demodulation_stats pusch_demodulator_gpu_impl::read_completed_inline_stats() const
+{
+  if (!last_metrics_submission_ok_) {
+    return {};
+  }
+  // No getters before the immediate/deferred caller has checked completion.
+  float post_eq_sinr = NAN;
+  if (last_dapp_post_eq_noise_valid_) {
+    static_cast<void>(post_eq_sinr_db_from_mean_noise(pusch_e2e_dapp_noise_get_mean(e2e_handle_), post_eq_sinr));
+  }
+  auto stats = make_pusch_e2e_demodulation_stats(
+      post_eq_sinr,
+      last_common_pilot_csi_ ? pusch_e2e_channel_estimator_sinr_get_result(e2e_handle_) : NAN,
+      last_common_pilot_csi_ ? pusch_e2e_epre_get_result(e2e_handle_) : NAN,
+      last_common_pilot_csi_ ? pusch_e2e_rsrp_get_result(e2e_handle_) : NAN,
+      last_common_pilot_csi_ ? pusch_e2e_ta_get_result(e2e_handle_) : NAN,
+      last_common_pilot_csi_ ? pusch_e2e_cfo_get_result(e2e_handle_) : NAN, NAN);
+  stats = select_pusch_inline_demodulation_stats(stats, true, last_common_pilot_csi_, last_dapp_post_eq_noise_valid_);
+  sanitize_stats_in_place(stats, last_rnti_);
+  return stats;
 }
 
 void pusch_demodulator_gpu_impl::report_deferred_dapp_completion()

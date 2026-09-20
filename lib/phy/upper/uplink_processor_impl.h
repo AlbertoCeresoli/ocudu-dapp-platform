@@ -18,6 +18,8 @@
 #include "ocudu/phy/upper/uplink_slot_processor.h"
 #include "ocudu/phy/upper/upper_phy_rx_results_notifier.h"
 #include "ocudu/support/executors/task_executor.h"
+#include <atomic>
+#include <limits>
 #include <utility>
 
 namespace ocudu {
@@ -28,10 +30,12 @@ namespace detail {
 /// It collects the Channel State Information (CSI), control and data decoding information from a PUSCH processor object
 /// and notifies them through the upper PHY notification interface.
 ///
-/// \remark The order of the calls matters. Method on_csi() must be called before on_uci() or on_sch(). Otherwise, an
-/// assertion is triggered.
+/// \remark UCI must be delivered before terminal SCH. Results are forwarded immediately; the completion callback
+/// runs only after terminal SCH and the final processing activity release. Activity retention is not a GPU fence.
 class pusch_processor_result_notifier_adaptor : private pusch_processor_result_notifier
 {
+  static_assert(std::atomic<unsigned>::is_always_lock_free, "Slot activity must not introduce a hidden lock.");
+
 public:
   /// Callback function type.
   using callback_func = unique_function<void(), default_unique_task_buffer_size, true>;
@@ -52,6 +56,8 @@ public:
                                              std::optional<unsigned>        n_rapid_,
                                              callback_func                  callback_)
   {
+    ocudu_assert(activities.load(std::memory_order_relaxed) == 0 && notifier == nullptr,
+                 "PUSCH slot notifier is still in use.");
     notifier = &notifier_;
     rnti     = rnti_;
     slot     = slot_;
@@ -59,13 +65,38 @@ public:
     payload  = payload_;
     n_rapid  = n_rapid_;
     callback = std::move(callback_);
+    // The terminal SCH closes this reference; processing tasks and consumers may hold additional loans.
+    activities.store(1, std::memory_order_relaxed);
     return *this;
   }
 
 private:
+  pusch_processing_activity acquire_processing_activity() noexcept override
+  {
+    const unsigned previous = activities.fetch_add(1, std::memory_order_relaxed);
+    ocudu_assert(previous != 0 && previous != std::numeric_limits<unsigned>::max(), "Invalid slot activity count.");
+    return {this, &release_activity};
+  }
+
+  static void release_activity(void* context) noexcept
+  {
+    auto& owner = *static_cast<pusch_processor_result_notifier_adaptor*>(context);
+    const unsigned previous = owner.activities.fetch_sub(1, std::memory_order_acq_rel);
+    ocudu_assert(previous != 0, "Unbalanced slot activity release.");
+    if (previous == 1) {
+      // Move before calling: the callback can make this slot/adaptor available for immediate reuse.
+      auto completion = std::move(owner.callback);
+      if (!completion.is_empty()) {
+        completion();
+      }
+      // Do not access owner after the completion callback.
+    }
+  }
+
   // See interface for documentation.
   void on_uci(const pusch_processor_result_control& uci) override
   {
+    auto activity = acquire_processing_activity();
     ocudu_assert(notifier != nullptr, "Invalid notifier.");
 
     ul_pusch_results_control result;
@@ -93,9 +124,9 @@ private:
   // See interface for documentation.
   void on_sch(const pusch_processor_result_data& sch) override
   {
+    auto activity = acquire_processing_activity();
     // Gets the notifier and invalidates. It makes sure the notifier is no longer available after the exchange.
-    upper_phy_rx_results_notifier* notifier_ = nullptr;
-    std::exchange(notifier_, notifier);
+    upper_phy_rx_results_notifier* notifier_ = std::exchange(notifier, nullptr);
     ocudu_assert(notifier_ != nullptr, "Invalid notifier.");
 
     // Notify the completion of PUSCH data.
@@ -111,9 +142,7 @@ private:
 
     l1_ul_tracer << instant_trace_event("on_sch", instant_trace_event::cpu_scope::thread);
 
-    if (!callback.is_empty()) {
-      callback();
-    }
+    release_activity(this);
   }
 
   upper_phy_rx_results_notifier* notifier = nullptr;
@@ -123,6 +152,7 @@ private:
   span<const uint8_t>            payload;
   std::optional<unsigned>        n_rapid;
   callback_func                  callback;
+  std::atomic<unsigned>          activities{};
 };
 
 } // namespace detail

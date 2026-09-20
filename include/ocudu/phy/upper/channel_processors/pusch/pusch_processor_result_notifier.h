@@ -5,6 +5,7 @@
 #pragma once
 
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_decoder_result.h"
+#include "ocudu/phy/upper/channel_processors/pusch/pusch_processing_activity.h"
 #include "ocudu/phy/upper/channel_processors/uci/uci_status.h"
 #include "ocudu/phy/upper/channel_state_information.h"
 #include "ocudu/ran/uci/uci_payload_type.h"
@@ -55,6 +56,11 @@ class pusch_processor_result_notifier
 public:
   /// Default destructor.
   virtual ~pusch_processor_result_notifier() = default;
+
+  /// Retains the originating processing object through a caller's remaining work. Non-pooled sinks may return
+  /// an empty token. Intermediate notifiers MUST forward acquisition to their original notifier, not manufacture
+  /// a new owner. Acquire before terminal result delivery; keep it through every deferred consumer/fence.
+  virtual pusch_processing_activity acquire_processing_activity() noexcept { return {}; }
 
   /// \brief Notifies the detection of Uplink Control Information (UCI) on PUSCH.
   ///

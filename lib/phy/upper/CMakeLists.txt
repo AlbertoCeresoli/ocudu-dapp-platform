@@ -3,6 +3,16 @@
 # Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 
+# Both the CUDA demodulator and native dApp adapters use this cold-path
+# helper. Keep it independent of the adapters' channel-processor dependency
+# so static linkage has no reverse dependency on the adapter archive.
+add_library(ocudu_native_control_context STATIC dapp/native_cuda_control_context.cpp)
+if(CUDA_ACCEL_FOUND)
+    target_compile_definitions(ocudu_native_control_context PRIVATE ENABLE_CUDA)
+    target_link_libraries(ocudu_native_control_context PRIVATE CUDA::cuda_driver)
+endif()
+add_to_exported_libs(ocudu_native_control_context)
+
 add_subdirectory(channel_coding)
 add_subdirectory(channel_modulation)
 add_subdirectory(channel_processors)

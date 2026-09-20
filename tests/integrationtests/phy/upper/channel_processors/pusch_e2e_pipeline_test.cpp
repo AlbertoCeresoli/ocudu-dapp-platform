@@ -11,6 +11,16 @@
 
 #include "pxsch_bler_test_channel_emulator.h"
 #include "pxsch_bler_test_factories.h"
+#include "pusch_test_cold_trace.h"
+#include "pusch_test_payload_buffer.h"
+#include "pusch_test_failure_trace.h"
+#include "pusch_test_pooled_processor.h"
+#ifdef OCUDU_PUSCH_TEST_DAPP
+#include "pusch_test_dapp_fixture.h"
+#include "pusch_test_receiver_retirement_trace.h"
+#include "pusch_test_receiver_capture.h"
+#include "ocudu/dapp/runtime/artifact_verifier.h"
+#endif
 #include "ocudu/ocuduvec/bit.h"
 #include "ocudu/ocuduvec/sc_prod.h"
 #include "ocudu/phy/generic_functions/generic_functions_factories.h"
@@ -35,10 +45,13 @@
 #include "ocudu/ran/transform_precoding/transform_precoding_helpers.h"
 #include "ocudu/support/executors/task_worker_pool.h"
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -48,6 +61,9 @@
 #include <vector>
 
 #ifdef ENABLE_CUDA
+#include "pusch_test_cuda_context.h"
+#include "pusch_transform_deprecoder_selection.h"
+#include "cuda/cuda_rt_utils.h"
 #include "cuda/pusch_device_grid_reader_cuda.h"
 #include "lib/phy/upper/resource_grid_cuda_visible_impl.h"
 #include <cuda_runtime_api.h>
@@ -128,6 +144,23 @@ static pusch_mcs_table              mcs_table                   = pusch_mcs_tabl
 static bool                         enable_transform_precoding  = false;
 static std::string                  transform_deprecoder_backend;
 static unsigned                     n_rs_id = 0;
+static std::optional<uint32_t>      payload_seed;
+
+static uint32_t parse_u32(const char* text, uint32_t maximum)
+{
+  uint32_t   value{};
+  const auto end    = text + std::strlen(text);
+  const auto parsed = std::from_chars(text, end, value);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || value > maximum) {
+    throw std::runtime_error(std::string("Invalid unsigned value: ") + text);
+  }
+  return value;
+}
+
+static double epoch_seconds()
+{
+  return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
 
 // CLI-configurable antenna/layer parameters.
 static unsigned nof_layers   = 1;
@@ -150,7 +183,25 @@ static std::string rx_device_grid_mode = "auto";
 #else
 static std::string rx_device_grid_mode;
 #endif
-static std::string gpu_output_buffer_mode = "vector";
+static std::string               gpu_output_buffer_mode = "vector";
+static std::string               dapp_manifest;
+static std::string               sample_jsonl_path;
+static std::string               cold_jsonl_path;
+static std::string               receiver_capture_prefix;
+static unsigned                  benchmark_workers = 0;
+static std::chrono::milliseconds iteration_pause{0};
+static std::chrono::milliseconds post_teardown_hold{0};
+static std::chrono::milliseconds phase_observation{0};
+static bool                      require_all_tb = false;
+static bool                      decoded_sensitivity = false;
+static std::string               channel_profile = "single-tap";
+static std::string               fading_distribution = "uniform-phase";
+static bool                      receiver_completion = false;
+static bool                      cuda_owned_context = false;
+static bool                      cuda_init_only = false;
+static bool                      trace_terminate = false;
+static bool                      require_pilot_csi = false;
+static channel_state_information::sinr_type sinr_method = channel_state_information::sinr_type::post_equalization;
 
 namespace {
 
@@ -160,7 +211,7 @@ class cuda_stream_guard
 public:
   cuda_stream_guard()
   {
-    cudaError_t status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+    cudaError_t status = ocudu::cudaStreamCreateUpperPhy(&stream, "OCUDU_PUSCH_CUDA_STREAM_PRIORITY");
     if (status != cudaSuccess) {
       throw std::runtime_error(
           fmt::format("Failed to create CUDA grid-producer stream: {}", cudaGetErrorString(status)));
@@ -232,102 +283,6 @@ public:
 
 private:
   std::atomic<bool> completed = {false};
-};
-
-class guarded_payload_buffer
-{
-public:
-  guarded_payload_buffer(size_t payload_bytes_, const std::string& mode_) :
-    payload_bytes(payload_bytes_), total_bytes(payload_bytes_ + guard_bytes), mode(mode_)
-  {
-    allocate();
-    reset();
-  }
-
-  guarded_payload_buffer(const guarded_payload_buffer&)            = delete;
-  guarded_payload_buffer& operator=(const guarded_payload_buffer&) = delete;
-
-  ~guarded_payload_buffer() { release(); }
-
-  span<uint8_t> as_span() { return span<uint8_t>(data_ptr, payload_bytes); }
-
-  std::vector<uint8_t> payload_vector() const { return std::vector<uint8_t>(data_ptr, data_ptr + payload_bytes); }
-
-  void reset()
-  {
-    std::fill(data_ptr, data_ptr + total_bytes, fill_value);
-    std::fill(data_ptr + payload_bytes, data_ptr + total_bytes, guard_value);
-  }
-
-  bool guard_ok(size_t* first_bad_offset = nullptr, uint8_t* bad_value = nullptr) const
-  {
-    for (size_t i = payload_bytes; i != total_bytes; ++i) {
-      if (data_ptr[i] != guard_value) {
-        if (first_bad_offset != nullptr) {
-          *first_bad_offset = i - payload_bytes;
-        }
-        if (bad_value != nullptr) {
-          *bad_value = data_ptr[i];
-        }
-        return false;
-      }
-    }
-    return true;
-  }
-
-private:
-  void allocate()
-  {
-    if (mode == "vector") {
-      vector_storage.resize(total_bytes);
-      data_ptr = vector_storage.data();
-      return;
-    }
-
-#ifdef ENABLE_CUDA
-    if (mode == "pinned") {
-      cudaError_t status = cudaHostAlloc(reinterpret_cast<void**>(&data_ptr), total_bytes, cudaHostAllocDefault);
-      if (status != cudaSuccess) {
-        throw std::runtime_error(
-            fmt::format("cudaHostAlloc failed for GPU output payload: {}", cudaGetErrorString(status)));
-      }
-      return;
-    }
-
-    if (mode == "managed") {
-      cudaError_t status = cudaMallocManaged(reinterpret_cast<void**>(&data_ptr), total_bytes);
-      if (status != cudaSuccess) {
-        throw std::runtime_error(
-            fmt::format("cudaMallocManaged failed for GPU output payload: {}", cudaGetErrorString(status)));
-      }
-      return;
-    }
-#endif
-
-    throw std::runtime_error(fmt::format("Unknown GPU output buffer mode '{}'.", mode));
-  }
-
-  void release()
-  {
-#ifdef ENABLE_CUDA
-    if (data_ptr != nullptr && mode == "pinned") {
-      cudaFreeHost(data_ptr);
-    } else if (data_ptr != nullptr && mode == "managed") {
-      cudaFree(data_ptr);
-    }
-#endif
-    data_ptr = nullptr;
-  }
-
-  static constexpr size_t  guard_bytes = 64;
-  static constexpr uint8_t fill_value  = 0xa5;
-  static constexpr uint8_t guard_value = 0x7e;
-
-  size_t               payload_bytes = 0;
-  size_t               total_bytes   = 0;
-  std::string          mode;
-  std::vector<uint8_t> vector_storage;
-  uint8_t*             data_ptr = nullptr;
 };
 
 class pusch_transform_precoding_tx_generator
@@ -475,6 +430,7 @@ struct test_results {
   unsigned disagreements         = 0;
   unsigned byte_mismatches       = 0;
   unsigned output_guard_failures = 0;
+  unsigned gpu_truth_mismatches  = 0;
   unsigned gpu_e2e_count         = 0; ///< Number of iterations with resident GPU pipeline timing.
   unsigned gpu_device_grid_count = 0; ///< Number of iterations that consumed the producer-owned device grid.
   unsigned gpu_owned_grid_count  = 0; ///< Number of iterations that consumed the immutable owned snapshot.
@@ -518,7 +474,8 @@ struct test_results {
   latency_stats gpu_avg_iters_query;
 };
 
-void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_idx)
+void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_idx,
+                           test_support::pusch_cold_trace& cold_trace)
 {
   fmt::print("\n=== E2E GPU Pipeline Test ===\n");
   fmt::print(
@@ -542,12 +499,53 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
       max_ta_offset_us > 0.0f ? fmt::format(", TA offset: +/-{:.1f}us", max_ta_offset_us) : "",
       cfo_std_hz > 0.0f ? fmt::format(", CFO std: {:.1f}Hz", cfo_std_hz) : "");
 
-  test_results results;
+  test_results                                   results;
+  const uint32_t                                 selected_seed = payload_seed ? *payload_seed : std::random_device{}();
+  const auto                                     close_samples = [](FILE* file) { std::fclose(file); };
+  std::unique_ptr<FILE, decltype(close_samples)> samples(nullptr, close_samples);
+  if (!sample_jsonl_path.empty()) {
+    samples.reset(std::fopen(sample_jsonl_path.c_str(), "wx"));
+    if (!samples)
+      throw std::runtime_error("A new writable sample JSONL path is required.");
+    fmt::print(
+        samples.get(),
+        "{{\"kind\":\"start\",\"prbs\":{},\"mcs\":{},\"iterations\":{},\"warmups\":{},\"dapp\":{},\"pace_ms\":{},"
+        "\"epoch_s\":{},\"seed\":{},\"sinr_dB\":{},\"mcs_table\":\"{}\",\"workers\":{},\"ports\":{},\"layers\":{},"
+        "\"receiver_completion\":{},\"require_pilot_csi\":{},\"common_pilot_csi_requested\":{},\"sinr_method\":\"{}\","
+        "\"decoded_sensitivity\":{},\"require_all_tb\":{},\"channel_profile\":\"{}\","
+        "\"fading_distribution\":\"{}\",\"post_teardown_hold_ms\":{},\"phase_observation_ms\":{},\"diagnostic_capture\":{}}}\n",
+        nof_prb,
+        mcs_idx,
+        nof_iterations,
+        nof_warmup,
+        !dapp_manifest.empty(),
+        iteration_pause.count(),
+        epoch_seconds(),
+        selected_seed,
+        sinr_dB,
+        pusch_mcs_table_to_string(mcs_table),
+        benchmark_workers,
+        nof_rx_ports,
+        nof_layers,
+        receiver_completion,
+        require_pilot_csi,
+        require_pilot_csi,
+        sinr_method == channel_state_information::sinr_type::channel_estimator ? "channel_estimator" : "post_equalization",
+        decoded_sensitivity,
+        require_all_tb,
+        channel_profile,
+        fading_distribution,
+        post_teardown_hold.count(),
+        phase_observation.count(),
+        !receiver_capture_prefix.empty());
+    std::fflush(samples.get());
+  }
 
   // Setup thread pool.
-  unsigned max_nof_threads = std::min(8U, std::thread::hardware_concurrency());
-  auto     worker_pool =
-      std::make_unique<task_worker_pool<concurrent_queue_policy::locking_mpmc>>("thread", max_nof_threads, 1024);
+  unsigned max_nof_threads = benchmark_workers ? benchmark_workers : std::min(8U, std::thread::hardware_concurrency());
+  auto worker_pool = cold_trace.measure("executor_create", [&] {
+    return std::make_unique<task_worker_pool<concurrent_queue_policy::locking_mpmc>>("thread", max_nof_threads, 1024);
+  });
   auto executor = std::make_unique<task_worker_pool_executor<concurrent_queue_policy::locking_mpmc>>(*worker_pool);
 
   ocudulog::fetch_basic_logger("ALL").set_level(debug_logs ? ocudulog::basic_levels::debug
@@ -584,6 +582,22 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
   rb_allocation freq_alloc = rb_allocation::make_type1(freq_allocation.start(), freq_allocation.length(), std::nullopt);
 
   // Create factories.
+#ifdef OCUDU_PUSCH_TEST_DAPP
+  // Declared before all processors/factories so their worker references retire
+  // before the isolated service is destroyed, including exception unwinding.
+  std::unique_ptr<test_support::pusch_test_dapp_fixture> dapp_fixture;
+#endif
+  pxsch_test_dapp_config dapp_hooks;
+#ifdef OCUDU_PUSCH_TEST_DAPP
+  if (!dapp_manifest.empty()) {
+    dapp_fixture = cold_trace.measure("dapp_service_create", [&] {
+      return std::make_unique<test_support::pusch_test_dapp_fixture>(
+          dapp_manifest, max_nof_threads + 1, nof_prb, nof_rx_ports, nof_layers, receiver_completion);
+    });
+    dapp_hooks = dapp_fixture->factory_config();
+  }
+#endif
+  cold_trace.record("cpu_factories_create", "begin");
   std::shared_ptr<resource_grid_factory> grid_factory = create_resource_grid_factory();
 
   std::shared_ptr<pdsch_processor_factory> pdsch_factory =
@@ -596,31 +610,53 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
                                         use_early_stop,
                                         "auto",
                                         port_channel_estimator_td_interpolation_strategy::average,
-                                        channel_equalizer_algorithm_type::mmse);
+                                        channel_equalizer_algorithm_type::mmse,
+                                        {},
+                                        nof_prb,
+                                        nof_layers,
+                                        sinr_method,
+                                        nof_rx_ports,
+                                        &cold_trace);
+  cold_trace.record("cpu_factories_create", "end");
 
-  std::shared_ptr<pusch_processor_factory> gpu_factory =
-      create_sw_pusch_processor_factory(*executor,
-                                        max_nof_threads + 1,
-                                        nof_ldpc_iterations,
-                                        use_early_stop,
-                                        "gpu",
-                                        port_channel_estimator_td_interpolation_strategy::average,
-                                        channel_equalizer_algorithm_type::mmse);
+  std::shared_ptr<pusch_processor_factory> gpu_factory = cold_trace.measure("gpu_factory_create", [&] {
+    return create_sw_pusch_processor_factory(*executor,
+                                             max_nof_threads + 1,
+                                             nof_ldpc_iterations,
+                                             use_early_stop,
+                                             "gpu",
+                                             port_channel_estimator_td_interpolation_strategy::average,
+                                             channel_equalizer_algorithm_type::mmse,
+                                             dapp_hooks,
+                                             nof_prb,
+                                             nof_layers,
+                                             sinr_method,
+                                             nof_rx_ports,
+                                             &cold_trace);
+  });
 
   if (!gpu_factory) {
-    fmt::print("ERROR: GPU PUSCH factory not available. Cannot run E2E pipeline test.\n");
     worker_pool->stop();
-    return;
+    throw std::runtime_error("GPU PUSCH factory not available.");
   }
 
   // Create processors.
+  cold_trace.record("cpu_processors_create", "begin");
   auto pdsch_proc = pdsch_factory->create();
   auto cpu_proc   = cpu_factory->create();
-  auto gpu_proc   = gpu_factory->create();
+  cold_trace.record("cpu_processors_create", "end");
+  auto gpu_proc = cold_trace.measure("gpu_processor_create", [&] {
+    return std::make_unique<pusch_test_pooled_processor>(gpu_factory->create());
+  });
+#ifdef OCUDU_PUSCH_TEST_DAPP
+  if (dapp_fixture)
+    cold_trace.measure("dapp_activate_and_bind", [&] { dapp_fixture->activate(); });
+#endif
   auto transform_tx_generator =
       enable_transform_precoding ? std::make_unique<pusch_transform_precoding_tx_generator>() : nullptr;
 
-  // Create grids.
+  // Create grids. Paired markers survive a killed process without changing the sample schema.
+  cold_trace.record("grid_create", "begin");
   auto                           tx_grid = grid_factory->create(nof_layers, MAX_NSYMB_PER_SLOT, MAX_NOF_SUBCARRIERS);
   std::unique_ptr<resource_grid> rx_grid;
 #ifdef ENABLE_CUDA
@@ -660,6 +696,8 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
   }
 #endif
 
+  cold_trace.record("grid_create", "end");
+
   unsigned nof_codeblocks = compute_nof_codeblocks(units::bits(tbs), ldpc_base_graph);
 
   rx_buffer_pool_config pool_config;
@@ -673,8 +711,8 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
   auto gpu_pool = create_rx_buffer_pool(pool_config);
 
   // Channel emulator.
-  channel_emulator emulator("single-tap",
-                            "uniform-phase",
+  channel_emulator emulator(channel_profile,
+                            fading_distribution,
                             sinr_dB,
                             0.0f,
                             0,
@@ -686,8 +724,7 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
                             scs,
                             *executor);
 
-  std::random_device                    rd;
-  std::mt19937                          rgen(rd());
+  std::mt19937                          rgen(selected_seed);
   std::vector<cf_t>                     ta_symbol_buffer(nof_prb * NOF_SUBCARRIERS_PER_RB);
   std::uniform_real_distribution<float> ta_dist(-max_ta_offset_us, max_ta_offset_us);
   std::normal_distribution<float>       cfo_dist(0.0f, std::max(cfo_std_hz, 1e-9f));
@@ -728,8 +765,31 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
   unsigned total_iterations  = nof_warmup + nof_iterations;
   bool     gpu_e2e_validated = false;
 
+  // Allocate once, outside the frame loop. The completion notifier is awaited
+  // before the next reset, so changing output contents cannot race GPU writes.
+  // The old per-frame managed/pinned allocation churn was outside gpu_us but
+  // could still perturb the colocated cell and subsequent measurements.
+  auto gpu_rx_data = cold_trace.measure("output_allocate", [&] {
+    return std::make_unique<test_support::guarded_payload_buffer>(tbs / 8, gpu_output_buffer_mode);
+  });
+#ifdef OCUDU_PUSCH_TEST_DAPP
+  std::unique_ptr<test_support::pusch_test_receiver_capture> receiver_capture;
+  if (!receiver_capture_prefix.empty()) {
+    receiver_capture = cold_trace.measure("receiver_capture_allocate", [&] {
+      return std::make_unique<test_support::pusch_test_receiver_capture>(
+          receiver_capture_prefix, get_bits_per_symbol(mcs_descr.modulation), mcs_idx.value(), !dapp_manifest.empty());
+    });
+  }
+#endif
+  if (phase_observation.count()) {
+    cold_trace.measure("observe_prepared", [] { std::this_thread::sleep_for(phase_observation); });
+  }
+  cold_trace.record("frame_loop", "begin");
+
   for (unsigned iter = 0; iter < total_iterations; ++iter) {
     bool is_warmup = (iter < nof_warmup);
+    if (iteration_pause.count())
+      std::this_thread::sleep_for(iteration_pause);
 
     // Generate random TX data.
     std::vector<uint8_t> tx_data(tbs / 8);
@@ -738,7 +798,6 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
     }
 
     std::vector<uint8_t>   cpu_rx_data(tbs / 8);
-    guarded_payload_buffer gpu_rx_data(tbs / 8, gpu_output_buffer_mode);
 
     if (enable_transform_precoding) {
       transform_tx_generator->process(*tx_grid,
@@ -872,11 +931,11 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
       unique_rx_buffer cpu_buffer =
           cpu_pool->get_pool().reserve(pusch_pdu.slot, trx_buffer_identifier(to_rnti(rnti), 0), nof_codeblocks, true);
 
-      auto cpu_start = std::chrono::high_resolution_clock::now();
+      auto cpu_start = std::chrono::steady_clock::now();
       cpu_proc->process(cpu_rx_data, std::move(cpu_buffer), cpu_notifier, rx_grid->get_reader(), pusch_pdu);
       cpu_result_ptr = &cpu_notifier.wait_for_completion();
-      auto cpu_end   = std::chrono::high_resolution_clock::now();
-      cpu_us         = std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count();
+      auto cpu_end   = std::chrono::steady_clock::now();
+      cpu_us         = std::chrono::duration<double, std::micro>(cpu_end - cpu_start).count();
     }
 
     // GPU decode. For direct-managed mode, publish the asynchronous producer
@@ -945,17 +1004,137 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
 #else
     const resource_grid_reader& gpu_grid_reader = rx_grid->get_reader();
 #endif
-    auto gpu_start = std::chrono::high_resolution_clock::now();
-    gpu_rx_data.reset();
-    gpu_proc->process(gpu_rx_data.as_span(), std::move(gpu_buffer), gpu_notifier, gpu_grid_reader, pusch_pdu);
+#ifdef OCUDU_PUSCH_TEST_DAPP
+    uint64_t invoke_before = 0, fallback_before = 0, deadline_before = 0;
+    if (dapp_fixture) {
+      invoke_before   = dapp_fixture->counter(OCUDU_DAPP_METRIC_INVOKE_COUNT_V1);
+      fallback_before = dapp_fixture->fallback_count();
+      deadline_before = dapp_fixture->counter(OCUDU_DAPP_METRIC_CLASS_A_COMPLETION_DEADLINE_MISSES_V1);
+    }
+#endif
+#ifdef OCUDU_PUSCH_TEST_DAPP
+    if (receiver_capture) receiver_capture->begin(iter);
+#endif
+    auto gpu_start = std::chrono::steady_clock::now();
+#ifdef OCUDU_PUSCH_TEST_DAPP
+    test_support::enable_receiver_retirement_trace(trace_terminate);
+#endif
+    gpu_rx_data->reset();
+    gpu_proc->process(gpu_rx_data->as_span(), std::move(gpu_buffer), gpu_notifier, gpu_grid_reader, pusch_pdu);
     const auto& gpu_result     = gpu_notifier.wait_for_completion();
-    auto        gpu_end        = std::chrono::high_resolution_clock::now();
-    double      gpu_us         = std::chrono::duration_cast<std::chrono::microseconds>(gpu_end - gpu_start).count();
-    auto        gpu_rx_payload = gpu_rx_data.payload_vector();
+    // Both baseline and receiver must return the real processing lease before
+    // this iteration's payload, input grid and notifier can be reused/destroyed.
+    gpu_proc->require_idle();
+    auto        gpu_end        = std::chrono::steady_clock::now();
+    double      gpu_us         = std::chrono::duration<double, std::micro>(gpu_end - gpu_start).count();
+    auto        gpu_rx_payload = gpu_rx_data->payload_vector();
+#ifdef OCUDU_PUSCH_TEST_DAPP
+    if (receiver_capture) {
+      receiver_capture->finish(tx_data, tx_grid->get_reader().get_contiguous_view(),
+                               rx_grid->get_reader().get_contiguous_view());
+    }
+#endif
+    uint64_t    invoke_delta = 0, fallback_delta = 0, deadline_delta = 0;
+    std::string fallback_detail;
+#ifdef OCUDU_PUSCH_TEST_DAPP
+    if (dapp_fixture) {
+      invoke_delta   = dapp_fixture->counter(OCUDU_DAPP_METRIC_INVOKE_COUNT_V1) - invoke_before;
+      fallback_delta = dapp_fixture->fallback_count() - fallback_before;
+      deadline_delta = dapp_fixture->counter(OCUDU_DAPP_METRIC_CLASS_A_COMPLETION_DEADLINE_MISSES_V1) - deadline_before;
+      if (fallback_delta != 0) {
+        fallback_detail = dapp_fixture->fallback_details();
+      }
+    }
+#endif
+    const bool matches_tx = gpu_rx_payload == tx_data;
+    if (gpu_result.data.tb_crc_ok && !matches_tx)
+      ++results.gpu_truth_mismatches;
+    if (samples) {
+      auto number = [](std::optional<float> value) {
+        return value && std::isfinite(*value) ? fmt::format("{}", *value) : std::string("null");
+      };
+      const auto& timing = gpu_result.data.acceleration_pipeline_timing;
+      std::string input_hash, payload_hash;
+#ifdef OCUDU_PUSCH_TEST_DAPP
+      // Evidence only, outside timing: hash the original host-side received
+      // grant and transmitted payload. The direct-managed test uses a separate
+      // immutable device snapshot; hashing never reads that live allocation.
+      std::vector<cbf16_t> observed_input;
+      for (unsigned port = 0; port != nof_rx_ports; ++port) {
+        for (unsigned symbol = 0; symbol != nof_ofdm_symbols; ++symbol) {
+          auto row = rx_grid->get_reader().get_view(port, symbol).first(nof_prb * NOF_SUBCARRIERS_PER_RB);
+          observed_input.insert(observed_input.end(), row.begin(), row.end());
+        }
+      }
+      input_hash   = dapp::to_hex(dapp::sha256_bytes(reinterpret_cast<const uint8_t*>(observed_input.data()),
+                                                   observed_input.size() * sizeof(cbf16_t)));
+      payload_hash = dapp::to_hex(dapp::sha256_bytes(tx_data.data(), tx_data.size()));
+#endif
+      fmt::print(samples.get(),
+                 "{{\"kind\":\"frame\",\"frame\":{},\"warmup\":{},\"qm\":{},\"tb_bits\":{},"
+                 "\"gpu_wall_us\":{},\"cpu_wall_us\":{},\"cpu_ran\":{},\"gpu_crc\":{},\"matches_tx\":{},"
+                 "\"resident\":{},\"device_grid\":{},\"owned_grid\":{},\"dapp_invocations\":{},\"dapp_fallbacks\":{},"
+                 "\"sinr_dB\":{},\"evm\":{},\"epre_dB\":{},\"rsrp_dB\":{},\"ta_s\":{},\"cfo_Hz\":{},"
+                 "\"epoch_s\":{},\"input_sha256\":\"{}\",\"payload_sha256\":\"{}\",\"dapp_deadline_misses\":{},"
+                 "\"cpu_crc\":{},\"cpu_matches_tx\":{},\"cpu_sinr_dB\":{},"
+                 "\"demod_call_us\":{},\"decode_call_us\":{},\"completion_wait_us\":{},\"sinr_readback_us\":{}}}\n",
+                 iter,
+                 is_warmup,
+                 get_bits_per_symbol(mcs_descr.modulation),
+                 tbs,
+                 gpu_us,
+                 cpu_us,
+                 run_cpu,
+                 gpu_result.data.tb_crc_ok,
+                 matches_tx,
+                 timing.valid,
+                 timing.device_grid_used,
+                 timing.owned_device_grid_used,
+                 invoke_delta,
+                 fallback_delta,
+                 number(gpu_result.csi.get_sinr_dB()),
+                 number(gpu_result.csi.get_total_evm()),
+                 number(gpu_result.csi.get_epre_dB()),
+                 number(gpu_result.csi.get_rsrp_dB()),
+                 gpu_result.csi.get_time_alignment()
+                     ? fmt::format("{}", gpu_result.csi.get_time_alignment()->to_seconds())
+                     : std::string("null"),
+                 number(gpu_result.csi.get_cfo_Hz()),
+                 epoch_seconds(),
+                 input_hash,
+                 payload_hash,
+                 deadline_delta,
+                 run_cpu && cpu_result_ptr->data.tb_crc_ok,
+                 run_cpu && cpu_rx_data == tx_data,
+                 run_cpu ? number(cpu_result_ptr->csi.get_sinr_dB()) : std::string("null"),
+                 timing.demod_call_us,
+                 timing.decode_call_us,
+                 timing.completion_wait_us,
+                 timing.sinr_readback_us);
+      if (std::fflush(samples.get()))
+        throw std::runtime_error("Writing PUSCH samples failed.");
+    }
+    if (!dapp_manifest.empty() && (invoke_delta != 1 || fallback_delta != 0 || deadline_delta != 0)) {
+      throw std::runtime_error(
+          fmt::format("Receiver hook qualification failed: invocations={}, fallbacks={}, deadline_misses={}, reasons=[{}]",
+                      invoke_delta,
+                      fallback_delta,
+                      deadline_delta,
+                      fallback_detail));
+    }
+    if (require_pilot_csi) {
+      auto finite = [](std::optional<float> value) { return value && std::isfinite(*value); };
+      const auto& csi = gpu_result.csi;
+      if (!finite(csi.get_sinr_dB()) || !finite(csi.get_epre_dB()) || !finite(csi.get_rsrp_dB()) ||
+          !finite(csi.get_cfo_Hz()) || !csi.get_time_alignment() ||
+          !std::isfinite(csi.get_time_alignment()->to_seconds())) {
+        throw std::runtime_error("Incomplete selected pilot CSI after actual receiver/decoder completion");
+      }
+    }
 
     size_t  first_bad_guard_offset = 0;
     uint8_t bad_guard_value        = 0;
-    if (!gpu_rx_data.guard_ok(&first_bad_guard_offset, &bad_guard_value)) {
+    if (!gpu_rx_data->guard_ok(&first_bad_guard_offset, &bad_guard_value)) {
       ++results.output_guard_failures;
       fmt::print("OUTPUT GUARD CORRUPTION at iteration {}: mode={} first_guard_offset={} value=0x{:02x}\n",
                  is_warmup ? 0 : iter - nof_warmup,
@@ -1169,6 +1348,8 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
     }
   }
 
+  cold_trace.record("frame_loop", "end");
+
   // === Summary Report ===
   unsigned measured_iters = nof_iterations;
 
@@ -1310,7 +1491,7 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
                delta_str(results.cpu_sinr, results.gpu_sinr, "{:+.2f}"),
                pop_str(results.gpu_sinr));
     fmt::print("{:<16s} {:>10s} {:>10s} {:>10s}   {}\n",
-               "EVM (%):",
+               "EVM (ratio):",
                mean_str(results.cpu_evm, "{:.2f}"),
                mean_str(results.gpu_evm, "{:.2f}"),
                delta_str(results.cpu_evm, results.gpu_evm, "{:+.2f}"),
@@ -1354,6 +1535,10 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
   }
 
   // === Final verdict ===
+  // Sensitivity compares independent CRC outcomes at a fixed waveform/SNR.
+  // Different algorithms may decode different blocks; accepted payloads and
+  // all resident/ownership/metric checks remain mandatory in either mode.
+  const bool check_reference_crc = dapp_manifest.empty() && !decoded_sensitivity;
   bool resident_requirement_failed = require_gpu_resident && (results.gpu_e2e_count != measured_iters);
   bool device_grid_requirement_failed =
       (rx_device_grid_mode == "direct-managed") && (results.gpu_device_grid_count != measured_iters);
@@ -1374,27 +1559,63 @@ void run_e2e_pipeline_test(unsigned nof_prb, float sinr_dB, sch_mcs_index mcs_id
                measured_iters);
   } else if (results.output_guard_failures > 0) {
     fmt::print("\n*** FAIL: {} GPU output guard corruptions ***\n", results.output_guard_failures);
-  } else if (results.disagreements > 0) {
+  } else if (results.disagreements > 0 && check_reference_crc) {
     fmt::print("\n*** FAIL: {} CRC disagreements between CPU and GPU ***\n", results.disagreements);
   } else if (results.byte_mismatches > 0) {
     fmt::print("\n*** FAIL: {} byte-level mismatches (CRCs agreed but TB data differed) ***\n",
                results.byte_mismatches);
+  } else if (results.gpu_truth_mismatches > 0 || (require_all_tb && results.gpu_fail)) {
+    fmt::print("\n*** FAIL: GPU decoded-payload or all-TB requirement ***\n");
+  } else if (decoded_sensitivity) {
+    fmt::print("\nDecoded sensitivity: GPU {}/{} measured TBs decoded; {} CPU CRC disagreements recorded.\n",
+               results.gpu_pass, measured_iters, results.disagreements);
+  } else if (!dapp_manifest.empty()) {
+    fmt::print("\nReceiver dApp: {}/{} measured TBs decoded, {} CPU CRC disagreements (not a parity requirement).\n",
+               results.gpu_pass,
+               measured_iters,
+               results.disagreements);
   } else if (results.cpu_fail == 0 && results.gpu_fail == 0) {
     fmt::print("\nPASS: Both paths decoded all {} iterations, 0 byte mismatches\n", measured_iters);
   } else {
     fmt::print("\nPASS: Both paths agree on BLER, 0 byte mismatches\n");
   }
 
-  worker_pool->stop();
-  if (resident_requirement_failed || device_grid_requirement_failed) {
-    std::exit(2);
+  if (phase_observation.count()) {
+    cold_trace.measure("observe_before_retirement", [] { std::this_thread::sleep_for(phase_observation); });
   }
+  cold_trace.measure("executor_stop", [&] { worker_pool->stop(); });
+  cold_trace.measure("gpu_processor_destroy", [&] { gpu_proc.reset(); });
+  cold_trace.measure("gpu_factory_destroy", [&] { gpu_factory.reset(); });
+#ifdef OCUDU_PUSCH_TEST_DAPP
+  if (dapp_fixture)
+    cold_trace.measure("dapp_unload", [&] { dapp_fixture->unload(); });
+#endif
+  cold_trace.measure("output_release", [&] { gpu_rx_data.reset(); });
+  const bool failed = resident_requirement_failed || device_grid_requirement_failed || owned_grid_requirement_failed ||
+                      results.output_guard_failures || results.gpu_truth_mismatches || results.byte_mismatches ||
+                      (check_reference_crc && results.disagreements) ||
+                      (require_all_tb && results.gpu_fail);
+  if (samples) {
+    fmt::print(samples.get(),
+               "{{\"kind\":\"end\",\"passed\":{},\"gpu_pass\":{},\"gpu_fail\":{},\"truth_mismatches\":{},\"guard_"
+               "failures\":{},\"epoch_s\":{}}}\n",
+               !failed,
+               results.gpu_pass,
+               results.gpu_fail,
+               results.gpu_truth_mismatches,
+               results.output_guard_failures,
+               epoch_seconds());
+    if (std::fflush(samples.get()))
+      throw std::runtime_error("Writing PUSCH summary failed.");
+  }
+  if (failed)
+    throw std::runtime_error("PUSCH resident/correctness requirements failed.");
 }
 
 } // namespace
 
 int main(int argc, char** argv)
-{
+try {
   unsigned      nof_prb = 106;
   float         sinr_dB = 20.0f;
   sch_mcs_index mcs_idx = static_cast<sch_mcs_index>(20);
@@ -1413,6 +1634,64 @@ int main(int argc, char** argv)
       nof_warmup = std::stoi(argv[++i]);
     } else if (arg == "--cpu-every" && i + 1 < argc) {
       cpu_every = std::max(1, std::stoi(argv[++i]));
+    } else if (arg == "--workers" && i + 1 < argc) {
+      benchmark_workers = parse_u32(argv[++i], 32);
+      if (!benchmark_workers || benchmark_workers > 32)
+        return 1;
+    } else if (arg == "--pace-ms" && i + 1 < argc) {
+      const auto value = parse_u32(argv[++i], 1000);
+      if (value > 1000)
+        return 1;
+      iteration_pause = std::chrono::milliseconds{value};
+    } else if (arg == "--seed" && i + 1 < argc) {
+      payload_seed = parse_u32(argv[++i], std::numeric_limits<uint32_t>::max());
+    } else if (arg == "--sample-jsonl" && i + 1 < argc) {
+      sample_jsonl_path = argv[++i];
+    } else if (arg == "--cold-jsonl" && i + 1 < argc) {
+      cold_jsonl_path = argv[++i];
+    } else if (arg == "--dapp-manifest" && i + 1 < argc) {
+      dapp_manifest = argv[++i];
+    } else if (arg == "--dapp-receiver-completion") {
+      receiver_completion = true;
+    } else if (arg == "--cuda-owned-context") {
+      cuda_owned_context = true;
+    } else if (arg == "--cuda-init-only") {
+      cuda_init_only = true;
+    } else if (arg == "--trace-terminate") {
+      trace_terminate = true;
+    } else if (arg == "--post-teardown-hold-ms" && i + 1 < argc) {
+      post_teardown_hold = std::chrono::milliseconds{parse_u32(argv[++i], 5000)};
+    } else if (arg == "--phase-observation-ms" && i + 1 < argc) {
+      phase_observation = std::chrono::milliseconds{parse_u32(argv[++i], 5000)};
+    } else if (arg == "--receiver-capture-prefix" && i + 1 < argc) {
+      receiver_capture_prefix = argv[++i];
+      if (receiver_capture_prefix.empty()) throw std::runtime_error("Empty receiver capture prefix");
+    } else if (arg == "--require-pilot-csi") {
+      require_pilot_csi = true;
+    } else if (arg == "--sinr-method" && i + 1 < argc) {
+      const std::string method = argv[++i];
+      if (method == "channel_estimator") {
+        sinr_method = channel_state_information::sinr_type::channel_estimator;
+      } else if (method == "post_equalization") {
+        sinr_method = channel_state_information::sinr_type::post_equalization;
+      } else {
+        throw std::runtime_error("--sinr-method requires channel_estimator or post_equalization");
+      }
+    } else if (arg == "--require-all-tb") {
+      require_all_tb = true;
+    } else if (arg == "--decoded-sensitivity") {
+      decoded_sensitivity = true;
+    } else if (arg == "--channel-profile" && i + 1 < argc) {
+      channel_profile = argv[++i];
+      if (channel_profile != "single-tap" && channel_profile != "TDLA" &&
+          channel_profile != "TDLB" && channel_profile != "TDLC") {
+        throw std::runtime_error("--channel-profile requires single-tap, TDLA, TDLB or TDLC");
+      }
+    } else if (arg == "--fading-distribution" && i + 1 < argc) {
+      fading_distribution = argv[++i];
+      if (fading_distribution != "uniform-phase" && fading_distribution != "rayleigh") {
+        throw std::runtime_error("--fading-distribution requires uniform-phase or rayleigh");
+      }
     } else if (arg == "--mcs-table" && i + 1 < argc) {
       std::string table_str = argv[++i];
       if (table_str == "qam64") {
@@ -1490,6 +1769,25 @@ int main(int argc, char** argv)
       fmt::print("  --mcs-table T   MCS table: qam64, qam256, qam64LowSe (default: qam64)\n");
       fmt::print("  --iterations N  Number of measured iterations (default: 100)\n");
       fmt::print("  --warmup N      Number of warmup iterations before measurement (default: 5)\n");
+      fmt::print("  --workers N     Background executor threads, 1-32 (default: up to 8)\n");
+      fmt::print("  --seed N        Explicit payload/TA/CFO seed; use one worker for paired input replay\n");
+      fmt::print("  --pace-ms N     Pause before each iteration, 0-1000 ms (default: 0)\n");
+      fmt::print("  --sample-jsonl PATH  New per-frame timing/metric evidence file (never overwritten)\n");
+      fmt::print("  --decoded-sensitivity  Record independent CPU/CUDA CRC outcomes; requires resident sample evidence\n");
+      fmt::print("  --post-teardown-hold-ms N  Diagnostic only: hold 0..5000 ms after explicit owned-context cleanup\n");
+      fmt::print("  --phase-observation-ms N  Test-only 0..5000-ms gaps after context/setup and before retirement; outside frame timing\n");
+      fmt::print("  --receiver-capture-prefix PATH  Diagnostic-only raw grid/LLR captures; timing is perturbed, four PRB SISO, at most 64 frames\n");
+      fmt::print("  --channel-profile STR  single-tap (default), TDLA, TDLB or TDLC; frequency-domain proxies, no Doppler\n");
+      fmt::print("  --fading-distribution STR  uniform-phase (default) or rayleigh\n");
+      fmt::print("  --cold-jsonl PATH  New flushed startup/teardown trace; separate from frame timing\n");
+      fmt::print("  --dapp-manifest PATH  Explicit local CUDA receiver package; requires resident mode and samples\n");
+      fmt::print("  --dapp-receiver-completion  Opt in only this isolated service to the real completion adapter\n");
+      fmt::print("  --cuda-owned-context  Initialize/retain the test primary context before constructing PHY factories\n");
+      fmt::print("  --cuda-init-only  With owned context and cold trace: initialize/retire only; no decode or dApp\n");
+      fmt::print("  --trace-terminate  Isolated test only: print bounded abort stack; never resume after failure\n");
+      fmt::print("  --sinr-method STR  channel_estimator or post_equalization (default) for both CPU/GPU arms\n");
+      fmt::print("  --require-pilot-csi  Require selected channel-estimator SINR/EPRE/RSRP/TA/CFO after completion\n");
+      fmt::print("  --require-all-tb  Fail unless all measured GPU transport blocks decode successfully\n");
       fmt::print("  --cpu-every N   Run the CPU reference decode every Nth measured iteration (default: 1).\n");
       fmt::print("                  N>1 keeps the GPU on a tighter slot cadence (the ~10ms CPU decode\n");
       fmt::print("                  otherwise lets the GPU idle/downclock between GPU slots).\n");
@@ -1513,21 +1811,138 @@ int main(int argc, char** argv)
       fmt::print("  --scrambling-id N  DMRS scrambling ID (default: 0)\n");
       fmt::print("  --n-scid N      DMRS n_SCID 0 or 1 (default: 0)\n");
       return 0;
+    } else {
+      throw std::runtime_error("Unknown option or missing value: " + arg);
     }
   }
 
-  ocudulog::init();
+  if (!nof_prb || nof_prb > MAX_NOF_PRBS || !nof_iterations || nof_iterations > 100000 || nof_warmup > 1000 ||
+      !std::isfinite(sinr_dB))
+    return 1;
+  if (decoded_sensitivity && (!require_gpu_resident || sample_jsonl_path.empty() || !require_pilot_csi)) {
+    throw std::runtime_error("--decoded-sensitivity requires --require-gpu-resident, --require-pilot-csi and --sample-jsonl");
+  }
+  if (receiver_completion && dapp_manifest.empty()) {
+    throw std::runtime_error("--dapp-receiver-completion requires an explicit receiver manifest");
+  }
+  if (!receiver_capture_prefix.empty()) {
+#ifndef OCUDU_PUSCH_TEST_DAPP
+    throw std::runtime_error("Receiver capture requires CUDA/dApp test support");
+#endif
+    if (!cuda_owned_context || cuda_init_only || !decoded_sensitivity || cold_jsonl_path.empty() ||
+        !payload_seed || benchmark_workers != 1 || nof_prb != 4 || nof_layers != 1 || nof_rx_ports != 1 ||
+        nof_warmup + nof_iterations > 64 || enable_transform_precoding || dmrs != dmrs_config_type::type1 ||
+        rnti != 0x1234 || n_id != 0 || scrambling_id != 0 || n_scid ||
+        dmrs_symbols_mask.to_uint64() != ((1U << 2) | (1U << 11)) ||
+        (!dapp_manifest.empty() && !receiver_completion)) {
+      throw std::runtime_error("Receiver capture requires seeded, owned, traced, serialized four-PRB SISO decoded test; at most 64 frames");
+    }
+  }
+  if (post_teardown_hold.count() && (!cuda_owned_context || cold_jsonl_path.empty() || cuda_init_only)) {
+    throw std::runtime_error("Post-teardown hold requires a full owned-context run and --cold-jsonl");
+  }
+  if (phase_observation.count() && (!cuda_owned_context || cold_jsonl_path.empty() ||
+                                     sample_jsonl_path.empty() || cuda_init_only)) {
+    throw std::runtime_error("Phase observation requires a full owned-context run, --cold-jsonl and --sample-jsonl");
+  }
+  if (cuda_init_only && (!cuda_owned_context || !dapp_manifest.empty() || !sample_jsonl_path.empty())) {
+    throw std::runtime_error("--cuda-init-only requires owned context and forbids receiver/sample arguments");
+  }
+  if (cuda_owned_context && cold_jsonl_path.empty()) {
+    throw std::runtime_error("--cuda-owned-context requires an exclusive --cold-jsonl trace");
+  }
+#ifndef ENABLE_CUDA
+  if (cuda_owned_context || cuda_init_only) {
+    throw std::runtime_error("Owned context qualification requires a CUDA build");
+  }
+#endif
+  if (require_pilot_csi && (sinr_method != channel_state_information::sinr_type::channel_estimator ||
+                            !require_gpu_resident || sample_jsonl_path.empty())) {
+    throw std::runtime_error("--require-pilot-csi requires channel_estimator SINR, resident mode and samples");
+  }
+  if (!dapp_manifest.empty()) {
+#ifndef OCUDU_PUSCH_TEST_DAPP
+    fmt::print("Receiver dApp test support is not compiled in.\n");
+    return 1;
+#endif
+    if (!require_gpu_resident || sample_jsonl_path.empty()) {
+      fmt::print("--dapp-manifest requires --require-gpu-resident and --sample-jsonl.\n");
+      return 1;
+    }
+  }
+  // Requiring matched pilot CSI must select its producer in BOTH test arms.
+  // Checking only for finite conventional metrics lets the baseline pass while
+  // an inline receiver correctly leaves unavailable physical CSI unset.
+  // This affects only this test process and runs before any PHY factory can
+  // cache the environment option. Production defaults remain unchanged.
+  if (require_pilot_csi && setenv("OCUDU_PUSCH_COMMON_PILOT_CSI", "1", 1) != 0) {
+    throw std::runtime_error("Failed to enable required common-pilot CSI in the isolated test");
+  }
+  test_support::pusch_cold_trace cold_trace(cold_jsonl_path);
+  if (trace_terminate) {
+    test_support::enable_test_termination_trace();
+  }
+  cold_trace.measure("logging_init", [] { ocudulog::init(); });
+#ifdef ENABLE_CUDA
+  test_support::pusch_test_cuda_context_operations context_operations(cold_trace);
+  test_support::pusch_test_primary_context         context_owner(context_operations);
+  if (cuda_owned_context) {
+    cold_trace.measure("cuda_owned_context_initialize", [&] {
+      if (!context_owner.initialize()) {
+        throw std::runtime_error("Owned primary context initialization/identity validation failed");
+      }
+    });
+  }
+  if (cuda_init_only) {
+    cold_trace.measure("cuda_owned_context_close", [&] {
+      if (!context_owner.close()) {
+        throw std::runtime_error("Owned primary context restoration/retirement failed");
+      }
+    });
+    cold_trace.record("process", "complete");
+    fmt::print("{{\"cuda_initialization_only\":true,\"decoded_frames\":0,\"receiver_invocations\":0}}\n");
+    return 0;
+  }
+  // Test-only separation of cold startup, frame execution and retirement.
+  // Never called from production L1; these gaps cannot qualify full-rate isolation.
+  if (phase_observation.count()) {
+    cold_trace.measure("observe_context", [] { std::this_thread::sleep_for(phase_observation); });
+  }
+#endif
   if ((nof_layers == 3) && (nof_rx_ports < 4)) {
     nof_rx_ports = 4;
   } else if (nof_rx_ports < nof_layers) {
     nof_rx_ports = nof_layers;
   }
   if (!transform_deprecoder_backend.empty()) {
-    setenv("OCUDU_PUSCH_TRANSFORM_DEPRECODER", transform_deprecoder_backend.c_str(), 1);
+#ifdef ENABLE_CUDA
+    if (setenv(PUSCH_TRANSFORM_DEPRECODER_ENV, transform_deprecoder_backend.c_str(), 1) != 0) {
+      throw std::runtime_error("Failed to set requested CUDA transform-deprecoder backend");
+    }
+#endif
   }
   if (require_gpu_resident && std::getenv("OCUDU_PUSCH_ACCELERATION_TIMING") == nullptr) {
     setenv("OCUDU_PUSCH_ACCELERATION_TIMING", "1", 1);
   }
-  run_e2e_pipeline_test(nof_prb, sinr_dB, mcs_idx);
+  run_e2e_pipeline_test(nof_prb, sinr_dB, mcs_idx, cold_trace);
+#ifdef ENABLE_CUDA
+  if (cuda_owned_context) {
+    cold_trace.measure("cuda_owned_context_close", [&] {
+      if (!context_owner.close()) {
+        throw std::runtime_error("Owned primary context restoration/retirement failed");
+      }
+    });
+  }
+#endif
+  // Includes local grid/service destruction after the function's explicit teardown.
+  // Optional control-only diagnostic: distinguish explicit CUDA cleanup from
+  // runtime/static destruction at process exit. Never part of per-frame timing.
+  if (post_teardown_hold.count()) {
+    cold_trace.measure("post_teardown_hold", [] { std::this_thread::sleep_for(post_teardown_hold); });
+  }
+  cold_trace.record("process", "complete");
   return 0;
+} catch (const std::exception& error) {
+  fmt::print(stderr, "PUSCH test failed: {}\n", error.what());
+  return 2;
 }

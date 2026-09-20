@@ -20,6 +20,7 @@
 #include "ocudu/phy/upper/channel_modulation/evm_calculator.h"
 #include "ocudu/phy/upper/channel_processors/pusch/factories.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_demodulator.h"
+#include "ocudu/phy/upper/channel_processors/pusch/pusch_demodulator_notifier.h"
 #include "ocudu/phy/upper/dapp/pusch_resident_dapp.h"
 #include "ocudu/phy/upper/equalization/channel_equalizer.h"
 #include "ocudu/phy/upper/equalization/dynamic_ch_est_list.h"
@@ -104,14 +105,7 @@ public:
   span<const std::complex<float>> get_captured_symbols() const override;
   void                            wait_captured_symbols() override;
 
-  bool install_resident_dapp(std::shared_ptr<pusch_resident_dapp> dapp) override
-  {
-    if (!dapp || resident_dapp_) {
-      return false;
-    }
-    resident_dapp_ = std::move(dapp);
-    return true;
-  }
+  bool install_resident_dapp(std::shared_ptr<pusch_resident_dapp> dapp) override;
 
   // See interface for documentation.
   resident_softbit_buffer get_resident_softbits() const override
@@ -119,7 +113,10 @@ public:
     // Both E2E and batch paths use FP16 output for GPU-resident LDPC decode.
     // FP16 provides best performance with the optimized resident decoder kernels.
     // Return the buffer from the most recently completed processing.
-    return {.data              = last_resident_llrs_,
+    if (last_buf_ < 0 || static_cast<size_t>(last_buf_) >= NUM_BUFFERS) {
+      return {};
+    }
+    const resident_softbit_buffer current{.data              = last_resident_llrs_,
             .nof_softbits      = last_num_llrs_,
             .execution_context = static_cast<void*>(stream_),
             .completion_token  = static_cast<void*>(kernel_complete_[last_buf_]),
@@ -127,9 +124,18 @@ public:
             .n_id              = last_n_id_,
             .rnti              = last_rnti_,
             .buffer_index      = static_cast<int>(last_buf_)};
+    return resident_dapp_ ? resident_dapp_->receiver_softbits(current) : current;
+  }
+
+  void finish_resident_consumers() override
+  {
+    if (resident_dapp_) {
+      resident_dapp_->receiver_consumers_returned();
+    }
   }
 
   bool used_host_codeword_fallback() const override { return host_codeword_written_; }
+  bool discarded_inline_input() const override { return inline_input_discarded_; }
 
   // See interface for documentation.
   resident_uci_buffer get_resident_uci() const override
@@ -429,9 +435,15 @@ private:
   /// True when the last slot's SINR readback copies were routed to d2h_stream_
   /// (OCUDU_PUSCH_SINR_SIDE_STREAM); report_deferred_sinr must sync d2h_complete_.
   bool last_sinr_on_side_stream_        = false;
+  /// Current-grant admission only. Submission success still requires a successful completion fence.
+  bool last_metrics_submission_ok_     = false;
+  bool last_metrics_fence_recorded_    = false;
+  /// Current-grant common pilot-stage submission; completion/readback is also required.
+  bool last_common_pilot_csi_          = false;
   bool gpu_uci_device_decode_requested_ = false;
   /// True when the current demodulation wrote data through the host codeword buffer.
   bool host_codeword_written_ = false;
+  bool inline_input_discarded_ = false;
 
   /// Saved config from last demodulation (for decoder).
   unsigned last_n_id_ = 0;
@@ -446,11 +458,10 @@ private:
   bool                                 last_dapp_inline_ = false;
   /// True only when the last inline dApp produced every post-EQ noise sample.
   bool last_dapp_post_eq_noise_valid_ = false;
+  pusch_demodulator_notifier::demodulation_stats read_completed_inline_stats() const;
   /// Number of post-EQ noise samples written for the last Class-A dApp inline equalize
   /// (`nof_data_re * nof_tx_layers`). Used by deferred CSI so OLLA gets real UL SINR.
   size_t last_nof_eq_re_ = 0;
-  /// Host scratch for D2H of post-EQ noise when exporting dApp-inline SINR after decoder sync.
-  std::vector<float> dapp_post_eq_noise_host_;
 
   /// Copy buffer for channel RE.
   modular_re_buffer_reader<cbf16_t, MAX_PORTS> ch_re_view;

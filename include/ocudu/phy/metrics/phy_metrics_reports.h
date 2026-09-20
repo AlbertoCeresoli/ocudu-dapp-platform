@@ -89,6 +89,8 @@ struct pusch_processor_metrics {
   float sinr_dB;
   /// EVM value extracted from channel estimator.
   float evm;
+  /// False for a software-invalid input. Its processing cost remains measurable, but it is not a radio BLER sample.
+  bool input_valid = true;
 };
 
 /// Collects scrambling metrics for PDSCH and PUSCH.

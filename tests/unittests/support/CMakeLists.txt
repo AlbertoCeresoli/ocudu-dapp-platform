@@ -68,7 +68,7 @@ add_executable(ring_buffer_pool_test ring_buffer_pool_test.cpp)
 target_link_libraries(ring_buffer_pool_test ocudu_support gtest ocudu_gtest_main)
 add_test(ring_buffer_pool_test ring_buffer_pool_test)
 
-add_executable(object_pool_test unbounded_object_pool_test.cpp bounded_object_pool_test.cpp)
+add_executable(object_pool_test unbounded_object_pool_test.cpp bounded_object_pool_test.cpp bounded_object_pool_bitmap_test.cpp)
 target_link_libraries(object_pool_test ocudu_support gtest ocudu_gtest_main)
 add_test(object_pool_test object_pool_test)
 

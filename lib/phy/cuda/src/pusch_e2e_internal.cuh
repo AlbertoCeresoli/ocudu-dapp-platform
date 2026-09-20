@@ -10,13 +10,12 @@
 
 #pragma once
 #include "pusch_e2e.h"
+#include "pusch_transform_deprecoder_selection.h"
 #include "scrambling.h"
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuComplex.h>
 #include <cuda_fp16.h>
-#ifdef OCUDU_PHY_CUDA_ENABLE_VKFFT
-    #include "vkFFT.h"
-#endif
 
 /* Transform-deprecoder (DFT-s-OFDM) bounds */
 #define PUSCH_DEPRECODE_MAX_DFT_SIZE 3240
@@ -34,20 +33,9 @@
 #define MIMO_CFO_PHASOR_COUNT (MIMO_CFO_DATA_PHASOR_COUNT + MIMO_CFO_RESIDUAL_PHASOR_COUNT)
 #define MIMO_CFO_RESIDUAL_PHASOR_OFFSET MIMO_CFO_DATA_PHASOR_COUNT
 
-enum pusch_transform_deprecoder_backend {
-    PUSCH_DEPRECODER_CUSTOM = 0,
-    PUSCH_DEPRECODER_VKFFT = 1,
-    PUSCH_DEPRECODER_AUTO = 2
-};
-
-#ifdef OCUDU_PHY_CUDA_ENABLE_VKFFT
-struct pusch_vkfft_deprecoder_plan {
-    VkFFTApplication app;
-    pfUINT buffer_size;
-    int dft_size;
-    bool initialized;
-};
-#endif
+// Keep the context layout independent of private backend compile definitions.
+// Only the host API translation unit owns or dereferences these opaque plans.
+struct pusch_vkfft_deprecoder_plan;
 
 /* Jump-table init lives in the kernels TU (writes module-local __constant__);
  * exposed so the host API TU (create) can trigger it. */
@@ -203,13 +191,11 @@ struct pusch_e2e_ctx {
     float*   d_deprecode_noise_vars;
     size_t   deprecode_symbols_capacity;
     size_t   deprecode_noise_capacity;
-#ifdef OCUDU_PHY_CUDA_ENABLE_VKFFT
     pusch_vkfft_deprecoder_plan* vkfft_plans[PUSCH_DEPRECODE_MAX_DFT_SIZE + 1];
     void* vkfft_buffer_ptr;
     CUdevice vkfft_device;
     cudaStream_t vkfft_stream;
     bool vkfft_preplanned;
-#endif
 
     /* Precomputed OFDM symbol start times (seconds from slot start) */
     float* d_symbol_start_times;         /* Device memory [14] */

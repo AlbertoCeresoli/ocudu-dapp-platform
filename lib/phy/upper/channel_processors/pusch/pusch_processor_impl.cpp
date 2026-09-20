@@ -3,6 +3,7 @@
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 #include "pusch_processor_impl.h"
+#include "pusch_pooled_resources.h"
 #include "../../phy_acceleration_runtime_options.h"
 #include "pusch_acceleration_runtime_options.h"
 #include "pusch_decoder_buffer_dummy.h"
@@ -351,6 +352,7 @@ void pusch_processor_impl::process(span<uint8_t>                    data,
                                    const resource_grid_reader&      grid,
                                    const pusch_processor::pdu_t&    pdu)
 {
+  auto processing = notifier.acquire_processing_activity();
   auto scope = make_scoped_trace(l1_ul_tracer, "L1.UL.PUSCH.process");
 
   // Host-side phase clocks are always collected (steady_clock only) so OTA logs can show
@@ -545,7 +547,7 @@ void pusch_processor_impl::process(span<uint8_t>                    data,
 
 void pusch_processor_impl::process_data(span<uint8_t>                          data,
                                         unique_rx_buffer                       rm_buffer,
-                                        concurrent_dependencies_pool_type::ptr dependencies,
+                                        concurrent_dependencies_pool_type::ptr incoming_dependencies,
                                         pusch_processor_result_notifier&       notifier,
                                         const dmrs_pusch_estimator_results&    est_results,
                                         const resource_grid_reader&            grid,
@@ -554,6 +556,11 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
                                         unsigned                               nof_cdm_groups_without_data,
                                         float                                  ch_estimate_us)
 {
+  auto processing = notifier.acquire_processing_activity();
+  // Return the demodulator/dependency lease before releasing the processing activity.
+  auto dependencies = std::move(incoming_dependencies);
+  pooled_pusch_resource_provider<concurrent_dependencies_pool_type> resource_owner(
+      dependencies_pool, dependencies, notifier);
   using namespace units::literals;
 
   auto scope = make_scoped_trace(l1_ul_tracer, "L1.UL.PUSCH.process_data");
@@ -712,6 +719,7 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
   bool enable_transform_precoding = !std::holds_alternative<ocudu::pusch_processor::dmrs_configuration>(pdu.dmrs);
 
   pusch_demodulator::configuration demod_config;
+  demod_config.resource_owner               = &resource_owner;
   demod_config.cell_id                     = pdu.cell_id;
   demod_config.rnti                        = pdu.rnti;
   demod_config.rb_mask                     = pdu.freq_alloc.get_crb_mask(pdu.bwp_start_rb, pdu.bwp_size_rb);
@@ -803,6 +811,16 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
         demodulator_buffer, notifier_adaptor.get_demodulator_notifier(), grid, est_results, demod_config);
   }
 
+  if (demodulator.discarded_inline_input()) {
+    demodulator.disable_symbol_capture();
+    notifier_adaptor.discard_resident_outputs(pdu.uci.nof_harq_ack, pdu.uci.nof_csi_part1);
+    if (resident_plan.has_sch_data && !decoder->discard_unsubmitted_input()) {
+      report_fatal_error("PUSCH failed inline input cannot be discarded after decoder submission.");
+    }
+    // No resident/host decode, deferred metric callback, symbol fetch or CRC diagnostic for this input.
+    return;
+  }
+
   // Stash metadata (+ any already-ready IQ). Do NOT wait/sync here — that stalls the slot path
   // and breaks Msg3/RACH timing. Pre-join (after LDPC sync) fills IQ via wait_captured_symbols.
   if (publish_symbols) {
@@ -881,15 +899,6 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
       }
     };
 
-    bool resident_uci_notified = false;
-    if (use_resident_sch_with_uci) {
-      resident_uci_info uci_info = get_last_resident_uci(demodulator);
-      if (uci_info.valid) {
-        notify_resident_uci();
-        resident_uci_notified = true;
-      }
-    }
-
     resident_codeword_info resident_codeword = get_last_resident_codeword(demodulator);
 
     if (resident_codeword.valid) {
@@ -907,12 +916,17 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
                                       this,
                                       use_resident_sch_with_uci,
                                       notify_resident_uci,
-                                      &resident_uci_notified,
+                                      nof_harq_ack = pdu.uci.nof_harq_ack,
+                                      nof_csi_part1 = pdu.uci.nof_csi_part1,
                                       resident_stats_deferred,
                                       decoder_ptr = decoder.get(),
                                       &sinr_readback_us,
-                                      publish_symbols]() {
+                                      publish_symbols](bool accepted) {
         demodulator.report_deferred_dapp_completion();
+        if (!accepted) {
+          notifier_adaptor.discard_resident_outputs(nof_harq_ack, nof_csi_part1);
+          return;
+        }
         if (resident_stats_deferred) {
           if (collect_accelerator_timing) {
             auto sinr_start = std::chrono::steady_clock::now();
@@ -924,10 +938,10 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
             demodulator.report_deferred_sinr(notifier_adaptor.get_demodulator_notifier());
           }
         }
-        if (use_resident_sch_with_uci && !resident_uci_notified) {
+        // Even already-fenced UCI must wait for the codeword's acceptance decision.
+        if (use_resident_sch_with_uci) {
           demodulator.finalize_resident_uci();
           notify_resident_uci();
-          resident_uci_notified = true;
         }
         // Late constellation IQ: async D2H on d2h_stream_ is done by now (decoder has
         // already waited for LLR kernels). Off the slot-critical path — same as ai-ran.
@@ -952,6 +966,9 @@ void pusch_processor_impl::process_data(span<uint8_t>                          d
       if (!resident_decode_started) {
         report_fatal_error("PUSCH resident decode failed after resident demodulation; no safe host fallback exists.");
       }
+      // Actual resident decoding is synchronous. Keep this dependency and the original processing activity
+      // alive while releasing completed native loans; terminal SCH delivery alone is not this boundary.
+      demodulator.finish_resident_consumers();
 
     } else if (demodulator.used_host_codeword_fallback()) {
       ocudulog::fetch_basic_logger("PHY").warning(

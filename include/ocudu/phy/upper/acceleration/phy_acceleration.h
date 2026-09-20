@@ -37,6 +37,29 @@ struct resident_softbit_buffer {
   uint16_t rnti = 0;
   /// Optional resident buffer index for implementations that use a fixed buffer ring.
   int buffer_index = -1;
+  /// Optional host-owned acceptance check, evaluated after the backend fences this exact codeword and before
+  /// committing TB/CB CRCs or exporting HARQ softbits. This is not a module-supplied function pointer: the native
+  /// host adapter must retain the issuing worker, receipt and tensor leases in completion_context until decode
+  /// returns, including during deactivation. The callback must be bounded, nonblocking and noexcept, and validate
+  /// the original invocation/generations. It must not release storage still used by the decoder.
+  ///
+  /// Conventional producers leave all three fields empty. A producer requiring asynchronous acceptance sets
+  /// acceptance_required; a missing callback/context then rejects, never silently accepts. This internal C++
+  /// contract neither changes the dApp v1 ABI nor supplies the still-required native module/receipt adapter.
+  bool  acceptance_required = false;
+  void* completion_context  = nullptr;
+  bool (*accept_completion)(void*, const resident_softbit_buffer&) noexcept = nullptr;
+  /// Adapter-owned generation of this completion_context publication. It prevents a copied descriptor from
+  /// accepting a later grant when the same fixed context and tensor addresses are reused. Zero is conventional.
+  uint64_t completion_generation = 0;
+
+  bool accept_completed_input() const noexcept
+  {
+    if (!acceptance_required) {
+      return completion_context == nullptr && accept_completion == nullptr && completion_generation == 0;
+    }
+    return completion_context != nullptr && accept_completion != nullptr && accept_completion(completion_context, *this);
+  }
 };
 
 /// Opaque accelerator-event tokens for opt-in resident dApp stage diagnostics.

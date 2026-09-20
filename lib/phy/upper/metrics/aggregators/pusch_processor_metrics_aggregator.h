@@ -103,17 +103,20 @@ public:
 
   double get_decoding_bler() const
   {
-    return count.load(std::memory_order_relaxed) ? static_cast<double>(count.load(std::memory_order_relaxed) -
-                                                                       sum_crc_ok.load(std::memory_order_relaxed)) /
-                                                       static_cast<double>(count.load(std::memory_order_relaxed))
-                                                 : 0;
+    const auto processed = count.load(std::memory_order_relaxed);
+    const auto total = processed - std::min(processed, software_discards.load(std::memory_order_relaxed));
+    return total ? static_cast<double>(total - std::min(total, sum_crc_ok.load(std::memory_order_relaxed))) / total : 0;
   }
+
+  /// Software discards are not radio CRC failures; their processing cost remains in timing statistics.
+  uint64_t get_nof_software_discards() const { return software_discards.load(std::memory_order_relaxed); }
 
   /// Resets values of all internal counters.
   void reset()
   {
     sum_tbs.store(0, std::memory_order_relaxed);
     sum_crc_ok.store(0, std::memory_order_relaxed);
+    software_discards.store(0, std::memory_order_relaxed);
     sum_return_elapsed_ns.store(0, std::memory_order_relaxed);
     sum_data_elapsed_ns.store(0, std::memory_order_relaxed);
     sum_uci_elapsed_ns.store(0, std::memory_order_relaxed);
@@ -143,8 +146,12 @@ private:
       sum_waiting_ns.fetch_add(metrics.elapsed_data.count() - metrics.elapsed_return.count(),
                                std::memory_order_relaxed);
     }
-    if (metrics.crc_ok) {
-      sum_crc_ok.fetch_add(1, std::memory_order_relaxed);
+    if (metrics.input_valid) {
+      if (metrics.crc_ok) {
+        sum_crc_ok.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else {
+      software_discards.fetch_add(1, std::memory_order_relaxed);
     }
     count.fetch_add(1, std::memory_order_relaxed);
     update_slotmax(metrics.slot, metrics.elapsed_data.count(), packed_max_data_latency_ns);
@@ -158,12 +165,15 @@ private:
     sum_used_cpu_time_ns.fetch_add(metrics.cpu_time_usage_ns, std::memory_order_relaxed);
 
     // Save last channel estimation metrics.
-    ch_est_sinr_db.store(metrics.sinr_dB, std::memory_order_relaxed);
-    ch_est_evm.store(metrics.evm, std::memory_order_relaxed);
+    if (metrics.input_valid) {
+      ch_est_sinr_db.store(metrics.sinr_dB, std::memory_order_relaxed);
+      ch_est_evm.store(metrics.evm, std::memory_order_relaxed);
+    }
   }
 
   std::atomic<uint64_t> sum_tbs                    = {};
   std::atomic<uint64_t> sum_crc_ok                 = {};
+  std::atomic<uint64_t> software_discards          = {};
   std::atomic<uint64_t> sum_return_elapsed_ns      = {};
   std::atomic<uint64_t> sum_data_elapsed_ns        = {};
   std::atomic<uint64_t> sum_uci_elapsed_ns         = {};

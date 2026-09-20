@@ -5,6 +5,7 @@
 
 #include "ocudu/dapp/runtime/native_completion_barrier.h"
 #include "ocudu/dapp/runtime/native_worker.h"
+#include "ocudu/dapp/runtime/native_control_context.h"
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -32,6 +33,12 @@ public:
   virtual uint32_t                    lane_count() const noexcept                                               = 0;
   virtual uint32_t                    worker_id(uint32_t lane, pusch_dapp_demodulator_mode mode) const noexcept = 0;
   virtual uint32_t backend_id(pusch_dapp_demodulator_mode) const noexcept { return OCUDU_DAPP_BACKEND_HOST_V1; }
+  /// Advisory routing only: invocation independently verifies the bound worker's required contract.
+  virtual bool receiver_completion_required() const noexcept { return false; }
+  virtual bool set_receiver_control_context(uint32_t, std::shared_ptr<dapp::native_control_context>) noexcept
+  {
+    return true; // Non-native test/adaptor targets have no module lifecycle to bind.
+  }
   virtual bool     set_completion_barrier(uint32_t,
                                           pusch_dapp_demodulator_mode,
                                           std::shared_ptr<dapp::native_completion_barrier>) noexcept
@@ -44,6 +51,18 @@ public:
                                                 ocudu_dapp_equalizer_output_v1&      output) noexcept = 0;
   virtual dapp::native_invocation_result
   invoke(uint32_t lane, const ocudu_dapp_receiver_input_v1& input, ocudu_dapp_receiver_output_v1& output) noexcept = 0;
+  /// Completion-aware dispatch is a separate contract: never silently call ordinary invoke().
+  /// Before dispatch rejection leaves ticket/owner untouched. A possibly submitted operation must retain its
+  /// original worker and ticket, and must forbid fallback. Caller retains tensor/metadata storage independently.
+  virtual dapp::native_invocation_result
+  invoke_receiver_deferred(uint32_t,
+                           const ocudu_dapp_receiver_input_v1&,
+                           ocudu_dapp_receiver_output_v1&,
+                           dapp::native_receiver_ticket&,
+                           std::shared_ptr<dapp::native_worker>&) noexcept
+  {
+    return {OCUDU_DAPP_UNSUPPORTED_V1, true};
+  }
   virtual void report_invalid_output(uint32_t, pusch_dapp_demodulator_mode, const ocudu_dapp_invocation_v1&) noexcept {}
   virtual void report_completion_deadline(uint32_t,
                                           pusch_dapp_demodulator_mode,

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 add_library(ocudu_phy_dapp_adapters STATIC
+        native_pusch_dapp_demodulator_target.cpp
+        native_receiver_resident_adapter.cpp
         pusch_dapp_channel_estimator.cpp
         pusch_dapp_demodulator.cpp
         pusch_resident_dapp.cpp
@@ -19,13 +21,14 @@ target_link_libraries(ocudu_phy_dapp_adapters PUBLIC
         ocudu_channel_modulation
         ocudu_signal_processors
         ocudu_phy_support)
+target_link_libraries(ocudu_phy_dapp_adapters PRIVATE ocudu_native_control_context)
 if(CUDA_ACCEL_FOUND)
     target_sources(ocudu_phy_dapp_adapters PRIVATE
             class_c_cuda_export_pool.cpp
             srs_channel_estimate_cuda.cu
             srs_channel_estimate_tensor_adapter.cpp)
     target_compile_definitions(ocudu_phy_dapp_adapters PRIVATE ENABLE_CUDA)
-    target_link_libraries(ocudu_phy_dapp_adapters PUBLIC CUDA::cudart)
+    target_link_libraries(ocudu_phy_dapp_adapters PUBLIC CUDA::cudart CUDA::cuda_driver)
     # Device code is contained in one translation unit; keep the static archive
     # directly linkable from ordinary C++ targets without a device-link step.
     set_target_properties(ocudu_phy_dapp_adapters PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)

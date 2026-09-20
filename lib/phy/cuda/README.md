@@ -68,8 +68,12 @@ standalone test inventory. Enable them with
 - VkFFT support is required for the FFT-backed low-PHY kernels and is provided
   from `external/vkfft` by default. Override with
   `-DOCUDU_PHY_CUDA_VKFFT_ROOT=/path/to/vkfft` when needed.
-- `OCUDU_PHY_CUDA_PUSCH_TRANSFORM_DEPRECODER=0|1` overrides the PUSCH
-  transform-deprecoder path for debugging.
+- `OCUDU_PHY_CUDA_PUSCH_TRANSFORM_DEPRECODER=custom|vkfft|auto` selects the PUSCH
+  transform-deprecoder backend. `custom` is the CUDA mixed-radix path and skips
+  VkFFT preplanning; it does not select CPU processing. Unset/unknown values
+  retain the compiled default (auto with VkFFT, custom without it). Numeric
+  `0|1` are not backend names. The full-PUSCH test's `--transform-deprecoder`
+  option sets this same variable before constructing the receiver factories.
 - `OCUDU_PHY_CUDA_PUSCH_VKFFT_MIN_DFT_SIZE=<n>` controls the minimum DFT size
   that uses the VkFFT path.
 
