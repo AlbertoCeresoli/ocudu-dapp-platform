@@ -90,7 +90,7 @@ read_result read_secure_file(const std::filesystem::path&                path,
   if (S_ISLNK(link_status.st_mode)) {
     return {read_status::error, {}, "file must not be a symbolic link"};
   }
-  fd_guard descriptor{::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+  fd_guard descriptor{::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)};
   if (descriptor.value < 0) {
     return {read_status::error, {}, std::string("unable to open file: ") + std::strerror(errno)};
   }
@@ -217,7 +217,9 @@ struct package_signature_policy {
 
 } // namespace
 
-struct package_signature_verifier::implementation : package_signature_policy {};
+struct package_signature_verifier::implementation : package_signature_policy {
+  package_signature_config config;
+};
 
 namespace {
 
@@ -355,12 +357,13 @@ package_signature_verifier& package_signature_verifier::operator=(package_signat
 package_signature_verifier_result package_signature_verifier::create(package_signature_config config) noexcept
 {
   try {
-    auto result = create_verifier_state(std::move(config));
+    auto result = create_verifier_state(config);
     if (!result.state) {
       return {{}, std::move(result.detail)};
     }
     auto state                                     = std::make_unique<implementation>();
     static_cast<package_signature_policy&>(*state) = std::move(*result.state);
+    state->config                                  = std::move(config);
     return {std::unique_ptr<package_signature_verifier>(new package_signature_verifier(std::move(state))), {}};
   } catch (const std::bad_alloc&) {
     return {{}, "package trust policy exhausted memory"};
@@ -368,6 +371,68 @@ package_signature_verifier_result package_signature_verifier::create(package_sig
     return {{}, std::string("package trust policy failed: ") + error.what()};
   } catch (...) {
     return {{}, "unknown package trust policy failure"};
+  }
+}
+
+package_signature_result package_signature_verifier::authorize_admitted(const package_record& package) const
+{
+  if (package.signature_status == package_signature_status::unsigned_package) {
+    return state->mode == package_signature_mode::allow_unsigned
+               ? package_signature_result{true, {}}
+               : package_signature_result{false, "package is unsigned under required signature policy"};
+  }
+  if (state->revoked_keys.count(package.signing_key_id) != 0 ||
+      std::none_of(state->keys.begin(), state->keys.end(), [&](const auto& key) {
+        return key.key_id == package.signing_key_id;
+      })) {
+    return {false, "admitted package signing key is no longer trusted"};
+  }
+  const auto floor = state->minimum_sequences.find(package.package_id);
+  if (floor == state->minimum_sequences.end() || package.signature_sequence < floor->second) {
+    return {false, "admitted package is below the current trusted sequence floor"};
+  }
+  return {true, {}};
+}
+
+package_signature_verifier_result package_signature_verifier::reload() const noexcept
+{
+  try {
+    if (state->config.trust_store_path.empty()) {
+      return {{}, "runtime catalog admission requires a configured trust store"};
+    }
+    auto candidate = create(state->config);
+    if (!candidate) {
+      return candidate;
+    }
+    const auto& next = *candidate.verifier->state;
+    // Compare parsed policy rather than whitespace or key order. An equal epoch
+    // is only a no-op; a new epoch may extend trust but cannot restore revoked
+    // keys or erase/lower any previously remembered package floor.
+    bool same_keys = next.keys.size() == state->keys.size();
+    for (const auto& key : state->keys) {
+      same_keys &= std::any_of(next.keys.begin(), next.keys.end(), [&](const auto& item) {
+        return item.key_id == key.key_id && item.public_key_spki == key.public_key_spki;
+      });
+    }
+    const bool same_policy =
+        same_keys && next.revoked_keys == state->revoked_keys && next.minimum_sequences == state->minimum_sequences;
+    if (next.policy_epoch < state->policy_epoch || (next.policy_epoch == state->policy_epoch && !same_policy)) {
+      return {{}, "changed trust policy requires a strictly newer policy epoch"};
+    }
+    for (const auto& key : state->revoked_keys) {
+      if (next.revoked_keys.count(key) == 0) {
+        return {{}, "trust refresh cannot undo key revocation"};
+      }
+    }
+    for (const auto& floor : state->minimum_sequences) {
+      const auto found = next.minimum_sequences.find(floor.first);
+      if (found == next.minimum_sequences.end() || found->second < floor.second) {
+        return {{}, "trust refresh cannot remove or lower a package sequence floor"};
+      }
+    }
+    return candidate;
+  } catch (...) {
+    return {{}, "unable to refresh package trust policy"};
   }
 }
 

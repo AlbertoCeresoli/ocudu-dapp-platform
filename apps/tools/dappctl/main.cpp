@@ -874,6 +874,18 @@ int main(int argc, char** argv)
   inventory_command->add_flag("--omit-packages", omit_packages);
   inventory_command->add_flag("--omit-instances", omit_instances);
 
+  std::string         catalog_package;
+  optional_generation catalog_generation;
+  bool                catalog_dry_run{};
+  auto*               catalog_command = app.add_subcommand("catalog", "Manage locally staged signed catalog packages");
+  catalog_command->require_subcommand(1);
+  auto* admit_command = catalog_command->add_subcommand("admit", "Verify and admit a bundle without loading it");
+  admit_command->add_option("--package", catalog_package, "16-byte staged package ID (hex)")->required();
+  catalog_generation.option =
+      admit_command->add_option("--expected-inventory-generation", catalog_generation.value, "Reject stale inventory");
+  catalog_generation.option->check(CLI::PositiveNumber);
+  admit_command->add_flag("--dry-run", catalog_dry_run);
+
   struct {
     std::string         package;
     std::string         placement{"in-process"};
@@ -1084,6 +1096,10 @@ int main(int argc, char** argv)
 
     if (*inventory_command) {
       request = inventory_query{common, !omit_packages, !omit_instances};
+    } else if (*admit_command) {
+      common.expected_inventory_generation = catalog_generation.get();
+      common.dry_run                       = catalog_dry_run;
+      request                              = catalog_admit{common, parse_identifier(catalog_package)};
     } else if (*load_command) {
       common.expected_inventory_generation = load.expected_inventory.get();
       common.dry_run                       = load.dry_run;

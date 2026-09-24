@@ -56,6 +56,17 @@ TEST_F(ue_link_adaptation_controller_test, starts_with_no_snr_offset)
   ASSERT_EQ(controller.ul_snr_offset_db(), 0);
 }
 
+TEST_F(ue_link_adaptation_controller_test, ul_crc_eligibility_tracks_actual_controller_decision)
+{
+  EXPECT_FALSE(controller.handle_ul_crc_info(true, sch_mcs_index{5}, ul_mcs_table, std::nullopt, 20.0F));
+  EXPECT_FALSE(controller.handle_ul_crc_info(true, sch_mcs_index{5}, ul_mcs_table, sch_mcs_index{6}, 20.0F));
+  EXPECT_FALSE(controller.handle_ul_crc_info(
+      false, sch_mcs_index{5}, ul_mcs_table, sch_mcs_index{5}, sched_cfg.ue.olla_ul_min_pusch_snr - 1.0F));
+  EXPECT_EQ(controller.ul_snr_offset_db(), 0.0F);
+  EXPECT_TRUE(controller.handle_ul_crc_info(true, sch_mcs_index{5}, ul_mcs_table, sch_mcs_index{5}, 20.0F));
+  EXPECT_GT(controller.ul_snr_offset_db(), 0.0F);
+}
+
 TEST_F(ue_link_adaptation_controller_test, acks_increase_offsets)
 {
   controller.handle_dl_ack_info(true, sch_mcs_index{5}, dl_mcs_table, sch_mcs_index{5});

@@ -358,6 +358,22 @@ nr_ldpc_status_t pusch_e2e_dapp_noise_async(pusch_e2e_handle_t handle,
                                          cudaStream_t stream);
 
 /**
+ * dapp_noise_async plus decision-directed EVM of the dApp's equalized symbols, in the same
+ * reduction pass. With symbols, the unit-power QAM error of every finite symbol (the fused
+ * baseline's convention) is reduced into the EVM half of the mailbox and the readback grows to
+ * sixteen bytes; read it with pusch_e2e_evm_get_result after the same completion fence. Without
+ * symbols this is exactly dapp_noise_async and the EVM half is left untouched. Either input may
+ * be null (its result is then unavailable); both null with a nonzero count is invalid.
+ * Symbols are CF32, RE-major/layer-minor, count elements, modulation_bits in {2, 4, 6, 8}.
+ */
+nr_ldpc_status_t pusch_e2e_dapp_metrics_async(pusch_e2e_handle_t handle,
+                                           const float* d_noise,
+                                           const float2* d_symbols,
+                                           unsigned count,
+                                           unsigned modulation_bits,
+                                           cudaStream_t stream);
+
+/**
  * Read mean noise ONLY after successful dapp_noise_async and its completion fence.
  * Empty/erased/malformed results return NAN; never falls back to prior DMRS CSI.
  */

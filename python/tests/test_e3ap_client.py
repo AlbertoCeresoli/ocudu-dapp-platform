@@ -319,6 +319,28 @@ class LiveAgentTests(unittest.TestCase):
             with self.assertRaises(E3ProtocolError):
                 client.subscribe([999])
 
+    def test_catalog_admission_is_a_job_and_cannot_bypass_missing_trust(self):
+        from ocudu_e3 import management
+        with self.client() as client:
+            client.setup()
+            before = client.inventory()["payload"]["inventory"]
+            accepted = client.catalog_admit("00112233-4455-6677-8899-aabbccddeeff", dry_run=True)
+            self.assertEqual(accepted["code"], "accepted")
+            request = {"header": management.header(), "operation": ("jobs", {
+                "action": "get", "jobId": management.parse_identifier(accepted["jobId"])})}
+            deadline = time.monotonic() + 5
+            while True:
+                result = client.management(request)["payload"][1]["jobs"][0]
+                if result["state"] in ("succeeded", "failed"):
+                    break
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            self.assertEqual(result["state"], "failed")
+            self.assertEqual(result["result"]["code"], "verificationFailed")
+            after = client.inventory()["payload"]["inventory"]
+            self.assertEqual(before["generation"], after["generation"])
+            self.assertEqual(after.get("packages", []), [])
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()

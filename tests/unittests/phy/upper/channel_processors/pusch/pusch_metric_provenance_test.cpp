@@ -2,12 +2,35 @@
 // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
 
 #include "pusch_demodulation_metrics.h"
+#include "pusch_equalized_metrics.h"
 #include "pusch_processor_notifier_adaptor.h"
 #include "pusch_sinr_readback.h"
 #include <gtest/gtest.h>
 #include <limits>
 
 using namespace ocudu;
+
+TEST(pusch_equalized_metrics, all_qam_points_and_known_displacements)
+{
+  for (unsigned bits : {2U, 4U, 6U, 8U}) {
+    const int   axis  = 1 << (bits / 2);
+    const float scale = std::sqrt(3.0F / (2.0F * (axis * axis - 1)));
+    for (int re = 1 - axis; re < axis; re += 2) {
+      for (int im = 1 - axis; im < axis; im += 2) {
+        EXPECT_NEAR(ocudu::detail::pusch_qam_error_power(re * scale, im * scale, bits), 0, 1e-12F);
+        EXPECT_NEAR(ocudu::detail::pusch_qam_error_power(re * scale + 0.01F, im * scale - 0.02F, bits), 0.0005F, 1e-7F);
+      }
+    }
+  }
+}
+
+TEST(pusch_equalized_metrics, invalid_noise_and_erasures_are_not_link_sinr)
+{
+  for (float value : {0.0F, -1.0F, NAN, INFINITY, 1.0e5F, 1.0e6F}) {
+    EXPECT_FALSE(ocudu::detail::pusch_metric_noise_valid(value));
+  }
+  EXPECT_TRUE(ocudu::detail::pusch_metric_noise_valid(0.01F));
+}
 
 namespace {
 using sinr_type         = channel_state_information::sinr_type;
@@ -140,15 +163,16 @@ TEST(pusch_metric_provenance, post_eq_accumulator_rejects_invalid_measurements)
 TEST(pusch_metric_provenance, inline_common_pilots_never_invent_post_eq_or_evm)
 {
   const auto raw = make_pusch_e2e_demodulation_stats(27, 12, -23, -25, 1e-6F, 81, .01F);
-  for (bool completion : {false, true}) for (bool pilots : {false, true}) for (bool post_eq : {false, true}) {
-    const auto stats = select_pusch_inline_demodulation_stats(raw, completion, pilots, post_eq);
+  for (bool completion : {false, true}) for (bool pilots : {false, true}) for (bool post_eq : {false, true})
+  for (bool evm : {false, true}) {
+    const auto stats = select_pusch_inline_demodulation_stats(raw, completion, pilots, post_eq, evm);
     EXPECT_EQ(stats.channel_estimator_sinr_dB.has_value(), completion && pilots);
     EXPECT_EQ(stats.sinr_dB.has_value(), completion && post_eq);
     EXPECT_EQ(stats.epre_dB.has_value(), completion && pilots);
     EXPECT_EQ(stats.rsrp_dB.has_value(), completion && pilots);
     EXPECT_EQ(stats.time_alignment_s.has_value(), completion && pilots);
     EXPECT_EQ(stats.cfo_Hz.has_value(), completion && pilots);
-    EXPECT_FALSE(stats.evm);
+    EXPECT_EQ(stats.evm.has_value(), completion && evm);
     for (bool provisional : {false, true}) {
       const auto pilot_report = report(sinr_type::channel_estimator, stats, provisional);
       const auto data_report = report(sinr_type::post_equalization, stats, provisional);

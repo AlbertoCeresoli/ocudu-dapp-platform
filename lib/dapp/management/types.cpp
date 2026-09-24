@@ -89,6 +89,17 @@ uint64_t ocudu::dapp::management::canonical_fingerprint(const load_request& requ
   return has_generation ? append(hash, *request.expected_inventory_generation) : hash;
 }
 
+uint64_t ocudu::dapp::management::canonical_fingerprint(const catalog_admit_request& request) noexcept
+{
+  constexpr char domain[]   = "catalog.admit.v1";
+  uint64_t       hash       = append(1469598103934665603ULL, domain, sizeof(domain));
+  hash                      = append(hash, request.package_id.bytes.data(), request.package_id.bytes.size());
+  hash                      = append(hash, request.dry_run);
+  const bool has_generation = request.expected_inventory_generation.has_value();
+  hash                      = append(hash, has_generation);
+  return has_generation ? append(hash, *request.expected_inventory_generation) : hash;
+}
+
 uint64_t ocudu::dapp::management::canonical_fingerprint(const lifecycle_request& request) noexcept
 {
   uint64_t hash = append(1469598103934665603ULL, request.instance_id.bytes.data(), request.instance_id.bytes.size());

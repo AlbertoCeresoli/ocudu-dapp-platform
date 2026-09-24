@@ -439,7 +439,9 @@ ocudu::dapp::read_package_manifest(const std::string&                catalog_roo
       return {{}, "manifest must be an existing non-symbolic file"};
     }
 
-    fd_guard descriptor{::open(candidate.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+    // A staged FIFO (including a racing regular-file replacement) must not
+    // block the management worker before fstat rejects its type.
+    fd_guard descriptor{::open(candidate.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)};
     if (descriptor.value < 0) {
       return {{}, std::string("unable to open manifest: ") + std::strerror(errno)};
     }

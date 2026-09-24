@@ -52,7 +52,7 @@ void ue_link_adaptation_controller::handle_dl_ack_info(bool                     
   dl_olla->update(ack_value, used_mcs, dl_mcs_lims);
 }
 
-void ue_link_adaptation_controller::handle_ul_crc_info(bool                         crc,
+bool ue_link_adaptation_controller::handle_ul_crc_info(bool                         crc,
                                                        sch_mcs_index                used_mcs,
                                                        pusch_mcs_table              mcs_table,
                                                        std::optional<sch_mcs_index> olla_mcs,
@@ -60,18 +60,18 @@ void ue_link_adaptation_controller::handle_ul_crc_info(bool                     
 {
   if (not ul_olla.has_value()) {
     // UL OLLA is disabled.
-    return;
+    return false;
   }
 
   // A NACK reported at very low SINR (e.g. deep in a coverage hole) does not reflect a bias in the link adaptation
   // and would spuriously drag the OLLA offset down, so such CRCs are excluded from the update.
   if (pusch_snr_db.has_value() and pusch_snr_db.value() < cell_cfg.expert_cfg.ue.olla_ul_min_pusch_snr) {
-    return;
+    return false;
   }
 
   // Only run OLLA if the chosen MCS actually matches the MCS suggested by the OLLA.
   if (not olla_mcs.has_value() or olla_mcs.value() != used_mcs) {
-    return;
+    return false;
   }
 
   // Update the MCS boundaries based on the chosen MCS table.
@@ -79,6 +79,7 @@ void ue_link_adaptation_controller::handle_ul_crc_info(bool                     
 
   // Finally, run OLLA algorithm.
   ul_olla->update(crc, used_mcs, ul_mcs_lims);
+  return true;
 }
 
 float ue_link_adaptation_controller::get_effective_cqi() const

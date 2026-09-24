@@ -78,6 +78,29 @@ void to_json(nlohmann::json& json, const scheduler_ue_metrics& metrics)
   json["ul_brate"]                     = metrics.ul_brate_kbps * 1e3;
   json["ul_nof_ok"]                    = metrics.ul_nof_ok;
   json["ul_nof_nok"]                   = metrics.ul_nof_nok;
+  json["report_period_ms"]             = metrics.report_period.count();
+  json["report_sequence"]              = metrics.report_sequence;
+  json["ul_mac_delivered_bytes"]       = metrics.ul_mac_delivered_bytes;
+  json["ul_prb_symbols"]               = metrics.ul_prb_symbols;
+  json["ul_retx_prb_symbols"]          = metrics.ul_retx_prb_symbols;
+  json["ul_first_tx_ok"]               = metrics.ul_first_tx_ok;
+  json["ul_first_tx_nok"]              = metrics.ul_first_tx_nok;
+  json["ul_retx_ok"]                   = metrics.ul_retx_ok;
+  json["ul_retx_nok"]                  = metrics.ul_retx_nok;
+  json["ul_olla_eligible_ok"]          = metrics.ul_olla_eligible_ok;
+  json["ul_olla_eligible_nok"]         = metrics.ul_olla_eligible_nok;
+  json["ul_olla_skipped"]              = metrics.ul_olla_skipped;
+  json["dl_olla_offset_db"]            = metrics.last_dl_olla;
+  json["ul_olla_offset_db"] =
+      metrics.ul_link_adaptation ? std::optional<float>{metrics.ul_link_adaptation->offset_db} : metrics.last_ul_olla;
+  if (metrics.ul_link_adaptation) {
+    const auto& feedback           = *metrics.ul_link_adaptation;
+    json["ul_olla_enabled"]        = feedback.olla_enabled;
+    json["ul_olla_target_bler"]    = feedback.target_bler;
+    json["ul_olla_max_offset_db"]  = feedback.max_offset_db;
+    json["ul_olla_at_lower_limit"] = feedback.olla_enabled && feedback.offset_db <= -feedback.max_offset_db;
+    json["ul_olla_at_upper_limit"] = feedback.olla_enabled && feedback.offset_db >= feedback.max_offset_db;
+  }
   json["last_phr"]                     = metrics.last_phr.has_value() ? metrics.last_phr : 0;
   json["max_pusch_distance"]           = metrics.max_pusch_distance_ms.has_value() ? metrics.max_pusch_distance_ms : 0;
   json["max_pdsch_distance"]           = metrics.max_pdsch_distance_ms.has_value() ? metrics.max_pdsch_distance_ms : 0;

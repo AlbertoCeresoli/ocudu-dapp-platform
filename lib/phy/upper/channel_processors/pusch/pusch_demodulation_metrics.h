@@ -45,12 +45,14 @@ inline pusch_demodulator_notifier::demodulation_stats make_pusch_e2e_demodulatio
 }
 
 /// Select only current, completion-fenced inline-receiver sources. A receiver's
-/// constellation or learned LLR scale is not an EVM/noise measurement contract.
+/// learned LLR scale is not a noise measurement contract; EVM is kept only when the
+/// host reduced the receiver's equalized symbols with the baseline QAM convention.
 inline pusch_demodulator_notifier::demodulation_stats select_pusch_inline_demodulation_stats(
     pusch_demodulator_notifier::demodulation_stats stats,
     bool completion_ok,
     bool pilot_valid,
-    bool post_eq_valid)
+    bool post_eq_valid,
+    bool evm_valid)
 {
   if (!completion_ok) {
     return {};
@@ -65,7 +67,9 @@ inline pusch_demodulator_notifier::demodulation_stats select_pusch_inline_demodu
   if (!post_eq_valid) {
     stats.sinr_dB.reset();
   }
-  stats.evm.reset();
+  if (!evm_valid) {
+    stats.evm.reset();
+  }
   return stats;
 }
 

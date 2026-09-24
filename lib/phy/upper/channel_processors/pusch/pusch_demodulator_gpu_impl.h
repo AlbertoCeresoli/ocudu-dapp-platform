@@ -458,6 +458,8 @@ private:
   bool                                 last_dapp_inline_ = false;
   /// True only when the last inline dApp produced every post-EQ noise sample.
   bool last_dapp_post_eq_noise_valid_ = false;
+  /// True only when the last inline dApp's equalized symbols were reduced into the EVM mailbox.
+  bool last_dapp_evm_valid_ = false;
   pusch_demodulator_notifier::demodulation_stats read_completed_inline_stats() const;
   /// Number of post-EQ noise samples written for the last Class-A dApp inline equalize
   /// (`nof_data_re * nof_tx_layers`). Used by deferred CSI so OLLA gets real UL SINR.

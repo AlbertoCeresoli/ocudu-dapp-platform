@@ -94,6 +94,14 @@ Both `dappctl` implementations share one exit contract: `0` accepted,
 `1` transport failure, `2` invalid input, `3` the agent refused the
 operation.
 
+## Runtime catalog admission
+
+`catalog admit --package <uuid>` verifies and admits an operator-staged signed
+native bundle without restarting, loading, or activating it. It is an
+asynchronous, generation-checked `catalogAdmit` extension over either carrier;
+no filesystem path is carried over E3. See [runtime_catalog.md](runtime_catalog.md)
+for staging, trust-policy updates, dry-run, and resident-package restrictions.
+
 `ocudu_dappctl.py` defaults: `--socket` falls back to `OCUDU_DAPP_E3_SOCKET`
 or `/run/ocudu/dapp-management.sock`; `--sctp` falls back to `OCUDU_DAPP_E3_SCTP`
 (empty = use the local socket). Common flags: `--transaction` (16-byte id),

@@ -28,6 +28,11 @@ struct inventory_query {
   bool           include_instances{true};
 };
 
+struct catalog_admit {
+  request_header         header;
+  management::identifier package_id;
+};
+
 struct e3_subscription_record {
   uint16_t              subscription_id{};
   uint16_t              ran_function_id{};
@@ -271,7 +276,8 @@ using management_request = std::variant<inventory_query,
                                         data_subscription_control,
                                         data_poll_query,
                                         ran_control,
-                                        cell_info_query>;
+                                        cell_info_query,
+                                        catalog_admit>;
 
 struct config_result {
   std::optional<uint64_t>                    generation;

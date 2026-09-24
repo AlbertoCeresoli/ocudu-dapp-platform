@@ -1644,6 +1644,7 @@ void pusch_demodulator_gpu_impl::demodulate(pusch_codeword_buffer&              
   last_owned_device_grid_used_       = false;
   last_dapp_inline_                  = false;
   last_dapp_post_eq_noise_valid_     = false;
+  last_dapp_evm_valid_               = false;
   last_common_pilot_csi_             = false;
   last_nof_eq_re_                    = 0;
   last_capture_src_                  = nullptr;
@@ -2896,6 +2897,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   pusch_inline_replacement replacement;
   bool dapp_inline_used         = false;
   bool dapp_post_eq_noise_valid = false;
+  bool dapp_eq_symbols_valid    = false;
   auto demodulate_equalized     = [&]() {
     // PUSCH data scrambling (TS 38.211 §6.3.1.1): c_init = n_RNTI·2^15 + q·2^14 + n_ID.
     // Slot index is NOT part of data scrambling (only DMRS). Passing n_s into
@@ -3016,6 +3018,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
           }
           status                   = dapp_inline_used ? NR_LDPC_SUCCESS : NR_LDPC_ERROR_CUDA_FAILED;
           dapp_post_eq_noise_valid = dapp_inline_used;
+          dapp_eq_symbols_valid    = dapp_inline_used;
         }
       }
     } else if (resident_mode == pusch_resident_dapp_mode::equalizer) {
@@ -3030,6 +3033,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
         queue_eq_symbol_d2h(d_symbols_, last_nof_eq_re_);
         dapp_inline_used         = demodulate_equalized();
         dapp_post_eq_noise_valid = dapp_inline_used;
+        dapp_eq_symbols_valid    = dapp_inline_used;
       }
     } else if (resident_mode == pusch_resident_dapp_mode::receiver) {
       const auto invoked = resident_dapp_->invoke_receiver(buffers, config);
@@ -3048,7 +3052,8 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
         }
         dapp_inline_used         = status == NR_LDPC_SUCCESS;
         dapp_post_eq_noise_valid = dapp_inline_used && resident_dapp_->receiver_post_eq_noise_valid();
-        if (dapp_inline_used && resident_dapp_->receiver_equalized_symbols_valid()) {
+        dapp_eq_symbols_valid    = dapp_inline_used && resident_dapp_->receiver_equalized_symbols_valid();
+        if (dapp_eq_symbols_valid) {
           last_nof_eq_re_   = static_cast<std::size_t>(nof_re) * static_cast<std::size_t>(nof_tx_layers);
           last_capture_src_ = d_symbols_;
           last_capture_n_   = last_nof_eq_re_;
@@ -3095,6 +3100,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
     last_metrics_submission_ok_ = false;
     last_dapp_inline_ = false;
     last_dapp_post_eq_noise_valid_ = false;
+    last_dapp_evm_valid_ = false;
     last_resident_llrs_ = nullptr;
     last_num_llrs_ = 0;
     last_capture_src_ = nullptr;
@@ -3427,18 +3433,27 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   last_metrics_fence_recorded_ = false;
   bool producer_event_recorded = false;
   bool noise_metrics_failed = false;
-  if (dapp_inline_used && dapp_post_eq_noise_valid) {
+  bool dapp_evm_valid = false;
+  if (dapp_inline_used && (dapp_post_eq_noise_valid || dapp_eq_symbols_valid)) {
     // Same compute stream as the producer: the existing completion fence covers
-    // reduction and eight-byte readback for both immediate and deferred stats.
-    // No reporting-time allocation, full tensor D2H or additional synchronization.
-    const unsigned noise_count = nof_re * nof_tx_layers;
-    if (pusch_e2e_dapp_noise_async(e2e_handle_, static_cast<const float*>(d_noise_vars_), noise_count, stream_) !=
-        NR_LDPC_SUCCESS) {
+    // reduction and readback for both immediate and deferred stats. The dApp's
+    // equalized symbols add decision-directed EVM with the baseline's QAM
+    // convention in the same pass. No reporting-time allocation, full tensor D2H
+    // or additional synchronization.
+    const unsigned count = nof_re * nof_tx_layers;
+    if (pusch_e2e_dapp_metrics_async(e2e_handle_,
+                                     dapp_post_eq_noise_valid ? static_cast<const float*>(d_noise_vars_) : nullptr,
+                                     dapp_eq_symbols_valid ? static_cast<const float2*>(d_symbols_) : nullptr,
+                                     count,
+                                     static_cast<unsigned>(mod_order),
+                                     stream_) != NR_LDPC_SUCCESS) {
       dapp_post_eq_noise_valid = false;
       noise_metrics_failed = true;
       static_cast<void>(cudaGetLastError());
+    } else {
+      dapp_evm_valid = dapp_eq_symbols_valid;
     }
-    last_metrics_submission_ok_ = dapp_post_eq_noise_valid;
+    last_metrics_submission_ok_ = dapp_post_eq_noise_valid || dapp_evm_valid;
   }
   if (!dapp_inline_used || last_common_pilot_csi_) {
     last_metrics_submission_ok_ = false;
@@ -3505,6 +3520,7 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
   gpu_llrs_valid_                = true;
   last_dapp_inline_              = dapp_inline_used;
   last_dapp_post_eq_noise_valid_ = dapp_inline_used && dapp_post_eq_noise_valid;
+  last_dapp_evm_valid_           = dapp_inline_used && dapp_evm_valid;
   // Preserve last_nof_eq_re_ if EQ was already stashed above (NeuralEq / CE-EQ). Only overwrite
   // when dApp-inline succeeded so deferred SINR still has a size; do NOT zero it when soft-demod
   // falls back — constellation force-D2H still needs the EQ buffer size.
@@ -4015,8 +4031,10 @@ pusch_demodulator_notifier::demodulation_stats pusch_demodulator_gpu_impl::read_
       last_common_pilot_csi_ ? pusch_e2e_epre_get_result(e2e_handle_) : NAN,
       last_common_pilot_csi_ ? pusch_e2e_rsrp_get_result(e2e_handle_) : NAN,
       last_common_pilot_csi_ ? pusch_e2e_ta_get_result(e2e_handle_) : NAN,
-      last_common_pilot_csi_ ? pusch_e2e_cfo_get_result(e2e_handle_) : NAN, NAN);
-  stats = select_pusch_inline_demodulation_stats(stats, true, last_common_pilot_csi_, last_dapp_post_eq_noise_valid_);
+      last_common_pilot_csi_ ? pusch_e2e_cfo_get_result(e2e_handle_) : NAN,
+      last_dapp_evm_valid_ ? pusch_e2e_evm_get_result(e2e_handle_) : NAN);
+  stats = select_pusch_inline_demodulation_stats(
+      stats, true, last_common_pilot_csi_, last_dapp_post_eq_noise_valid_, last_dapp_evm_valid_);
   sanitize_stats_in_place(stats, last_rnti_);
   return stats;
 }

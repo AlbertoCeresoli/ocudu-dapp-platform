@@ -247,7 +247,7 @@ artifact_verification_result artifact_verifier::inspect_impl(const std::string& 
     return {artifact_error::open_failed, nullptr, "symbolic links are not admitted"};
   }
 
-  const int fd = ::open(canonical.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  const int fd = ::open(canonical.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (fd < 0) {
     return {artifact_error::open_failed, nullptr, std::strerror(errno)};
   }

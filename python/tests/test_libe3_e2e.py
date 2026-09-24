@@ -164,6 +164,18 @@ class LibE3DAppAgainstOcuduAgent(unittest.TestCase):
         # succeeded twice without leaking one.
         self.assertEqual(first["dapp_id"], second["dapp_id"])
 
+    def test_catalog_admission_extension_over_real_libe3_control_action(self):
+        # The positive carrier ACK means the bounded management job was
+        # accepted, not that an unsigned/unconfigured package was admitted.
+        codec = load_codec(os.environ.get("OCUDU_E3_SCHEMA_DIR"))
+        request = management.catalog_admit_request(bytes.fromhex("00112233445566778899aabbccddeeff"), dry_run=True)
+        control = codec.encode("ManagementRequest", request)
+        summary = self.run_dapp("--indications", "1", "--control-hex", control.hex())
+        self.assertTrue(summary["setup"], summary)
+        self.assertEqual(summary["control_ack"], "positive", summary)
+        self.assertTrue(summary["released"], summary)
+        self.assertTrue(summary["ok"], summary)
+
 
 @unittest.skipUnless(VECTORS, "needs --vectors (or OCUDU_LIBE3_INTEROP_VECTORS)")
 class LibE3EncoderAgainstAsn1tools(unittest.TestCase):

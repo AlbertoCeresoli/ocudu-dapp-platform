@@ -22,6 +22,10 @@ REQUIRED = {
         "portable_data_store_test.fanout_copy_budget_drops_whole_objects_and_rotates_admission",
         "portable_data_store_test.concurrent_removal_and_replacement_do_not_reclaim_a_borrowed_producer_slot",
         "dapp_telemetry_isolation.no_producer_allocation",
+        "dapp_e3_cli.cross_language",
+        "dapp_package_signature.runtime_policy_reload_is_monotonic_and_keeps_original_immutable",
+        "dapp_package_signature.runtime_catalog_verifies_then_admits_without_loading_and_replays_transactions",
+        "dapp_package_signature.special_files_never_wait_for_a_fifo_writer",
     },
     "sdk": {
         "contract.ref_channel_estimator_cpu", "contract.ref_equalizer_cpu",
@@ -39,7 +43,7 @@ def main():
     args = parser.parse_args()
     build = args.build.resolve()
     base = ["ctest", "--test-dir", str(build)]
-    selection = (["-R", r"^dapp_e3|^dapp_portable_data_store|^portable_data_store_test|^dapp_telemetry_isolation",
+    selection = (["-R", r"^dapp_e3|^dapp_portable_data_store|^portable_data_store_test|^dapp_telemetry_isolation|^dapp_package_signature",
                   "-E", "by_reference_delivery_is_faster_than_in_band"] if args.profile == "host" else [])
     inventory = json.loads(subprocess.check_output(base + selection + ["--show-only=json-v1"], text=True))
     tests = {test["name"] for test in inventory["tests"]}

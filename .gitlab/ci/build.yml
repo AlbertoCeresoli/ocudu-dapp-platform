@@ -605,7 +605,7 @@ dapp interoperability release gate:
     - python3 -m pip install --break-system-packages 'asn1tools>=0.166,<1' numpy h5py flatbuffers
     - >-
       builder.sh -b "${OCUDU_BUILD_DIR}" -c gcc
-      -m "-j${CPU_JOBS} dapp_runtime_test dapp_telemetry_allocation_test e3ap_test_server libe3_interop_dapp libe3_interop_vectors ocudu-dappctl"
+      -m "-j${CPU_JOBS} dapp_runtime_test dapp_telemetry_allocation_test e3ap_test_server libe3_interop_dapp libe3_interop_vectors ocudu-dappctl ocudu-pusch-replay"
       -DCMAKE_BUILD_TYPE=Release -DENABLE_DAPP=ON -DENABLE_E3=ON
       -DENABLE_E3_ASN1_CODEC=ON -DOCUDU_DAPP_LIBE3_INTEROP=ON -DENABLE_UHD=OFF .
     - python3 scripts/check_dapp_interop_gate.py --build "${OCUDU_BUILD_DIR}"

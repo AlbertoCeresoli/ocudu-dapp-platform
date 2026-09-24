@@ -647,6 +647,10 @@ class E3Client:
     def inventory(self, **kwargs) -> dict:
         return mgmt.normalize(self.management(mgmt.inventory_request(**kwargs)))
 
+    def catalog_admit(self, package_id: Union[str, bytes], **kwargs) -> dict:
+        identifier = mgmt.parse_identifier(package_id) if isinstance(package_id, str) else package_id
+        return mgmt.normalize(self.management(mgmt.catalog_admit_request(identifier, **kwargs)))
+
     def health(self) -> dict:
         return mgmt.normalize(self.management(mgmt.health_request()))
 

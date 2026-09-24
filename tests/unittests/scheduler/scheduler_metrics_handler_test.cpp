@@ -215,6 +215,54 @@ TEST_F(scheduler_metrics_handler_tester, compute_nof_ul_oks_and_noks)
   ASSERT_EQ(ue_metrics.ul_nof_nok, 0) << "Nof DL NOKs not reset";
 }
 
+TEST_F(scheduler_metrics_handler_tester, classified_crc_and_exact_resource_metrics_reset_each_report)
+{
+  get_next_metric();
+  ul_crc_pdu_indication crc{};
+  crc.rnti     = to_rnti(0x4601);
+  crc.ue_index = test_ue_index;
+  const ul_crc_link_adaptation_info first{0, true, true, -6.0F, 6.0F, 0.02F};
+  const ul_crc_link_adaptation_info retry{1, true, false, -6.0F, 6.0F, 0.02F};
+  crc.tb_crc_success = false;
+  metrics.handle_crc_indication(next_sl_tx.without_hyper_sfn() - 1, crc, units::bytes{100}, first);
+  crc.tb_crc_success = true;
+  metrics.handle_crc_indication(next_sl_tx.without_hyper_sfn() - 1, crc, units::bytes{100}, retry);
+  sched_result res;
+  res.dl.nof_dl_symbols   = 14;
+  res.ul.nof_ul_symbols   = 14;
+  auto& grant             = res.ul.puschs.emplace_back();
+  grant.pusch_cfg.rnti    = crc.rnti;
+  grant.pusch_cfg.rbs     = vrb_interval{2, 7};
+  grant.pusch_cfg.symbols = ofdm_symbol_range{2, 14};
+  grant.context.nof_retxs = 1;
+  run_slot(res);
+  get_next_metric();
+  const auto& result = metrics_notif.last_report.ue_metrics[0];
+  EXPECT_EQ(result.ul_first_tx_nok, 1U);
+  EXPECT_EQ(result.ul_first_tx_ok, 0U);
+  EXPECT_EQ(result.ul_retx_ok, 1U);
+  EXPECT_EQ(result.ul_retx_nok, 0U);
+  EXPECT_EQ(result.ul_mac_delivered_bytes, 100U);
+  EXPECT_EQ(result.ul_prb_symbols, 60U);
+  EXPECT_EQ(result.ul_retx_prb_symbols, 60U);
+  EXPECT_EQ(result.ul_olla_eligible_nok, 1U);
+  EXPECT_EQ(result.ul_olla_skipped, 1U);
+  ASSERT_TRUE(result.ul_link_adaptation);
+  EXPECT_EQ(result.ul_link_adaptation->offset_db, -6.0F);
+  EXPECT_EQ(result.report_period, report_period);
+  const uint64_t sequence = result.report_sequence;
+  get_next_metric();
+  const auto& empty = metrics_notif.last_report.ue_metrics[0];
+  EXPECT_EQ(empty.ul_first_tx_nok, 0U);
+  EXPECT_EQ(empty.ul_retx_ok, 0U);
+  EXPECT_EQ(empty.ul_prb_symbols, 0U);
+  EXPECT_EQ(empty.ul_olla_skipped, 0U);
+  EXPECT_EQ(empty.ul_mac_delivered_bytes, 0U);
+  EXPECT_EQ(empty.ul_retx_prb_symbols, 0U);
+  EXPECT_EQ(empty.ul_olla_eligible_nok, 0U);
+  EXPECT_EQ(empty.report_sequence, sequence + 1);
+}
+
 TEST_F(scheduler_metrics_handler_tester, compute_mcs)
 {
   sch_mcs_index dl_mcs{test_rng::uniform_int<uint8_t>(1, 28)};

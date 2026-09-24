@@ -177,7 +177,7 @@ package_provenance_result ocudu::dapp::verify_package_provenance(const std::stri
     if (::lstat(candidate.c_str(), &link_status) != 0 || S_ISLNK(link_status.st_mode)) {
       return {false, "SBOM must be an existing non-symbolic file"};
     }
-    fd_guard descriptor{::open(candidate.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+    fd_guard descriptor{::open(candidate.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)};
     if (descriptor.value < 0) {
       return {false, std::string("unable to open SBOM: ") + std::strerror(errno)};
     }

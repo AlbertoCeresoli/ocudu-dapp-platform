@@ -11,6 +11,7 @@
 
 #include "pusch_e2e.h"
 #include "pusch_pilot_mask.h"
+#include "pusch_equalized_metrics.h"
 #include "scrambling.h"
 #include "ocudu_phy_cuda_mimo_math.cuh"
 #include <cuda_runtime.h>
@@ -378,39 +379,9 @@ __device__ __forceinline__ void sinr_accumulate_warp(
     warp_accumulate_sum_count(d_sum, d_count, valid_count ? eq_noise_var : 0.0f, valid_count);
 }
 
-__device__ __forceinline__ float nearest_qam_axis(float value, int max_abs_level, float scale)
-{
-    float clipped = fminf((float)max_abs_level, fmaxf((float)-max_abs_level, value / scale));
-    int idx = (int)floorf((clipped + (float)max_abs_level) * 0.5f + 0.5f);
-    idx = max(0, min(max_abs_level, idx));
-    return ((float)(-max_abs_level + 2 * idx)) * scale;
-}
-
 __device__ __forceinline__ float evm_error_power(cuFloatComplex eq, int mod_order)
 {
-    float ref_re;
-    float ref_im;
-    if (mod_order == 2) {
-        constexpr float scale = 0.7071067811865475f;
-        ref_re = (eq.x >= 0.0f) ? scale : -scale;
-        ref_im = (eq.y >= 0.0f) ? scale : -scale;
-    } else if (mod_order == 4) {
-        constexpr float scale = 0.31622776601683794f;
-        ref_re = nearest_qam_axis(eq.x, 3, scale);
-        ref_im = nearest_qam_axis(eq.y, 3, scale);
-    } else if (mod_order == 6) {
-        constexpr float scale = 0.1543033499620919f;
-        ref_re = nearest_qam_axis(eq.x, 7, scale);
-        ref_im = nearest_qam_axis(eq.y, 7, scale);
-    } else {
-        constexpr float scale = 0.07669649888473704f;
-        ref_re = nearest_qam_axis(eq.x, 15, scale);
-        ref_im = nearest_qam_axis(eq.y, 15, scale);
-    }
-
-    float err_re = eq.x - ref_re;
-    float err_im = eq.y - ref_im;
-    return err_re * err_re + err_im * err_im;
+    return ocudu::detail::pusch_qam_error_power(eq.x, eq.y, mod_order);
 }
 
 __device__ __forceinline__ void evm_accumulate(

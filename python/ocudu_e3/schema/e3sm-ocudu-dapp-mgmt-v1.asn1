@@ -520,6 +520,13 @@ RequestHeader ::= SEQUENCE {
   ...
 }
 
+-- Explicitly admit one locally staged signed native bundle, without loading it.
+-- The host pins catalog root and trust-store path; neither is supplied remotely.
+CatalogAdmit ::= SEQUENCE {
+  packageId Identifier,
+  ...
+}
+
 ManagementOperation ::= CHOICE {
   inventory InventoryQuery,
   lifecycle LifecycleControl,
@@ -535,7 +542,8 @@ ManagementOperation ::= CHOICE {
   dataPoll DataPollQuery,
   ...,
   ranControl RanControl,
-  cellInfo CellInfoQuery
+  cellInfo CellInfoQuery,
+  catalogAdmit CatalogAdmit
 }
 ManagementRequest ::= SEQUENCE { header RequestHeader, operation ManagementOperation, ... }
 

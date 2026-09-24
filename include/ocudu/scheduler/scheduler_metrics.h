@@ -19,6 +19,17 @@
 
 namespace ocudu {
 
+/// Scheduler-thread snapshot taken after a HARQ-matched CRC. No inference from RV:
+/// retransmission round and OLLA eligibility come from the actual HARQ/controller.
+struct ul_crc_link_adaptation_info {
+  unsigned nof_retxs     = 0;
+  bool     olla_enabled  = false;
+  bool     olla_eligible = false;
+  float    offset_db     = 0;
+  float    max_offset_db = 0;
+  float    target_bler   = 0;
+};
+
 /// \brief Snapshot of the metrics for a UE.
 struct scheduler_ue_metrics {
   /// UE index in the DU for this UE.
@@ -55,6 +66,22 @@ struct scheduler_ue_metrics {
   unsigned ul_nof_ok;
   /// Number of negative CRC PDU indications received.
   unsigned ul_nof_nok;
+  /// Exact report-window counters (MAC TB bytes include padding, not application goodput).
+  uint64_t ul_mac_delivered_bytes = 0;
+  uint64_t ul_prb_symbols         = 0;
+  uint64_t ul_retx_prb_symbols    = 0;
+  unsigned ul_first_tx_ok         = 0;
+  unsigned ul_first_tx_nok        = 0;
+  unsigned ul_retx_ok             = 0;
+  unsigned ul_retx_nok            = 0;
+  unsigned ul_olla_eligible_ok    = 0;
+  unsigned ul_olla_eligible_nok   = 0;
+  unsigned ul_olla_skipped        = 0;
+  /// Last classified CRC state; absent until a matched feedback was observed.
+  std::optional<ul_crc_link_adaptation_info> ul_link_adaptation;
+  std::chrono::milliseconds                  report_period{0};
+  /// Per-cell monotonic report ID, reset on host restart; consumers can detect gaps/duplicates.
+  uint64_t report_sequence = 0;
   /// Sum of the last UL buffer status reports (BSRs) of all logical channel groups.
   unsigned bsr;
   /// Number of scheduling requests detected.

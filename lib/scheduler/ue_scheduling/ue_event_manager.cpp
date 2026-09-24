@@ -560,7 +560,7 @@ void ue_cell_event_manager::handle_crc_indication(const ul_crc_indication& crc_i
                                                           crc_ptr->ul_sinr_dB});
 
       // Notify metrics handler.
-      metrics.handle_crc_indication(sl_rx, *crc_ptr, tbs.value());
+      metrics.handle_crc_indication(sl_rx, *crc_ptr, tbs.value(), ue_cc->last_ul_crc_metrics());
 
       return event_result::processed;
     };

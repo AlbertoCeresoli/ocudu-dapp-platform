@@ -93,6 +93,117 @@ operation_result instance_manager::register_package(const package_record& packag
   return map_catalog_outcome(catalog.register_package(package_record), no_transaction);
 }
 
+operation_result instance_manager::admit_package(const catalog_admit_request& request)
+{
+  // Take a bounded control-plane snapshot, then release the manager lock for
+  // all file IO/hashing. Inventory/health readers and native L1 invocation must
+  // not wait behind package verification. Commit rechecks the snapshot below.
+  std::unique_lock<std::mutex> lock(mutex);
+  const auto                   fingerprint = canonical_fingerprint(request);
+  if (request.transaction_id.is_zero()) {
+    return make_result(result_code::invalid_request, request.transaction_id, "transaction ID is required");
+  }
+  if (auto prior = replay(request.transaction_id, fingerprint)) {
+    return *prior;
+  }
+  const auto finish = [&](result_code code, const std::string& detail) {
+    if (!lock.owns_lock()) {
+      lock.lock();
+    }
+    if (auto prior = replay(request.transaction_id, fingerprint)) {
+      return *prior;
+    }
+    auto result = make_result(code, request.transaction_id, detail.c_str());
+    remember(fingerprint, result);
+    return result;
+  };
+  if (request.expected_inventory_generation &&
+      *request.expected_inventory_generation != catalog.inventory_generation()) {
+    return finish(result_code::conflict, "inventory generation mismatch");
+  }
+  if (request.package_id.is_zero()) {
+    return finish(result_code::invalid_request, "package ID is required");
+  }
+  // Fixed UUID namespace: no transport-supplied path, scan, or upload. Bundles
+  // are staged by the local operator under <32 lowercase hex>/package.manifest.json.
+  constexpr char hex[] = "0123456789abcdef";
+  std::string    manifest_path;
+  manifest_path.reserve(64);
+  for (auto byte : request.package_id.bytes) {
+    manifest_path.push_back(hex[byte >> 4U]);
+    manifest_path.push_back(hex[byte & 15U]);
+  }
+  manifest_path += "/package.manifest.json";
+  if (!package_signatures) {
+    return finish(result_code::verification_failed, "runtime catalog admission requires a signature verifier");
+  }
+  const auto inventory_generation = catalog.inventory_generation();
+  const auto previous_policy      = package_signatures;
+  auto       candidate            = catalog;
+  lock.unlock();
+  auto policy = previous_policy->reload();
+  if (!policy) {
+    return finish(result_code::verification_failed, policy.detail);
+  }
+  auto parsed = read_package_manifest(candidate.verifier().catalog_root(), manifest_path, policy.verifier.get());
+  if (!parsed) {
+    return finish(result_code::verification_failed, parsed.detail);
+  }
+  const auto& package = *parsed.package;
+  if (package.package_id != request.package_id) {
+    return finish(result_code::verification_failed, "staged manifest carries a different package identity");
+  }
+  if (package.signature_status != package_signature_status::verified) {
+    return finish(result_code::verification_failed, "runtime admission never accepts unsigned packages");
+  }
+  // New supervised-process routes need host-owned topology/factory construction;
+  // catalog admission must not manufacture one from untrusted package metadata.
+  if (package.placement_mask != OCUDU_DAPP_PLACEMENT_IN_PROCESS_V1) {
+    return finish(result_code::incompatible, "runtime admission currently supports native in-process packages only");
+  }
+  for (const auto& entry : candidate.packages()) {
+    if (entry.first != package.package_id && entry.second.global_name == package.global_name) {
+      return finish(result_code::conflict, "global package name already belongs to another package identifier");
+    }
+  }
+  auto existing = candidate.find_package(package.package_id);
+  if (!existing && candidate.packages().size() >= 256) {
+    return finish(result_code::resource_exhausted, "runtime catalog package limit reached");
+  }
+  if (existing && (package.signature_sequence < existing->signature_sequence ||
+                   (package.signature_sequence == existing->signature_sequence &&
+                    (package.content_digest != existing->content_digest || package.version != existing->version ||
+                     package.sbom_digest != existing->sbom_digest)))) {
+    return finish(result_code::verification_failed, "package sequence rollback or sequence reuse for changed content");
+  }
+  // Use a bounded candidate catalog to validate replacement identity and artifact
+  // digest even on dry-run, without mutating the admitted inventory or policy.
+  const auto outcome = candidate.replace_package(package);
+  lock.lock();
+  if (auto prior = replay(request.transaction_id, fingerprint)) {
+    return *prior;
+  }
+  if (catalog.inventory_generation() != inventory_generation || package_signatures != previous_policy) {
+    return finish(result_code::conflict,
+                  "inventory or trust policy changed during verification; retry with a new transaction");
+  }
+  if (package_has_resident_instance(package.package_id)) {
+    return finish(result_code::conflict, "unload all instances before updating an admitted package");
+  }
+  if (outcome.code != package_catalog::status::ok && outcome.code != package_catalog::status::ok_already) {
+    auto result = map_catalog_outcome(outcome, request.transaction_id);
+    remember(fingerprint, result);
+    return result;
+  }
+  if (request.dry_run) {
+    return finish(result_code::dry_run_ok, "signed package verified; catalog and trust policy unchanged");
+  }
+  std::shared_ptr<const package_signature_verifier> next_policy(std::move(policy.verifier));
+  catalog            = std::move(candidate);
+  package_signatures = std::move(next_policy);
+  return finish(result_code::ok, "signed package admitted; load and activation remain explicit");
+}
+
 bool instance_manager::package_has_resident_instance(const identifier& package_id) const
 {
   for (const auto& entry : instances) {
@@ -138,6 +249,12 @@ bool instance_manager::try_refresh_package_from_disk(const identifier& package_i
   // Unsigned packages carry sequence 0 on both sides, so labs are unaffected.
   if (parsed.package->signature_sequence < found->signature_sequence) {
     refusal_detail = "refresh refused: on-disk package sequence is older than the admitted one (anti-rollback)";
+    return false;
+  }
+  if (parsed.package->signature_sequence != 0 && parsed.package->signature_sequence == found->signature_sequence &&
+      (parsed.package->content_digest != found->content_digest || parsed.package->version != found->version ||
+       parsed.package->sbom_digest != found->sbom_digest)) {
+    refusal_detail = "refresh refused: signed sequence was reused for changed content";
     return false;
   }
   const auto outcome = catalog.replace_package(*parsed.package);
@@ -466,6 +583,13 @@ inventory_snapshot instance_manager::inventory()
   snapshot.instances.reserve(instances.size());
   for (const auto& entry : catalog.packages()) {
     snapshot.packages.push_back(entry.second);
+    if (package_signatures) {
+      auto permitted = package_signatures->authorize_admitted(entry.second);
+      if (!permitted) {
+        snapshot.packages.back().compatible      = false;
+        snapshot.packages.back().incompatibility = permitted.detail;
+      }
+    }
   }
   for (auto& entry : instances) {
     refresh(entry.second);

@@ -50,7 +50,8 @@ bool same_interfaces(const std::vector<interface_record>& left, const std::vecto
         left[index].interface_minor != right[index].interface_minor ||
         left[index].dapp_class != right[index].dapp_class ||
         left[index].placement_mask != right[index].placement_mask ||
-        left[index].requirement != right[index].requirement || left[index].threading != right[index].threading) {
+        left[index].requirement != right[index].requirement || left[index].threading != right[index].threading ||
+        left[index].capability_bits != right[index].capability_bits || left[index].pusch != right[index].pusch) {
       return false;
     }
   }
@@ -122,14 +123,24 @@ package_catalog::outcome package_catalog::replace_package(const package_record& 
   if (!same_identity) {
     return {status::conflict, "package identifier already names different content"};
   }
-  if (found->second.content_digest == package_record.content_digest &&
-      found->second.canonical_artifact_path == package_record.canonical_artifact_path &&
-      found->second.version == package_record.version) {
-    return {status::ok_already, "package already registered"};
-  }
+  // Even idempotent admission must verify current disk bytes. Otherwise a
+  // valid manifest with a now-tampered artifact could pass a catalog dry-run.
   auto verified = verifier_.verify(package_record.canonical_artifact_path, package_record.content_digest);
   if (!verified) {
     return {status::verification_failed, verified.detail};
+  }
+  if (found->second.content_digest == package_record.content_digest &&
+      found->second.canonical_artifact_path == package_record.canonical_artifact_path &&
+      found->second.version == package_record.version &&
+      found->second.signature_sequence == package_record.signature_sequence &&
+      found->second.signing_key_id == package_record.signing_key_id &&
+      found->second.trust_policy_epoch == package_record.trust_policy_epoch &&
+      found->second.signature_status == package_record.signature_status &&
+      found->second.manifest_schema_version == package_record.manifest_schema_version &&
+      found->second.canonical_sbom_path == package_record.canonical_sbom_path &&
+      found->second.sbom_verified == package_record.sbom_verified &&
+      found->second.sbom_digest == package_record.sbom_digest) {
+    return {status::ok_already, "package already registered"};
   }
   auto canonical                    = package_record;
   canonical.canonical_artifact_path = verified.artifact->canonical_path();

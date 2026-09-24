@@ -69,6 +69,8 @@ guides reference. The remaining guides are references for one aspect each:
 | [extension_model.md](extension_model.md) | Algorithm authors: packaging, placement, and the host boundary |
 | [yaml_configuration.md](yaml_configuration.md) | Complete `dapp:` configuration reference |
 | [e3_management.md](e3_management.md) | E3 management operations and client usage |
+| [runtime_catalog.md](runtime_catalog.md) | Signed native-package admission without restarting; trust and lifecycle boundaries |
+| [receiver_metric_qualification.md](receiver_metric_qualification.md) | Comparable CUDA receiver metrics, scheduler adaptation counters, and controlled OTA qualification |
 | [e3_wire.md](e3_wire.md) | Carriers (local socket, E3AP over SCTP, E3 data profile), APER layout, telemetry streams, interop notes |
 | [e3_system_design.md](e3_system_design.md) | Runtime architecture, timing classes, composition |
 | [security_model.md](security_model.md) | Trust, containment, admission, and class-specific failure behavior |

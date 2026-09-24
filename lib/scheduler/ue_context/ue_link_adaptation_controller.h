@@ -26,7 +26,8 @@ public:
                           std::optional<sch_mcs_index> olla_mcs);
 
   /// \brief Update UL link quality with the latest UL CRC feedback.
-  void handle_ul_crc_info(bool                         crc,
+  /// Returns true only when this CRC was eligible for an OLLA update.
+  bool handle_ul_crc_info(bool                         crc,
                           sch_mcs_index                used_mcs,
                           pusch_mcs_table              mcs_table,
                           std::optional<sch_mcs_index> olla_mcs,
@@ -57,6 +58,9 @@ public:
 
   /// Checks whether OLLA is enabled for UL.
   bool is_ul_olla_enabled() const { return ul_olla.has_value(); }
+
+  float ul_target_bler() const { return cell_cfg.expert_cfg.ue.olla_ul_target_bler; }
+  float ul_max_snr_offset_db() const { return cell_cfg.expert_cfg.ue.olla_max_ul_snr_offset; }
 
   /// \brief Get the effective CQI, accounting CQI and OLLA offset, to be used for MCS derivation.
   float get_effective_cqi() const;
