@@ -624,6 +624,12 @@ void print_interface(const interface_record& interface, std::string_view indent)
               << interface.pusch->modulation_mask << " dmrs-type-mask=0x" << interface.pusch->dmrs_type_mask
               << " flags=0x" << interface.pusch->flags << std::dec << '\n';
   }
+  if (interface.srs) {
+    std::cout << indent << "  srs-profile max-rx-ports=" << interface.srs->max_nof_rx_ports
+              << " max-tx-ports=" << interface.srs->max_nof_tx_ports
+              << " max-sequence-length=" << interface.srs->max_sequence_length << " comb-mask=0x" << std::hex
+              << interface.srs->comb_mask << std::dec << '\n';
+  }
 }
 
 void print_operation(const operation_result& result, std::string_view indent)

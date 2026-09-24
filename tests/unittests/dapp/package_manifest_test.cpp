@@ -11,6 +11,7 @@
 #include "ocudu/dapp/runtime/native_hook_point.h"
 #include "ocudu/dapp/runtime/package_manifest.h"
 #include "ocudu/dapp/use_cases/v1/spectrum.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include "ocudu/dapp/use_cases/v1/srs_isac.h"
 #include "ocudu/phy/upper/dapp/upper_phy_dapp_hook_provider.h"
 #include "ocudu/phy/upper/phy_tap/phy_tap.h"
@@ -651,6 +652,55 @@ TEST(dapp_package_manifest, parses_and_bounds_class_a_pusch_admission_profile)
   EXPECT_FALSE(read_package_manifest(DAPP_TEST_CATALOG, missing_profile.filename));
 }
 
+TEST(dapp_package_manifest, parses_and_bounds_the_srs_channel_estimator_profile)
+{
+  auto document                             = valid_manifest();
+  document["interfaces"][0]["interface_id"] = OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1;
+  document["interfaces"][0]["class"]        = "A";
+  document["interfaces"][0]["threading"]    = "per_worker";
+  document["interfaces"][0]["srs_profile"]  = {
+      {"max_rx_ports", 8}, {"max_tx_ports", 4}, {"max_sequence_length", 1632}, {"comb_mask", 3}};
+  temporary_manifest manifest(document);
+  auto               parsed = read_package_manifest(DAPP_TEST_CATALOG, manifest.filename);
+  ASSERT_TRUE(parsed) << parsed.detail;
+  const auto& interface = parsed.package->interfaces[0];
+  ASSERT_TRUE(interface.srs);
+  EXPECT_FALSE(interface.pusch);
+  EXPECT_EQ(interface.srs->max_nof_rx_ports, 8U);
+  EXPECT_EQ(interface.srs->max_nof_tx_ports, 4U);
+  EXPECT_EQ(interface.srs->max_sequence_length, 1632U);
+  EXPECT_EQ(interface.srs->comb_mask, 3U);
+
+  const auto expect_rejected = [](json invalid) {
+    temporary_manifest rejected(invalid);
+    EXPECT_FALSE(read_package_manifest(DAPP_TEST_CATALOG, rejected.filename)) << invalid.dump();
+  };
+  for (const auto& [field, value] : std::initializer_list<std::pair<const char*, int>>{
+           {"max_rx_ports", 9}, {"max_tx_ports", 0}, {"max_sequence_length", 1633}, {"comb_mask", 4}}) {
+    auto invalid                                   = document;
+    invalid["interfaces"][0]["srs_profile"][field] = value;
+    expect_rejected(invalid);
+  }
+  auto unknown_field                                     = document;
+  unknown_field["interfaces"][0]["srs_profile"]["flags"] = 0;
+  expect_rejected(unknown_field);
+  // The SRS estimator carries exactly its own profile.
+  auto missing = document;
+  missing["interfaces"][0].erase("srs_profile");
+  expect_rejected(missing);
+  auto both                              = document;
+  both["interfaces"][0]["pusch_profile"] = {
+      {"max_prb", 275}, {"max_rx_ports", 64}, {"max_layers", 1}, {"modulation_mask", 15}, {"dmrs_type_mask", 3}};
+  expect_rejected(both);
+  auto not_class_a                      = document;
+  not_class_a["interfaces"][0]["class"] = "C";
+  expect_rejected(not_class_a);
+  // A PUSCH Class-A interface does not take the SRS profile.
+  auto pusch                             = document;
+  pusch["interfaces"][0]["interface_id"] = OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1;
+  expect_rejected(pusch);
+}
+
 TEST(dapp_package_manifest, rejects_ambiguous_or_unsafe_authority_records)
 {
   auto expect_rejected = [](json document) {
@@ -981,7 +1031,7 @@ TEST(dapp_package_manifest, process_srs_result_is_source_correlated_and_normaliz
   const uint64_t active_generation = result.instance_generation;
 
   auto fallback = std::make_shared<process_srs_factory>();
-  auto factory  = created.service->upper_phy_hooks()->decorate_srs_estimator(fallback, 1);
+  auto factory  = created.service->upper_phy_hooks()->decorate_srs_estimator(fallback, 1, 52);
   ASSERT_NE(factory, nullptr);
   auto estimator = factory->create();
   ASSERT_NE(estimator, nullptr);

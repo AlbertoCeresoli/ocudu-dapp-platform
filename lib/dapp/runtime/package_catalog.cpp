@@ -51,7 +51,8 @@ bool same_interfaces(const std::vector<interface_record>& left, const std::vecto
         left[index].dapp_class != right[index].dapp_class ||
         left[index].placement_mask != right[index].placement_mask ||
         left[index].requirement != right[index].requirement || left[index].threading != right[index].threading ||
-        left[index].capability_bits != right[index].capability_bits || left[index].pusch != right[index].pusch) {
+        left[index].capability_bits != right[index].capability_bits || left[index].pusch != right[index].pusch ||
+        left[index].srs != right[index].srs) {
       return false;
     }
   }

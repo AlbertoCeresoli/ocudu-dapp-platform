@@ -468,6 +468,10 @@ struct srs_channel_record {
   std::optional<uint16_t>    frequency_shift;
   std::optional<uint8_t>     frequency_hopping;
   std::vector<uint8_t>       coefficients;
+  /// CF32 [symbol, pilot]: the received pilots at the transmit port's comb subcarriers; empty when not captured.
+  std::vector<uint8_t> received_pilots;
+  /// CF32 [pilot]: the transmit port's sequence, cyclic shift included; empty when not captured.
+  std::vector<uint8_t> reference_symbols;
 };
 
 struct pusch_dmrs_channel_record {

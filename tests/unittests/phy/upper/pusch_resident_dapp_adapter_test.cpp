@@ -1978,7 +1978,8 @@ TEST(pusch_resident_dapp_adapter, production_service_routes_cuda_srs_estimates_t
     generation = result.instance_generation;
   }
 
-  auto decorated = service.service->upper_phy_hooks()->decorate_srs_estimator(std::make_shared<fixed_srs_factory>(), 2);
+  auto decorated =
+      service.service->upper_phy_hooks()->decorate_srs_estimator(std::make_shared<fixed_srs_factory>(), 2, 52);
   ASSERT_NE(decorated, nullptr);
   auto estimator0 = decorated->create();
   auto estimator1 = decorated->create();
@@ -2090,7 +2091,8 @@ TEST(pusch_resident_dapp_adapter, production_service_exports_cuda_srs_estimates_
   };
   constexpr auto process_test_timeout = 15s;
 
-  auto decorated = service.service->upper_phy_hooks()->decorate_srs_estimator(std::make_shared<fixed_srs_factory>(), 1);
+  auto decorated =
+      service.service->upper_phy_hooks()->decorate_srs_estimator(std::make_shared<fixed_srs_factory>(), 1, 52);
   ASSERT_NE(decorated, nullptr);
   auto estimator = decorated->create();
   ASSERT_NE(estimator, nullptr);

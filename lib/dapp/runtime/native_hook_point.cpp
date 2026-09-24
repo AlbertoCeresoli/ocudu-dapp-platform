@@ -198,6 +198,13 @@ native_invocation_result native_hook_point::invoke(uint32_t                     
   return dispatch(lane, [&](native_hook_slot& slot) { return slot.invoke(input, output); });
 }
 
+native_invocation_result native_hook_point::invoke(uint32_t                                         lane,
+                                                   const ocudu_dapp_srs_channel_estimator_input_v1& input,
+                                                   ocudu_dapp_srs_channel_estimator_output_v1&      output) noexcept
+{
+  return dispatch(lane, [&](native_hook_slot& slot) { return slot.invoke(input, output); });
+}
+
 native_invocation_result native_hook_point::invoke(uint32_t                             lane,
                                                    const ocudu_dapp_equalizer_input_v1& input,
                                                    ocudu_dapp_equalizer_output_v1&      output) noexcept

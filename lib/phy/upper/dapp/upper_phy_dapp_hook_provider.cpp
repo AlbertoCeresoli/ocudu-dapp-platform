@@ -7,6 +7,7 @@
 #include "ocudu/phy/upper/channel_processors/pusch/factories.h"
 #include "ocudu/phy/upper/dapp/pusch_dapp_channel_estimator.h"
 #include "ocudu/phy/upper/dapp/pusch_dapp_demodulator.h"
+#include "ocudu/phy/upper/dapp/srs_dapp_channel_estimator.h"
 #include "ocudu/phy/upper/dapp/upper_phy_dapp_data_router.h"
 #include "ocudu/phy/upper/phy_tap/phy_tap.h"
 #include "ocudu/phy/upper/sequence_generators/sequence_generator_factories.h"
@@ -451,10 +452,12 @@ public:
   upper_phy_dapp_hook_provider_impl(std::shared_ptr<upper_phy_dapp_data_router>          router_,
                                     std::shared_ptr<pusch_dapp_channel_estimator_target> channel_estimator_,
                                     std::shared_ptr<pusch_dapp_demodulator_target>       demodulator_,
-                                    uint32_t                                             nof_srs_lanes_) :
+                                    uint32_t                                             nof_srs_lanes_,
+                                    std::shared_ptr<srs_dapp_channel_estimator_target>   srs_channel_estimator_) :
     router(std::move(router_)),
     channel_estimator(std::move(channel_estimator_)),
     demodulator(std::move(demodulator_)),
+    srs_channel_estimator(std::move(srs_channel_estimator_)),
     nof_srs_lanes(nof_srs_lanes_)
   {
   }
@@ -502,18 +505,30 @@ public:
   }
 
   std::shared_ptr<srs_estimator_factory> decorate_srs_estimator(std::shared_ptr<srs_estimator_factory> fallback,
-                                                                unsigned nof_lanes) override
+                                                                unsigned                               nof_lanes,
+                                                                unsigned max_nof_prb) override
   {
-    if (!router) {
-      return fallback;
-    }
     // The caller only knows the SRS executor concurrency, which undercounts the estimators the
     // upper PHY builds when no pooling factory is inserted (concurrency 1). Every lane the
     // router registered is publishable, so take the larger of the two budgets.
     const unsigned lanes = std::max<unsigned>(nof_lanes, nof_srs_lanes);
-    return fallback && lanes != 0
-               ? std::make_shared<srs_estimator_factory_decorator>(std::move(fallback), router, lanes)
-               : nullptr;
+    if (!fallback || (!router && !srs_channel_estimator)) {
+      return fallback;
+    }
+    if (lanes == 0) {
+      return nullptr;
+    }
+    if (srs_channel_estimator) {
+      fallback = create_srs_dapp_channel_estimator_factory(
+          std::move(fallback),
+          srs_channel_estimator,
+          create_low_papr_sequence_generator_sw_factory(),
+          {.nof_lanes = srs_channel_estimator->lane_count(), .max_nof_prb = max_nof_prb});
+      if (!fallback) {
+        return nullptr;
+      }
+    }
+    return router ? std::make_shared<srs_estimator_factory_decorator>(std::move(fallback), router, lanes) : fallback;
   }
 
   std::unique_ptr<phy_tap> wrap_phy_tap(upper_phy_dapp_producer_context context,
@@ -529,6 +544,7 @@ private:
   std::shared_ptr<upper_phy_dapp_data_router>          router;
   std::shared_ptr<pusch_dapp_channel_estimator_target> channel_estimator;
   std::shared_ptr<pusch_dapp_demodulator_target>       demodulator;
+  std::shared_ptr<srs_dapp_channel_estimator_target>   srs_channel_estimator;
   uint32_t                                             nof_srs_lanes{};
 };
 
@@ -538,10 +554,14 @@ std::shared_ptr<upper_phy_dapp_hook_provider>
 ocudu::create_upper_phy_dapp_hook_provider(std::shared_ptr<upper_phy_dapp_data_router>          router,
                                            std::shared_ptr<pusch_dapp_channel_estimator_target> channel_estimator,
                                            std::shared_ptr<pusch_dapp_demodulator_target>       demodulator,
-                                           uint32_t                                             nof_srs_lanes)
+                                           uint32_t                                             nof_srs_lanes,
+                                           std::shared_ptr<srs_dapp_channel_estimator_target>   srs_channel_estimator)
 {
-  return router || channel_estimator || demodulator
-             ? std::make_shared<upper_phy_dapp_hook_provider_impl>(
-                   std::move(router), std::move(channel_estimator), std::move(demodulator), nof_srs_lanes)
+  return router || channel_estimator || demodulator || srs_channel_estimator
+             ? std::make_shared<upper_phy_dapp_hook_provider_impl>(std::move(router),
+                                                                   std::move(channel_estimator),
+                                                                   std::move(demodulator),
+                                                                   nof_srs_lanes,
+                                                                   std::move(srs_channel_estimator))
              : nullptr;
 }

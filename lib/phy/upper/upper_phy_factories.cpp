@@ -776,8 +776,8 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
       sequence_factory, ta_est_factory, config.ul_bw_rb, resolved_srs_acceleration_mode, config.nvcuda_device_id);
   report_fatal_error_if_not(srs_factory, "Invalid SRS estimator factory.");
   if (dependencies.dapp_hooks) {
-    srs_factory = dependencies.dapp_hooks->decorate_srs_estimator(std::move(srs_factory),
-                                                                  dependencies.executors.srs_executor.max_concurrency);
+    srs_factory = dependencies.dapp_hooks->decorate_srs_estimator(
+        std::move(srs_factory), dependencies.executors.srs_executor.max_concurrency, config.ul_bw_rb);
     report_fatal_error_if_not(srs_factory, "Invalid dApp-decorated SRS estimator factory.");
   }
   if (dependencies.diagnostics) {

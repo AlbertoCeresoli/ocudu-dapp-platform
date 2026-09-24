@@ -6,6 +6,7 @@
 #include "ocudu/dapp/abi/v1/metric_catalog.h"
 #include "ocudu/dapp/runtime/package_manifest.h"
 #include "ocudu/dapp/use_cases/v1/scheduler.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -731,7 +732,12 @@ std::vector<interface_record> instance_manager::describe_interfaces(const ocudu_
   for (uint32_t i = 0; i != module.nof_interfaces; ++i) {
     const auto&                                    source = module.interfaces[i];
     std::optional<interface_record::pusch_profile> pusch;
-    if (source.use_case_profile != nullptr) {
+    std::optional<interface_record::srs_profile>   srs;
+    if (source.use_case_profile != nullptr && source.interface_id == OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1) {
+      const auto& profile = *static_cast<const ocudu_dapp_srs_profile_v1*>(source.use_case_profile);
+      srs                 = interface_record::srs_profile{
+          profile.max_nof_rx_ports, profile.max_nof_tx_ports, profile.max_sequence_length, profile.comb_mask};
+    } else if (source.use_case_profile != nullptr) {
       const auto& profile = *static_cast<const ocudu_dapp_pusch_profile_v1*>(source.use_case_profile);
       pusch               = interface_record::pusch_profile{profile.max_nof_prb,
                                               profile.max_nof_rx_ports,
@@ -747,7 +753,10 @@ std::vector<interface_record> instance_manager::describe_interfaces(const ocudu_
                       source.placement_mask,
                       static_cast<ocudu_dapp_threading_v1>(source.threading),
                       source.capability_bits,
-                      pusch});
+                      pusch,
+                      binding_requirement::required,
+                      binding_state::unbound,
+                      srs});
   }
   return result;
 }

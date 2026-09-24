@@ -5,8 +5,10 @@
 #include "ocudu/dapp/runtime/native_hook_point.h"
 #include "ocudu/dapp/runtime/native_hook_slot.h"
 #include "ocudu/dapp/runtime/native_instance.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include <array>
 #include <gtest/gtest.h>
+#include <initializer_list>
 #include <thread>
 
 using namespace ocudu::dapp;
@@ -59,6 +61,11 @@ instance_create_result create_fixture(fixture_control& control)
 instance_create_result create_class_a_fixture(fixture_control& control)
 {
   return native_instance::create(load_fixture(DAPP_CLASS_A_FIXTURE), host_api(&control), &control);
+}
+
+instance_create_result create_class_a_srs_fixture(fixture_control& control)
+{
+  return native_instance::create(load_fixture(DAPP_CLASS_A_SRS_FIXTURE), host_api(&control), &control);
 }
 
 instance_create_result create_class_b_fixture(fixture_control& control)
@@ -430,6 +437,200 @@ TEST(dapp_native_instance, class_a_worker_contexts_execute_concurrently_without_
   first.worker.reset();
   second.worker.reset();
   EXPECT_EQ(control.data_worker_destroys.load(std::memory_order_relaxed), 2U);
+  EXPECT_TRUE(created.instance->drain(std::chrono::steady_clock::now() + 100ms));
+  EXPECT_TRUE(created.instance->unload());
+}
+
+/// A one-port-pair SRS occasion of four comb-4 pilots, with host tensors the test owns.
+struct srs_invocation_fixture {
+  explicit srs_invocation_fixture(uint32_t worker_id, uint32_t nof_rx_ports = 1)
+  {
+    metadata.struct_size              = sizeof(metadata);
+    metadata.abi_major                = OCUDU_DAPP_ABI_MAJOR_V1;
+    metadata.nof_rx_ports             = nof_rx_ports;
+    metadata.nof_tx_ports             = 1;
+    metadata.start_symbol             = 13;
+    metadata.nof_symbols              = 1;
+    metadata.sequence_length          = 4;
+    metadata.comb_size                = 4;
+    metadata.nof_pilot_sets           = 1;
+    metadata.n_cs_max                 = 12;
+    metadata.subcarrier_spacing_hz    = 30000;
+    metadata.numerology               = 1;
+    metadata.grid_nof_subcarriers     = 48;
+    metadata.max_time_alignment_s     = 1.0 / (12.0 * 30000.0 * 4.0);
+    input.invocation.struct_size      = sizeof(input.invocation);
+    input.invocation.abi_major        = OCUDU_DAPP_ABI_MAJOR_V1;
+    input.invocation.invocation_id    = worker_id + 200;
+    input.invocation.worker_id        = worker_id;
+    input.invocation.cell_id          = 2;
+    input.rx_symbols                  = tensor(rx.data(),
+                              OCUDU_DAPP_ELEMENT_CF32_V1,
+                              sizeof(complex32),
+                              OCUDU_DAPP_ACCESS_READ_V1,
+                              OCUDU_DAPP_LAYOUT_SRS_RX_SET_PORT_SYMBOL_PILOT_CF32_V1,
+                                               {1, nof_rx_ports, 1, 4},
+                              1);
+    input.reference_symbols           = tensor(reference.data(),
+                                     OCUDU_DAPP_ELEMENT_CF32_V1,
+                                     sizeof(complex32),
+                                     OCUDU_DAPP_ACCESS_READ_V1,
+                                     OCUDU_DAPP_LAYOUT_SRS_REFERENCE_TX_PILOT_CF32_V1,
+                                               {1, 4},
+                                     2);
+    input.srs.struct_size             = sizeof(input.srs);
+    input.srs.abi_major               = OCUDU_DAPP_ABI_MAJOR_V1;
+    input.srs.metadata_schema_id      = OCUDU_DAPP_METADATA_SRS_CHANNEL_ESTIMATOR_V1;
+    input.srs.metadata_schema_version = 1;
+    input.srs.metadata                = {&metadata, sizeof(metadata), 0};
+    output.channel_matrix             = tensor(channel.data(),
+                                   OCUDU_DAPP_ELEMENT_CF32_V1,
+                                   sizeof(complex32),
+                                   OCUDU_DAPP_ACCESS_WRITE_V1,
+                                   OCUDU_DAPP_LAYOUT_SRS_CHANNEL_MATRIX_RX_TX_CF32_V1,
+                                               {nof_rx_ports, 1},
+                                   3);
+    output.measurements               = tensor(measurements.data(),
+                                 OCUDU_DAPP_ELEMENT_F32_V1,
+                                 sizeof(float),
+                                 OCUDU_DAPP_ACCESS_WRITE_V1,
+                                 OCUDU_DAPP_LAYOUT_SRS_MEASUREMENTS_F32_V1,
+                                               {OCUDU_DAPP_SRS_MEASUREMENT_COUNT_V1},
+                                 4);
+  }
+
+  static ocudu_dapp_tensor_view_v1 tensor(void*                           data,
+                                          uint32_t                        element_type,
+                                          uint32_t                        element_size,
+                                          uint32_t                        access,
+                                          uint32_t                        layout_id,
+                                          std::initializer_list<uint64_t> dimensions,
+                                          uint64_t                        allocation)
+  {
+    ocudu_dapp_tensor_view_v1 view{};
+    view.struct_size           = sizeof(view);
+    view.abi_major             = OCUDU_DAPP_ABI_MAJOR_V1;
+    view.domain                = OCUDU_DAPP_MEM_HOST_V1;
+    view.element_type          = element_type;
+    view.rank                  = dimensions.size();
+    view.access                = access | OCUDU_DAPP_ACCESS_HOST_VISIBLE_V1;
+    view.allocation_id         = allocation;
+    view.allocation_generation = 1;
+    view.lease_token           = 1;
+    view.native_handle         = reinterpret_cast<uintptr_t>(data);
+    view.layout_id             = layout_id;
+    view.layout_version        = 1;
+    uint64_t elements          = 1;
+    uint32_t index             = 0;
+    for (uint64_t dimension : dimensions) {
+      view.dimensions[index++] = dimension;
+      elements *= dimension;
+    }
+    uint64_t stride = element_size;
+    for (uint32_t dimension = view.rank; dimension != 0; --dimension) {
+      view.byte_strides[dimension - 1] = stride;
+      stride *= view.dimensions[dimension - 1];
+    }
+    view.byte_length = elements * element_size;
+    return view;
+  }
+
+  ocudu_dapp_srs_channel_estimator_metadata_v1           metadata{};
+  std::array<complex32, 8>                               rx{{{2, 0}, {0, 2}, {-2, 0}, {0, -2}, {1, 0}, {0, 1}}};
+  std::array<complex32, 4>                               reference{{{1, 0}, {0, 1}, {-1, 0}, {0, -1}}};
+  std::array<complex32, 2>                               channel{};
+  std::array<float, OCUDU_DAPP_SRS_MEASUREMENT_COUNT_V1> measurements{};
+  ocudu_dapp_srs_channel_estimator_input_v1              input{};
+  ocudu_dapp_srs_channel_estimator_output_v1             output{};
+};
+
+TEST(dapp_native_instance, srs_channel_estimator_worker_invokes_the_module_with_validated_tensors)
+{
+  fixture_control control;
+  auto            created = create_class_a_srs_fixture(control);
+  ASSERT_TRUE(created);
+  advance_to_active(*created.instance);
+  auto worker = created.instance->create_worker(OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1, 6);
+  ASSERT_TRUE(worker) << worker.detail;
+  EXPECT_EQ(worker.worker->backend_id(), OCUDU_DAPP_BACKEND_HOST_V1);
+
+  srs_invocation_fixture call(6);
+  EXPECT_TRUE(worker.worker->invoke(call.input, call.output));
+  EXPECT_EQ(control.data_invocations.load(std::memory_order_relaxed), 1U);
+  EXPECT_FLOAT_EQ(call.channel[0].real, 2.0F);
+  EXPECT_FLOAT_EQ(call.channel[0].imag, 0.0F);
+  EXPECT_FLOAT_EQ(call.measurements[OCUDU_DAPP_SRS_MEASUREMENT_RSRP_DB_V1], 2.0F);
+  EXPECT_EQ(created.instance->health().input_cell_bitmap, uint32_t{1} << 2U);
+
+  // The worker of another interface is not an SRS estimator.
+  EXPECT_FALSE(created.instance->create_worker(OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1, 7));
+  worker.worker.reset();
+  EXPECT_TRUE(created.instance->drain(std::chrono::steady_clock::now() + 100ms));
+  EXPECT_TRUE(created.instance->unload());
+}
+
+TEST(dapp_native_instance, srs_channel_estimator_profile_and_contract_are_checked_before_module_callback)
+{
+  fixture_control control;
+  auto            created = create_class_a_srs_fixture(control);
+  ASSERT_TRUE(created);
+  advance_to_active(*created.instance);
+  auto worker = created.instance->create_worker(OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1, 6);
+  ASSERT_TRUE(worker) << worker.detail;
+  const auto reason_count = [&](class_a_fallback_reason reason) {
+    return created.instance->health().class_a_fallbacks.reasons[static_cast<std::size_t>(reason)];
+  };
+
+  // The profile admits two rx ports, one tx port and comb 4.
+  {
+    srs_invocation_fixture call(6);
+    call.metadata.comb_size = 2;
+    call.metadata.n_cs_max  = 8;
+    EXPECT_EQ(worker.worker->invoke(call.input, call.output).status, OCUDU_DAPP_UNSUPPORTED_V1);
+    EXPECT_EQ(reason_count(class_a_fallback_reason::unsupported_allocation), 1U);
+  }
+  {
+    srs_invocation_fixture call(6, 2);
+    EXPECT_TRUE(worker.worker->invoke(call.input, call.output));
+    EXPECT_EQ(control.data_invocations.load(std::memory_order_relaxed), 1U);
+  }
+  // Occasions the SRS configuration cannot produce, and tensors that disagree with the metadata.
+  const auto malformed = {
+      +[](srs_invocation_fixture& call) { call.metadata.n_cs_max = 8; },
+      +[](srs_invocation_fixture& call) { call.metadata.cyclic_shift[0] = 12; },
+      +[](srs_invocation_fixture& call) { call.metadata.flags = OCUDU_DAPP_SRS_FLAG_INTERLEAVED_PILOTS_V1; },
+      +[](srs_invocation_fixture& call) { call.metadata.first_subcarrier[0] = 40; },
+      +[](srs_invocation_fixture& call) { call.metadata.subcarrier_spacing_hz = 15000; },
+      +[](srs_invocation_fixture& call) { call.input.srs.metadata_schema_id = OCUDU_DAPP_METADATA_PUSCH_V1; },
+  };
+  for (const auto corrupt : malformed) {
+    srs_invocation_fixture call(6);
+    corrupt(call);
+    EXPECT_EQ(worker.worker->invoke(call.input, call.output).status, OCUDU_DAPP_UNSUPPORTED_V1);
+  }
+  EXPECT_EQ(reason_count(class_a_fallback_reason::unsupported_metadata), malformed.size());
+  const auto invalid = {
+      +[](srs_invocation_fixture& call) { call.input.rx_symbols.layout_id = 0; },
+      +[](srs_invocation_fixture& call) { call.input.reference_symbols.dimensions[1] = 3; },
+      +[](srs_invocation_fixture& call) { call.output.channel_matrix.dimensions[0] = 2; },
+      +[](srs_invocation_fixture& call) { call.output.measurements.access = OCUDU_DAPP_ACCESS_READ_V1; },
+      +[](srs_invocation_fixture& call) { call.output.measurements.domain = OCUDU_DAPP_MEM_ACCELERATOR_DEVICE_V1; },
+  };
+  for (const auto corrupt : invalid) {
+    srs_invocation_fixture call(6);
+    corrupt(call);
+    EXPECT_EQ(worker.worker->invoke(call.input, call.output).status, OCUDU_DAPP_INVALID_INPUT_V1);
+  }
+  EXPECT_EQ(reason_count(class_a_fallback_reason::invalid_input), invalid.size());
+  EXPECT_EQ(control.data_invocations.load(std::memory_order_relaxed), 1U);
+
+  // A module that swaps the host-owned output storage produced an invalid output.
+  control.replace_data_output.store(true, std::memory_order_relaxed);
+  srs_invocation_fixture call(6);
+  const auto             replaced = worker.worker->invoke(call.input, call.output);
+  EXPECT_NE(replaced.status, OCUDU_DAPP_OK_V1);
+  EXPECT_TRUE(replaced.invoke_fallback);
+  worker.worker.reset();
   EXPECT_TRUE(created.instance->drain(std::chrono::steady_clock::now() + 100ms));
   EXPECT_TRUE(created.instance->unload());
 }

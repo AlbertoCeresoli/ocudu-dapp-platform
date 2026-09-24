@@ -8,6 +8,7 @@
 #include "ocudu/dapp/use_cases/v1/receiver.h"
 #include "ocudu/dapp/use_cases/v1/scheduler.h"
 #include "ocudu/dapp/use_cases/v1/spectrum.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include "ocudu/dapp/use_cases/v1/srs_isac.h"
 #include <algorithm>
 #include <cerrno>
@@ -246,6 +247,7 @@ bool known_worker_interface(uint32_t interface_id) noexcept
     case OCUDU_DAPP_INTERFACE_SPECTRUM_V1:
     case OCUDU_DAPP_INTERFACE_SRS_ISAC_V1:
     case OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1:
+    case OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1:
     case OCUDU_DAPP_INTERFACE_EQUALIZER_V1:
     case OCUDU_DAPP_INTERFACE_RECEIVER_V1:
     case OCUDU_DAPP_INTERFACE_SCHEDULER_V1:
@@ -266,6 +268,9 @@ ocudu_dapp_status_v1 invoke_invalid_vector(const ocudu_dapp_interface_descriptor
           ->publish(context, nullptr);
     case OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1:
       return static_cast<const ocudu_dapp_channel_estimator_interface_v1*>(descriptor.interface_vtable)
+          ->invoke(context, nullptr, nullptr);
+    case OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1:
+      return static_cast<const ocudu_dapp_srs_channel_estimator_interface_v1*>(descriptor.interface_vtable)
           ->invoke(context, nullptr, nullptr);
     case OCUDU_DAPP_INTERFACE_EQUALIZER_V1:
       return static_cast<const ocudu_dapp_equalizer_interface_v1*>(descriptor.interface_vtable)

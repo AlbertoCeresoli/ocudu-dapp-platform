@@ -21,6 +21,7 @@
 #include "ocudu/dapp/use_cases/v1/srs_isac.h"
 #include "ocudu/phy/upper/dapp/pusch_dapp_channel_estimator.h"
 #include "ocudu/phy/upper/dapp/pusch_dapp_demodulator.h"
+#include "ocudu/phy/upper/dapp/srs_dapp_channel_estimator.h"
 #include "ocudu/phy/upper/dapp/upper_phy_dapp_data_router.h"
 #include "ocudu/ran/du_cell_index.h"
 #include "ocudu/ran/resource_block.h"
@@ -1113,7 +1114,8 @@ bool build_hook_topology(const std::shared_ptr<dapp::native_hook_registry>&     
   auto spectrum = add_point(registry, OCUDU_DAPP_INTERFACE_SPECTRUM_V1, spectrum_lanes, detail);
   auto srs      = add_point(registry, OCUDU_DAPP_INTERFACE_SRS_ISAC_V1, config.nof_srs_lanes, detail);
   auto sched    = add_point(registry, OCUDU_DAPP_INTERFACE_SCHEDULER_V1, config.nof_scheduler_lanes, detail);
-  if (!spectrum || !srs || !sched) {
+  auto srs_ce   = add_point(registry, OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1, config.nof_srs_lanes, detail);
+  if (!spectrum || !srs || !sched || !srs_ce) {
     return false;
   }
   // One point per route-table slot of each Class-A PUSCH hook; slot 0 is the single-owner point.
@@ -1130,9 +1132,10 @@ bool build_hook_topology(const std::shared_ptr<dapp::native_hook_registry>&     
   }
 
   // Per-hook backend policy follows the *data path* each hook is wired into:
-  //   Class-A CE/EQ/RX — host PUSCH adapters use HOST tensors; accelerated PUSCH
-  //     uses CUDA device tensors. When CUDA is in backend_mask, acceleration is
-  //     the primary Class-A path → only CUDA packages may bind those hooks.
+  //   Class-A CE/EQ/RX and SRS CE — host adapters use HOST tensors; accelerated
+  //     PUSCH and SRS use CUDA device tensors. When CUDA is in backend_mask,
+  //     acceleration is the primary Class-A path → only CUDA packages may bind
+  //     those hooks.
   //   Class-B scheduler — always host-record intents (CPU backend packages).
   //   Class-C spectrum/SRS — host publish path always; CUDA packages also allowed
   //     when the host advertises CUDA (device/process paths).
@@ -1147,6 +1150,7 @@ bool build_hook_topology(const std::shared_ptr<dapp::native_hook_registry>&     
     eq_slots[slot]->set_allowed_backend_mask(class_a_hook_backends);
     rx_slots[slot]->set_allowed_backend_mask(class_a_hook_backends);
   }
+  srs_ce->set_allowed_backend_mask(class_a_hook_backends);
   sched->set_allowed_backend_mask(class_b_hook_backends);
   spectrum->set_allowed_backend_mask(class_c_hook_backends);
   srs->set_allowed_backend_mask(class_c_hook_backends);
@@ -1254,12 +1258,16 @@ bool build_hook_topology(const std::shared_ptr<dapp::native_hook_registry>&     
   auto ce_target = create_native_pusch_dapp_channel_estimator_target(std::move(ce_slots), pusch_routes);
   auto demod_target =
       create_native_pusch_dapp_demodulator_target(std::move(eq_slots), std::move(rx_slots), pusch_routes);
-  if (!ce_target || !demod_target) {
-    detail = "unable to create the routed Class-A PUSCH targets";
+  auto srs_ce_target = create_native_srs_dapp_channel_estimator_target(std::move(srs_ce));
+  if (!ce_target || !demod_target || !srs_ce_target) {
+    detail = "unable to create the Class-A PUSCH and SRS targets";
     return false;
   }
-  upper_phy_provider = create_upper_phy_dapp_hook_provider(
-      std::move(router.router), std::move(ce_target), std::move(demod_target), config.nof_srs_lanes);
+  upper_phy_provider                         = create_upper_phy_dapp_hook_provider(std::move(router.router),
+                                                           std::move(ce_target),
+                                                           std::move(demod_target),
+                                                           config.nof_srs_lanes,
+                                                           std::move(srs_ce_target));
   auto                      scheduler_target = create_native_scheduler_dapp_target(sched);
   scheduler_dapp_guardrails sched_guardrails{};
   sched_guardrails.max_ul_prbs_avoided     = config.max_scheduler_ul_prbs_avoided;

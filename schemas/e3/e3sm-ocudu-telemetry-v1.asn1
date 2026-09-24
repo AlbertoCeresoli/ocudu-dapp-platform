@@ -184,7 +184,11 @@ SrsChannelRecord ::= SEQUENCE {
   frequencyShift           INTEGER (0..65535) OPTIONAL,
   frequencyHopping         INTEGER (0..255) OPTIONAL,
   coefficients             Cf32Samples,
-  ...
+  ...,
+  -- The SRS channel-estimator dApp input of this port pair: received pilots [symbol, pilot] and the reference
+  -- sequence [pilot]. The least-squares estimate above is their product averaged over the symbols.
+  receivedPilots           Cf32Samples OPTIONAL,
+  referenceSymbols         Cf32Samples OPTIONAL
 }
 
 PuschDmrsChannelRecord ::= SEQUENCE {

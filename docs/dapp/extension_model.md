@@ -31,7 +31,7 @@ and the optional management vtable (config, metrics, models).
 | `sha256` | **Artifact content hash**; admission fails if the file does not match |
 | `placements` | Exactly one of `in_process` / `out_of_process` |
 | `backends` | 1..3 of `cpu` / `cuda` / `other_accelerator` |
-| `interfaces` | 1..64 records: `interface_id`, `major`/`minor`, `class` (`A`/`B`/`C`), per-interface `placements`, `threading` (`per_worker` / `reentrant_shared` / `serialized`), optional `binding` (`required`/`optional`), `capabilities` bits, and — for Class-A PUSCH interfaces — the declarative `pusch_profile` (max PRB/rx ports/layers, modulation and DM-RS masks, flags) the host enforces before dispatch |
+| `interfaces` | 1..64 records: `interface_id`, `major`/`minor`, `class` (`A`/`B`/`C`), per-interface `placements`, `threading` (`per_worker` / `reentrant_shared` / `serialized`), optional `binding` (`required`/`optional`), `capabilities` bits, and — for Class-A PUSCH interfaces — the declarative `pusch_profile` (max PRB/rx ports/layers, modulation and DM-RS masks, flags) the host enforces before dispatch, or for the SRS channel estimator its `srs_profile` (max rx/tx ports, sequence length, comb mask) |
 | `provenance` | SBOM binding: catalog-relative `sbom` path, `format` `spdx-2.3-json`, and the SBOM's own `sha256` |
 
 The manifest is read as a bounded, non-writable JSON file below the catalog

@@ -80,7 +80,8 @@ if(ENABLE_DAPP)
           dapp_demodulator_test.cpp
           dapp_data_router_test.cpp
           dapp_hook_provider_test.cpp
-          dapp_process_target_test.cpp)
+          dapp_process_target_test.cpp
+          dapp_srs_channel_estimator_test.cpp)
   if(ENABLE_E3)
     target_sources(dapp_hook_provider_test PRIVATE dapp_portable_e3_target_test.cpp)
   endif()
@@ -93,6 +94,47 @@ if(ENABLE_DAPP)
           GTest::gtest
           GTest::gtest_main)
   gtest_discover_tests(dapp_hook_provider_test PROPERTIES LABELS "tsan")
+
+  # End-to-end parity of an SRS channel-estimator dApp with the host estimator (skipped unless
+  # OCUDU_DAPP_SRS_REFERENCE_MODULE names a module, e.g. the SDK's ref_srs_channel_estimator_cpu.so).
+  add_executable(srs_dapp_reference_parity_test srs_dapp_reference_parity_test.cpp)
+  target_link_libraries(srs_dapp_reference_parity_test
+          ocudu_phy_dapp_adapters
+          ocudu_dapp_runtime
+          ocudu_srs_estimator
+          ocudu_phy_support
+          ocudu_sequence_generators
+          ocudu_dft
+          ocudulog
+          GTest::gtest
+          GTest::gtest_main)
+  if(CUDA_ACCEL_FOUND)
+    target_link_libraries(srs_dapp_reference_parity_test ocudu_upper_phy)
+    target_compile_definitions(srs_dapp_reference_parity_test PRIVATE ENABLE_CUDA)
+  endif()
+  gtest_discover_tests(srs_dapp_reference_parity_test PROPERTIES RESOURCE_LOCK ocudu_cuda_device)
+
+  add_executable(srs_diagnostic_decorator_test srs_diagnostic_decorator_test.cpp)
+  target_link_libraries(srs_diagnostic_decorator_test
+          ocudu_upper_phy
+          ocudu_srs_estimator
+          ocudu_phy_support
+          ocudu_sequence_generators
+          ocudu_dft
+          ocudulog
+          GTest::gtest
+          GTest::gtest_main)
+  gtest_discover_tests(srs_diagnostic_decorator_test)
+
+  # Golden vectors for SRS channel-estimator dApps (the SDK's reference parity tests read them).
+  add_executable(srs_dapp_channel_estimator_vectors srs_dapp_channel_estimator_vectors.cpp)
+  target_link_libraries(srs_dapp_channel_estimator_vectors
+          ocudu_phy_dapp_adapters
+          ocudu_srs_estimator
+          ocudu_phy_support
+          ocudu_sequence_generators
+          ocudu_dft
+          ocudulog)
 endif()
 
 if(CUDA_ACCEL_FOUND)

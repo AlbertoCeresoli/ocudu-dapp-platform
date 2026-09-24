@@ -173,9 +173,22 @@ class SrsChannelRecord:
     frequency_shift: Optional[int]
     frequency_hopping: Optional[int]
     coefficients: bytes = field(repr=False)
+    #: CF32 [symbol, pilot]: the received pilots at this transmit port's comb subcarriers (empty if not captured).
+    received_pilots: bytes = field(default=b"", repr=False)
+    #: CF32 [pilot]: this transmit port's sequence, cyclic shift included (empty if not captured).
+    reference_symbols: bytes = field(default=b"", repr=False)
 
     def samples(self):
+        """Least-squares estimate per comb subcarrier, averaged over the symbols, time-alignment ramp removed."""
         return _complex_view(self.coefficients)
+
+    def pilots(self):
+        """Received pilots, one row per SRS symbol: the dApp's rx_symbols plane for this port pair."""
+        return _complex_view(self.received_pilots)
+
+    def reference(self):
+        """Reference sequence of the transmit port: the dApp's reference_symbols row."""
+        return _complex_view(self.reference_symbols)
 
 
 @dataclass
@@ -332,6 +345,8 @@ def _record_from_asn(kind: str, body: dict) -> TelemetryRecord:
             frequency_shift=body.get("frequencyShift"),
             frequency_hopping=body.get("frequencyHopping"),
             coefficients=body["coefficients"],
+            received_pilots=body.get("receivedPilots", b""),
+            reference_symbols=body.get("referenceSymbols", b""),
         )
     if kind == "puschDmrsChannel":
         return PuschDmrsChannelRecord(
@@ -446,6 +461,8 @@ _SLOT = struct.Struct("<HBB")
 _PUSCH_SYMBOLS = struct.Struct("<H" + "HBB" + "HBBBB" + "7f")
 _PUSCH_CRC = struct.Struct("<H" + "HBB" + "B3x")
 _SRS = struct.Struct("<H" + "HBB" + "H" + "12B" + "7H" + "4f")
+#: srs_channel_metadata_v2 tail: pilot length, pilot symbols, reserved.
+_SRS_PILOTS = struct.Struct("<HBB")
 _DMRS = struct.Struct("<H" + "HBB" + "HHH" + "12B" + "H" + "7f")
 _GRANT = struct.Struct("<4B" + "9H" + "2I" + "10B" + "4f" + "35s" + "x")  # 92 bytes
 _SYMBOLS_V2_TAIL = struct.Struct("<B3x")  # symbol_flags + reserved, followed by _GRANT
@@ -544,7 +561,17 @@ def decode_store_publication(interface_id: int, metadata: bytes, tensor: bytes) 
         fields = _PUSCH_CRC.unpack(body)
         return PuschCrcRecord(rnti=fields[0], radio_slot=RadioSlot(*fields[1:4]), crc_ok=bool(fields[4]))
     if kind == 3:
-        f = _SRS.unpack(body)
+        f = _SRS.unpack_from(body, 0)
+        coefficients, pilots, reference = tensor, b"", b""
+        if len(body) == _SRS.size + _SRS_PILOTS.size:
+            length, symbols, _ = _SRS_PILOTS.unpack_from(body, _SRS.size)
+            estimate = f[4] * 8
+            if length and len(tensor) == estimate + (symbols + 1) * length * 8:
+                coefficients = tensor[:estimate]
+                pilots = tensor[estimate : estimate + symbols * length * 8]
+                reference = tensor[estimate + symbols * length * 8 :]
+        elif len(body) != _SRS.size:
+            raise ValueError("SRS channel metadata size mismatch")
         u8 = f[5:17]
         u16 = f[17:24]
         return SrsChannelRecord(
@@ -574,7 +601,9 @@ def decode_store_publication(interface_id: int, metadata: bytes, tensor: bytes) 
             epre_db=_finite(f[25]),
             noise_variance=_finite(f[26]),
             time_alignment_ns=_finite(f[27]),
-            coefficients=tensor,
+            coefficients=coefficients,
+            received_pilots=pilots,
+            reference_symbols=reference,
         )
     if kind == 4:
         f = _DMRS.unpack(body)

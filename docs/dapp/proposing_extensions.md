@@ -29,7 +29,7 @@ allocation must be coordinated here:
 
 | Namespace | Range in use | Registry (source of truth) |
 |---|---|---|
-| Use-case **interface ids** | `0x00010001`–`0x00010006` | `include/ocudu/dapp/use_cases/v1/*.h` |
+| Use-case **interface ids** | `0x00010001`–`0x00010007` | `include/ocudu/dapp/use_cases/v1/*.h` |
 | Telemetry-stream **interface ids** | `0x00020001`–`0x00020006` | `include/ocudu/dapp/e3/telemetry_types.h` |
 | **Telemetry ids** (small ints, wire) | 1–8 | `e3ap_protocol.h` / `default_telemetry_streams()` |
 | **Context / layout / output schema ids** | per-contract, `0x0001xxxx` | the owning contract's header |

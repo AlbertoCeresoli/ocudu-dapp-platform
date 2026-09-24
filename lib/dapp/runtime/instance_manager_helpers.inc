@@ -59,6 +59,7 @@
         left[index].dapp_class != right[index].dapp_class ||
         left[index].placement_mask != right[index].placement_mask || left[index].threading != right[index].threading ||
         left[index].capability_bits != right[index].capability_bits || left[index].pusch != right[index].pusch ||
+        left[index].srs != right[index].srs ||
         (compare_binding_policy && left[index].requirement != right[index].requirement)) {
       return false;
     }
@@ -261,7 +262,7 @@ query_result<std::vector<Owned>> collect_bounded(Invoke&& invoke, Convert&& conv
 }
 
 /// Class-A resident hooks are path-specific: host adapters only invoke HOST
-/// backend packages; the accelerated PUSCH path only invokes CUDA packages.
+/// backend packages; the accelerated PUSCH and SRS paths only invoke CUDA packages.
 /// When the host advertises CUDA in backend_mask, acceleration is enabled and
 /// the CUDA Class-A path is primary — loading a CPU Class-A package would
 /// activate lifecycle successfully but never receive invokes (silent dead-path).
@@ -278,7 +279,7 @@ query_result<std::vector<Owned>> collect_bounded(Invoke&& invoke, Convert&& conv
   constexpr uint64_t cuda_bit = uint64_t{1} << OCUDU_DAPP_BACKEND_CUDA_V1;
   const bool         cuda_l1  = (host_backend_mask & cuda_bit) != 0;
   const bool         host_l1  = (host_backend_mask & host_bit) != 0;
-  // When CUDA is advertised, the accelerated PUSCH Class-A path is primary and
+  // When CUDA is advertised, the accelerated Class-A path is primary and
   // only CUDA-backend packages receive invokes on that path.
   if (selected == backend::cpu && cuda_l1) {
     return "Class-A cpu backend is incompatible with the active accelerated L1 path "

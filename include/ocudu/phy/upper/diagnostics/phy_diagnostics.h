@@ -117,7 +117,8 @@ struct pusch_grid_diagnostic {
   span<const std::complex<float>> resource_elements = {};
 };
 
-/// SRS frequency-domain channel estimate diagnostic event for one Rx/Tx port pair.
+/// SRS frequency-domain channel estimate diagnostic event for one Rx/Tx port pair. The first subcarrier and the
+/// cyclic shift (n_cs) are the transmit port's.
 struct srs_channel_diagnostic {
   uint16_t                        rnti                       = 0;
   slot_point                      slot                       = {};
@@ -145,7 +146,14 @@ struct srs_channel_diagnostic {
   uint8_t                         freq_position              = 0;
   uint16_t                        freq_shift                 = 0;
   uint8_t                         freq_hopping               = 0;
-  span<const std::complex<float>> h_coefficients             = {};
+  /// Least-squares estimate per comb subcarrier, averaged over the SRS symbols, time-alignment ramp removed.
+  span<const std::complex<float>> h_coefficients = {};
+  /// Received pilots of the transmit port's comb subcarriers at the receive port, [symbol, pilot]: the
+  /// rx_symbols plane of the SRS channel-estimator dApp input. Empty when not captured.
+  span<const std::complex<float>> received_pilots = {};
+  /// Transmitted sequence of the transmit port, cyclic shift included: its reference_symbols row. Empty when not
+  /// captured.
+  span<const std::complex<float>> reference_symbols = {};
 };
 
 /// PUSCH DM-RS channel-estimate diagnostic event for one Rx/layer/symbol view.

@@ -338,7 +338,7 @@ fragments that share the PDU `id` (control) or `subscriptionId` + `sequence`
 |--------------|------|-----------------|--------|-------------------------|
 | 1 | `pusch.symbols` | `0x00020001` | `PuschSymbolsRecord`: RNTI, slot, PRB/symbol/layer counts, modulation, SINR/EPRE/RSRP/EVM/TA/CFO/code rate, equalized symbols | 50 ms (`telemetry_pusch_symbols_min_interval_ms`) |
 | 2 | `pusch.crc` | `0x00020002` | `PuschCrcRecord`: RNTI, slot, CRC outcome | none |
-| 3 | `srs.channel` | `0x00020003` | `SrsChannelRecord`: RNTI, slot, port pair, RSRP/EPRE/noise/TA, SRS resource fields, coefficients | 20 ms |
+| 3 | `srs.channel` | `0x00020003` | `SrsChannelRecord`: RNTI, slot, port pair, RSRP/EPRE/noise/TA, SRS resource fields, coefficients, and the received pilots and reference sequence (`receivedPilots`, `referenceSymbols`) | 20 ms |
 | 4 | `pusch.dmrs_channel` | `0x00020004` | `PuschDmrsChannelRecord`: RNTI, slot, PRB span, DM-RS parameters, estimates | 20 ms |
 | 5 | `gnb.metrics_json` | `0x00020005` | `GnbMetricsJsonRecord`: one gNB JSON metrics report, byte for byte | none (report period) |
 | 6 | `classc.spectrum` | `0x00010001` | `ClassCPortableRecord`: `OCC3` metadata + complete tensor | producer rate |
@@ -432,7 +432,8 @@ mirrored by `python/ocudu_e3/telemetry.py`):
 ```text
 header  : magic 0x3345544F ("OTE3") u32 | version u16 (1 or 2) | kind u16 | monotonic_ns u64   (16 bytes)
 kind 1  : pusch_symbols  v1 56 bytes; v2 152 bytes (v1 layout + symbol_flags + grant block)
-kind 2  : pusch_crc 26 bytes              kind 3 : srs_channel 66 bytes
+kind 2  : pusch_crc 26 bytes
+kind 3  : srs_channel    v1 66 bytes; v2 70 bytes (v1 layout + pilot_length u16 + pilot_symbols u8 + reserved u8)
 kind 4  : pusch_dmrs_channel 70 bytes     kind 5 : gnb_metrics_json  header only (16 bytes);
                                                    the tensor is the JSON text
 kind 6  : pusch_grid 120 bytes (28-byte capture header + 92-byte grant block)
@@ -444,8 +445,17 @@ The publisher now emits `pusch.symbols` as **header version 2**
 bit3 `grant_valid`), 3 reserved bytes, and the 92-byte
 `pusch_grant_metadata_v1` grant block shared with `pusch.grid`. The grant
 block's own `flags` byte is: bit0 `mcs_known`, bit1 `transform_precoding`,
-bit2 `n_scid`, bit3 `dc_present`, bit4 `csi_part2_expected`. Version 2 applies
-only to the PUSCH symbols kind; every other kind keeps version 1.
+bit2 `n_scid`, bit3 `dc_present`, bit4 `csi_part2_expected`.
+
+`srs.channel` is emitted as **header version 2** (`srs_channel_metadata_v2`, 70
+bytes): the v1 record followed by `pilot_length` and `pilot_symbols`. With a
+non-zero `pilot_length` the tensor is the least-squares estimate
+(`nof_subcarriers` CF32), then the received pilots (`pilot_symbols` ×
+`pilot_length` CF32, symbol major) and the transmit port's reference sequence
+(`pilot_length` CF32) — the SRS channel-estimator dApp input of the port pair
+([srs_channel_estimator.md](srs_channel_estimator.md)). The record's
+`mapping_initial_subcarrier` and `cyclic_shift_index` are the transmit port's
+own. Version 2 applies only to these two kinds; every other kind keeps version 1.
 
 Every per-UE record places the RNTI (u16) directly after the header; the agent
 uses that to apply `rntiFilter` without a codec.

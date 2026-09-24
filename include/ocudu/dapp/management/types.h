@@ -98,9 +98,24 @@ struct interface_record {
     }
     bool operator!=(const pusch_profile& other) const noexcept { return !(*this == other); }
   };
+  /// Admission envelope of the SRS channel estimator (ocudu_dapp_srs_profile_v1).
+  struct srs_profile {
+    uint32_t max_nof_rx_ports{};
+    uint32_t max_nof_tx_ports{};
+    uint32_t max_sequence_length{};
+    uint32_t comb_mask{};
+    bool     operator==(const srs_profile& other) const noexcept
+    {
+      return max_nof_rx_ports == other.max_nof_rx_ports && max_nof_tx_ports == other.max_nof_tx_ports &&
+             max_sequence_length == other.max_sequence_length && comb_mask == other.comb_mask;
+    }
+    bool operator!=(const srs_profile& other) const noexcept { return !(*this == other); }
+  };
   std::optional<pusch_profile> pusch;
   binding_requirement          requirement{binding_requirement::required};
   binding_state                state{binding_state::unbound};
+  /// Set for the SRS channel estimator, whose Class-A profile replaces the PUSCH one.
+  std::optional<srs_profile> srs;
 };
 
 struct package_record {

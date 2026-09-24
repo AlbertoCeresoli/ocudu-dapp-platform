@@ -24,7 +24,8 @@ using namespace ocudu;
 namespace {
 
 /// Publishes the per-subcarrier least-squares SRS channel estimate for every
-/// (receive port, transmit port) pair.
+/// (receive port, transmit port) pair, with the received pilots and the
+/// reference sequence it was computed from (the SRS channel-estimator dApp input).
 ///
 /// The estimator implementations only return the wideband channel matrix (one
 /// coefficient per port pair), which is what the scheduler needs, but the
@@ -109,7 +110,7 @@ private:
         2.0 * M_PI * result.time_alignment.time_alignment * scs_to_khz(scs) * 1000.0 * info.comb_size;
 
     sequence.resize(info.sequence_length);
-    received.resize(info.sequence_length);
+    received.resize(static_cast<size_t>(nof_symbols) * info.sequence_length);
     lse.resize(info.sequence_length);
     ramp.resize(info.sequence_length);
 
@@ -129,13 +130,17 @@ private:
 
       for (unsigned rx = 0; rx != nof_rx; ++rx) {
         const unsigned rx_port = config.ports[rx];
-        for (unsigned symbol = config.resource.start_symbol.value(), end = symbol + nof_symbols; symbol != end;
-             ++symbol) {
-          grid.get(received, rx_port, symbol, port_info.mapping_initial_subcarrier, port_info.comb_size);
-          if (symbol == config.resource.start_symbol.value()) {
-            ocuduvec::copy(lse, received);
+        for (unsigned i_symbol = 0; i_symbol != nof_symbols; ++i_symbol) {
+          span<cf_t> pilots = span<cf_t>(received).subspan(i_symbol * info.sequence_length, info.sequence_length);
+          grid.get(pilots,
+                   rx_port,
+                   config.resource.start_symbol.value() + i_symbol,
+                   port_info.mapping_initial_subcarrier,
+                   port_info.comb_size);
+          if (i_symbol == 0) {
+            ocuduvec::copy(lse, pilots);
           } else {
-            ocuduvec::add(lse, received, lse);
+            ocuduvec::add(lse, pilots, lse);
           }
         }
         // Least-squares estimate, averaged over the SRS symbols, with the TA phase ramp removed.
@@ -147,7 +152,13 @@ private:
 
         event.rx_port_index  = static_cast<uint8_t>(rx);
         event.tx_port_index  = static_cast<uint8_t>(tx);
-        event.h_coefficients = span<const std::complex<float>>(lse.data(), lse.size());
+        // The comb subcarriers and the cyclic shift are the transmit port's own (odd ports differ with
+        // interleaved pilots).
+        event.mapping_initial_subcarrier = static_cast<uint16_t>(port_info.mapping_initial_subcarrier);
+        event.n_cs                       = static_cast<uint16_t>(port_info.n_cs);
+        event.h_coefficients             = span<const std::complex<float>>(lse.data(), lse.size());
+        event.received_pilots            = span<const std::complex<float>>(received.data(), received.size());
+        event.reference_symbols          = span<const std::complex<float>>(sequence.data(), sequence.size());
         sink->on_srs_channel(event);
       }
     }

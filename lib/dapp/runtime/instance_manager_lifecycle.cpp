@@ -4,10 +4,11 @@
 // Lifecycle orchestration for instance_manager: load() and control().
 // Split translation unit only — identical methods, no behavior change.
 
-#include "ocudu/dapp/runtime/instance_manager.h"
 #include "ocudu/dapp/abi/v1/memory.h"
 #include "ocudu/dapp/abi/v1/metric_catalog.h"
+#include "ocudu/dapp/runtime/instance_manager.h"
 #include "ocudu/dapp/use_cases/v1/scheduler.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include <algorithm>
 #include <array>
 #include <chrono>

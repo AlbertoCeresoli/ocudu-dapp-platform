@@ -224,6 +224,7 @@ struct native_worker::implementation {
   uint32_t                                       bound_worker_id{};
   uint64_t                                       interface_capabilities{};
   std::optional<ocudu_dapp_pusch_profile_v1>     pusch_profile;
+  std::optional<ocudu_dapp_srs_profile_v1>        srs_profile;
   uint32_t                                       selected_backend{};
   void*                                          host_context{};
   std::shared_ptr<native_control_context>         control_context;
@@ -272,12 +273,7 @@ struct native_worker::implementation {
     }
   }
 
-  bool class_a() const noexcept
-  {
-    return bound_interface_id == OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1 ||
-           bound_interface_id == OCUDU_DAPP_INTERFACE_EQUALIZER_V1 ||
-           bound_interface_id == OCUDU_DAPP_INTERFACE_RECEIVER_V1;
-  }
+  bool class_a() const noexcept { return is_class_a_interface(bound_interface_id); }
 
   incident_context make_context(const ocudu_dapp_invocation_v1& invocation) const noexcept
   {
@@ -418,16 +414,14 @@ native_worker_create_result native_worker::create(native_instance& owner, uint32
   if (descriptor == owner.module.interfaces + owner.module.nof_interfaces) {
     return {OCUDU_DAPP_UNSUPPORTED_V1, "module does not implement the requested interface", {}};
   }
+  const bool class_a_interface = is_class_a_interface(interface_id);
   const bool valid_class =
-      ((interface_id == OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1 ||
-        interface_id == OCUDU_DAPP_INTERFACE_EQUALIZER_V1 || interface_id == OCUDU_DAPP_INTERFACE_RECEIVER_V1) &&
-       descriptor->dapp_class == OCUDU_DAPP_CLASS_A_INLINE_V1) ||
+      (class_a_interface && descriptor->dapp_class == OCUDU_DAPP_CLASS_A_INLINE_V1) ||
       ((interface_id == OCUDU_DAPP_INTERFACE_SPECTRUM_V1 || interface_id == OCUDU_DAPP_INTERFACE_SRS_ISAC_V1) &&
        descriptor->dapp_class == OCUDU_DAPP_CLASS_C_OPEN_LOOP_V1) ||
       (interface_id == OCUDU_DAPP_INTERFACE_SCHEDULER_V1 && descriptor->dapp_class == OCUDU_DAPP_CLASS_B_DEADLINE_V1);
-  const bool class_a_interface = interface_id == OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1 ||
-                                 interface_id == OCUDU_DAPP_INTERFACE_EQUALIZER_V1 ||
-                                 interface_id == OCUDU_DAPP_INTERFACE_RECEIVER_V1;
+  // The PUSCH and SRS resident-accelerator capabilities share bit 0.
+  static_assert(OCUDU_DAPP_PUSCH_CAP_RESIDENT_ACCELERATOR_V1 == OCUDU_DAPP_SRS_CAP_RESIDENT_ACCELERATOR_V1);
   const bool resident_accelerator =
       class_a_interface && (descriptor->capability_bits & OCUDU_DAPP_PUSCH_CAP_RESIDENT_ACCELERATOR_V1) != 0;
   // Class-A residency determines the tensor-memory contract. Class-B always
@@ -486,7 +480,11 @@ native_worker_create_result native_worker::create(native_instance& owner, uint32
         return {OCUDU_DAPP_UNSUPPORTED_V1, "required receiver completion service unavailable", {}};
     }
     if (descriptor->use_case_profile != nullptr) {
-      implementation_->pusch_profile = *static_cast<const ocudu_dapp_pusch_profile_v1*>(descriptor->use_case_profile);
+      if (interface_id == OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1) {
+        implementation_->srs_profile = *static_cast<const ocudu_dapp_srs_profile_v1*>(descriptor->use_case_profile);
+      } else {
+        implementation_->pusch_profile = *static_cast<const ocudu_dapp_pusch_profile_v1*>(descriptor->use_case_profile);
+      }
     }
     implementation_->selected_backend = owner.backend_id();
     implementation_->host_context     = owner.host_api.host_context;
@@ -561,6 +559,34 @@ native_invocation_result native_worker::invoke(const ocudu_dapp_channel_estimato
         return valid_output_tensor(output.channel_estimates) && valid_output_tensor(output.noise_variances) &&
                same_tensor_storage(channel_storage, output.channel_estimates) &&
                same_tensor_storage(noise_storage, output.noise_variances);
+      });
+}
+
+native_invocation_result native_worker::invoke(const ocudu_dapp_srs_channel_estimator_input_v1& input,
+                                               ocudu_dapp_srs_channel_estimator_output_v1&      output) noexcept
+{
+  if (state->bound_interface_id != OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1 || !state->srs_profile) {
+    return {OCUDU_DAPP_INVALID_INPUT_V1, true};
+  }
+  if (!valid_invocation(input.invocation, state->bound_worker_id)) {
+    state->incident_source->record(class_a_fallback_reason::invalid_input);
+    return {OCUDU_DAPP_INVALID_INPUT_V1, true};
+  }
+  if (const auto reason = classify_srs_channel_estimator_input(*state->srs_profile, input, output)) {
+    state->incident_source->record(*reason);
+    return {*reason == class_a_fallback_reason::invalid_input ? OCUDU_DAPP_INVALID_INPUT_V1 : OCUDU_DAPP_UNSUPPORTED_V1,
+            true};
+  }
+  const auto  channel_storage      = output.channel_matrix;
+  const auto  measurements_storage = output.measurements;
+  const auto* api = static_cast<const ocudu_dapp_srs_channel_estimator_interface_v1*>(state->interface_vtable);
+  return state->call(
+      input.invocation,
+      [&]() { return api->invoke(state->worker_context, &input, &output); },
+      [&]() {
+        return valid_output_tensor(output.channel_matrix) && valid_output_tensor(output.measurements) &&
+               same_tensor_storage(channel_storage, output.channel_matrix) &&
+               same_tensor_storage(measurements_storage, output.measurements);
       });
 }
 

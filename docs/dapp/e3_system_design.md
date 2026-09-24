@@ -61,7 +61,8 @@ Working version **v1**.
 | **C** | Open-loop analytics | Best-effort; producer never waits | Native or supervised process |
 
 Interface ids (v1 references): spectrum `0x00010001`, SRS–ISAC `0x00010002`,
-CE `0x00010003`, EQ `0x00010004`, RX `0x00010005`, scheduler `0x00010006`.
+CE `0x00010003`, EQ `0x00010004`, RX `0x00010005`, scheduler `0x00010006`,
+SRS channel estimator `0x00010007`.
 
 ## Package admission path
 

@@ -10,6 +10,7 @@
 #include <limits>
 #include <new>
 #include <type_traits>
+#include <vector>
 
 using namespace ocudu;
 using namespace ocudu::dapp::e3;
@@ -157,7 +158,8 @@ struct telemetry_publisher::implementation {
   template <typename Metadata>
   static telemetry_metadata_header& header_of(Metadata& metadata) noexcept
   {
-    if constexpr (std::is_same_v<Metadata, pusch_symbols_metadata_v2>) {
+    if constexpr (std::is_same_v<Metadata, pusch_symbols_metadata_v2> ||
+                  std::is_same_v<Metadata, srs_channel_metadata_v2>) {
       return metadata.base.header;
     } else {
       return metadata.header;
@@ -373,7 +375,9 @@ void telemetry_publisher::on_srs_channel(const srs_channel_diagnostic& event)
     state->invalid.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  srs_channel_metadata_v1 metadata;
+  srs_channel_metadata_v2  extended;
+  srs_channel_metadata_v1& metadata   = extended.base;
+  metadata.header.version             = 2;
   metadata.rnti                       = event.rnti;
   metadata.radio_slot                 = to_radio_slot(event.slot);
   metadata.nof_subcarriers            = event.nof_subcarriers;
@@ -400,11 +404,31 @@ void telemetry_publisher::on_srs_channel(const srs_channel_diagnostic& event)
   metadata.epre_db                    = sanitized(event.epre_dB);
   metadata.noise_variance             = sanitized(event.noise_variance);
   metadata.time_alignment_ns          = sanitized(event.time_alignment_ns);
+  // The pilots travel only as a complete, consistent set: symbols x length pilots and a length-long sequence.
+  const std::size_t length = event.reference_symbols.size();
+  const bool        pilots = length != 0 && length <= std::numeric_limits<uint16_t>::max() &&
+                      event.received_pilots.size() == length * event.nof_symbols;
+  if (!pilots) {
+    state->publish(telemetry_stream_srs_channel,
+                   state->config.default_cell_id,
+                   extended,
+                   event.h_coefficients.data(),
+                   event.h_coefficients.size() * sizeof(std::complex<float>));
+    return;
+  }
+  extended.pilot_length  = static_cast<uint16_t>(length);
+  extended.pilot_symbols = event.nof_symbols;
+  // One contiguous tensor per publication; the scratch is per SRS worker thread and sized by the largest occasion.
+  thread_local std::vector<std::complex<float>> tensor;
+  tensor.clear();
+  tensor.insert(tensor.end(), event.h_coefficients.begin(), event.h_coefficients.end());
+  tensor.insert(tensor.end(), event.received_pilots.begin(), event.received_pilots.end());
+  tensor.insert(tensor.end(), event.reference_symbols.begin(), event.reference_symbols.end());
   state->publish(telemetry_stream_srs_channel,
                  state->config.default_cell_id,
-                 metadata,
-                 event.h_coefficients.data(),
-                 event.h_coefficients.size() * sizeof(std::complex<float>));
+                 extended,
+                 tensor.data(),
+                 tensor.size() * sizeof(std::complex<float>));
 }
 
 void telemetry_publisher::on_pusch_dmrs_channel(const pusch_dmrs_channel_diagnostic& event)

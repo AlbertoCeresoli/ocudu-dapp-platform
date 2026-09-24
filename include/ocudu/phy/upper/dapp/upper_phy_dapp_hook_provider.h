@@ -49,9 +49,12 @@ public:
   decorate_pusch_demodulator(std::shared_ptr<pusch_demodulator_factory> fallback,
                              upper_phy_dapp_pusch_factory_config        config) = 0;
 
-  /// Decorates every concurrent SRS estimator lane with a post-estimation Class-C publication hook.
-  virtual std::shared_ptr<srs_estimator_factory> decorate_srs_estimator(std::shared_ptr<srs_estimator_factory> fallback,
-                                                                        unsigned nof_lanes) = 0;
+  /// \brief Decorates every concurrent SRS estimator lane with the dApp SRS hooks.
+  ///
+  /// The Class-A SRS channel estimator, when present, replaces \p fallback for the occasions its module serves; the
+  /// Class-C SRS publication then observes whichever estimate was produced. \p max_nof_prb is the uplink bandwidth.
+  virtual std::shared_ptr<srs_estimator_factory>
+  decorate_srs_estimator(std::shared_ptr<srs_estimator_factory> fallback, unsigned nof_lanes, unsigned max_nof_prb) = 0;
 
   /// Wraps one per-cell/per-shard legacy PHY tap with the dApp resource-grid publication adapter.
   virtual std::unique_ptr<phy_tap> wrap_phy_tap(upper_phy_dapp_producer_context context,

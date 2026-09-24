@@ -5,6 +5,7 @@
 #include "ocudu/dapp/runtime/abi_validation.h"
 #include "ocudu/dapp/use_cases/v1/channel_estimator.h"
 #include "ocudu/dapp/use_cases/v1/pusch_metadata.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include <gtest/gtest.h>
 #include <limits>
 
@@ -43,6 +44,13 @@ void destroy_worker(void*, void*) {}
 
 ocudu_dapp_status_v1
 invoke_channel_estimator(void*, const ocudu_dapp_channel_estimator_input_v1*, ocudu_dapp_channel_estimator_output_v1*)
+{
+  return OCUDU_DAPP_OK_V1;
+}
+
+ocudu_dapp_status_v1 invoke_srs_channel_estimator(void*,
+                                                  const ocudu_dapp_srs_channel_estimator_input_v1*,
+                                                  ocudu_dapp_srs_channel_estimator_output_v1*)
 {
   return OCUDU_DAPP_OK_V1;
 }
@@ -203,4 +211,59 @@ TEST(dapp_abi_validation, validates_known_interface_worker_and_invoke_vtables)
   api.invoke                = invoke_channel_estimator;
   interface.interface_major = 2;
   EXPECT_EQ(validate_module_descriptor(&module), validation_error::incompatible_abi);
+}
+
+TEST(dapp_abi_validation, srs_channel_estimator_requires_class_a_and_its_own_profile)
+{
+  ocudu_dapp_worker_api_v1 worker{};
+  worker.struct_size            = sizeof(worker);
+  worker.abi_major              = OCUDU_DAPP_ABI_MAJOR_V1;
+  worker.create_worker_context  = create_worker;
+  worker.destroy_worker_context = destroy_worker;
+  ocudu_dapp_srs_channel_estimator_interface_v1 api{worker, invoke_srs_channel_estimator, {}};
+
+  ocudu_dapp_srs_profile_v1 profile{};
+  profile.struct_size         = sizeof(profile);
+  profile.abi_major           = OCUDU_DAPP_ABI_MAJOR_V1;
+  profile.profile_id          = OCUDU_DAPP_SRS_PROFILE_V1;
+  profile.max_nof_rx_ports    = 4;
+  profile.max_nof_tx_ports    = 2;
+  profile.max_sequence_length = 816;
+  profile.comb_mask           = OCUDU_DAPP_SRS_COMB_2_V1 | OCUDU_DAPP_SRS_COMB_4_V1;
+
+  ocudu_dapp_module_v1 module{};
+  populate_valid_module(&module);
+  auto interface             = module.interfaces[0];
+  module.interfaces          = &interface;
+  interface.interface_id     = OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1;
+  interface.interface_major  = 1;
+  interface.interface_vtable = &api;
+  interface.dapp_class       = OCUDU_DAPP_CLASS_A_INLINE_V1;
+  interface.threading        = OCUDU_DAPP_THREADING_PER_WORKER_V1;
+  interface.use_case_profile = &profile;
+  EXPECT_EQ(validate_module_descriptor(&module), validation_error::none);
+  EXPECT_TRUE(is_class_a_interface(OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1));
+
+  // The profile is mandatory, and it is the SRS profile.
+  interface.use_case_profile = nullptr;
+  EXPECT_EQ(validate_module_descriptor(&module), validation_error::invalid_dimensions);
+  interface.use_case_profile = &profile;
+  for (const auto corrupt : {+[](ocudu_dapp_srs_profile_v1& value) { value.profile_id = OCUDU_DAPP_PUSCH_PROFILE_V1; },
+                             +[](ocudu_dapp_srs_profile_v1& value) { value.max_nof_rx_ports = 9; },
+                             +[](ocudu_dapp_srs_profile_v1& value) { value.max_nof_tx_ports = 0; },
+                             +[](ocudu_dapp_srs_profile_v1& value) { value.max_sequence_length = 1633; },
+                             +[](ocudu_dapp_srs_profile_v1& value) { value.comb_mask = 4; },
+                             +[](ocudu_dapp_srs_profile_v1& value) { value.flags = 1; }}) {
+    auto invalid = profile;
+    corrupt(invalid);
+    interface.use_case_profile = &invalid;
+    EXPECT_EQ(validate_module_descriptor(&module), validation_error::invalid_dimensions);
+  }
+  interface.use_case_profile = &profile;
+  interface.dapp_class       = OCUDU_DAPP_CLASS_C_OPEN_LOOP_V1;
+  EXPECT_EQ(validate_module_descriptor(&module), validation_error::invalid_dimensions);
+
+  interface.dapp_class = OCUDU_DAPP_CLASS_A_INLINE_V1;
+  api.invoke           = nullptr;
+  EXPECT_EQ(validate_module_descriptor(&module), validation_error::missing_callback);
 }

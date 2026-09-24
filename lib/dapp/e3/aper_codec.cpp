@@ -61,6 +61,7 @@ extern "C" {
 #include "RanControlCapabilities.h"
 #include "RequestHeader.h"
 #include "Signed64.h"
+#include "SrsProfile.h"
 #include "TypedValue.h"
 #include "Unsigned64.h"
 #include "aper_decoder.h"
@@ -1076,6 +1077,13 @@ void set_interface_record(InterfaceRecord_t& destination, const interface_record
     destination.puschProfile->dmrsTypeMask   = source.pusch->dmrs_type_mask;
     destination.puschProfile->flags          = source.pusch->flags;
   }
+  if (source.srs) {
+    destination.srsProfile                    = make_asn<SrsProfile_t>();
+    destination.srsProfile->maxRxPorts        = source.srs->max_nof_rx_ports;
+    destination.srsProfile->maxTxPorts        = source.srs->max_nof_tx_ports;
+    destination.srsProfile->maxSequenceLength = source.srs->max_sequence_length;
+    destination.srsProfile->combMask          = source.srs->comb_mask;
+  }
 }
 
 interface_record read_interface_record(const InterfaceRecord_t& source)
@@ -1117,6 +1125,19 @@ interface_record read_interface_record(const InterfaceRecord_t& source)
                                             static_cast<uint32_t>(profile.dmrsTypeMask),
                                             static_cast<uint32_t>(profile.flags)};
   }
+  std::optional<interface_record::srs_profile> srs;
+  if (source.srsProfile != nullptr) {
+    const auto& profile = *source.srsProfile;
+    if (profile.maxRxPorts < 1 || profile.maxRxPorts > 8 || profile.maxTxPorts < 1 || profile.maxTxPorts > 4 ||
+        profile.maxSequenceLength < 1 || profile.maxSequenceLength > 1632 || profile.combMask < 1 ||
+        profile.combMask > 3) {
+      throw std::runtime_error("invalid SRS profile");
+    }
+    srs = interface_record::srs_profile{static_cast<uint32_t>(profile.maxRxPorts),
+                                        static_cast<uint32_t>(profile.maxTxPorts),
+                                        static_cast<uint32_t>(profile.maxSequenceLength),
+                                        static_cast<uint32_t>(profile.combMask)};
+  }
   return {static_cast<uint32_t>(source.interfaceId),
           static_cast<uint16_t>(source.interfaceMajor),
           static_cast<uint16_t>(source.interfaceMinor),
@@ -1126,7 +1147,8 @@ interface_record read_interface_record(const InterfaceRecord_t& source)
           read_bits(source.capabilityBits, 8),
           pusch,
           requirement,
-          state};
+          state,
+          srs};
 }
 
 void set_package_record(PackageRecord_t& destination, const package_record& source)

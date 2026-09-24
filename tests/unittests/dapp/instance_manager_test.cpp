@@ -6,6 +6,7 @@
 #include "ocudu/dapp/runtime/instance_manager.h"
 #include "ocudu/dapp/use_cases/v1/channel_estimator.h"
 #include "ocudu/dapp/use_cases/v1/scheduler.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include <algorithm>
 #include <cstring>
 #include <gtest/gtest.h>
@@ -85,6 +86,31 @@ package_record class_a_package()
                                                 /*modulation_mask*/ OCUDU_DAPP_PUSCH_MODULATION_QPSK_V1,
                                                 /*dmrs_type_mask*/ OCUDU_DAPP_PUSCH_DMRS_TYPE1_V1,
                                                 /*flags*/ 0};
+  package.interfaces.push_back(iface);
+  return package;
+}
+
+package_record class_a_srs_package()
+{
+  artifact_verifier verifier(DAPP_TEST_CATALOG);
+  auto              inspected = verifier.inspect(DAPP_CLASS_A_SRS_FIXTURE);
+  EXPECT_TRUE(inspected) << inspected.detail;
+  package_record package;
+  package.package_id              = id(4);
+  package.global_name             = "org.deepsig.ocudu.test.class-a-srs";
+  package.vendor                  = "DeepSig";
+  package.version                 = "1.0.0";
+  package.canonical_artifact_path = DAPP_CLASS_A_SRS_FIXTURE;
+  package.content_digest          = inspected.digest;
+  package.backends                = {backend::cpu};
+  // Must match fixtures/class_a_srs.cpp (including the SRS profile).
+  interface_record iface{};
+  iface.interface_id    = OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1;
+  iface.interface_major = 1;
+  iface.dapp_class      = OCUDU_DAPP_CLASS_A_INLINE_V1;
+  iface.placement_mask  = 1U << (OCUDU_DAPP_PLACEMENT_IN_PROCESS_V1 - 1);
+  iface.threading       = OCUDU_DAPP_THREADING_PER_WORKER_V1;
+  iface.srs = interface_record::srs_profile{2, 1, OCUDU_DAPP_SRS_MAX_SEQUENCE_LENGTH_V1, OCUDU_DAPP_SRS_COMB_4_V1};
   package.interfaces.push_back(iface);
   return package;
 }
@@ -260,6 +286,29 @@ TEST(dapp_instance_manager, load_rejects_class_a_cpu_when_accelerated_l1_path_is
   const auto result        = manager.load(request);
   EXPECT_EQ(result.code, result_code::incompatible);
   EXPECT_NE(result.detail.find("accelerated L1 path"), std::string::npos) << result.detail;
+}
+
+TEST(dapp_instance_manager, the_srs_channel_estimator_follows_the_class_a_l1_path_rule)
+{
+  // Host L1: the CPU package loads. Accelerated L1: only CUDA packages are served, so it is incompatible.
+  const std::pair<uint64_t, result_code> cases[] = {
+      {uint64_t{1} << OCUDU_DAPP_BACKEND_HOST_V1, result_code::dry_run_ok},
+      {(uint64_t{1} << OCUDU_DAPP_BACKEND_HOST_V1) | (uint64_t{1} << OCUDU_DAPP_BACKEND_CUDA_V1),
+       result_code::incompatible}};
+  uint8_t transaction = 20;
+  for (const auto& [mask, expected] : cases) {
+    auto host         = host_info();
+    host.backend_mask = mask;
+    instance_manager manager(DAPP_TEST_CATALOG, host, host_api(), 32);
+    ASSERT_TRUE(manager.register_package(class_a_srs_package()));
+    load_request request;
+    request.transaction_id   = id(transaction++);
+    request.package_id       = id(4);
+    request.selected_backend = backend::cpu;
+    request.dry_run          = true;
+    const auto result        = manager.load(request);
+    EXPECT_EQ(result.code, expected) << result.detail;
+  }
 }
 
 TEST(dapp_instance_manager, load_rejects_class_a_cuda_when_only_host_l1_path_is_active)

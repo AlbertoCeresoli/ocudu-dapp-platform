@@ -13,6 +13,7 @@
 #include "ocudu/dapp/use_cases/v1/receiver.h"
 #include "ocudu/dapp/use_cases/v1/scheduler.h"
 #include "ocudu/dapp/use_cases/v1/spectrum.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include "ocudu/dapp/use_cases/v1/srs_isac.h"
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +39,13 @@ classify_unsupported_pusch(uint32_t                            interface_id,
                            const ocudu_dapp_pusch_profile_v1&  profile,
                            const ocudu_dapp_typed_metadata_v1& pusch_wrapper,
                            const ocudu_dapp_typed_metadata_v1& dmrs_wrapper) noexcept;
+
+/// Checks an SRS channel-estimator invocation: a malformed request is invalid_input, a well-formed occasion
+/// outside the module's declared profile is the matching unsupported_* reason.
+std::optional<class_a_fallback_reason>
+classify_srs_channel_estimator_input(const ocudu_dapp_srs_profile_v1&                  profile,
+                                     const ocudu_dapp_srs_channel_estimator_input_v1&  input,
+                                     const ocudu_dapp_srs_channel_estimator_output_v1& output) noexcept;
 
 class_a_fallback_reason status_reason(ocudu_dapp_status_v1 status) noexcept;
 

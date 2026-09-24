@@ -211,6 +211,16 @@ struct srs_channel_metadata_v1 {
   float                     time_alignment_ns{}; ///< Measured time alignment in nanoseconds (note: ns, not us).
 };
 
+/// SRS channel metadata with the SRS channel-estimator dApp input. The tensor holds the least-squares estimate
+/// (base.nof_subcarriers), then the received pilots (pilot_symbols x pilot_length, symbol major) and the
+/// reference sequence (pilot_length); pilot_length zero means only the estimate.
+struct srs_channel_metadata_v2 {
+  srs_channel_metadata_v1 base{};
+  uint16_t                pilot_length{};
+  uint8_t                 pilot_symbols{};
+  uint8_t                 reserved{};
+};
+
 struct pusch_dmrs_channel_metadata_v1 {
   telemetry_metadata_header header{telemetry_metadata_header::expected_magic,
                                    telemetry_metadata_header::expected_version,
@@ -258,6 +268,7 @@ static_assert(sizeof(pusch_symbols_metadata_v2) == 152);
 static_assert(sizeof(pusch_grid_metadata_v1) == 120);
 static_assert(sizeof(pusch_crc_metadata_v1) == 26);
 static_assert(sizeof(srs_channel_metadata_v1) == 66);
+static_assert(sizeof(srs_channel_metadata_v2) == 70);
 static_assert(sizeof(pusch_dmrs_channel_metadata_v1) == 70);
 static_assert(sizeof(gnb_metrics_json_metadata_v1) == 16);
 

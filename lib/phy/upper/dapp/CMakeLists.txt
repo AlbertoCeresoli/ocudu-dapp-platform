@@ -8,6 +8,7 @@ add_library(ocudu_phy_dapp_adapters STATIC
         pusch_dapp_demodulator.cpp
         pusch_resident_dapp.cpp
         resource_grid_tensor_adapter.cpp
+        srs_dapp_channel_estimator.cpp
         upper_phy_dapp_data_router.cpp
         upper_phy_dapp_hook_provider.cpp
         upper_phy_dapp_process_target.cpp)
@@ -26,10 +27,11 @@ if(CUDA_ACCEL_FOUND)
     target_sources(ocudu_phy_dapp_adapters PRIVATE
             class_c_cuda_export_pool.cpp
             srs_channel_estimate_cuda.cu
+            srs_dapp_channel_estimator_cuda.cu
             srs_channel_estimate_tensor_adapter.cpp)
     target_compile_definitions(ocudu_phy_dapp_adapters PRIVATE ENABLE_CUDA)
     target_link_libraries(ocudu_phy_dapp_adapters PUBLIC CUDA::cudart CUDA::cuda_driver)
-    # Device code is contained in one translation unit; keep the static archive
+    # Each CUDA translation unit is self-contained; keep the static archive
     # directly linkable from ordinary C++ targets without a device-link step.
     set_target_properties(ocudu_phy_dapp_adapters PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 endif()

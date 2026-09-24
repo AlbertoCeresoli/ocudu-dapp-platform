@@ -31,6 +31,7 @@ from ocudu_e3.telemetry import (  # noqa: E402
     _PUSCH_CRC,
     _PUSCH_SYMBOLS,
     _SRS,
+    _SRS_PILOTS,
     _SYMBOLS_V2_TAIL,
     PuschCrcRecord,
     PuschDmrsChannelRecord,
@@ -329,6 +330,24 @@ class PackedStoreLayoutTests(unittest.TestCase):
         samples = list(record.samples())
         self.assertEqual(complex(samples[0]), 1.0 + 0.0j)
         self.assertEqual(complex(samples[1]), -1.0j)
+        self.assertEqual(record.received_pilots, b"")
+
+    # -- srs v2 (70 B): the dApp input rides after the estimate ---------------
+    def test_srs_v2_splits_estimate_pilots_and_reference(self):
+        body = _SRS.pack(0x17, 900, 15, 1, 2, 4, 1, 1, 0, 0, 12, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0,
+                         -70.0, -72.0, 0.1, 150.0) + _SRS_PILOTS.pack(2, 2, 0)
+        metadata = header(kind=3) + body
+        estimate = struct.pack("<4f", 1.0, 0.0, 0.0, 1.0)
+        pilots = struct.pack("<8f", 1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0)
+        reference = struct.pack("<4f", 1.0, 0.0, 0.0, -1.0)
+        record = decode_store_publication(STORE_INTERFACES["srs.channel"], metadata, estimate + pilots + reference)
+        self.assertEqual(record.coefficients, estimate)
+        self.assertEqual(record.received_pilots, pilots)
+        self.assertEqual(record.reference_symbols, reference)
+        self.assertEqual([complex(value) for value in record.pilots()], [1, 1j, -1, -1j])
+        self.assertEqual([complex(value) for value in record.reference()], [1, -1j])
+        with self.assertRaises(ValueError):
+            decode_store_publication(STORE_INTERFACES["srs.channel"], metadata + b"\x00", estimate)
 
     # -- dmrs (70 B) --------------------------------------------------------
     def test_dmrs_round_trip(self):

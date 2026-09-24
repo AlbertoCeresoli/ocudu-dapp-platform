@@ -324,7 +324,7 @@ telemetry identifiers:
 |----|--------|---------|------------------|
 | 1 | `pusch.symbols` | per-UE equalized PUSCH symbols plus SINR/EPRE/RSRP/EVM/TA/CFO | constellation, link-quality history |
 | 2 | `pusch.crc` | per-TB CRC outcome | BLER |
-| 3 | `srs.channel` | Per-subcarrier SRS channel response per port pair plus RSRP/EPRE/TA | SRS pane, positioning experiments |
+| 3 | `srs.channel` | Per-subcarrier SRS channel response per port pair plus RSRP/EPRE/TA, the received pilots and the reference sequence | SRS pane, positioning experiments, SRS estimator datasets |
 | 4 | `pusch.dmrs_channel` | PUSCH DM-RS channel estimate | channel research |
 | 5 | `gnb.metrics_json` | the periodic gNB JSON metrics report (needs `metrics.enable_json: true`) | UE table, MCS/BLER/throughput history, cell/DU/CU metrics |
 | 6 | `classc.spectrum` | Class-C spectrum snapshot (`OCC3` metadata + resource grid) | spectrum sensing observers |

@@ -6,6 +6,7 @@
 #include "ocudu/dapp/e3/management_service.h"
 #include "ocudu/dapp/e3/portable_data_store.h"
 #include "ocudu/dapp/runtime/pusch_route_table.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include "ocudu/scheduler/dapp/quiet_reservation.h"
 #include <chrono>
 #include <cstring>
@@ -501,6 +502,11 @@ TEST(dapp_e3_aper_codec, roundtrips_inventory_and_management_payloads)
                            OCUDU_DAPP_PUSCH_CAP_RESIDENT_ACCELERATOR_V1};
   class_a.pusch = interface_record::pusch_profile{275, 64, 2, 15, 3, 0};
   package.interfaces.push_back(class_a);
+  interface_record srs_estimator = class_a;
+  srs_estimator.interface_id     = OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1;
+  srs_estimator.pusch.reset();
+  srs_estimator.srs = interface_record::srs_profile{8, 4, 1632, 3};
+  package.interfaces.push_back(srs_estimator);
   package.compatible = true;
   std::fill(package.content_digest.begin(), package.content_digest.end(), 0x5a);
   package.signature_status = package_signature_status::verified;
@@ -565,6 +571,11 @@ TEST(dapp_e3_aper_codec, roundtrips_inventory_and_management_payloads)
   EXPECT_EQ(decoded_inventory.packages[0].interfaces[0].state, binding_state::unbound);
   ASSERT_TRUE(decoded_inventory.packages[0].interfaces[1].pusch);
   EXPECT_EQ(decoded_inventory.packages[0].interfaces[1].pusch->max_nof_layers, 2U);
+  EXPECT_FALSE(decoded_inventory.packages[0].interfaces[1].srs);
+  const auto& srs_estimator_decoded = decoded_inventory.packages[0].interfaces[2];
+  EXPECT_FALSE(srs_estimator_decoded.pusch);
+  ASSERT_TRUE(srs_estimator_decoded.srs);
+  EXPECT_EQ(*srs_estimator_decoded.srs, (interface_record::srs_profile{8, 4, 1632, 3}));
   EXPECT_EQ(decoded_inventory.instances[0].state, OCUDU_DAPP_STATE_ACTIVE_V1);
   EXPECT_EQ(decoded_inventory.instances[0].interfaces[0].requirement, binding_requirement::optional);
   EXPECT_EQ(decoded_inventory.instances[0].interfaces[0].state, binding_state::unavailable);

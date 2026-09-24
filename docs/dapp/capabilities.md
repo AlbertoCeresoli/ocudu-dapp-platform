@@ -52,6 +52,7 @@ message layout: [e3_wire.md](e3_wire.md); operations:
 | Seam | Class | Timing character | Placement | Authority |
 |------|-------|------------------|-----------|-----------|
 | PUSCH CE / EQ / RX | A | Inline, enqueue-bound; completion tracked with soft wall budgets | In-process only | Replaces one L1 stage; conventional stage remains fallback |
+| SRS channel estimator | A | Inline on the SRS executor; completion tracked with a soft wall | In-process only | Replaces the SRS estimator; the host estimator remains fallback |
 | Scheduler policy | B | Complete boundary ~100 µs including validation and commit | In-process | Bounded intents under host allow flags; host stays the oracle |
 | Spectrum / SRS-ISAC observation | C | Open-loop; producer never waits | Native or supervised process | Publishes results into host caches; quiet requests need host grant |
 | Management and telemetry | E3 | Off the real-time path (management executors) | Local socket, SCTP | Full lifecycle/config/model/RAN control; push and pull observation |
@@ -67,6 +68,13 @@ slot-processing path. Three v1 interfaces cover the PUSCH receive chain
 | Channel estimator (`channel_estimator.h`) | `0x00010003` | PUSCH channel and noise estimation |
 | Equalizer (`equalizer.h`) | `0x00010004` | Channel estimation + MIMO equalization + post-EQ noise |
 | Receiver (`receiver.h`) | `0x00010005` | The full chain through soft demapping (grid in, LLRs out) |
+
+A fourth Class-A interface replaces the SRS channel estimator
+(`srs_channel_estimator.h`, `0x00010007`): SRS pilots and reference sequences
+in, the wideband channel matrix, noise, EPRE, RSRP and time alignment out. Its
+contract, profile and metrics are in
+[srs_channel_estimator.md](srs_channel_estimator.md); the rest of this section
+describes the PUSCH interfaces.
 
 All three consume the same inputs — the received resource grid plus typed
 PUSCH and DM-RS metadata — and differ in how much of the chain they own and

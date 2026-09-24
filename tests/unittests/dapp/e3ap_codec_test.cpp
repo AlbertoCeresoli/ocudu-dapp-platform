@@ -340,6 +340,16 @@ TEST(dapp_e3ap_codec, telemetry_indications_round_trip_every_record_kind)
   ASSERT_TRUE(std::get<srs_channel_record>(decoded.value->object).comb_offset);
   EXPECT_EQ(*std::get<srs_channel_record>(decoded.value->object).comb_offset, 2U);
   EXPECT_FALSE(std::get<srs_channel_record>(decoded.value->object).sequence_id);
+  EXPECT_TRUE(std::get<srs_channel_record>(decoded.value->object).received_pilots.empty());
+  srs.received_pilots   = samples(3, 0.5F);
+  srs.reference_symbols = samples(1, -1.0F);
+  indication.object     = srs;
+  encoded               = e3ap_codec::encode(indication);
+  ASSERT_TRUE(encoded) << encoded.detail;
+  decoded = e3ap_codec::decode_telemetry(*encoded.value);
+  ASSERT_TRUE(decoded) << decoded.detail;
+  EXPECT_EQ(std::get<srs_channel_record>(decoded.value->object).received_pilots, srs.received_pilots);
+  EXPECT_EQ(std::get<srs_channel_record>(decoded.value->object).reference_symbols, srs.reference_symbols);
 
   pusch_dmrs_channel_record dmrs;
   dmrs.rnti               = 0x4601;

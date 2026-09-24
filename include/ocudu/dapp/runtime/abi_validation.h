@@ -27,6 +27,10 @@ enum class validation_error {
   forbidden_threading
 };
 
+/// True for the Class-A (inline L1) interfaces this host implements. Their use-case profile is
+/// ocudu_dapp_srs_profile_v1 for the SRS channel estimator and ocudu_dapp_pusch_profile_v1 otherwise.
+bool is_class_a_interface(uint32_t interface_id) noexcept;
+
 validation_error validate_tensor_view(const ocudu_dapp_tensor_view_v1& view) noexcept;
 /// Compares caller-owned storage identity while allowing the producer to publish a completion token.
 bool same_tensor_storage(const ocudu_dapp_tensor_view_v1& expected, const ocudu_dapp_tensor_view_v1& actual) noexcept;

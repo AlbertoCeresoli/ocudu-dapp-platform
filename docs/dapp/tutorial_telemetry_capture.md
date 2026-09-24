@@ -18,7 +18,7 @@ Reference docs: [e3_wire.md](e3_wire.md) (wire formats),
 |---|---|---|
 | `pusch.symbols` | 1 | per-UE equalized data I/Q for a whole grant + SINR/EVM/TA/CFO, **plus the full grant parameters and the gNB's CRC verdict** — the offline-replay stream |
 | `pusch.crc` | 2 | rnti, slot, CRC ok/KO — the lightest link-quality signal |
-| `srs.channel` | 3 | SRS channel coefficients + RSRP/EPRE/noise/TA(ns) |
+| `srs.channel` | 3 | SRS channel coefficients + RSRP/EPRE/noise/TA(ns), with the received pilots and reference sequence (the SRS channel-estimator dApp input; the SDK's `examples/e3_srs_dataset` turns it into datasets) |
 | `pusch.dmrs_channel` | 4 | DM-RS channel estimates + per-grant quality |
 | `gnb.metrics_json` | 5 | the gNB's JSON metrics report, byte-for-byte |
 | `classc.spectrum` | 6 | Class-C spectrum snapshot (FlatBuffers metadata + tensor) |

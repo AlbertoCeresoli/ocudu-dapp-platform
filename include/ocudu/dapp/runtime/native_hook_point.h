@@ -70,6 +70,9 @@ public:
   native_invocation_result invoke(uint32_t                                     lane,
                                   const ocudu_dapp_channel_estimator_input_v1& input,
                                   ocudu_dapp_channel_estimator_output_v1&      output) noexcept;
+  native_invocation_result invoke(uint32_t                                         lane,
+                                  const ocudu_dapp_srs_channel_estimator_input_v1& input,
+                                  ocudu_dapp_srs_channel_estimator_output_v1&      output) noexcept;
   native_invocation_result
   invoke(uint32_t lane, const ocudu_dapp_equalizer_input_v1& input, ocudu_dapp_equalizer_output_v1& output) noexcept;
   native_invocation_result

@@ -10,6 +10,7 @@
 #include "ocudu/dapp/use_cases/v1/receiver_completion.h"
 #include "ocudu/dapp/use_cases/v1/scheduler.h"
 #include "ocudu/dapp/use_cases/v1/spectrum.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include "ocudu/dapp/use_cases/v1/srs_isac.h"
 #include <cstdint>
 #include <memory>
@@ -73,6 +74,8 @@ public:
 
   native_invocation_result invoke(const ocudu_dapp_channel_estimator_input_v1& input,
                                   ocudu_dapp_channel_estimator_output_v1&      output) noexcept;
+  native_invocation_result invoke(const ocudu_dapp_srs_channel_estimator_input_v1& input,
+                                  ocudu_dapp_srs_channel_estimator_output_v1&      output) noexcept;
   native_invocation_result invoke(const ocudu_dapp_equalizer_input_v1& input,
                                   ocudu_dapp_equalizer_output_v1&      output) noexcept;
   native_invocation_result invoke(const ocudu_dapp_receiver_input_v1& input,

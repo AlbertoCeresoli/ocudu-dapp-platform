@@ -6,7 +6,7 @@ target_include_directories(dapp_c_abi_compile_test PRIVATE ${PROJECT_SOURCE_DIR}
 
 set(DAPP_TEST_CATALOG ${CMAKE_CURRENT_BINARY_DIR}/catalog)
 foreach(fixture
-    valid v1_pre_profile class_a class_b class_c class_c_srs multi optional_multi missing_query
+    valid v1_pre_profile class_a class_a_srs class_b class_c class_c_srs multi optional_multi missing_query
     throwing_query crashing_query hanging_query
     throwing_create crashing_prepare hanging_start throwing_worker throwing_invoke rejected_query invalid_descriptor
     executable_stack sandbox_probe)
@@ -163,6 +163,7 @@ add_dependencies(dapp_runtime_test
   dapp_valid_fixture
   dapp_v1_pre_profile_fixture
   dapp_class_a_fixture
+  dapp_class_a_srs_fixture
   dapp_class_b_fixture
   dapp_class_c_fixture
   dapp_class_c_srs_fixture
@@ -243,6 +244,7 @@ target_compile_definitions(dapp_runtime_test PRIVATE
   DAPP_VALID_FIXTURE="$<TARGET_FILE:dapp_valid_fixture>"
   DAPP_V1_PRE_PROFILE_FIXTURE="$<TARGET_FILE:dapp_v1_pre_profile_fixture>"
   DAPP_CLASS_A_FIXTURE="$<TARGET_FILE:dapp_class_a_fixture>"
+  DAPP_CLASS_A_SRS_FIXTURE="$<TARGET_FILE:dapp_class_a_srs_fixture>"
   DAPP_CLASS_B_FIXTURE="$<TARGET_FILE:dapp_class_b_fixture>"
   DAPP_CLASS_C_FIXTURE="$<TARGET_FILE:dapp_class_c_fixture>"
   DAPP_CLASS_C_SRS_FIXTURE="$<TARGET_FILE:dapp_class_c_srs_fixture>"
@@ -293,12 +295,13 @@ gtest_discover_tests(dapp_composition_test PROPERTIES LABELS "dapp;integration;t
 add_executable(dapp_native_hook_tsan_test native_instance_test.cpp)
 target_link_libraries(dapp_native_hook_tsan_test ocudu_dapp_runtime GTest::gtest ocudu_gtest_main)
 add_dependencies(dapp_native_hook_tsan_test
-  dapp_valid_fixture dapp_class_a_fixture dapp_class_b_fixture dapp_class_c_fixture
+  dapp_valid_fixture dapp_class_a_fixture dapp_class_a_srs_fixture dapp_class_b_fixture dapp_class_c_fixture
   dapp_class_c_srs_fixture)
 target_compile_definitions(dapp_native_hook_tsan_test PRIVATE
   DAPP_TEST_CATALOG="${DAPP_TEST_CATALOG}"
   DAPP_VALID_FIXTURE="$<TARGET_FILE:dapp_valid_fixture>"
   DAPP_CLASS_A_FIXTURE="$<TARGET_FILE:dapp_class_a_fixture>"
+  DAPP_CLASS_A_SRS_FIXTURE="$<TARGET_FILE:dapp_class_a_srs_fixture>"
   DAPP_CLASS_B_FIXTURE="$<TARGET_FILE:dapp_class_b_fixture>"
   DAPP_CLASS_C_FIXTURE="$<TARGET_FILE:dapp_class_c_fixture>"
   DAPP_CLASS_C_SRS_FIXTURE="$<TARGET_FILE:dapp_class_c_srs_fixture>")

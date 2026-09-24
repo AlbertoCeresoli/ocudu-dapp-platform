@@ -229,6 +229,34 @@ TEST(dapp_telemetry_publisher, publishes_crc_srs_dmrs_and_json_records)
   EXPECT_EQ(std::get<srs_channel_record>(channel.value->object).rx_port_index, 1U);
   ASSERT_TRUE(std::get<srs_channel_record>(channel.value->object).rsrp_db);
   EXPECT_EQ(std::get<srs_channel_record>(channel.value->object).coefficients.size(), 16U);
+  EXPECT_TRUE(std::get<srs_channel_record>(channel.value->object).received_pilots.empty());
+
+  // With the dApp input attached, the record splits the tensor back into estimate, pilots and reference.
+  std::vector<std::complex<float>> pilots{{1, 0}, {0, 1}, {-1, 0}, {0, -1}};
+  std::vector<std::complex<float>> reference{{1, 0}, {0, -1}};
+  srs.nof_symbols       = 2;
+  srs.received_pilots   = pilots;
+  srs.reference_symbols = reference;
+  publisher.on_srs_channel(srs);
+  ASSERT_TRUE(drain_one(*store, make_id(4), metadata, tensor, first));
+  EXPECT_EQ(metadata.size(), sizeof(srs_channel_metadata_v2));
+  auto with_pilots = e3ap_codec::from_publication(first.interface_id, 0, 1, first.route_epoch, 0, metadata, tensor);
+  ASSERT_TRUE(with_pilots) << with_pilots.detail;
+  const auto& record = std::get<srs_channel_record>(with_pilots.value->object);
+  EXPECT_EQ(record.coefficients.size(), 16U);
+  ASSERT_EQ(record.received_pilots.size(), 32U);
+  ASSERT_EQ(record.reference_symbols.size(), 16U);
+  EXPECT_EQ(std::memcmp(record.received_pilots.data(), pilots.data(), 32), 0);
+  EXPECT_EQ(std::memcmp(record.reference_symbols.data(), reference.data(), 16), 0);
+
+  // An inconsistent pilot set is not published: the record keeps only the estimate.
+  srs.nof_symbols = 1;
+  publisher.on_srs_channel(srs);
+  ASSERT_TRUE(drain_one(*store, make_id(4), metadata, tensor, first));
+  auto partial = e3ap_codec::from_publication(first.interface_id, 0, 1, first.route_epoch, 0, metadata, tensor);
+  ASSERT_TRUE(partial) << partial.detail;
+  EXPECT_TRUE(std::get<srs_channel_record>(partial.value->object).received_pilots.empty());
+  EXPECT_EQ(std::get<srs_channel_record>(partial.value->object).coefficients.size(), 16U);
 
   ASSERT_TRUE(drain_one(*store, make_id(5), metadata, tensor, first));
   auto estimate = e3ap_codec::from_publication(first.interface_id, 0, 1, first.route_epoch, 0, metadata, tensor);

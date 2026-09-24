@@ -1301,6 +1301,14 @@ void set_object(Telemetry_Object_t& destination, const srs_channel_record& sourc
   set_optional_small(record.frequencyShift, source.frequency_shift, 65535, "frequency shift");
   set_optional_small(record.frequencyHopping, source.frequency_hopping, 255, "frequency hopping");
   set_samples(record.coefficients, source.coefficients);
+  if (!source.received_pilots.empty()) {
+    record.receivedPilots = make_asn<Cf32Samples_t>();
+    set_samples(*record.receivedPilots, source.received_pilots);
+  }
+  if (!source.reference_symbols.empty()) {
+    record.referenceSymbols = make_asn<Cf32Samples_t>();
+    set_samples(*record.referenceSymbols, source.reference_symbols);
+  }
 }
 
 srs_channel_record read_object(const SrsChannelRecord_t& source)
@@ -1334,6 +1342,12 @@ srs_channel_record read_object(const SrsChannelRecord_t& source)
   result.frequency_shift      = read_optional_small<uint16_t>(source.frequencyShift, 65535, "frequency shift");
   result.frequency_hopping    = read_optional_small<uint8_t>(source.frequencyHopping, 255, "frequency hopping");
   result.coefficients         = read_samples(source.coefficients);
+  if (source.receivedPilots != nullptr) {
+    result.received_pilots = read_samples(*source.receivedPilots);
+  }
+  if (source.referenceSymbols != nullptr) {
+    result.reference_symbols = read_samples(*source.referenceSymbols);
+  }
   return result;
 }
 
@@ -1992,11 +2006,24 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
         break;
       }
       case telemetry_kind::srs_channel: {
-        srs_channel_metadata_v1 source;
-        if (metadata.size() != sizeof(source)) {
+        srs_channel_metadata_v2 extended;
+        if (metadata.size() == sizeof(extended)) {
+          std::memcpy(&extended, metadata.data(), sizeof(extended));
+        } else if (metadata.size() == sizeof(extended.base)) {
+          std::memcpy(&extended.base, metadata.data(), sizeof(extended.base));
+        } else {
           return {std::nullopt, "SRS channel metadata size mismatch"};
         }
-        std::memcpy(&source, metadata.data(), sizeof(source));
+        const srs_channel_metadata_v1& source = extended.base;
+        // Tensor: estimate, then optionally pilots (symbols x length) and the reference sequence (length).
+        constexpr std::size_t sample   = 2 * sizeof(float);
+        const std::size_t     estimate = static_cast<std::size_t>(source.nof_subcarriers) * sample;
+        const std::size_t pilots    = static_cast<std::size_t>(extended.pilot_symbols) * extended.pilot_length * sample;
+        const std::size_t reference = static_cast<std::size_t>(extended.pilot_length) * sample;
+        const bool        with_pilots = extended.pilot_length != 0;
+        if (include_bulk && with_pilots && tensor.size() != estimate + pilots + reference) {
+          return {std::nullopt, "SRS channel tensor size mismatch"};
+        }
         srs_channel_record record;
         record.rnti                       = source.rnti;
         record.radio_slot                 = radio(source.radio_slot);
@@ -2024,7 +2051,11 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
         record.frequency_position         = source.frequency_position;
         record.frequency_shift            = source.frequency_shift;
         record.frequency_hopping          = source.frequency_hopping;
-        if (include_bulk) {
+        if (include_bulk && with_pilots) {
+          record.coefficients.assign(tensor.begin(), tensor.begin() + estimate);
+          record.received_pilots.assign(tensor.begin() + estimate, tensor.begin() + estimate + pilots);
+          record.reference_symbols.assign(tensor.begin() + estimate + pilots, tensor.end());
+        } else if (include_bulk) {
           record.coefficients.assign(tensor.begin(), tensor.end());
         }
         result.object = std::move(record);

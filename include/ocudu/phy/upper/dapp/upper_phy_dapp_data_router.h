@@ -17,6 +17,7 @@ namespace ocudu {
 class resource_grid_reader;
 class pusch_dapp_channel_estimator_target;
 class pusch_dapp_demodulator_target;
+class srs_dapp_channel_estimator_target;
 struct srs_estimator_configuration;
 struct srs_estimator_result;
 class upper_phy_dapp_hook_provider;
@@ -109,6 +110,8 @@ public:
 };
 
 /// Creates the concrete OCUDU factory decorator used by DU-low construction.
+/// \param srs_channel_estimator Class-A SRS channel-estimator target; it takes one of the \p nof_srs_lanes lanes
+///                              per SRS estimator, like the Class-C publication.
 /// \param nof_srs_lanes Number of SRS publication lanes registered with the router. The SRS
 ///                       estimator decorator hands out one lane per estimator instance, so this
 ///                       bounds how many estimators the upper PHY may build. It is not the SRS
@@ -117,9 +120,10 @@ public:
 ///                       uplink resource grid.
 std::shared_ptr<upper_phy_dapp_hook_provider>
 create_upper_phy_dapp_hook_provider(std::shared_ptr<upper_phy_dapp_data_router>          router,
-                                    std::shared_ptr<pusch_dapp_channel_estimator_target> channel_estimator = {},
-                                    std::shared_ptr<pusch_dapp_demodulator_target>       demodulator       = {},
-                                    uint32_t                                             nof_srs_lanes     = 0);
+                                    std::shared_ptr<pusch_dapp_channel_estimator_target> channel_estimator     = {},
+                                    std::shared_ptr<pusch_dapp_demodulator_target>       demodulator           = {},
+                                    uint32_t                                             nof_srs_lanes         = 0,
+                                    std::shared_ptr<srs_dapp_channel_estimator_target>   srs_channel_estimator = {});
 
 /// Builds an immutable, bounded fanout table and preallocates all SRS reference scratch.
 upper_phy_dapp_data_router_create_result

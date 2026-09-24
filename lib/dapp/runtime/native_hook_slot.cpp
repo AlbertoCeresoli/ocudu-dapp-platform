@@ -109,6 +109,14 @@ native_invocation_result native_hook_slot::invoke(const ocudu_dapp_channel_estim
   return worker != nullptr ? worker->invoke(input, output) : native_invocation_result{OCUDU_DAPP_BYPASS_V1, true};
 }
 
+native_invocation_result native_hook_slot::invoke(const ocudu_dapp_srs_channel_estimator_input_v1& input,
+                                                  ocudu_dapp_srs_channel_estimator_output_v1&      output) noexcept
+{
+  reader_guard   guard(*this);
+  native_worker* worker = guard.get();
+  return worker != nullptr ? worker->invoke(input, output) : native_invocation_result{OCUDU_DAPP_BYPASS_V1, true};
+}
+
 native_invocation_result native_hook_slot::invoke(const ocudu_dapp_equalizer_input_v1& input,
                                                   ocudu_dapp_equalizer_output_v1&      output) noexcept
 {

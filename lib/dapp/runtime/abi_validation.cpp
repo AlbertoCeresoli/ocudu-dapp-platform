@@ -8,6 +8,7 @@
 #include "ocudu/dapp/use_cases/v1/receiver.h"
 #include "ocudu/dapp/use_cases/v1/scheduler.h"
 #include "ocudu/dapp/use_cases/v1/spectrum.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include "ocudu/dapp/use_cases/v1/srs_isac.h"
 #include <cstddef>
 #include <limits>
@@ -34,6 +35,32 @@ bool valid_pusch_profile(const ocudu_dapp_pusch_profile_v1& profile) noexcept
          profile.dmrs_type_mask != 0 && (profile.dmrs_type_mask & ~dmrs) == 0 &&
          (profile.flags &
           ~(OCUDU_DAPP_PUSCH_PROFILE_TRANSFORM_PRECODING_V1 | OCUDU_DAPP_PUSCH_PROFILE_DC_OVERLAP_V1)) == 0;
+}
+
+bool valid_srs_profile(const ocudu_dapp_srs_profile_v1& profile) noexcept
+{
+  constexpr uint32_t minimum = offsetof(ocudu_dapp_srs_profile_v1, reserved);
+  constexpr uint32_t combs   = OCUDU_DAPP_SRS_COMB_2_V1 | OCUDU_DAPP_SRS_COMB_4_V1;
+  return valid_abi(profile.struct_size, profile.abi_major, minimum) &&
+         profile.profile_id == OCUDU_DAPP_SRS_PROFILE_V1 && profile.max_nof_rx_ports != 0 &&
+         profile.max_nof_rx_ports <= OCUDU_DAPP_SRS_MAX_RX_PORTS_V1 && profile.max_nof_tx_ports != 0 &&
+         profile.max_nof_tx_ports <= OCUDU_DAPP_SRS_MAX_TX_PORTS_V1 && profile.max_sequence_length != 0 &&
+         profile.max_sequence_length <= OCUDU_DAPP_SRS_MAX_SEQUENCE_LENGTH_V1 && profile.comb_mask != 0 &&
+         (profile.comb_mask & ~combs) == 0 && profile.flags == 0;
+}
+
+/// A Class-A interface carries the profile of its use case; the SRS estimator's is mandatory.
+bool valid_use_case_profile(const ocudu_dapp_interface_descriptor_v1& interface) noexcept
+{
+  const bool srs = interface.interface_id == OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1;
+  if (interface.use_case_profile == nullptr) {
+    return !srs;
+  }
+  if (interface.dapp_class != OCUDU_DAPP_CLASS_A_INLINE_V1) {
+    return false;
+  }
+  return srs ? valid_srs_profile(*static_cast<const ocudu_dapp_srs_profile_v1*>(interface.use_case_profile))
+             : valid_pusch_profile(*static_cast<const ocudu_dapp_pusch_profile_v1*>(interface.use_case_profile));
 }
 
 validation_error validate_worker_api(const ocudu_dapp_worker_api_v1& worker) noexcept
@@ -73,6 +100,10 @@ validation_error validate_known_interface_api(const ocudu_dapp_interface_descrip
     }
     case OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1: {
       const auto& api = *static_cast<const ocudu_dapp_channel_estimator_interface_v1*>(descriptor.interface_vtable);
+      return validate_interface_api(api, descriptor.interface_major, api.invoke != nullptr);
+    }
+    case OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1: {
+      const auto& api = *static_cast<const ocudu_dapp_srs_channel_estimator_interface_v1*>(descriptor.interface_vtable);
       return validate_interface_api(api, descriptor.interface_major, api.invoke != nullptr);
     }
     case OCUDU_DAPP_INTERFACE_EQUALIZER_V1: {
@@ -270,10 +301,7 @@ validation_error ocudu::dapp::validate_module_descriptor(const ocudu_dapp_module
     if (interface_api != validation_error::none) {
       return interface_api;
     }
-    const bool class_a = interface.dapp_class == OCUDU_DAPP_CLASS_A_INLINE_V1;
-    if (interface.use_case_profile != nullptr &&
-        (!class_a ||
-         !valid_pusch_profile(*static_cast<const ocudu_dapp_pusch_profile_v1*>(interface.use_case_profile)))) {
+    if (!valid_use_case_profile(interface)) {
       return validation_error::invalid_dimensions;
     }
     for (uint32_t j = 0; j != i; ++j) {
@@ -294,6 +322,13 @@ validation_error ocudu::dapp::validate_module_descriptor(const ocudu_dapp_module
     }
   }
   return validation_error::none;
+}
+
+bool ocudu::dapp::is_class_a_interface(uint32_t interface_id) noexcept
+{
+  return interface_id == OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1 ||
+         interface_id == OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1 ||
+         interface_id == OCUDU_DAPP_INTERFACE_EQUALIZER_V1 || interface_id == OCUDU_DAPP_INTERFACE_RECEIVER_V1;
 }
 
 const char* ocudu::dapp::to_string(validation_error error) noexcept

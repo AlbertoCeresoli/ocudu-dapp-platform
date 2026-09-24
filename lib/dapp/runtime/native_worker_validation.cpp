@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 
@@ -126,6 +127,127 @@ classify_unsupported_pusch(uint32_t                            interface_id,
                                                    : 0;
   if (dmrs_bit == 0 || (profile.dmrs_type_mask & dmrs_bit) == 0) {
     return class_a_fallback_reason::unsupported_dmrs;
+  }
+  return std::nullopt;
+}
+
+namespace {
+
+bool read_srs_metadata(const ocudu_dapp_typed_metadata_v1&                  wrapper,
+                       const ocudu_dapp_srs_channel_estimator_metadata_v1*& metadata) noexcept
+{
+  constexpr uint32_t wrapper_minimum  = offsetof(ocudu_dapp_typed_metadata_v1, metadata) + sizeof(wrapper.metadata);
+  constexpr uint32_t metadata_minimum = offsetof(ocudu_dapp_srs_channel_estimator_metadata_v1, reserved);
+  if (wrapper.struct_size < wrapper_minimum || wrapper.abi_major != OCUDU_DAPP_ABI_MAJOR_V1 ||
+      wrapper.metadata_schema_id != OCUDU_DAPP_METADATA_SRS_CHANNEL_ESTIMATOR_V1 ||
+      wrapper.metadata_schema_version != 1 || wrapper.metadata.data == nullptr ||
+      wrapper.metadata.size < metadata_minimum) {
+    return false;
+  }
+  metadata = static_cast<const ocudu_dapp_srs_channel_estimator_metadata_v1*>(wrapper.metadata.data);
+  return metadata->struct_size >= metadata_minimum && metadata->abi_major == OCUDU_DAPP_ABI_MAJOR_V1;
+}
+
+/// The occasion is one the SRS configuration of TS 38.211 Section 6.4.1.4 can produce.
+bool consistent_srs_metadata(const ocudu_dapp_srs_channel_estimator_metadata_v1& srs) noexcept
+{
+  const bool interleaved = (srs.flags & OCUDU_DAPP_SRS_FLAG_INTERLEAVED_PILOTS_V1) != 0;
+  const bool valid_comb  = (srs.comb_size == 2 && srs.n_cs_max == 8) || (srs.comb_size == 4 && srs.n_cs_max == 12);
+  if ((srs.flags & ~OCUDU_DAPP_SRS_FLAG_INTERLEAVED_PILOTS_V1) != 0 || srs.nof_rx_ports == 0 ||
+      srs.nof_rx_ports > OCUDU_DAPP_SRS_MAX_RX_PORTS_V1 ||
+      (srs.nof_tx_ports != 1 && srs.nof_tx_ports != 2 && srs.nof_tx_ports != 4) || srs.nof_symbols == 0 ||
+      srs.start_symbol >= OCUDU_DAPP_SRS_MAX_SYMBOLS_V1 ||
+      srs.nof_symbols > OCUDU_DAPP_SRS_MAX_SYMBOLS_V1 - srs.start_symbol || srs.sequence_length == 0 ||
+      srs.sequence_length > OCUDU_DAPP_SRS_MAX_SEQUENCE_LENGTH_V1 || !valid_comb ||
+      srs.nof_pilot_sets != (interleaved ? 2U : 1U) || (interleaved && srs.nof_tx_ports != 4) ||
+      srs.sequence_group >= 30 || srs.sequence_number > 1 || srs.numerology > 4 ||
+      srs.subcarrier_spacing_hz != (15000U << srs.numerology) || srs.grid_nof_subcarriers == 0 ||
+      !std::isfinite(srs.max_time_alignment_s) || !(srs.max_time_alignment_s > 0.0)) {
+    return false;
+  }
+  for (uint32_t set = 0; set != srs.nof_pilot_sets; ++set) {
+    const uint64_t last = srs.first_subcarrier[set] + static_cast<uint64_t>(srs.comb_size) * (srs.sequence_length - 1);
+    if (last >= srs.grid_nof_subcarriers) {
+      return false;
+    }
+  }
+  for (uint32_t port = 0; port != srs.nof_tx_ports; ++port) {
+    if (srs.pilot_set[port] >= srs.nof_pilot_sets || srs.cyclic_shift[port] >= srs.n_cs_max) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool srs_tensor(const ocudu_dapp_tensor_view_v1& tensor,
+                uint32_t                         element_type,
+                uint32_t                         layout_id,
+                std::initializer_list<uint64_t>  dimensions,
+                bool                             output) noexcept
+{
+  if (!(output ? valid_output_tensor(tensor) : valid_input_tensor(tensor)) || tensor.element_type != element_type ||
+      tensor.layout_id != layout_id || tensor.layout_version != 1 || tensor.rank != dimensions.size()) {
+    return false;
+  }
+  uint32_t index = 0;
+  for (uint64_t dimension : dimensions) {
+    if (tensor.dimensions[index++] != dimension) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool same_memory(const ocudu_dapp_tensor_view_v1& left, const ocudu_dapp_tensor_view_v1& right) noexcept
+{
+  return left.domain == right.domain && left.backend_id == right.backend_id &&
+         left.device_ordinal == right.device_ordinal;
+}
+
+} // namespace
+
+std::optional<class_a_fallback_reason>
+classify_srs_channel_estimator_input(const ocudu_dapp_srs_profile_v1&                  profile,
+                                     const ocudu_dapp_srs_channel_estimator_input_v1&  input,
+                                     const ocudu_dapp_srs_channel_estimator_output_v1& output) noexcept
+{
+  const ocudu_dapp_srs_channel_estimator_metadata_v1* srs = nullptr;
+  if (!read_srs_metadata(input.srs, srs) || !consistent_srs_metadata(*srs)) {
+    return class_a_fallback_reason::unsupported_metadata;
+  }
+  if (!srs_tensor(input.rx_symbols,
+                  OCUDU_DAPP_ELEMENT_CF32_V1,
+                  OCUDU_DAPP_LAYOUT_SRS_RX_SET_PORT_SYMBOL_PILOT_CF32_V1,
+                  {srs->nof_pilot_sets, srs->nof_rx_ports, srs->nof_symbols, srs->sequence_length},
+                  false) ||
+      !srs_tensor(input.reference_symbols,
+                  OCUDU_DAPP_ELEMENT_CF32_V1,
+                  OCUDU_DAPP_LAYOUT_SRS_REFERENCE_TX_PILOT_CF32_V1,
+                  {srs->nof_tx_ports, srs->sequence_length},
+                  false) ||
+      !srs_tensor(output.channel_matrix,
+                  OCUDU_DAPP_ELEMENT_CF32_V1,
+                  OCUDU_DAPP_LAYOUT_SRS_CHANNEL_MATRIX_RX_TX_CF32_V1,
+                  {srs->nof_rx_ports, srs->nof_tx_ports},
+                  true) ||
+      !srs_tensor(output.measurements,
+                  OCUDU_DAPP_ELEMENT_F32_V1,
+                  OCUDU_DAPP_LAYOUT_SRS_MEASUREMENTS_F32_V1,
+                  {OCUDU_DAPP_SRS_MEASUREMENT_COUNT_V1},
+                  true) ||
+      !same_memory(input.rx_symbols, input.reference_symbols) ||
+      !same_memory(input.rx_symbols, output.channel_matrix) || !same_memory(input.rx_symbols, output.measurements)) {
+    return class_a_fallback_reason::invalid_input;
+  }
+  if (srs->nof_rx_ports > profile.max_nof_rx_ports) {
+    return class_a_fallback_reason::unsupported_rx_ports;
+  }
+  if (srs->nof_tx_ports > profile.max_nof_tx_ports) {
+    return class_a_fallback_reason::unsupported_layers;
+  }
+  if (srs->sequence_length > profile.max_sequence_length ||
+      (profile.comb_mask & (srs->comb_size == 2 ? OCUDU_DAPP_SRS_COMB_2_V1 : OCUDU_DAPP_SRS_COMB_4_V1)) == 0) {
+    return class_a_fallback_reason::unsupported_allocation;
   }
   return std::nullopt;
 }
@@ -323,6 +445,8 @@ const ocudu_dapp_worker_api_v1* get_worker_api(const ocudu_dapp_interface_descri
   switch (descriptor.interface_id) {
     case OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1:
       return &static_cast<const ocudu_dapp_channel_estimator_interface_v1*>(descriptor.interface_vtable)->worker;
+    case OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1:
+      return &static_cast<const ocudu_dapp_srs_channel_estimator_interface_v1*>(descriptor.interface_vtable)->worker;
     case OCUDU_DAPP_INTERFACE_EQUALIZER_V1:
       return &static_cast<const ocudu_dapp_equalizer_interface_v1*>(descriptor.interface_vtable)->worker;
     case OCUDU_DAPP_INTERFACE_RECEIVER_V1:
@@ -343,6 +467,9 @@ bool valid_interface_callback(const ocudu_dapp_interface_descriptor_v1& descript
   switch (descriptor.interface_id) {
     case OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1:
       return static_cast<const ocudu_dapp_channel_estimator_interface_v1*>(descriptor.interface_vtable)->invoke !=
+             nullptr;
+    case OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1:
+      return static_cast<const ocudu_dapp_srs_channel_estimator_interface_v1*>(descriptor.interface_vtable)->invoke !=
              nullptr;
     case OCUDU_DAPP_INTERFACE_EQUALIZER_V1:
       return static_cast<const ocudu_dapp_equalizer_interface_v1*>(descriptor.interface_vtable)->invoke != nullptr;

@@ -7,6 +7,7 @@
 #include "ocudu/dapp/runtime/package_provenance.h"
 #include "ocudu/dapp/runtime/package_signature.h"
 #include "ocudu/dapp/use_cases/v1/channel_estimator.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -200,8 +201,16 @@ std::optional<ocudu_dapp_threading_v1> parse_threading(const std::string& value)
 
 std::optional<interface_record> parse_interface(const json& value)
 {
-  static constexpr std::initializer_list<const char*> fields = {
-      "interface_id", "major", "minor", "class", "placements", "threading", "binding", "capabilities", "pusch_profile"};
+  static constexpr std::initializer_list<const char*> fields = {"interface_id",
+                                                                "major",
+                                                                "minor",
+                                                                "class",
+                                                                "placements",
+                                                                "threading",
+                                                                "binding",
+                                                                "capabilities",
+                                                                "pusch_profile",
+                                                                "srs_profile"};
   if (!has_only_fields(value, fields) || !value.contains("interface_id") || !value.contains("major") ||
       !value.contains("minor") || !value.contains("class") || !value.contains("placements") ||
       !value.contains("threading") || !value.at("interface_id").is_number_unsigned() ||
@@ -284,8 +293,37 @@ std::optional<interface_record> parse_interface(const json& value)
       return std::nullopt;
     }
   }
+  std::optional<interface_record::srs_profile> srs;
+  if (value.contains("srs_profile")) {
+    static constexpr std::initializer_list<const char*> profile_fields = {
+        "max_rx_ports", "max_tx_ports", "max_sequence_length", "comb_mask"};
+    const auto& profile = value.at("srs_profile");
+    if (!profile.is_object() || !has_only_fields(profile, profile_fields)) {
+      return std::nullopt;
+    }
+    for (const char* field : profile_fields) {
+      if (!profile.contains(field) || !profile.at(field).is_number_unsigned() ||
+          profile.at(field).get<uint64_t>() > UINT32_MAX) {
+        return std::nullopt;
+      }
+    }
+    srs                          = interface_record::srs_profile{profile.at("max_rx_ports").get<uint32_t>(),
+                                        profile.at("max_tx_ports").get<uint32_t>(),
+                                        profile.at("max_sequence_length").get<uint32_t>(),
+                                        profile.at("comb_mask").get<uint32_t>()};
+    constexpr uint32_t all_combs = OCUDU_DAPP_SRS_COMB_2_V1 | OCUDU_DAPP_SRS_COMB_4_V1;
+    if (srs->max_nof_rx_ports == 0 || srs->max_nof_rx_ports > OCUDU_DAPP_SRS_MAX_RX_PORTS_V1 ||
+        srs->max_nof_tx_ports == 0 || srs->max_nof_tx_ports > OCUDU_DAPP_SRS_MAX_TX_PORTS_V1 ||
+        srs->max_sequence_length == 0 || srs->max_sequence_length > OCUDU_DAPP_SRS_MAX_SEQUENCE_LENGTH_V1 ||
+        srs->comb_mask == 0 || (srs->comb_mask & ~all_combs) != 0) {
+      return std::nullopt;
+    }
+  }
+  // Every Class-A interface declares the profile of its use case, and only that one.
   const bool class_a = *dapp_class == OCUDU_DAPP_CLASS_A_INLINE_V1;
-  if (class_a != pusch.has_value()) {
+  const bool srs_estimator = interface_id == OCUDU_DAPP_INTERFACE_SRS_CHANNEL_ESTIMATOR_V1;
+  if ((srs_estimator && !class_a) || pusch.has_value() != (class_a && !srs_estimator) ||
+      srs.has_value() != (class_a && srs_estimator)) {
     return std::nullopt;
   }
   return interface_record{static_cast<uint32_t>(interface_id),
@@ -297,7 +335,8 @@ std::optional<interface_record> parse_interface(const json& value)
                           capabilities,
                           pusch,
                           requirement,
-                          binding_state::unbound};
+                          binding_state::unbound,
+                          srs};
 }
 
 package_manifest_result

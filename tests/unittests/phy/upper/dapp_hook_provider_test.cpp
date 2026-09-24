@@ -246,7 +246,7 @@ TEST(dapp_hook_provider, srs_wrap_publishes_after_the_conventional_result_withou
   auto router           = std::make_shared<router_spy>();
   auto provider         = create_upper_phy_dapp_hook_provider(router);
   auto fallback_factory = std::make_shared<estimator_factory_spy>();
-  auto factory          = provider->decorate_srs_estimator(fallback_factory, 2);
+  auto factory          = provider->decorate_srs_estimator(fallback_factory, 2, 52);
   ASSERT_NE(factory, nullptr);
   EXPECT_NE(factory->create_validator(), nullptr);
   EXPECT_EQ(fallback_factory->validator_creations, 1U);

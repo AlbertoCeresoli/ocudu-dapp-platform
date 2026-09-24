@@ -8,6 +8,7 @@
 #include "ocudu/dapp/use_cases/v1/receiver.h"
 #include "ocudu/dapp/use_cases/v1/scheduler.h"
 #include "ocudu/dapp/use_cases/v1/spectrum.h"
+#include "ocudu/dapp/use_cases/v1/srs_channel_estimator.h"
 #include "ocudu/dapp/use_cases/v1/srs_isac.h"
 
 struct legacy_receiver_metrics_v1 {
@@ -22,6 +23,11 @@ _Static_assert(offsetof(ocudu_dapp_receiver_metrics_v1, equalized_symbols) == si
 _Static_assert(OCUDU_DAPP_RECEIVER_EQUALIZED_SYMBOLS_MIN_SIZE_V1 == sizeof(ocudu_dapp_receiver_metrics_v1),
                "symbol accessor must require the complete optional tensor");
 
+_Static_assert(sizeof(ocudu_dapp_srs_channel_estimator_metadata_v1) == 152, "SRS metadata layout is frozen in v1");
+_Static_assert(offsetof(ocudu_dapp_srs_channel_estimator_metadata_v1, max_time_alignment_s) == 112,
+               "SRS metadata: max_time_alignment_s is 8-byte aligned");
+_Static_assert(sizeof(ocudu_dapp_srs_profile_v1) == 64, "SRS profile layout is frozen in v1");
+
 uint32_t ocudu_dapp_c_abi_compile_test(void)
 {
   return (uint32_t)(sizeof(ocudu_dapp_module_v1) + sizeof(ocudu_dapp_management_v1) +
@@ -30,5 +36,6 @@ uint32_t ocudu_dapp_c_abi_compile_test(void)
                     sizeof(ocudu_dapp_equalizer_interface_v1) + sizeof(ocudu_dapp_receiver_interface_v1) +
                     sizeof(ocudu_dapp_scheduler_interface_v1) + sizeof(ocudu_dapp_pusch_metadata_v1) +
                     sizeof(ocudu_dapp_dmrs_metadata_v1) + sizeof(ocudu_dapp_spectrum_slot_metadata_v1) +
-                    sizeof(ocudu_dapp_srs_isac_metadata_v1));
+                    sizeof(ocudu_dapp_srs_isac_metadata_v1) + sizeof(ocudu_dapp_srs_channel_estimator_interface_v1) +
+                    sizeof(ocudu_dapp_srs_channel_estimator_metadata_v1) + sizeof(ocudu_dapp_srs_profile_v1));
 }
