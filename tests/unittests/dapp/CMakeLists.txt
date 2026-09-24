@@ -64,6 +64,7 @@ add_executable(dapp_runtime_test
   native_preflight_test.cpp
   native_hook_registry_test.cpp
   native_instance_test.cpp
+  pusch_route_table_test.cpp
   package_manifest_test.cpp
   package_signature_test.cpp
   prepared_output_test.cpp

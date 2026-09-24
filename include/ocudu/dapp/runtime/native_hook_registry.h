@@ -4,6 +4,7 @@
 #pragma once
 
 #include "native_hook_point.h"
+#include "pusch_route_table.h"
 #include "ocudu/dapp/management/types.h"
 #include <chrono>
 #include <memory>
@@ -40,8 +41,13 @@ class native_hook_registry
 public:
   explicit native_hook_registry(std::size_t maximum_hook_points = 64, std::size_t maximum_active_bindings = 1024);
 
+  /// Registers a hook point. A routable Class-A PUSCH interface (channel estimator, equalizer,
+  /// receiver) may be registered once per route-table slot; the registration order is the slot.
   native_hook_registry_result register_point(std::shared_ptr<native_hook_point> point) noexcept;
   native_hook_registry_result set_binding_observer(std::shared_ptr<native_hook_binding_observer> observer) noexcept;
+  /// Attaches the per-UE route table before any binding exists. Bindings of routable hooks are
+  /// reported to it, and it bounds how many points a routable interface may register.
+  native_hook_registry_result set_route_table(std::shared_ptr<pusch_route_table> table) noexcept;
   native_hook_registry_result validate(const std::vector<management::interface_record>& interfaces) const noexcept;
   native_hook_registry_result stage(const management::identifier&                    instance_id,
                                     native_instance&                                 instance,
@@ -55,7 +61,10 @@ public:
   /// Applies the current host binding state to a manifest-ordered interface inventory.
   bool                               binding_states(const management::identifier&              instance_id,
                                                     std::vector<management::interface_record>& interfaces) const noexcept;
+  /// Slot 0 of an interface.
   std::shared_ptr<native_hook_point> find(uint32_t interface_id) const noexcept;
+  /// Every point of an interface in slot order (one entry unless the interface is routed).
+  std::vector<std::shared_ptr<native_hook_point>> find_all(uint32_t interface_id) const;
 
 private:
   struct binding_record {
@@ -66,6 +75,7 @@ private:
     bool                                            committed{};
   };
 
+  bool bind_routes_locked(const management::identifier& instance_id, const binding_record& binding) const noexcept;
   native_hook_registry_result resolve(const std::vector<management::interface_record>& interfaces,
                                       std::vector<std::shared_ptr<native_hook_point>>& resolved,
                                       std::vector<management::interface_record>&       bound_interfaces,
@@ -74,9 +84,10 @@ private:
   const std::size_t                                                                       maximum_points;
   const std::size_t                                                                       maximum_bindings;
   mutable std::mutex                                                                      mutex;
-  std::unordered_map<uint32_t, std::shared_ptr<native_hook_point>>                        points;
+  std::unordered_map<uint32_t, std::vector<std::shared_ptr<native_hook_point>>>           points;
   std::unordered_map<management::identifier, binding_record, management::identifier_hash> bindings;
   std::shared_ptr<native_hook_binding_observer>                                           binding_observer;
+  std::shared_ptr<pusch_route_table>                                                      route_table;
 };
 
 } // namespace ocudu::dapp

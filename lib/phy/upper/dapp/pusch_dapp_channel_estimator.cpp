@@ -122,16 +122,18 @@ public:
                 const resource_grid_reader&    grid,
                 const configuration&           config) override
   {
-    if (!target->active()) {
+    // One route per grant; the stock-receiver and other-hook views are inactive.
+    auto& hook = target->route(target->resolve_route(config.cell_id, to_value(config.rnti)));
+    if (!hook.active()) {
       fallback->estimate(notifier, grid, config);
       return;
     }
     if (const auto reason = preflight(grid, config)) {
-      target->report_fallback(lane, *reason);
+      hook.report_fallback(lane, *reason);
       fallback->estimate(notifier, grid, config);
       return;
     }
-    if (!invoke(grid, config)) {
+    if (!invoke(hook, grid, config)) {
       fallback->estimate(notifier, grid, config);
       return;
     }
@@ -166,17 +168,20 @@ private:
     return std::nullopt;
   }
 
-  bool invoke(const resource_grid_reader& grid, const configuration& config) noexcept
+  bool invoke(pusch_dapp_channel_estimator_target& hook,
+              const resource_grid_reader&          grid,
+              const configuration&                 config) noexcept
   {
     try {
-      return invoke_impl(grid, config);
+      return invoke_impl(hook, grid, config);
     } catch (...) {
-      target->report_fallback(lane, dapp::class_a_fallback_reason::exception);
+      hook.report_fallback(lane, dapp::class_a_fallback_reason::exception);
       return false;
     }
   }
 
-  bool invoke_impl(const resource_grid_reader& grid, const configuration& config)
+  bool
+  invoke_impl(pusch_dapp_channel_estimator_target& hook, const resource_grid_reader& grid, const configuration& config)
   {
     const uint64_t deadline   = deadline_from_now(limits.deadline);
     const unsigned nof_ports  = config.rx_ports.size();
@@ -209,7 +214,7 @@ private:
     if (generation == 0) {
       generation = ++invocation_sequence;
     }
-    const uint64_t allocation_base = (static_cast<uint64_t>(target->worker_id(lane)) + 1U) << 8U;
+    const uint64_t allocation_base = (static_cast<uint64_t>(hook.worker_id(lane)) + 1U) << 8U;
 
     ocudu_dapp_pusch_metadata_v1 pusch{};
     pusch.struct_size          = sizeof(pusch);
@@ -226,6 +231,7 @@ private:
     pusch.reserved[OCUDU_DAPP_PUSCH_RESERVED_SUBCARRIER_SPACING_HZ_V1] =
         static_cast<uint64_t>(scs_to_khz(config.slot.scs())) * 1000U;
     pusch.reserved[OCUDU_DAPP_PUSCH_RESERVED_GRID_NOF_SUBCARRIERS_V1] = grid.get_nof_subc();
+    pusch.reserved[OCUDU_DAPP_PUSCH_RESERVED_RNTI_V1]                 = to_value(config.rnti);
 
     ocudu_dapp_dmrs_metadata_v1 dmrs{};
     dmrs.struct_size = sizeof(dmrs);
@@ -254,7 +260,7 @@ private:
     input.invocation.abi_minor             = OCUDU_DAPP_ABI_MINOR_V1;
     input.invocation.invocation_id         = generation;
     input.invocation.cell_id               = config.cell_id;
-    input.invocation.worker_id             = target->worker_id(lane);
+    input.invocation.worker_id             = hook.worker_id(lane);
     input.invocation.radio_time.sfn        = config.slot.sfn();
     input.invocation.radio_time.slot       = config.slot.slot_index();
     input.invocation.radio_time.numerology = config.slot.numerology();
@@ -285,13 +291,13 @@ private:
                                                    {nof_rx_ports, nof_tx_layers});
     const auto expected_channel = output.channel_estimates;
     const auto expected_noise   = output.noise_variances;
-    const auto invoked          = target->invoke(lane, input, output);
+    const auto invoked          = hook.invoke(lane, input, output);
     if (invoked.status != OCUDU_DAPP_OK_V1 || invoked.invoke_fallback) {
       return false;
     }
     if (!dapp::same_tensor_storage(expected_channel, output.channel_estimates) ||
         !dapp::same_tensor_storage(expected_noise, output.noise_variances) || !commit_outputs()) {
-      target->report_invalid_output(lane, input.invocation);
+      hook.report_invalid_output(lane, input.invocation);
       return false;
     }
     return true;
@@ -588,6 +594,109 @@ private:
   std::shared_ptr<dapp::native_hook_point> point;
 };
 
+/// The channel-estimator view of a grant routed to another hook or to the stock receiver.
+class inactive_channel_estimator_target final : public pusch_dapp_channel_estimator_target
+{
+public:
+  explicit inactive_channel_estimator_target(uint32_t nof_lanes_) : nof_lanes(nof_lanes_) {}
+
+  bool                           active() const noexcept override { return false; }
+  uint32_t                       lane_count() const noexcept override { return nof_lanes; }
+  uint32_t                       worker_id(uint32_t lane) const noexcept override { return lane; }
+  dapp::native_invocation_result invoke(uint32_t,
+                                        const ocudu_dapp_channel_estimator_input_v1&,
+                                        ocudu_dapp_channel_estimator_output_v1&) noexcept override
+  {
+    return {OCUDU_DAPP_BYPASS_V1, true};
+  }
+
+private:
+  const uint32_t nof_lanes;
+};
+
+/// Route-table slots of the channel-estimator hook behind one target; see routed_demodulator_target.
+class routed_channel_estimator_target final : public pusch_dapp_channel_estimator_target
+{
+public:
+  routed_channel_estimator_target(std::vector<std::shared_ptr<dapp::native_hook_point>> slots_,
+                                  std::shared_ptr<const dapp::pusch_route_table>        table_) :
+    slots(std::move(slots_)), table(std::move(table_)), inactive(lanes_of(slots))
+  {
+    for (const auto& point : slots) {
+      views.push_back(std::make_unique<native_channel_estimator_target>(point));
+    }
+  }
+
+  dapp::pusch_route resolve_route(uint32_t cell_index, uint16_t rnti) const noexcept override
+  {
+    return table->resolve(cell_index, rnti);
+  }
+
+  pusch_dapp_channel_estimator_target& route(const dapp::pusch_route& selected) noexcept override
+  {
+    switch (selected.type) {
+      case dapp::pusch_route::kind::primary:
+        return *views.front();
+      case dapp::pusch_route::kind::conventional:
+        return inactive;
+      case dapp::pusch_route::kind::instance:
+        break;
+    }
+    return selected.hook == dapp::pusch_route_hook::channel_estimator && selected.slot < views.size()
+               ? static_cast<pusch_dapp_channel_estimator_target&>(*views[selected.slot])
+               : inactive;
+  }
+
+  bool     active() const noexcept override { return views.front()->active(); }
+  uint32_t lane_count() const noexcept override { return inactive.lane_count(); }
+  uint32_t worker_id(uint32_t lane) const noexcept override { return views.front()->worker_id(lane); }
+  uint32_t backend_id() const noexcept override { return views.front()->backend_id(); }
+  bool set_completion_barrier(uint32_t lane, std::shared_ptr<dapp::native_completion_barrier> barrier) noexcept override
+  {
+    bool ok = true;
+    for (const auto& point : slots) {
+      ok &= point->set_completion_barrier(lane, barrier);
+    }
+    return ok;
+  }
+  dapp::native_invocation_result invoke(uint32_t                                     lane,
+                                        const ocudu_dapp_channel_estimator_input_v1& input,
+                                        ocudu_dapp_channel_estimator_output_v1&      output) noexcept override
+  {
+    return views.front()->invoke(lane, input, output);
+  }
+  void report_invalid_output(uint32_t lane, const ocudu_dapp_invocation_v1& invocation) noexcept override
+  {
+    views.front()->report_invalid_output(lane, invocation);
+  }
+  void report_completion_deadline(uint32_t                        lane,
+                                  const ocudu_dapp_invocation_v1& invocation,
+                                  uint64_t                        observed_latency_ns,
+                                  uint64_t                        deadline_ns) noexcept override
+  {
+    views.front()->report_completion_deadline(lane, invocation, observed_latency_ns, deadline_ns);
+  }
+  void report_fallback(uint32_t lane, dapp::class_a_fallback_reason reason) noexcept override
+  {
+    views.front()->report_fallback(lane, reason);
+  }
+
+private:
+  static uint32_t lanes_of(const std::vector<std::shared_ptr<dapp::native_hook_point>>& points) noexcept
+  {
+    uint32_t lanes = UINT32_MAX;
+    for (const auto& point : points) {
+      lanes = std::min(lanes, point->lane_count());
+    }
+    return lanes;
+  }
+
+  std::vector<std::shared_ptr<dapp::native_hook_point>>         slots;
+  std::shared_ptr<const dapp::pusch_route_table>                table;
+  inactive_channel_estimator_target                             inactive;
+  std::vector<std::unique_ptr<native_channel_estimator_target>> views;
+};
+
 bool valid_config(const pusch_dapp_channel_estimator_config& config) noexcept
 {
   return config.nof_lanes != 0 && config.max_nof_prb != 0 && config.max_nof_prb <= MAX_NOF_PRBS &&
@@ -625,6 +734,23 @@ ocudu::create_native_pusch_dapp_channel_estimator_target(std::shared_ptr<dapp::n
   }
   try {
     return std::make_shared<native_channel_estimator_target>(std::move(point));
+  } catch (...) {
+    return {};
+  }
+}
+
+std::shared_ptr<pusch_dapp_channel_estimator_target>
+ocudu::create_native_pusch_dapp_channel_estimator_target(std::vector<std::shared_ptr<dapp::native_hook_point>> slots,
+                                                         std::shared_ptr<const dapp::pusch_route_table> table) noexcept
+{
+  if (table == nullptr || slots.empty() || slots.size() > table->slots_per_hook() ||
+      std::any_of(slots.begin(), slots.end(), [](const auto& point) {
+        return !point || point->interface_id() != OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1;
+      })) {
+    return {};
+  }
+  try {
+    return std::make_shared<routed_channel_estimator_target>(std::move(slots), std::move(table));
   } catch (...) {
     return {};
   }

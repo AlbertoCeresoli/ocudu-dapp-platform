@@ -71,6 +71,32 @@ def bounded_integer(minimum, maximum):
     return parse
 
 
+def route_target(text):
+    """``primary``, ``conventional`` or an instance identifier (a PuschRouteTarget)."""
+    if text in ("primary", "conventional"):
+        return (text, None)
+    return ("instance", identifier(text))
+
+
+def route_entry(text):
+    """``RNTI[@CELL]=TARGET``: RNTI and cell accept 0x-prefixed hexadecimal or decimal."""
+    ue, separator, target = text.partition("=")
+    if not separator:
+        raise argparse.ArgumentTypeError("route entries are RNTI[@CELL]=TARGET")
+    rnti_text, _, cell_text = ue.partition("@")
+    try:
+        rnti = int(rnti_text, 0)
+        cell = int(cell_text, 0) if cell_text else None
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("RNTI and cell must be integers") from error
+    if not 1 <= rnti <= 0xFFEF or (cell is not None and not 0 <= cell <= 0xFFFE):
+        raise argparse.ArgumentTypeError("RNTI must be in 1..0xFFEF and the cell in 0..65534")
+    entry = {"rnti": rnti, "target": route_target(target)}
+    if cell is not None:
+        entry["cellIndex"] = cell
+    return entry
+
+
 def typed_entry(text):
     try:
         key, encoded = text.split("=", 1)
@@ -371,6 +397,21 @@ def build_request(args, transaction):
         }
     if args.operation == "cell-info":
         return {"header": request_header(args, transaction), "operation": ("cellInfo", {})}
+    if args.operation == "pusch-route":
+        action = {"show": "query", "set": "update", "replace": "replace", "clear": "clear"}[args.action]
+        if action in ("query", "clear") and (args.entry or args.default):
+            raise ValueError(f"pusch-route {args.action} takes no entries or default")
+        if action == "update" and (args.default or not args.entry):
+            raise ValueError("pusch-route set takes one or more --entry and no --default")
+        body = {"action": action}
+        if args.default:
+            body["defaultTarget"] = route_target(args.default)
+        if args.entry:
+            body["entries"] = args.entry
+        return {
+            "header": request_header(args, transaction, mutation=action != "query"),
+            "operation": ("puschRouting", body),
+        }
     if args.operation == "model":
         return {
             "header": request_header(args, transaction, args.instance, True),
@@ -569,6 +610,20 @@ def make_parser():
     cell_info = commands.add_parser("cell-info", help="Describe the served cells and RAN control capabilities")
     cell_info.set_defaults(operation="cell-info")
 
+    route = commands.add_parser(
+        "pusch-route",
+        help="Show or change the per-UE route of Class-A PUSCH grants between dApp instances",
+        description="Route each UE's PUSCH grants to one channel-estimator, equalizer or receiver instance, "
+        "or to the stock receiver. A target is primary (the first instance of each hook, as without routing), "
+        "conventional (the stock receiver) or an instance identifier. set updates the named UEs (a primary "
+        "target removes a UE's entry); replace sets the default and every entry; clear resets the table.",
+    )
+    route.add_argument("action", choices=("show", "set", "replace", "clear"))
+    route.add_argument("--entry", type=route_entry, action="append", default=[], metavar="RNTI[@CELL]=TARGET")
+    route.add_argument("--default", metavar="TARGET", help="Route of UEs without an entry (replace only)")
+    route.add_argument("--dry-run", action="store_true")
+    route.set_defaults(operation="pusch-route")
+
     model = commands.add_parser("model")
     model.add_argument("action", choices=("stage", "validate", "warm", "activate", "rollback", "retire"))
     add_instance_options(model, True)
@@ -660,6 +715,7 @@ IDENTIFIER_FIELDS = {
     "reservationId",
     "sourceInstanceId",
     "subscriptionId",
+    "instance",
 }
 TEXT_FIELDS = {
     "globalName",
@@ -729,6 +785,7 @@ COUNTER_FIELDS = {
     "associationId",
     "openedNs",
     "controlRequests",
+    "unavailableLookups",
 }
 
 

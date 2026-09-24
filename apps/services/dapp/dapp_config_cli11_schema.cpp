@@ -310,6 +310,13 @@ void ocudu::app_services::configure_cli11_with_dapp_service_config_schema(CLI::A
              "Maximum UL PRBs a scheduler dApp may avoid per invocation; zero disables this authority")
       ->capture_default_str()
       ->check(CLI::Range(0U, static_cast<unsigned>(MAX_NOF_PRBS - 1)));
+  add_option(*dapp,
+             "--pusch_route_slots",
+             config->pusch_route_slots,
+             "Instances each Class-A PUSCH hook (channel estimator, equalizer, receiver) can hold at once for "
+             "per-UE routing over E3; 1 keeps one instance per hook")
+      ->capture_default_str()
+      ->check(CLI::Range(1U, static_cast<unsigned>(dapp::pusch_route_table::max_slots_per_hook)));
   dapp->add_flag("--scheduler_evaluation_only",
                  config->scheduler_evaluation_only,
                  "Execute and validate Class-B scheduler output without applying it");

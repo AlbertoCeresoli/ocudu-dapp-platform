@@ -77,6 +77,7 @@ void ocudu::app_services::fill_dapp_service_config_in_yaml_schema(YAML::Node&   
   dapp["max_queued_jobs"]                         = config->maximum_queued_jobs;
   dapp["max_retained_jobs"]                       = config->maximum_retained_jobs;
   dapp["max_scheduler_ul_prbs_avoided"]           = config->max_scheduler_ul_prbs_avoided;
+  dapp["pusch_route_slots"]                       = config->pusch_route_slots;
   dapp["scheduler_evaluation_only"]               = config->scheduler_evaluation_only;
   dapp["scheduler_allow_mcs"]                     = config->scheduler_allow_mcs;
   dapp["scheduler_allow_prb_limits"]              = config->scheduler_allow_prb_limits;

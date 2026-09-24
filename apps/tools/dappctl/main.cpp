@@ -132,6 +132,70 @@ std::string identifier_text(const identifier& value)
          '-' + compact.substr(20);
 }
 
+/// ``primary``, ``conventional`` or an instance identifier.
+pusch_route_target parse_route_target(std::string_view text)
+{
+  if (text == "primary") {
+    return {};
+  }
+  if (text == "conventional") {
+    return {pusch_route_target::kind::conventional, {}};
+  }
+  return {pusch_route_target::kind::instance, parse_identifier(text)};
+}
+
+/// ``RNTI[@CELL]=TARGET``; RNTI and cell accept 0x-prefixed hexadecimal or decimal.
+pusch_route_entry parse_route_entry(const std::string& text)
+{
+  const auto separator = text.find('=');
+  if (separator == std::string::npos) {
+    throw std::invalid_argument("route entries are RNTI[@CELL]=TARGET");
+  }
+  const std::string   ue   = text.substr(0, separator);
+  const auto          cell = ue.find('@');
+  pusch_route_entry   entry;
+  const unsigned long rnti = std::stoul(ue.substr(0, cell), nullptr, 0);
+  if (rnti == 0 || rnti > 0xFFEF) {
+    throw std::invalid_argument("RNTI must be in 1..0xFFEF");
+  }
+  entry.rnti = static_cast<uint16_t>(rnti);
+  if (cell != std::string::npos) {
+    const unsigned long index = std::stoul(ue.substr(cell + 1), nullptr, 0);
+    if (index > 0xFFFE) {
+      throw std::invalid_argument("cell index must be in 0..65534");
+    }
+    entry.cell_index = static_cast<uint16_t>(index);
+  }
+  entry.target = parse_route_target(std::string_view(text).substr(separator + 1));
+  return entry;
+}
+
+std::string route_target_text(const pusch_route_target& target)
+{
+  switch (target.type) {
+    case pusch_route_target::kind::primary:
+      return "primary";
+    case pusch_route_target::kind::conventional:
+      return "conventional";
+    case pusch_route_target::kind::instance:
+      break;
+  }
+  return identifier_text(target.instance_id);
+}
+
+const char* route_hook_text(pusch_route_hook hook)
+{
+  switch (hook) {
+    case pusch_route_hook::channel_estimator:
+      return "channel-estimator";
+    case pusch_route_hook::equalizer:
+      return "equalizer";
+    case pusch_route_hook::receiver:
+      break;
+  }
+  return "receiver";
+}
+
 std::string safe_text(std::string_view text)
 {
   std::ostringstream output;
@@ -601,6 +665,20 @@ void print_response(const management_response& response)
         using payload_type = std::decay_t<decltype(payload)>;
         if constexpr (std::is_same_v<payload_type, std::monostate>) {
           return;
+        } else if constexpr (std::is_same_v<payload_type, pusch_routing_result>) {
+          std::cout << "pusch-routes generation=" << payload.generation
+                    << " slots-per-hook=" << unsigned(payload.slots_per_hook)
+                    << " default=" << route_target_text(payload.default_target)
+                    << " unavailable-lookups=" << payload.unavailable_lookups << '\n';
+          for (const pusch_route_binding& binding : payload.bindings) {
+            std::cout << "binding instance=" << identifier_text(binding.instance_id)
+                      << " hook=" << route_hook_text(binding.hook) << " slot=" << unsigned(binding.slot) << '\n';
+          }
+          for (const pusch_route_entry& entry : payload.entries) {
+            std::cout << "route rnti=0x" << std::hex << entry.rnti << std::dec
+                      << " cell=" << (entry.cell_index ? std::to_string(*entry.cell_index) : std::string("any"))
+                      << " target=" << route_target_text(entry.target) << '\n';
+          }
         } else if constexpr (std::is_same_v<payload_type, cell_info_result>) {
           std::cout << "ran-control ue-release=" << std::boolalpha << payload.capabilities.ue_release
                     << " handover=" << payload.capabilities.handover << " tx-gain=" << payload.capabilities.tx_gain
@@ -1065,6 +1143,19 @@ int main(int argc, char** argv)
 
   auto* cell_info_command = app.add_subcommand("cell-info", "Describe the served cells and RAN control capabilities");
 
+  std::string              route_action;
+  std::vector<std::string> route_entries;
+  std::string              route_default;
+  bool                     route_dry_run{};
+  auto*                    route_command = app.add_subcommand(
+      "pusch-route", "Show or change the per-UE route of Class-A PUSCH grants between dApp instances");
+  route_command->add_option("action", route_action, "show|set|replace|clear")
+      ->required()
+      ->check(CLI::IsMember({"show", "set", "replace", "clear"}));
+  route_command->add_option("--entry", route_entries, "RNTI[@CELL]=TARGET (primary, conventional or instance ID)");
+  route_command->add_option("--default", route_default, "Route of UEs without an entry (replace only)");
+  route_command->add_flag("--dry-run", route_dry_run, "Validate without changing the table");
+
   struct {
     instance_options instance;
     std::string      action;
@@ -1252,6 +1343,29 @@ int main(int argc, char** argv)
       cell_info_query operation;
       operation.header.transaction_id = transaction;
       request                         = std::move(operation);
+    } else if (*route_command) {
+      pusch_routing operation;
+      operation.header.transaction_id = transaction;
+      operation.header.dry_run        = route_dry_run;
+      operation.action                = route_action == "show"      ? pusch_routing_action::query
+                                        : route_action == "set"     ? pusch_routing_action::update
+                                        : route_action == "replace" ? pusch_routing_action::replace
+                                                                    : pusch_routing_action::clear;
+      const bool takes_entries =
+          operation.action == pusch_routing_action::update || operation.action == pusch_routing_action::replace;
+      if ((!takes_entries && !route_entries.empty()) ||
+          (!route_default.empty() && operation.action != pusch_routing_action::replace) ||
+          (operation.action == pusch_routing_action::update && route_entries.empty())) {
+        throw std::invalid_argument(
+            "show and clear take no entries, set needs --entry, and only replace takes --default");
+      }
+      for (const auto& text : route_entries) {
+        operation.entries.push_back(parse_route_entry(text));
+      }
+      if (!route_default.empty()) {
+        operation.default_target = parse_route_target(route_default);
+      }
+      request = std::move(operation);
     } else if (*model_command) {
       model_control operation;
       operation.header                    = instance_header(transaction, model.instance);

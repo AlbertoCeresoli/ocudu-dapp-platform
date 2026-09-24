@@ -752,3 +752,156 @@ TEST(dapp_demodulator, native_target_and_provider_preserve_interface_and_lane_id
                 std::shared_ptr<dapp::native_hook_point>(std::move(wrong.point)), nullptr),
             nullptr);
 }
+
+namespace {
+
+/// Two receiver instances and the stock receiver behind one target, selected per UE the way the
+/// native routed target selects hook-point slots.
+class routing_target final : public pusch_dapp_demodulator_target
+{
+public:
+  routing_target() { stock.mode = pusch_dapp_demodulator_mode::inactive; }
+
+  dapp::pusch_route resolve_route(uint32_t cell_index, uint16_t rnti) const noexcept override
+  {
+    ++lookups;
+    last_cell = cell_index;
+    switch (rnti) {
+      case 0x4601:
+        return dapp::pusch_route::instance(dapp::pusch_route_hook::receiver, 0);
+      case 0x4602:
+        return dapp::pusch_route::instance(dapp::pusch_route_hook::receiver, 1);
+      case 0x4603:
+        return dapp::pusch_route::conventional();
+      default:
+        return dapp::pusch_route::primary();
+    }
+  }
+  pusch_dapp_demodulator_target& route(const dapp::pusch_route& selected) noexcept override
+  {
+    if (selected == dapp::pusch_route::conventional()) {
+      return stock;
+    }
+    if (selected.type == dapp::pusch_route::kind::instance) {
+      return selected.slot == 0 ? first : second;
+    }
+    return primary;
+  }
+
+  pusch_dapp_demodulator_mode active_mode() const noexcept override { return primary.active_mode(); }
+  uint32_t                    lane_count() const noexcept override { return primary.lane_count(); }
+  uint32_t                    worker_id(uint32_t lane, pusch_dapp_demodulator_mode mode) const noexcept override
+  {
+    return primary.worker_id(lane, mode);
+  }
+  dapp::native_invocation_result invoke(uint32_t                             lane,
+                                        const ocudu_dapp_equalizer_input_v1& input,
+                                        ocudu_dapp_equalizer_output_v1&      output) noexcept override
+  {
+    return primary.invoke(lane, input, output);
+  }
+  dapp::native_invocation_result invoke(uint32_t                            lane,
+                                        const ocudu_dapp_receiver_input_v1& input,
+                                        ocudu_dapp_receiver_output_v1&      output) noexcept override
+  {
+    return primary.invoke(lane, input, output);
+  }
+
+  target_spy       primary{2};
+  target_spy       first{2};
+  target_spy       second{2};
+  target_spy       stock{2};
+  mutable unsigned lookups{};
+  mutable uint32_t last_cell{};
+};
+
+} // namespace
+
+TEST(dapp_demodulator, each_grant_is_served_by_the_instance_its_ue_is_routed_to)
+{
+  auto target      = std::make_shared<routing_target>();
+  auto fallback    = std::make_shared<fallback_state>();
+  auto demodulator = create_pusch_dapp_demodulator_factory(
+                         std::make_shared<fallback_factory>(fallback),
+                         target,
+                         create_pseudo_random_generator_sw_factory(),
+                         create_demodulation_mapper_factory(),
+                         {.nof_lanes = 2, .max_nof_prb = 1, .max_nof_rx_ports = 1, .max_nof_layers = 1})
+                         ->create();
+  ASSERT_NE(demodulator, nullptr);
+
+  const auto grant = [&](uint16_t rnti) {
+    auto config = make_config();
+    config.rnti = to_rnti(rnti);
+    codeword_spy codeword;
+    notifier_spy notifier;
+    run(*demodulator, config, codeword, notifier);
+    EXPECT_EQ(notifier.end_calls, 1U);
+  };
+
+  grant(0x4601);
+  grant(0x4602);
+  grant(0x4602);
+  grant(0x4603);
+  grant(0x1234);
+
+  EXPECT_EQ(target->lookups, 5U);
+  EXPECT_EQ(target->last_cell, 7U) << "the grant's cell is part of the lookup";
+  EXPECT_EQ(target->first.receiver_calls, 1U);
+  EXPECT_EQ(target->second.receiver_calls, 2U);
+  EXPECT_EQ(target->primary.receiver_calls, 1U) << "an unlisted UE keeps the primary receiver";
+  EXPECT_EQ(target->stock.receiver_calls, 0U);
+  EXPECT_EQ(fallback->calls, 1U) << "the stock-receiver route takes the conventional demodulator";
+  EXPECT_EQ(target->first.pusch.reserved[OCUDU_DAPP_PUSCH_RESERVED_RNTI_V1], 0x4601U);
+  EXPECT_EQ(target->second.pusch.reserved[OCUDU_DAPP_PUSCH_RESERVED_RNTI_V1], 0x4602U);
+}
+
+TEST(dapp_demodulator, native_routed_target_views_each_slot_of_each_hook)
+{
+  const auto point = [](uint32_t interface_id, uint32_t first_worker) {
+    auto created = dapp::native_hook_point::create(interface_id, first_worker, 2);
+    EXPECT_TRUE(created) << created.detail;
+    return std::shared_ptr<dapp::native_hook_point>(std::move(created.point));
+  };
+  auto table = std::make_shared<dapp::pusch_route_table>(2);
+  auto equalizers =
+      std::vector{point(OCUDU_DAPP_INTERFACE_EQUALIZER_V1, 40), point(OCUDU_DAPP_INTERFACE_EQUALIZER_V1, 50)};
+  auto receivers =
+      std::vector{point(OCUDU_DAPP_INTERFACE_RECEIVER_V1, 80), point(OCUDU_DAPP_INTERFACE_RECEIVER_V1, 90)};
+
+  EXPECT_EQ(create_native_pusch_dapp_demodulator_target(equalizers, {receivers.front()}, table), nullptr)
+      << "every slot needs both hooks";
+  EXPECT_EQ(
+      create_native_pusch_dapp_demodulator_target(equalizers, receivers, std::make_shared<dapp::pusch_route_table>(1)),
+      nullptr)
+      << "the table bounds the slots";
+  EXPECT_EQ(create_native_pusch_dapp_demodulator_target(receivers, equalizers, table), nullptr);
+  EXPECT_EQ(create_native_pusch_dapp_demodulator_target(equalizers, receivers, nullptr), nullptr);
+
+  auto target = create_native_pusch_dapp_demodulator_target(equalizers, receivers, table);
+  ASSERT_NE(target, nullptr);
+  EXPECT_EQ(target->lane_count(), 2U);
+  EXPECT_EQ(target->resolve_route(0, 0x4601), dapp::pusch_route::primary()) << "an empty table routes nobody";
+  EXPECT_EQ(target->active_mode(), pusch_dapp_demodulator_mode::inactive);
+
+  using dapp::pusch_route;
+  using dapp::pusch_route_hook;
+  EXPECT_EQ(target->route(pusch_route::primary()).worker_id(1, pusch_dapp_demodulator_mode::receiver), 81U);
+  EXPECT_EQ(target->route(pusch_route::primary()).worker_id(1, pusch_dapp_demodulator_mode::equalizer), 41U);
+  EXPECT_EQ(target->route(pusch_route::instance(pusch_route_hook::receiver, 1))
+                .worker_id(1, pusch_dapp_demodulator_mode::receiver),
+            91U);
+  EXPECT_EQ(target->route(pusch_route::instance(pusch_route_hook::equalizer, 1))
+                .worker_id(0, pusch_dapp_demodulator_mode::equalizer),
+            50U);
+  auto& stock = target->route(pusch_route::conventional());
+  EXPECT_EQ(stock.active_mode(), pusch_dapp_demodulator_mode::inactive);
+  EXPECT_EQ(stock.lane_count(), 2U);
+  EXPECT_EQ(&target->route(pusch_route::instance(pusch_route_hook::channel_estimator, 0)), &stock)
+      << "a channel-estimator route keeps the conventional demodulator";
+  EXPECT_EQ(&target->route(pusch_route::instance(pusch_route_hook::receiver, 7)), &stock) << "unknown slot";
+
+  ocudu_dapp_receiver_input_v1  input{};
+  ocudu_dapp_receiver_output_v1 output{};
+  EXPECT_EQ(stock.invoke(0, input, output).status, OCUDU_DAPP_BYPASS_V1);
+}

@@ -916,6 +916,90 @@ TEST(pusch_resident_dapp_adapter, receiver_still_rejects_msg3_rapid)
   cudaStreamDestroy(stream);
 }
 
+namespace {
+
+/// A receiver on the primary route, an equalizer on slot 1 of the equalizer hook, and the stock
+/// receiver, selected per UE like the native routed target.
+class resident_routing_target final : public pusch_dapp_demodulator_target
+{
+public:
+  resident_routing_target()
+  {
+    primary.mode   = pusch_dapp_demodulator_mode::receiver;
+    equalizer.mode = pusch_dapp_demodulator_mode::equalizer;
+    stock.mode     = pusch_dapp_demodulator_mode::inactive;
+  }
+
+  dapp::pusch_route resolve_route(uint32_t, uint16_t rnti) const noexcept override
+  {
+    return rnti == 0x4601   ? dapp::pusch_route::instance(dapp::pusch_route_hook::equalizer, 1)
+           : rnti == 0x4602 ? dapp::pusch_route::conventional()
+                            : dapp::pusch_route::primary();
+  }
+  pusch_dapp_demodulator_target& route(const dapp::pusch_route& selected) noexcept override
+  {
+    if (selected.type == dapp::pusch_route::kind::instance) {
+      return equalizer;
+    }
+    return selected.type == dapp::pusch_route::kind::conventional ? static_cast<pusch_dapp_demodulator_target&>(stock)
+                                                                  : primary;
+  }
+
+  pusch_dapp_demodulator_mode active_mode() const noexcept override { return primary.active_mode(); }
+  uint32_t                    lane_count() const noexcept override { return primary.lane_count(); }
+  uint32_t                    worker_id(uint32_t lane, pusch_dapp_demodulator_mode mode) const noexcept override
+  {
+    return primary.worker_id(lane, mode);
+  }
+  dapp::native_invocation_result invoke(uint32_t                             lane,
+                                        const ocudu_dapp_equalizer_input_v1& input,
+                                        ocudu_dapp_equalizer_output_v1&      output) noexcept override
+  {
+    return primary.invoke(lane, input, output);
+  }
+  dapp::native_invocation_result invoke(uint32_t                            lane,
+                                        const ocudu_dapp_receiver_input_v1& input,
+                                        ocudu_dapp_receiver_output_v1&      output) noexcept override
+  {
+    return primary.invoke(lane, input, output);
+  }
+
+  target_spy primary;
+  target_spy equalizer;
+  target_spy stock;
+};
+
+} // namespace
+
+TEST(pusch_resident_dapp_adapter, the_selected_route_decides_the_mode_until_the_next_grant)
+{
+  auto target = std::make_shared<resident_routing_target>();
+  auto dapp   = create_pusch_resident_dapp(target,
+                                         nullptr,
+                                         0,
+                                         create_pseudo_random_generator_sw_factory()->create(),
+                                         1,
+                                         1,
+                                         1,
+                                         std::chrono::microseconds(100),
+                                         1.0e-6F);
+  ASSERT_TRUE(dapp);
+  EXPECT_EQ(dapp->mode(), pusch_resident_dapp_mode::receiver) << "no selection is the primary route";
+
+  ASSERT_TRUE(dapp->begin_grant());
+  dapp->select_route(dapp->resolve_route(0, 0x4601));
+  EXPECT_EQ(dapp->mode(), pusch_resident_dapp_mode::equalizer);
+
+  ASSERT_TRUE(dapp->begin_grant());
+  EXPECT_EQ(dapp->mode(), pusch_resident_dapp_mode::receiver) << "every grant starts on the primary route";
+  dapp->select_route(dapp->resolve_route(0, 0x4602));
+  EXPECT_EQ(dapp->mode(), pusch_resident_dapp_mode::inactive) << "the stock receiver serves this UE";
+
+  ASSERT_TRUE(dapp->begin_grant());
+  dapp->select_route(dapp->resolve_route(0, 0x1234));
+  EXPECT_EQ(dapp->mode(), pusch_resident_dapp_mode::receiver);
+}
+
 TEST(pusch_resident_dapp_adapter, publishes_cuda_channel_estimator_outputs)
 {
   auto demod_target                       = std::make_shared<target_spy>();

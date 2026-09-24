@@ -332,43 +332,117 @@ private:
   std::atomic<uint32_t>                       next_lane{};
 };
 
+/// Host channel estimator only while no demodulator dApp serves the grant.
+///
+/// With routing, the pair (channel estimator, demodulator) is chosen per grant: route() returns a
+/// prebuilt gate over the two targets' views of the same route, so a UE routed to a channel
+/// estimator slot sees an inactive demodulator and the estimator runs, while a UE routed to an
+/// equalizer or receiver keeps the conventional estimator.
 class channel_estimator_target_gate final : public pusch_dapp_channel_estimator_target
 {
 public:
   channel_estimator_target_gate(std::shared_ptr<pusch_dapp_channel_estimator_target> channel_estimator_,
                                 std::shared_ptr<pusch_dapp_demodulator_target>       demodulator_) :
-    channel_estimator(std::move(channel_estimator_)), demodulator(std::move(demodulator_))
+    owned_channel_estimator(std::move(channel_estimator_)),
+    owned_demodulator(std::move(demodulator_)),
+    channel_estimator(*owned_channel_estimator),
+    demodulator(*owned_demodulator)
   {
+    views.reserve(nof_route_views);
+    for (std::size_t index = 0; index != nof_route_views; ++index) {
+      const auto selected = route_of(index);
+      views.push_back(std::make_unique<channel_estimator_target_gate>(channel_estimator.route(selected),
+                                                                      demodulator.route(selected)));
+    }
+  }
+
+  channel_estimator_target_gate(pusch_dapp_channel_estimator_target& channel_estimator_,
+                                pusch_dapp_demodulator_target&       demodulator_) :
+    channel_estimator(channel_estimator_), demodulator(demodulator_)
+  {
+  }
+
+  dapp::pusch_route resolve_route(uint32_t cell_index, uint16_t rnti) const noexcept override
+  {
+    return channel_estimator.resolve_route(cell_index, rnti);
+  }
+  pusch_dapp_channel_estimator_target& route(const dapp::pusch_route& selected) noexcept override
+  {
+    const std::size_t index = index_of(selected);
+    return views.empty() || index >= views.size() ? *this : *views[index];
   }
 
   bool active() const noexcept override
   {
-    return channel_estimator->active() && channel_estimator->backend_id() == OCUDU_DAPP_BACKEND_HOST_V1 &&
-           demodulator->active_mode() == pusch_dapp_demodulator_mode::inactive;
+    return channel_estimator.active() && channel_estimator.backend_id() == OCUDU_DAPP_BACKEND_HOST_V1 &&
+           demodulator.active_mode() == pusch_dapp_demodulator_mode::inactive;
   }
-  uint32_t lane_count() const noexcept override { return channel_estimator->lane_count(); }
-  uint32_t worker_id(uint32_t lane) const noexcept override { return channel_estimator->worker_id(lane); }
-  uint32_t backend_id() const noexcept override { return channel_estimator->backend_id(); }
+  uint32_t lane_count() const noexcept override { return channel_estimator.lane_count(); }
+  uint32_t worker_id(uint32_t lane) const noexcept override { return channel_estimator.worker_id(lane); }
+  uint32_t backend_id() const noexcept override { return channel_estimator.backend_id(); }
   bool set_completion_barrier(uint32_t lane, std::shared_ptr<dapp::native_completion_barrier> barrier) noexcept override
   {
-    return channel_estimator->set_completion_barrier(lane, std::move(barrier));
+    return channel_estimator.set_completion_barrier(lane, std::move(barrier));
   }
 
   dapp::native_invocation_result invoke(uint32_t                                     lane,
                                         const ocudu_dapp_channel_estimator_input_v1& input,
                                         ocudu_dapp_channel_estimator_output_v1&      output) noexcept override
   {
-    return channel_estimator->invoke(lane, input, output);
+    return channel_estimator.invoke(lane, input, output);
   }
 
   void report_invalid_output(uint32_t lane, const ocudu_dapp_invocation_v1& invocation) noexcept override
   {
-    channel_estimator->report_invalid_output(lane, invocation);
+    channel_estimator.report_invalid_output(lane, invocation);
+  }
+  void report_completion_deadline(uint32_t                        lane,
+                                  const ocudu_dapp_invocation_v1& invocation,
+                                  uint64_t                        observed_latency_ns,
+                                  uint64_t                        deadline_ns) noexcept override
+  {
+    channel_estimator.report_completion_deadline(lane, invocation, observed_latency_ns, deadline_ns);
+  }
+  void report_fallback(uint32_t lane, dapp::class_a_fallback_reason reason) noexcept override
+  {
+    channel_estimator.report_fallback(lane, reason);
   }
 
 private:
-  std::shared_ptr<pusch_dapp_channel_estimator_target> channel_estimator;
-  std::shared_ptr<pusch_dapp_demodulator_target>       demodulator;
+  static constexpr std::size_t nof_route_views =
+      2 + dapp::nof_pusch_route_hooks * dapp::pusch_route_table::max_slots_per_hook;
+
+  static std::size_t index_of(const dapp::pusch_route& selected) noexcept
+  {
+    switch (selected.type) {
+      case dapp::pusch_route::kind::primary:
+        return 0;
+      case dapp::pusch_route::kind::conventional:
+        return 1;
+      case dapp::pusch_route::kind::instance:
+        break;
+    }
+    return 2 + static_cast<std::size_t>(selected.hook) * dapp::pusch_route_table::max_slots_per_hook + selected.slot;
+  }
+  static dapp::pusch_route route_of(std::size_t index) noexcept
+  {
+    if (index == 0) {
+      return dapp::pusch_route::primary();
+    }
+    if (index == 1) {
+      return dapp::pusch_route::conventional();
+    }
+    const std::size_t routed = index - 2;
+    return dapp::pusch_route::instance(
+        static_cast<dapp::pusch_route_hook>(routed / dapp::pusch_route_table::max_slots_per_hook),
+        static_cast<uint8_t>(routed % dapp::pusch_route_table::max_slots_per_hook));
+  }
+
+  std::shared_ptr<pusch_dapp_channel_estimator_target>        owned_channel_estimator;
+  std::shared_ptr<pusch_dapp_demodulator_target>              owned_demodulator;
+  pusch_dapp_channel_estimator_target&                        channel_estimator;
+  pusch_dapp_demodulator_target&                              demodulator;
+  std::vector<std::unique_ptr<channel_estimator_target_gate>> views;
 };
 
 class upper_phy_dapp_hook_provider_impl final : public upper_phy_dapp_hook_provider

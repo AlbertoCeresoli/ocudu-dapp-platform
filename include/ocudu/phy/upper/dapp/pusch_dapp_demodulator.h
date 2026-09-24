@@ -4,11 +4,13 @@
 #pragma once
 
 #include "ocudu/dapp/runtime/native_completion_barrier.h"
-#include "ocudu/dapp/runtime/native_worker.h"
 #include "ocudu/dapp/runtime/native_control_context.h"
+#include "ocudu/dapp/runtime/native_worker.h"
+#include "ocudu/dapp/runtime/pusch_route_table.h"
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace ocudu {
 
@@ -72,6 +74,17 @@ public:
   {
   }
   virtual void report_fallback(uint32_t, pusch_dapp_demodulator_mode, dapp::class_a_fallback_reason) noexcept {}
+
+  /// Per-UE routing (see dapp::pusch_route_table): the route of one grant. A target without a route
+  /// table always answers the primary route.
+  virtual dapp::pusch_route resolve_route(uint32_t /*cell_index*/, uint16_t /*rnti*/) const noexcept
+  {
+    return dapp::pusch_route::primary();
+  }
+  /// The target serving a grant on \p route. The primary route is this target, with the usual
+  /// equalizer/receiver exclusivity. A routed UE sees only its instance's hook; a route to the
+  /// channel estimator or to the stock receiver is an inactive target.
+  virtual pusch_dapp_demodulator_target& route(const dapp::pusch_route& /*route*/) noexcept { return *this; }
 };
 
 struct pusch_dapp_demodulator_config {
@@ -106,5 +119,13 @@ std::shared_ptr<pusch_demodulator_factory> create_pusch_dapp_demodulator_factory
 std::shared_ptr<pusch_dapp_demodulator_target>
 create_native_pusch_dapp_demodulator_target(std::shared_ptr<dapp::native_hook_point> equalizer,
                                             std::shared_ptr<dapp::native_hook_point> receiver) noexcept;
+
+/// Combines the route-table slots of the equalizer and receiver hooks (slot order, slot 0 first; the
+/// two vectors have equal length) into one routed target. The primary route behaves exactly like the
+/// single-slot target over slot 0; a routed UE is served by its instance's slot alone.
+std::shared_ptr<pusch_dapp_demodulator_target>
+create_native_pusch_dapp_demodulator_target(std::vector<std::shared_ptr<dapp::native_hook_point>> equalizers,
+                                            std::vector<std::shared_ptr<dapp::native_hook_point>> receivers,
+                                            std::shared_ptr<const dapp::pusch_route_table>        table) noexcept;
 
 } // namespace ocudu

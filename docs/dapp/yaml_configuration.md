@@ -27,6 +27,7 @@ unchanged.
 | `max_queued_jobs` | u32 | Default 64 (1..4096); queued dApp management jobs |
 | `max_retained_jobs` | u32 | Default 1024 (1..65536); retained dApp management job records |
 | `max_scheduler_ul_prbs_avoided` | u32 | Cap on Class-B avoid mask width; zero disables this authority |
+| `pusch_route_slots` | u32 | Default 1 (1..8); instances each Class-A PUSCH hook (channel estimator, equalizer, receiver) can hold at once for per-UE routing over E3 ([pusch_routing.md](pusch_routing.md)) |
 | `scheduler_evaluation_only` | bool | Measure Class B without authority (validate, then discard) |
 | `scheduler_allow_mcs` | bool | Commit Class-B MCS intents for newTx |
 | `scheduler_allow_prb_limits` | bool | Commit min/max PRB limits |

@@ -15,6 +15,10 @@ namespace ocudu {
 class ru_gain_controller;
 }
 
+namespace ocudu::dapp {
+class pusch_route_table;
+} // namespace ocudu::dapp
+
 namespace ocudu::dapp::e3 {
 
 class embedded_agent;
@@ -54,12 +58,14 @@ public:
                               std::shared_ptr<quiet_reservation_manager> reservations_  = {},
                               std::shared_ptr<portable_data_store>       portable_data_ = {},
                               std::shared_ptr<e3_connection_registry>    connections_   = {},
-                              std::shared_ptr<ran_control_handler>       ran_control_   = {}) :
+                              std::shared_ptr<ran_control_handler>       ran_control_   = {},
+                              std::shared_ptr<pusch_route_table>         pusch_routes_  = {}) :
     agent(agent_),
     reservations(std::move(reservations_)),
     portable_data(std::move(portable_data_)),
     connections(std::move(connections_)),
-    ran_actions(std::move(ran_control_))
+    ran_actions(std::move(ran_control_)),
+    pusch_routes(std::move(pusch_routes_))
   {
   }
 
@@ -71,6 +77,7 @@ private:
   std::shared_ptr<portable_data_store>       portable_data;
   std::shared_ptr<e3_connection_registry>    connections;
   std::shared_ptr<ran_control_handler>       ran_actions;
+  std::shared_ptr<pusch_route_table>         pusch_routes;
 };
 
 } // namespace ocudu::dapp::e3

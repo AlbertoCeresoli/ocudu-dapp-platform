@@ -2938,6 +2938,10 @@ void pusch_demodulator_gpu_impl::process_gpu_e2e(pusch_codeword_buffer&         
                            : config.dc_position.has_value() ? -2 : -1;
   const bool common_pilot_admitted = common_pilot_csi &&
       pusch_e2e_validate_pilot_metrics(e2e_handle_, d_grid_cbf16_, pilot_dc) == NR_LDPC_SUCCESS;
+  if (resident_dapp_) {
+    // Per-UE routing: one route per grant, before the mode is chosen.
+    resident_dapp_->select_route(resident_dapp_->resolve_route(config.cell_id, to_value(config.rnti)));
+  }
   const pusch_resident_dapp_mode resident_mode =
       resident_dapp_ ? resident_dapp_->mode_with_pilot_admission(common_pilot_csi, common_pilot_admitted)
                      : pusch_resident_dapp_mode::inactive;

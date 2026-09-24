@@ -76,6 +76,21 @@ def validate_catalog_admit(operation):
     assert operation == ("catalogAdmit", {"packageId": bytes.fromhex(PACKAGE)})
 
 
+def validate_pusch_route_replace(operation):
+    assert operation == ("puschRouting", {
+        "action": "replace",
+        "defaultTarget": ("conventional", None),
+        "entries": [
+            {"rnti": 0x4601, "target": ("instance", bytes.fromhex(PACKAGE))},
+            {"cellIndex": 2, "rnti": 0x4602, "target": ("primary", None)},
+        ],
+    })
+
+
+def validate_pusch_route_show(operation):
+    assert operation == ("puschRouting", {"action": "query"})
+
+
 def run_peer(codec, socket_path, command, expected_choice, validator=None):
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     listener.bind(socket_path)
@@ -125,6 +140,9 @@ def main():
     cases = [
         (("catalog", "admit", "--package", PACKAGE,
           "--expected-inventory-generation", "4", "--dry-run"), "catalogAdmit", validate_catalog_admit),
+        (("pusch-route", "replace", "--default", "conventional", "--entry", f"0x4601={PACKAGE}",
+          "--entry", "0x4602@2=primary", "--dry-run"), "puschRouting", validate_pusch_route_replace),
+        (("pusch-route", "show"), "puschRouting", validate_pusch_route_show),
         (("inventory",), "inventory", None),
         (
             ("load", "--package", PACKAGE, "--placement", "process", "--backend", "cuda", "--dry-run"),

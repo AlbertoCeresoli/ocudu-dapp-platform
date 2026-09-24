@@ -15,6 +15,8 @@ maxItems      INTEGER ::= 1024
 maxValueBytes INTEGER ::= 1048576
 maxDataChunks INTEGER ::= 8
 maxDataChunkBytes INTEGER ::= 65536
+-- Keeps a full route table below the 16 KiB open-type fragment every APER decoder handles.
+maxPuschRoutes INTEGER ::= 512
 
 Identifier ::= OCTET STRING (SIZE (16))
 Hash256 ::= OCTET STRING (SIZE (32))
@@ -527,6 +529,51 @@ CatalogAdmit ::= SEQUENCE {
   ...
 }
 
+-- Per-UE routing of Class-A PUSCH grants between active channel-estimator, equalizer and
+-- receiver dApp instances and the stock receiver. An entry names an instance; the host resolves it
+-- to the hook point that instance occupies and re-resolves on every (de)activation, so an entry
+-- whose instance is not active selects the stock receiver. UEs without an entry follow the default.
+-- primary is the behaviour without routing: the first instance of each hook, with the usual
+-- equalizer/receiver exclusivity.
+PuschRouteTarget ::= CHOICE {
+  primary      NULL,
+  conventional NULL,
+  instance     Identifier,
+  ...
+}
+PuschRouteEntry ::= SEQUENCE {
+  cellIndex INTEGER (0..65534) OPTIONAL, -- DU-local cell (CellDescriptor.cellId); absent: every cell
+  rnti      INTEGER (1..65519),          -- C-RNTI
+  target    PuschRouteTarget,
+  ...
+}
+-- query returns the table. replace sets the default (absent: primary) and every entry. update
+-- inserts or overwrites the given entries; an entry targeting primary removes that UE. clear
+-- removes every entry and resets the default to primary.
+PuschRoutingAction ::= ENUMERATED { query(0), replace(1), update(2), clear(3), ... }
+PuschRouting ::= SEQUENCE {
+  action        PuschRoutingAction,
+  defaultTarget PuschRouteTarget OPTIONAL,
+  entries       SEQUENCE (SIZE (0..maxPuschRoutes)) OF PuschRouteEntry OPTIONAL,
+  ...
+}
+PuschRouteHook ::= ENUMERATED { channelEstimator(0), equalizer(1), receiver(2), ... }
+PuschRouteBinding ::= SEQUENCE {
+  instanceId Identifier,
+  hook       PuschRouteHook,
+  slot       INTEGER (0..7),
+  ...
+}
+PuschRoutingResult ::= SEQUENCE {
+  generation         Generation,
+  slotsPerHook       INTEGER (1..8),
+  defaultTarget      PuschRouteTarget,
+  entries            SEQUENCE (SIZE (0..maxPuschRoutes)) OF PuschRouteEntry,
+  bindings           SEQUENCE (SIZE (0..24)) OF PuschRouteBinding,
+  unavailableLookups Counter, -- grants whose entry named an inactive instance (served by the stock receiver)
+  ...
+}
+
 ManagementOperation ::= CHOICE {
   inventory InventoryQuery,
   lifecycle LifecycleControl,
@@ -543,7 +590,8 @@ ManagementOperation ::= CHOICE {
   ...,
   ranControl RanControl,
   cellInfo CellInfoQuery,
-  catalogAdmit CatalogAdmit
+  catalogAdmit CatalogAdmit,
+  puschRouting PuschRouting
 }
 ManagementRequest ::= SEQUENCE { header RequestHeader, operation ManagementOperation, ... }
 
@@ -558,7 +606,8 @@ ManagementPayload ::= CHOICE {
   dataSubscriptions DataSubscriptionResult,
   dataPublications DataPublicationResult,
   ...,
-  cellInfo CellInfoResult
+  cellInfo CellInfoResult,
+  puschRouting PuschRoutingResult
 }
 ManagementResponse ::= SEQUENCE {
   transactionId Identifier,

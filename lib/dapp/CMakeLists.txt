@@ -40,6 +40,7 @@ add_library(ocudu_dapp_runtime STATIC
   runtime/module_loader.cpp
   runtime/native_hook_point.cpp
   runtime/native_hook_registry.cpp
+  runtime/pusch_route_table.cpp
   runtime/native_instance.cpp
   runtime/native_preflight.cpp
   runtime/native_hook_slot.cpp

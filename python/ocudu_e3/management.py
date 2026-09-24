@@ -24,6 +24,7 @@ IDENTIFIER_FIELDS = {
     "reservationId",
     "sourceInstanceId",
     "subscriptionId",
+    "instance",
 }
 TEXT_FIELDS = {
     "plmn",
@@ -95,6 +96,7 @@ COUNTER_FIELDS = {
     "associationId",
     "openedNs",
     "controlRequests",
+    "unavailableLookups",
 }
 SIGNED_FIELDS = {"signedValue", "cellFrequencyOffsetHz"}
 
@@ -154,6 +156,63 @@ def catalog_admit_request(package_id: bytes, *, expected_inventory_generation=No
         "header": header(transaction, expected_inventory_generation=expected_inventory_generation, dry_run=dry_run),
         "operation": ("catalogAdmit", {"packageId": package_id}),
     }
+
+
+PUSCH_ROUTING_ACTIONS = ("query", "replace", "update", "clear")
+
+
+def pusch_route_target(target=None) -> tuple:
+    """A ``PuschRouteTarget``: ``"primary"`` (or None), ``"conventional"``, or an instance identifier
+    given as 16 bytes or as UUID text."""
+    if target is None or target == "primary":
+        return ("primary", None)
+    if target == "conventional":
+        return ("conventional", None)
+    identifier = parse_identifier(target) if isinstance(target, str) else target
+    if not isinstance(identifier, bytes) or len(identifier) != 16 or not any(identifier):
+        raise ValueError("an instance route needs a nonzero 16-byte instance identifier")
+    return ("instance", identifier)
+
+
+def pusch_route_entry(rnti: int, target=None, cell_index: Optional[int] = None) -> dict:
+    """One UE of the route table. Without ``cell_index`` the entry applies in every cell of the DU."""
+    if not 1 <= int(rnti) <= 0xFFEF:
+        raise ValueError("RNTI must be a C-RNTI in 1..0xFFEF")
+    entry = {"rnti": int(rnti), "target": pusch_route_target(target)}
+    if cell_index is not None:
+        if not 0 <= int(cell_index) <= 0xFFFE:
+            raise ValueError("cell index must be in 0..65534")
+        entry["cellIndex"] = int(cell_index)
+    return entry
+
+
+def pusch_routing_request(action: str = "query", entries=(), default=None, *, dry_run: bool = False,
+                          transaction=None) -> dict:
+    """``puschRouting``: per-UE routing of Class-A PUSCH grants between dApp instances.
+
+    ``entries`` holds :func:`pusch_route_entry` dictionaries. ``replace`` sets ``default`` (primary
+    when omitted) and every entry; ``update`` inserts or overwrites entries, and an entry whose target
+    is ``"primary"`` removes that UE; ``query`` and ``clear`` take neither. Every action answers with
+    the resulting table."""
+    if action not in PUSCH_ROUTING_ACTIONS:
+        raise ValueError(f"PUSCH routing action must be one of {', '.join(PUSCH_ROUTING_ACTIONS)}")
+    entries = list(entries)
+    if action in ("query", "clear") and (entries or default is not None):
+        raise ValueError(f"{action} takes no entries or default")
+    if action == "update" and default is not None:
+        raise ValueError("only replace sets the default route")
+    body = {"action": action}
+    if action == "replace" and default is not None:
+        body["defaultTarget"] = pusch_route_target(default)
+    if entries:
+        body["entries"] = entries
+    return {"header": header(transaction, dry_run=dry_run), "operation": ("puschRouting", body)}
+
+
+def route_target_label(target: dict) -> str:
+    """Display form of a normalized ``PuschRouteTarget``: primary, conventional or the instance UUID."""
+    kind, value = next(iter(target.items()))
+    return value if kind == "instance" else kind
 
 
 def metrics_request(instance_id: bytes, schema: bool = False, transaction=None) -> dict:

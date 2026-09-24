@@ -5,9 +5,11 @@
 
 #include "ocudu/dapp/runtime/native_completion_barrier.h"
 #include "ocudu/dapp/runtime/native_worker.h"
+#include "ocudu/dapp/runtime/pusch_route_table.h"
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace ocudu {
 
@@ -39,6 +41,16 @@ public:
   virtual void                           report_invalid_output(uint32_t, const ocudu_dapp_invocation_v1&) noexcept {}
   virtual void report_completion_deadline(uint32_t, const ocudu_dapp_invocation_v1&, uint64_t, uint64_t) noexcept {}
   virtual void report_fallback(uint32_t, dapp::class_a_fallback_reason) noexcept {}
+
+  /// Per-UE routing (see dapp::pusch_route_table): the route of one grant. A target without a route
+  /// table always answers the primary route.
+  virtual dapp::pusch_route resolve_route(uint32_t /*cell_index*/, uint16_t /*rnti*/) const noexcept
+  {
+    return dapp::pusch_route::primary();
+  }
+  /// The target serving a grant on \p route. The primary route is this target; a route to another
+  /// hook or to the stock receiver is an inactive target, so the grant keeps the conventional estimator.
+  virtual pusch_dapp_channel_estimator_target& route(const dapp::pusch_route& /*route*/) noexcept { return *this; }
 };
 
 struct pusch_dapp_channel_estimator_config {
@@ -62,5 +74,11 @@ create_pusch_dapp_channel_estimator_factory(std::shared_ptr<dmrs_pusch_estimator
 /// Adapts an activated native hook point to the upper-PHY channel-estimator target.
 std::shared_ptr<pusch_dapp_channel_estimator_target>
 create_native_pusch_dapp_channel_estimator_target(std::shared_ptr<dapp::native_hook_point> point) noexcept;
+
+/// Adapts the route-table slots of the channel-estimator hook (slot order, slot 0 first) to one
+/// routed target: the primary route is slot 0 and a routed UE is served by its instance's slot.
+std::shared_ptr<pusch_dapp_channel_estimator_target>
+create_native_pusch_dapp_channel_estimator_target(std::vector<std::shared_ptr<dapp::native_hook_point>> slots,
+                                                  std::shared_ptr<const dapp::pusch_route_table>        table) noexcept;
 
 } // namespace ocudu

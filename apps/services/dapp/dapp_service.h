@@ -5,6 +5,7 @@
 
 #include "ocudu/dapp/management/types.h"
 #include "ocudu/dapp/runtime/package_signature.h"
+#include "ocudu/dapp/runtime/pusch_route_table.h"
 #include "ocudu/dapp/use_cases/v1/srs_isac.h"
 #include <array>
 #include <chrono>
@@ -168,6 +169,10 @@ struct dapp_service_config {
   dapp::package_signature_config            package_signatures;
   std::vector<dapp_service_cell_config>     cells;
   uint32_t                                  nof_pusch_lanes{};
+  /// Hook points per Class-A PUSCH hook (channel estimator, equalizer, receiver) for per-UE routing
+  /// (1 to 8). One keeps the single-owner topology; more lets that many instances of one hook stay
+  /// active at once, each serving the UEs the E3 route table sends it.
+  unsigned                                  pusch_route_slots{1};
   uint32_t                                  nof_srs_lanes{};
   uint32_t                                  nof_scheduler_lanes{};
   uint32_t                                  max_scheduler_ul_prbs_avoided{};

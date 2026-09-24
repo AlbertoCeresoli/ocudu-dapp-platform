@@ -269,6 +269,24 @@ subsequent radio procedure completed. The E3/SCTP session thread only admits
 and defers the request—it never mutates CU-CP state directly. Use dry-run to
 validate the control path without affecting a UE.
 
+### Per-UE PUSCH routing
+
+```bash
+... pusch-route show
+... pusch-route set --entry 0x4601=<instance-id> --entry 0x4602=conventional [--dry-run]
+... pusch-route replace --default conventional --entry 0x4601@0=<instance-id>
+... pusch-route set --entry 0x4601=primary     # remove the UE's entry
+... pusch-route clear
+```
+
+`puschRouting` routes each UE's PUSCH grants to one active channel-estimator,
+equalizer or receiver instance, to the stock receiver (`conventional`), or to
+the host default (`primary`). It is synchronous: the response carries the
+resulting table, which instance occupies which hook slot, and how many grants
+met an entry whose instance was not active (those used the stock receiver).
+Several instances of one hook need `dapp.pusch_route_slots` > 1. The model,
+guarantees and a controller example are in [pusch_routing.md](pusch_routing.md).
+
 ### Quiet reservations
 
 ```bash

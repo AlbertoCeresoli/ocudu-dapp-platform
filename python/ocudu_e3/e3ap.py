@@ -663,3 +663,7 @@ class E3Client:
 
     def cell_info(self) -> dict:
         return mgmt.normalize(self.management(mgmt.cell_info_request()))
+
+    def pusch_routing(self, action: str = "query", entries=(), default=None, **kwargs) -> dict:
+        """Query or change the per-UE Class-A PUSCH route table (see :func:`management.pusch_routing_request`)."""
+        return mgmt.normalize(self.management(mgmt.pusch_routing_request(action, entries, default, **kwargs)))

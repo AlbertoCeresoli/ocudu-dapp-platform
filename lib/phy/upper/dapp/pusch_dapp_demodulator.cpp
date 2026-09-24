@@ -171,9 +171,12 @@ public:
   {
     last_delegated = true;
     captured_symbols_valid = false;
-    const pusch_dapp_demodulator_mode mode = target->active_mode();
+    // One route per grant: every helper of this grant uses the routed view (the stock-receiver and
+    // channel-estimator views are inactive, so those grants take the conventional demodulator).
+    grant_target = &target->route(target->resolve_route(config.cell_id, to_value(config.rnti)));
+    const pusch_dapp_demodulator_mode mode = grant_target->active_mode();
     if (mode == pusch_dapp_demodulator_mode::conflict) {
-      target->report_fallback(lane, mode, dapp::class_a_fallback_reason::overlapped_hook);
+      grant_target->report_fallback(lane, mode, dapp::class_a_fallback_reason::overlapped_hook);
       fallback->demodulate(codeword_buffer, notifier, grid, est_results, config);
       return;
     }
@@ -181,22 +184,22 @@ public:
       fallback->demodulate(codeword_buffer, notifier, grid, est_results, config);
       return;
     }
-    if (target->backend_id(mode) != OCUDU_DAPP_BACKEND_HOST_V1) {
+    if (grant_target->backend_id(mode) != OCUDU_DAPP_BACKEND_HOST_V1) {
       fallback->demodulate(codeword_buffer, notifier, grid, est_results, config);
       return;
     }
     if (fallback->is_resident_mode_enabled()) {
-      target->report_fallback(lane, mode, dapp::class_a_fallback_reason::overlapped_hook);
+      grant_target->report_fallback(lane, mode, dapp::class_a_fallback_reason::overlapped_hook);
       fallback->demodulate(codeword_buffer, notifier, grid, est_results, config);
       return;
     }
     if (const auto reason = preflight(grid, config)) {
-      target->report_fallback(lane, mode, *reason);
+      grant_target->report_fallback(lane, mode, *reason);
       fallback->demodulate(codeword_buffer, notifier, grid, est_results, config);
       return;
     }
     if (const auto reason = prepare(mode, grid, config)) {
-      target->report_fallback(lane, mode, *reason);
+      grant_target->report_fallback(lane, mode, *reason);
       fallback->demodulate(codeword_buffer, notifier, grid, est_results, config);
       return;
     }
@@ -342,7 +345,7 @@ private:
     if (generation == 0) {
       generation = ++invocation_sequence;
     }
-    const uint32_t worker_id       = target->worker_id(lane, mode);
+    const uint32_t worker_id       = grant_target->worker_id(lane, mode);
     const uint64_t allocation_base = (static_cast<uint64_t>(worker_id) + 1U) << 8U;
 
     pusch_metadata                                = {};
@@ -361,6 +364,7 @@ private:
     pusch_metadata.reserved[OCUDU_DAPP_PUSCH_RESERVED_SUBCARRIER_SPACING_HZ_V1] =
         static_cast<uint64_t>(scs_to_khz(config.slot.scs())) * 1000U;
     pusch_metadata.reserved[OCUDU_DAPP_PUSCH_RESERVED_GRID_NOF_SUBCARRIERS_V1] = grid.get_nof_subc();
+    pusch_metadata.reserved[OCUDU_DAPP_PUSCH_RESERVED_RNTI_V1]                 = to_value(config.rnti);
     pusch_metadata.data_re_mask                   = make_host_tensor(data_mask.data(),
                                                    OCUDU_DAPP_ELEMENT_U8_V1,
                                                    OCUDU_DAPP_ACCESS_READ_V1,
@@ -535,14 +539,14 @@ private:
       const auto expected_channel    = output.channel_estimates;
       const auto expected_symbols    = output.equalized_symbols;
       const auto expected_noise      = output.post_equalization_noise;
-      const auto result              = target->invoke(lane, input, output);
+      const auto result              = grant_target->invoke(lane, input, output);
       if (result.status != OCUDU_DAPP_OK_V1 || result.invoke_fallback) {
         return false;
       }
       if (!dapp::same_tensor_storage(expected_channel, output.channel_estimates) ||
           !dapp::same_tensor_storage(expected_symbols, output.equalized_symbols) ||
           !dapp::same_tensor_storage(expected_noise, output.post_equalization_noise) || !commit_equalizer(config)) {
-        target->report_invalid_output(lane, mode, invocation);
+        grant_target->report_invalid_output(lane, mode, invocation);
         return false;
       }
       return true;
@@ -584,7 +588,7 @@ private:
     const auto expected_llrs                       = output.llrs;
     const auto expected_noise                      = metrics.post_equalization_noise;
     const auto expected_symbols                    = metrics.equalized_symbols;
-    const auto result                              = target->invoke(lane, input, output);
+    const auto result                              = grant_target->invoke(lane, input, output);
     if (result.status != OCUDU_DAPP_OK_V1 || result.invoke_fallback) {
       return false;
     }
@@ -594,7 +598,7 @@ private:
         (metrics_valid && !dapp::same_tensor_storage(expected_noise, metrics.post_equalization_noise)) ||
         (symbols_valid && (!capture_symbols || !dapp::same_tensor_storage(expected_symbols, metrics.equalized_symbols))) ||
         !commit_receiver(metrics_valid, symbols_valid)) {
-      target->report_invalid_output(lane, mode, invocation);
+      grant_target->report_invalid_output(lane, mode, invocation);
       return false;
     }
     return true;
@@ -813,6 +817,8 @@ private:
   bool                                         capture_symbols = false;
   bool                                         captured_symbols_valid = false;
   std::shared_ptr<pusch_dapp_demodulator_target> target;
+  /// The routed view of `target` serving the current grant (set at the start of demodulate()).
+  pusch_dapp_demodulator_target*                 grant_target = nullptr;
   uint32_t                                       lane;
   std::unique_ptr<pseudo_random_generator>       pilot_prg;
   std::unique_ptr<pseudo_random_generator>       descrambler;

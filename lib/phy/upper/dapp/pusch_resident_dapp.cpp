@@ -303,6 +303,7 @@ public:
                              NOF_SUBCARRIERS_PER_RB),
     pilot_sequence(static_cast<size_t>(max_nof_prb) * max_dmrs_re_per_rb)
   {
+    select_route(dapp::pusch_route::primary());
   }
 
   ~cuda_resident_dapp() override
@@ -390,7 +391,7 @@ public:
 
   pusch_resident_dapp_mode mode() const noexcept override
   {
-    const auto demodulator_mode = target->active_mode();
+    const auto demodulator_mode = grant_demodulator->active_mode();
     if (demodulator_mode == pusch_dapp_demodulator_mode::equalizer) {
       return pusch_resident_dapp_mode::equalizer;
     }
@@ -400,8 +401,8 @@ public:
     if (demodulator_mode == pusch_dapp_demodulator_mode::conflict) {
       return pusch_resident_dapp_mode::conflict;
     }
-    return channel_estimator && channel_estimator->active() ? pusch_resident_dapp_mode::channel_estimator
-                                                            : pusch_resident_dapp_mode::inactive;
+    return grant_estimator != nullptr && grant_estimator->active() ? pusch_resident_dapp_mode::channel_estimator
+                                                                   : pusch_resident_dapp_mode::inactive;
   }
 
   dapp::native_invocation_result
@@ -411,8 +412,8 @@ public:
     try {
       return invoke_channel_estimator_impl(buffers, config);
     } catch (...) {
-      if (channel_estimator) {
-        channel_estimator->report_fallback(lane, dapp::class_a_fallback_reason::exception);
+      if (grant_estimator != nullptr) {
+        grant_estimator->report_fallback(lane, dapp::class_a_fallback_reason::exception);
       }
       return {OCUDU_DAPP_EXCEPTION_V1, true};
     }
@@ -424,7 +425,8 @@ public:
     try {
       return invoke_equalizer_impl(buffers, config);
     } catch (...) {
-      target->report_fallback(lane, pusch_dapp_demodulator_mode::equalizer, dapp::class_a_fallback_reason::exception);
+      grant_demodulator->report_fallback(
+          lane, pusch_dapp_demodulator_mode::equalizer, dapp::class_a_fallback_reason::exception);
       return {OCUDU_DAPP_EXCEPTION_V1, true};
     }
   }
@@ -437,9 +439,21 @@ public:
     try {
       return invoke_receiver_impl(buffers, config);
     } catch (...) {
-      target->report_fallback(lane, pusch_dapp_demodulator_mode::receiver, dapp::class_a_fallback_reason::exception);
+      grant_demodulator->report_fallback(
+          lane, pusch_dapp_demodulator_mode::receiver, dapp::class_a_fallback_reason::exception);
       return {OCUDU_DAPP_EXCEPTION_V1, true};
     }
+  }
+
+  dapp::pusch_route resolve_route(uint32_t cell_index, uint16_t rnti) const noexcept override
+  {
+    return target->resolve_route(cell_index, rnti);
+  }
+
+  void select_route(const dapp::pusch_route& route) noexcept override
+  {
+    grant_demodulator = &target->route(route);
+    grant_estimator   = channel_estimator ? &channel_estimator->route(route) : nullptr;
   }
 
   bool begin_grant() noexcept override
@@ -447,6 +461,7 @@ public:
     if (receiver_pending.load(std::memory_order_acquire)) {
       return false;
     }
+    select_route(dapp::pusch_route::primary());
     // Reset at the grant boundary, not only in invoke_receiver(): the next grant may use baseline, CE or EQ.
     // finish_receiver() publishes pending=false only after all consumers and retained owners are finished.
     receiver_completion_selected = false;
@@ -525,7 +540,7 @@ public:
     float elapsed_ms{};
     if (query != cudaSuccess || cudaEventElapsedTime(&elapsed_ms, timing.start, timing.end) != cudaSuccess) {
       static_cast<void>(cudaGetLastError());
-      report_fallback(timing.mode, dapp::class_a_fallback_reason::device);
+      report_fallback_to(timing.demodulator, timing.estimator, timing.mode, dapp::class_a_fallback_reason::device);
       return;
     }
     const auto observed_latency_ns = static_cast<uint64_t>(static_cast<double>(elapsed_ms) * 1.0e6);
@@ -534,15 +549,17 @@ public:
       return;
     }
     if (timing.mode == pusch_resident_dapp_mode::channel_estimator) {
-      channel_estimator->report_completion_deadline(lane, timing.invocation, observed_latency_ns, deadline_ns);
-    } else {
-      target->report_completion_deadline(lane,
-                                         timing.mode == pusch_resident_dapp_mode::equalizer
-                                             ? pusch_dapp_demodulator_mode::equalizer
-                                             : pusch_dapp_demodulator_mode::receiver,
-                                         timing.invocation,
-                                         observed_latency_ns,
-                                         deadline_ns);
+      if (timing.estimator != nullptr) {
+        timing.estimator->report_completion_deadline(lane, timing.invocation, observed_latency_ns, deadline_ns);
+      }
+    } else if (timing.demodulator != nullptr) {
+      timing.demodulator->report_completion_deadline(lane,
+                                                     timing.mode == pusch_resident_dapp_mode::equalizer
+                                                         ? pusch_dapp_demodulator_mode::equalizer
+                                                         : pusch_dapp_demodulator_mode::receiver,
+                                                     timing.invocation,
+                                                     observed_latency_ns,
+                                                     deadline_ns);
     }
   }
 
@@ -662,6 +679,9 @@ private:
     cudaEvent_t              end{};
     ocudu_dapp_invocation_v1 invocation{};
     pusch_resident_dapp_mode mode{pusch_resident_dapp_mode::inactive};
+    /// Views that served this grant: completion is observed after later grants may have routed elsewhere.
+    pusch_dapp_demodulator_target*       demodulator{};
+    pusch_dapp_channel_estimator_target* estimator{};
     uint64_t                 deadline_ns{};
     bool                     armed{};
     bool                     pending{};
@@ -703,6 +723,8 @@ private:
     }
     timing.invocation  = invocation;
     timing.mode        = mode;
+    timing.demodulator = grant_demodulator;
+    timing.estimator   = grant_estimator;
     timing.deadline_ns = static_cast<uint64_t>(
         (mode == pusch_resident_dapp_mode::channel_estimator ? channel_estimator_deadline : demodulator_deadline)
             .count());
@@ -727,13 +749,23 @@ private:
 
   void report_fallback(pusch_resident_dapp_mode mode, dapp::class_a_fallback_reason reason) noexcept override
   {
+    report_fallback_to(grant_demodulator, grant_estimator, mode, reason);
+  }
+
+  void report_fallback_to(pusch_dapp_demodulator_target*       demodulator,
+                          pusch_dapp_channel_estimator_target* estimator,
+                          pusch_resident_dapp_mode             mode,
+                          dapp::class_a_fallback_reason        reason) noexcept
+  {
     if (mode == pusch_resident_dapp_mode::channel_estimator) {
-      channel_estimator->report_fallback(lane, reason);
-    } else {
-      target->report_fallback(lane,
-                              mode == pusch_resident_dapp_mode::equalizer ? pusch_dapp_demodulator_mode::equalizer
-                                                                          : pusch_dapp_demodulator_mode::receiver,
-                              reason);
+      if (estimator != nullptr) {
+        estimator->report_fallback(lane, reason);
+      }
+    } else if (demodulator != nullptr) {
+      demodulator->report_fallback(lane,
+                                   mode == pusch_resident_dapp_mode::equalizer ? pusch_dapp_demodulator_mode::equalizer
+                                                                               : pusch_dapp_demodulator_mode::receiver,
+                                   reason);
     }
   }
 
@@ -934,23 +966,23 @@ private:
   dapp::native_invocation_result invoke_channel_estimator_impl(const pusch_resident_dapp_buffers&      buffers,
                                                                const pusch_demodulator::configuration& config)
   {
-    if (!channel_estimator || !channel_estimator->active() ||
-        channel_estimator->backend_id() != OCUDU_DAPP_BACKEND_CUDA_V1 ||
-        target->active_mode() != pusch_dapp_demodulator_mode::inactive) {
+    if (grant_estimator == nullptr || !grant_estimator->active() ||
+        grant_estimator->backend_id() != OCUDU_DAPP_BACKEND_CUDA_V1 ||
+        grant_demodulator->active_mode() != pusch_dapp_demodulator_mode::inactive) {
       return {OCUDU_DAPP_BYPASS_V1, true};
     }
     if (const auto reason = preflight(buffers, config, pusch_resident_dapp_mode::channel_estimator)) {
-      channel_estimator->report_fallback(lane, *reason);
+      grant_estimator->report_fallback(lane, *reason);
       return {OCUDU_DAPP_UNSUPPORTED_V1, true};
     }
     prepared_invocation prepared;
     const auto          status =
-        prepare(buffers, config, channel_estimator->worker_id(lane), channel_estimator_deadline, prepared);
+        prepare(buffers, config, grant_estimator->worker_id(lane), channel_estimator_deadline, prepared);
     if (status != OCUDU_DAPP_OK_V1) {
-      channel_estimator->report_fallback(lane,
-                                         status == OCUDU_DAPP_RESOURCE_V1
-                                             ? dapp::class_a_fallback_reason::resource
-                                             : dapp::class_a_fallback_reason::unsupported_dmrs);
+      grant_estimator->report_fallback(lane,
+                                       status == OCUDU_DAPP_RESOURCE_V1
+                                           ? dapp::class_a_fallback_reason::resource
+                                           : dapp::class_a_fallback_reason::unsupported_dmrs);
       return {status, true};
     }
 
@@ -986,11 +1018,11 @@ private:
     output.reserved[OCUDU_DAPP_CHANNEL_ESTIMATOR_SCHED_NOISE_RESPONSE_INDEX_V1] = 0;
     scheduler_noise_valid                                                       = false;
     if (!begin_timing(buffers.completion_slot, pusch_resident_dapp_mode::channel_estimator, prepared.invocation)) {
-      channel_estimator->report_fallback(lane, dapp::class_a_fallback_reason::device);
+      grant_estimator->report_fallback(lane, dapp::class_a_fallback_reason::device);
       return {OCUDU_DAPP_DEVICE_ERROR_V1, true};
     }
     pending_callbacks.fetch_add(1, std::memory_order_acq_rel);
-    const auto result = channel_estimator->invoke(lane, input, output);
+    const auto result = grant_estimator->invoke(lane, input, output);
     scheduler_noise_valid =
         result.status == OCUDU_DAPP_OK_V1 && !result.invoke_fallback &&
         output.reserved[OCUDU_DAPP_CHANNEL_ESTIMATOR_SCHED_NOISE_REQUEST_INDEX_V1] ==
@@ -1007,32 +1039,32 @@ private:
   dapp::native_invocation_result invoke_equalizer_impl(const pusch_resident_dapp_buffers&      buffers,
                                                        const pusch_demodulator::configuration& config)
   {
-    if (target->active_mode() != pusch_dapp_demodulator_mode::equalizer ||
-        target->backend_id(pusch_dapp_demodulator_mode::equalizer) != OCUDU_DAPP_BACKEND_CUDA_V1) {
+    if (grant_demodulator->active_mode() != pusch_dapp_demodulator_mode::equalizer ||
+        grant_demodulator->backend_id(pusch_dapp_demodulator_mode::equalizer) != OCUDU_DAPP_BACKEND_CUDA_V1) {
       return {OCUDU_DAPP_BYPASS_V1, true};
     }
     if (buffers.equalized_cf32 == nullptr || buffers.post_eq_noise_f32 == nullptr) {
       log_equalizer_diag("fallback", config, buffers, dapp::class_a_fallback_reason::unsupported_metadata);
-      target->report_fallback(
+      grant_demodulator->report_fallback(
           lane, pusch_dapp_demodulator_mode::equalizer, dapp::class_a_fallback_reason::unsupported_metadata);
       return {OCUDU_DAPP_UNSUPPORTED_V1, true};
     }
     if (const auto reason = preflight(buffers, config, pusch_resident_dapp_mode::equalizer)) {
       log_equalizer_diag("fallback", config, buffers, *reason);
-      target->report_fallback(lane, pusch_dapp_demodulator_mode::equalizer, *reason);
+      grant_demodulator->report_fallback(lane, pusch_dapp_demodulator_mode::equalizer, *reason);
       return {OCUDU_DAPP_UNSUPPORTED_V1, true};
     }
     prepared_invocation prepared;
     const auto          status = prepare(buffers,
                                 config,
-                                target->worker_id(lane, pusch_dapp_demodulator_mode::equalizer),
+                                grant_demodulator->worker_id(lane, pusch_dapp_demodulator_mode::equalizer),
                                 demodulator_deadline,
                                 prepared);
     if (status != OCUDU_DAPP_OK_V1) {
       const auto reason = status == OCUDU_DAPP_RESOURCE_V1 ? dapp::class_a_fallback_reason::resource
                                                            : dapp::class_a_fallback_reason::unsupported_dmrs;
       log_equalizer_diag("fallback", config, buffers, reason);
-      target->report_fallback(lane, pusch_dapp_demodulator_mode::equalizer, reason);
+      grant_demodulator->report_fallback(lane, pusch_dapp_demodulator_mode::equalizer, reason);
       return {status, true};
     }
 
@@ -1069,11 +1101,12 @@ private:
                                                         OCUDU_DAPP_LAYOUT_PUSCH_POST_EQ_NOISE_DATA_RE_LAYER_V1);
     if (!begin_timing(buffers.completion_slot, pusch_resident_dapp_mode::equalizer, prepared.invocation)) {
       log_equalizer_diag("fallback", config, buffers, dapp::class_a_fallback_reason::device);
-      target->report_fallback(lane, pusch_dapp_demodulator_mode::equalizer, dapp::class_a_fallback_reason::device);
+      grant_demodulator->report_fallback(
+          lane, pusch_dapp_demodulator_mode::equalizer, dapp::class_a_fallback_reason::device);
       return {OCUDU_DAPP_DEVICE_ERROR_V1, true};
     }
     pending_callbacks.fetch_add(1, std::memory_order_acq_rel);
-    const auto result = target->invoke(lane, input, output);
+    const auto result = grant_demodulator->invoke(lane, input, output);
     record_module_end(buffers.completion_slot, result);
     if (result.status == OCUDU_DAPP_OK_V1 && !result.invoke_fallback) {
       log_equalizer_diag("ok", config, buffers);
@@ -1098,20 +1131,20 @@ private:
       return {OCUDU_DAPP_DEVICE_ERROR_V1, false};
     }
     receiver_completion_selected = false;
-    if (target->active_mode() != pusch_dapp_demodulator_mode::receiver ||
-        target->backend_id(pusch_dapp_demodulator_mode::receiver) != OCUDU_DAPP_BACKEND_CUDA_V1) {
+    if (grant_demodulator->active_mode() != pusch_dapp_demodulator_mode::receiver ||
+        grant_demodulator->backend_id(pusch_dapp_demodulator_mode::receiver) != OCUDU_DAPP_BACKEND_CUDA_V1) {
       return {OCUDU_DAPP_BYPASS_V1, true};
     }
     if (buffers.llrs_f16 == nullptr) {
-      target->report_fallback(
+      grant_demodulator->report_fallback(
           lane, pusch_dapp_demodulator_mode::receiver, dapp::class_a_fallback_reason::unsupported_metadata);
       return {OCUDU_DAPP_UNSUPPORTED_V1, true};
     }
     if (const auto reason = preflight(buffers, config, pusch_resident_dapp_mode::receiver)) {
-      target->report_fallback(lane, pusch_dapp_demodulator_mode::receiver, *reason);
+      grant_demodulator->report_fallback(lane, pusch_dapp_demodulator_mode::receiver, *reason);
       return {OCUDU_DAPP_UNSUPPORTED_V1, true};
     }
-    const bool deferred = target->receiver_completion_required();
+    const bool          deferred = grant_demodulator->receiver_completion_required();
     pusch_resource_loan tensors;
     if (deferred) {
       if (!config.resource_owner || !buffers.codeword.valid ||
@@ -1126,16 +1159,17 @@ private:
     // Stable dependency-owned metadata, retained together with tensors during deferred dispatch.
     receiver_prepared = {};
     auto& prepared = receiver_prepared;
-    const auto          status = prepare(buffers,
+    const auto status   = prepare(buffers,
                                 config,
-                                target->worker_id(lane, pusch_dapp_demodulator_mode::receiver),
+                                grant_demodulator->worker_id(lane, pusch_dapp_demodulator_mode::receiver),
                                 demodulator_deadline,
                                 prepared);
     if (status != OCUDU_DAPP_OK_V1) {
-      target->report_fallback(lane,
-                              pusch_dapp_demodulator_mode::receiver,
-                              status == OCUDU_DAPP_RESOURCE_V1 ? dapp::class_a_fallback_reason::resource
-                                                               : dapp::class_a_fallback_reason::unsupported_dmrs);
+      grant_demodulator->report_fallback(lane,
+                                         pusch_dapp_demodulator_mode::receiver,
+                                         status == OCUDU_DAPP_RESOURCE_V1
+                                             ? dapp::class_a_fallback_reason::resource
+                                             : dapp::class_a_fallback_reason::unsupported_dmrs);
       return {status, true};
     }
     receiver_input = {};
@@ -1183,7 +1217,8 @@ private:
       output.metrics                  = make_metadata(OCUDU_DAPP_METADATA_RECEIVER_METRICS_V1, metrics);
     }
     if (!begin_timing(buffers.completion_slot, pusch_resident_dapp_mode::receiver, prepared.invocation)) {
-      target->report_fallback(lane, pusch_dapp_demodulator_mode::receiver, dapp::class_a_fallback_reason::device);
+      grant_demodulator->report_fallback(
+          lane, pusch_dapp_demodulator_mode::receiver, dapp::class_a_fallback_reason::device);
       return {OCUDU_DAPP_DEVICE_ERROR_V1, true};
     }
     pending_callbacks.fetch_add(1, std::memory_order_acq_rel);
@@ -1193,7 +1228,7 @@ private:
       receiver_codeword = buffers.codeword;
       receiver_consumers_done.store(false, std::memory_order_relaxed);
       receiver_pending.store(true, std::memory_order_release);
-      result = receiver_adapter.submit(*target, lane, input, output, receiver_codeword, tensors);
+      result = receiver_adapter.submit(*grant_demodulator, lane, input, output, receiver_codeword, tensors);
       if (tensors) {
         // Before-dispatch rejection: no native owner escaped and original caller still owns the dependency.
         tensors.reset();
@@ -1206,7 +1241,7 @@ private:
         }
       }
     } else {
-      result = target->invoke(lane, input, output);
+      result = grant_demodulator->invoke(lane, input, output);
     }
     receiver_noise_valid = result.status == OCUDU_DAPP_OK_V1 && !result.invoke_fallback &&
                            (output.reserved0 & OCUDU_DAPP_RECEIVER_METRICS_VALID_V1) != 0;
@@ -1274,6 +1309,9 @@ private:
 
   std::shared_ptr<pusch_dapp_demodulator_target>                  target;
   std::shared_ptr<pusch_dapp_channel_estimator_target>            channel_estimator;
+  /// Routed views serving the current grant (select_route(); primary from begin_grant()).
+  pusch_dapp_demodulator_target*                                  grant_demodulator{};
+  pusch_dapp_channel_estimator_target*                            grant_estimator{};
   uint32_t                                                        lane;
   std::unique_ptr<pseudo_random_generator>                        pilot_generator;
   unsigned                                                        max_nof_prb;

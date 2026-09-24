@@ -319,6 +319,50 @@ class LiveAgentTests(unittest.TestCase):
             with self.assertRaises(E3ProtocolError):
                 client.subscribe([999])
 
+    def test_pusch_routing_round_trips_and_validates_over_sctp(self):
+        from ocudu_e3 import management
+        with self.client() as client:
+            client.setup()
+            table = client.pusch_routing()
+            self.assertEqual(table["code"], "success")
+            state = table["payload"]["puschRouting"]
+            self.assertEqual(state["slotsPerHook"], 2)
+            self.assertEqual(state["entries"], [])
+            self.assertEqual(state["defaultTarget"], {"primary": None})
+
+            unbound = management.pusch_route_entry(0x4601, "00112233-4455-6677-8899-aabbccddeeff")
+            self.assertEqual(client.pusch_routing("update", [unbound])["code"], "notFound")
+
+            dry = client.pusch_routing("replace", [management.pusch_route_entry(0x4601, "conventional")], dry_run=True)
+            self.assertEqual(dry["code"], "dryRunSuccess")
+            self.assertEqual(dry["payload"]["puschRouting"]["entries"], [])
+
+            applied = client.pusch_routing("replace", [
+                management.pusch_route_entry(0x4601, "conventional"),
+                management.pusch_route_entry(0x4602, "conventional", cell_index=1),
+            ], default="conventional")
+            self.assertEqual(applied["code"], "success")
+            state = applied["payload"]["puschRouting"]
+            self.assertEqual(state["defaultTarget"], {"conventional": None})
+            # Sorted by cell, then RNTI; entries for every cell (no cellIndex) come last.
+            self.assertEqual([entry["rnti"] for entry in state["entries"]], [0x4602, 0x4601])
+            self.assertEqual(state["entries"][0]["cellIndex"], 1)
+            self.assertNotIn("cellIndex", state["entries"][1])
+            self.assertGreater(state["generation"], table["payload"]["puschRouting"]["generation"])
+
+            removed = client.pusch_routing("update", [management.pusch_route_entry(0x4601, "primary")])
+            self.assertEqual([entry["rnti"] for entry in removed["payload"]["puschRouting"]["entries"]], [0x4602])
+            cleared = client.pusch_routing("clear")
+            self.assertEqual(cleared["payload"]["puschRouting"]["entries"], [])
+            self.assertEqual(cleared["payload"]["puschRouting"]["defaultTarget"], {"primary": None})
+
+        with self.assertRaises(ValueError):
+            management.pusch_routing_request("query", [management.pusch_route_entry(0x4601)])
+        with self.assertRaises(ValueError):
+            management.pusch_routing_request("update", default="conventional")
+        with self.assertRaises(ValueError):
+            management.pusch_route_entry(0xFFF0)
+
     def test_catalog_admission_is_a_job_and_cannot_bypass_missing_trust(self):
         from ocudu_e3 import management
         with self.client() as client:

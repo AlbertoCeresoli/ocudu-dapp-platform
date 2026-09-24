@@ -995,6 +995,7 @@ bool valid_config(const dapp_service_config& config) noexcept
   }
   const uint64_t portable_routes = config.portable_e3_data ? spectrum_lanes + config.nof_srs_lanes : 0;
   return config.backend_mask != 0 && config.max_scheduler_ul_prbs_avoided < MAX_NOF_PRBS && spectrum_lanes != 0 &&
+         config.pusch_route_slots >= 1 && config.pusch_route_slots <= dapp::pusch_route_table::max_slots_per_hook &&
          spectrum_lanes <= std::numeric_limits<uint32_t>::max() &&
          spectrum_lanes + config.nof_srs_lanes + portable_routes <= upper_phy_dapp_max_route_bindings;
 }
@@ -1037,6 +1038,7 @@ struct started_initial_instance {
 
 struct dapp_service::implementation {
   std::shared_ptr<dapp::native_hook_registry>                registry;
+  std::shared_ptr<dapp::pusch_route_table>                   pusch_routes;
   std::shared_ptr<upper_phy_dapp_hook_provider>              upper_phy_provider;
   std::shared_ptr<scheduler_dapp_hook_provider>              scheduler_provider;
   std::shared_ptr<scheduler_dapp_interference_cache>         interference;
@@ -1089,6 +1091,7 @@ std::shared_ptr<dapp::native_hook_point> add_point(const std::shared_ptr<dapp::n
 }
 
 bool build_hook_topology(const std::shared_ptr<dapp::native_hook_registry>&          registry,
+                         const std::shared_ptr<dapp::pusch_route_table>&             pusch_routes,
                          std::shared_ptr<upper_phy_dapp_hook_provider>&              upper_phy_provider,
                          std::shared_ptr<scheduler_dapp_hook_provider>&              scheduler_provider,
                          const std::shared_ptr<scheduler_dapp_interference_cache>&   interference,
@@ -1109,12 +1112,21 @@ bool build_hook_topology(const std::shared_ptr<dapp::native_hook_registry>&     
       }));
   auto spectrum = add_point(registry, OCUDU_DAPP_INTERFACE_SPECTRUM_V1, spectrum_lanes, detail);
   auto srs      = add_point(registry, OCUDU_DAPP_INTERFACE_SRS_ISAC_V1, config.nof_srs_lanes, detail);
-  auto ce       = add_point(registry, OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1, config.nof_pusch_lanes, detail);
-  auto eq       = add_point(registry, OCUDU_DAPP_INTERFACE_EQUALIZER_V1, config.nof_pusch_lanes, detail);
-  auto rx       = add_point(registry, OCUDU_DAPP_INTERFACE_RECEIVER_V1, config.nof_pusch_lanes, detail);
   auto sched    = add_point(registry, OCUDU_DAPP_INTERFACE_SCHEDULER_V1, config.nof_scheduler_lanes, detail);
-  if (!spectrum || !srs || !ce || !eq || !rx || !sched) {
+  if (!spectrum || !srs || !sched) {
     return false;
+  }
+  // One point per route-table slot of each Class-A PUSCH hook; slot 0 is the single-owner point.
+  std::vector<std::shared_ptr<dapp::native_hook_point>> ce_slots;
+  std::vector<std::shared_ptr<dapp::native_hook_point>> eq_slots;
+  std::vector<std::shared_ptr<dapp::native_hook_point>> rx_slots;
+  for (unsigned slot = 0; slot != pusch_routes->slots_per_hook(); ++slot) {
+    ce_slots.push_back(add_point(registry, OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1, config.nof_pusch_lanes, detail));
+    eq_slots.push_back(add_point(registry, OCUDU_DAPP_INTERFACE_EQUALIZER_V1, config.nof_pusch_lanes, detail));
+    rx_slots.push_back(add_point(registry, OCUDU_DAPP_INTERFACE_RECEIVER_V1, config.nof_pusch_lanes, detail));
+    if (!ce_slots.back() || !eq_slots.back() || !rx_slots.back()) {
+      return false;
+    }
   }
 
   // Per-hook backend policy follows the *data path* each hook is wired into:
@@ -1130,9 +1142,11 @@ bool build_hook_topology(const std::shared_ptr<dapp::native_hook_registry>&     
   const uint32_t     class_a_hook_backends = cuda_l1 ? cuda_bit : host_bit;
   const uint32_t     class_b_hook_backends = host_bit;
   const uint32_t     class_c_hook_backends = host_bit | (cuda_l1 ? cuda_bit : 0u);
-  ce->set_allowed_backend_mask(class_a_hook_backends);
-  eq->set_allowed_backend_mask(class_a_hook_backends);
-  rx->set_allowed_backend_mask(class_a_hook_backends);
+  for (unsigned slot = 0; slot != pusch_routes->slots_per_hook(); ++slot) {
+    ce_slots[slot]->set_allowed_backend_mask(class_a_hook_backends);
+    eq_slots[slot]->set_allowed_backend_mask(class_a_hook_backends);
+    rx_slots[slot]->set_allowed_backend_mask(class_a_hook_backends);
+  }
   sched->set_allowed_backend_mask(class_b_hook_backends);
   spectrum->set_allowed_backend_mask(class_c_hook_backends);
   srs->set_allowed_backend_mask(class_c_hook_backends);
@@ -1237,8 +1251,13 @@ bool build_hook_topology(const std::shared_ptr<dapp::native_hook_registry>&     
     return false;
   }
 
-  auto ce_target     = create_native_pusch_dapp_channel_estimator_target(ce);
-  auto demod_target  = create_native_pusch_dapp_demodulator_target(eq, rx);
+  auto ce_target = create_native_pusch_dapp_channel_estimator_target(std::move(ce_slots), pusch_routes);
+  auto demod_target =
+      create_native_pusch_dapp_demodulator_target(std::move(eq_slots), std::move(rx_slots), pusch_routes);
+  if (!ce_target || !demod_target) {
+    detail = "unable to create the routed Class-A PUSCH targets";
+    return false;
+  }
   upper_phy_provider = create_upper_phy_dapp_hook_provider(
       std::move(router.router), std::move(ce_target), std::move(demod_target), config.nof_srs_lanes);
   auto                      scheduler_target = create_native_scheduler_dapp_target(sched);
@@ -1483,6 +1502,10 @@ dapp_service_create_result dapp_service::create(dapp_service_config config) noex
         std::move(signature_verifier.verifier));
     auto service          = std::make_unique<implementation>();
     service->registry     = std::make_shared<dapp::native_hook_registry>();
+    service->pusch_routes = std::make_shared<dapp::pusch_route_table>(static_cast<uint8_t>(config.pusch_route_slots));
+    if (auto attached = service->registry->set_route_table(service->pusch_routes); !attached) {
+      return {{}, "unable to attach the PUSCH route table: " + attached.detail};
+    }
     service->interference = create_scheduler_dapp_interference_cache();
     std::array<uint16_t, MAX_NOF_DU_CELLS> widths{};
     uint32_t                               nof_widths = 0;
@@ -1539,6 +1562,7 @@ dapp_service_create_result dapp_service::create(dapp_service_config config) noex
       packages.push_back(std::move(*manifest.package));
     }
     if (!build_hook_topology(service->registry,
+                             service->pusch_routes,
                              service->upper_phy_provider,
                              service->scheduler_provider,
                              service->interference,
@@ -1596,8 +1620,12 @@ dapp_service_create_result dapp_service::create(dapp_service_config config) noex
     service->agent = std::make_unique<dapp::e3::embedded_agent>(
         *service->manager, config.maximum_queued_jobs, config.maximum_retained_jobs);
     service->connections = std::make_shared<dapp::e3::e3_connection_registry>();
-    service->management  = std::make_unique<dapp::e3::management_service>(
-        *service->agent, service->reservations, service->portable_data, service->connections, config.ran_control);
+    service->management  = std::make_unique<dapp::e3::management_service>(*service->agent,
+                                                                         service->reservations,
+                                                                         service->portable_data,
+                                                                         service->connections,
+                                                                         config.ran_control,
+                                                                         service->pusch_routes);
 #endif
 #ifdef OCUDU_DAPP_APP_SERVICE_LOCAL_E3
     if (config.local_e3) {

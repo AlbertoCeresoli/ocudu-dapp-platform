@@ -5,6 +5,7 @@
 #include "ocudu/dapp/e3/embedded_agent.h"
 #include "ocudu/dapp/e3/management_service.h"
 #include "ocudu/dapp/e3/portable_data_store.h"
+#include "ocudu/dapp/runtime/pusch_route_table.h"
 #include "ocudu/scheduler/dapp/quiet_reservation.h"
 #include <chrono>
 #include <cstring>
@@ -33,6 +34,116 @@ TEST(dapp_e3_aper_codec, catalog_admission_extension_preserves_headers_and_packa
   EXPECT_EQ(result->header.expected_inventory_generation, 27);
   EXPECT_TRUE(result->header.dry_run);
   EXPECT_EQ(result->package_id, request.package_id);
+}
+
+TEST(dapp_e3_aper_codec, pusch_routing_request_round_trips_every_target_and_scope)
+{
+  pusch_routing request;
+  request.header.transaction_id.bytes.back() = 2;
+  request.header.dry_run                     = true;
+  request.action                             = pusch_routing_action::replace;
+  identifier instance;
+  instance.bytes.front() = 0xA1;
+  instance.bytes.back()  = 0x05;
+  request.default_target = pusch_route_target{pusch_route_target::kind::conventional, {}};
+  request.entries        = {{std::nullopt, 0x4601, {pusch_route_target::kind::instance, instance}},
+                            {uint16_t{3}, 0x4602, {pusch_route_target::kind::conventional, {}}},
+                            {uint16_t{0}, 0xFFEF, {}}};
+  auto encoded           = aper_codec::encode(management_request{request});
+  ASSERT_TRUE(encoded) << encoded.detail;
+  auto decoded = aper_codec::decode_request(*encoded.value);
+  ASSERT_TRUE(decoded) << decoded.detail;
+  const auto* result = std::get_if<pusch_routing>(&*decoded.value);
+  ASSERT_NE(result, nullptr);
+  EXPECT_TRUE(result->header.dry_run);
+  EXPECT_EQ(result->action, pusch_routing_action::replace);
+  ASSERT_TRUE(result->default_target);
+  EXPECT_EQ(*result->default_target, *request.default_target);
+  ASSERT_EQ(result->entries.size(), 3U);
+  for (std::size_t index = 0; index != request.entries.size(); ++index) {
+    EXPECT_EQ(result->entries[index].cell_index, request.entries[index].cell_index);
+    EXPECT_EQ(result->entries[index].rnti, request.entries[index].rnti);
+    EXPECT_EQ(result->entries[index].target, request.entries[index].target);
+  }
+
+  pusch_routing query;
+  query.header.transaction_id.bytes.back() = 3;
+  encoded                                  = aper_codec::encode(management_request{query});
+  ASSERT_TRUE(encoded) << encoded.detail;
+  decoded = aper_codec::decode_request(*encoded.value);
+  ASSERT_TRUE(decoded) << decoded.detail;
+  result = std::get_if<pusch_routing>(&*decoded.value);
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result->action, pusch_routing_action::query);
+  EXPECT_FALSE(result->default_target);
+  EXPECT_TRUE(result->entries.empty());
+}
+
+TEST(dapp_e3_aper_codec, a_full_pusch_route_table_fits_one_open_type_fragment)
+{
+  // Extension additions are open types; asn1tools (the Python client) cannot decode fragmented
+  // open-type lengths, so the largest table must encode below 16 KiB in both directions.
+  identifier instance;
+  instance.bytes.fill(0x5A);
+  pusch_routing request;
+  request.header.transaction_id.bytes.back() = 4;
+  request.action                             = pusch_routing_action::replace;
+  pusch_routing_result table;
+  table.generation     = 77;
+  table.slots_per_hook = pusch_route_max_slots_per_hook;
+  table.default_target = {pusch_route_target::kind::instance, instance};
+  for (uint16_t rnti = 1; rnti <= pusch_route_max_entries; ++rnti) {
+    request.entries.push_back({uint16_t{65534}, rnti, {pusch_route_target::kind::instance, instance}});
+  }
+  table.entries = request.entries;
+  for (uint8_t slot = 0; slot != pusch_route_max_slots_per_hook; ++slot) {
+    for (auto hook : {pusch_route_hook::channel_estimator, pusch_route_hook::equalizer, pusch_route_hook::receiver}) {
+      table.bindings.push_back({instance, hook, slot});
+    }
+  }
+  table.unavailable_lookups = 123456789;
+
+  const auto encoded_request = aper_codec::encode(management_request{request});
+  ASSERT_TRUE(encoded_request) << encoded_request.detail;
+  EXPECT_LT(encoded_request.value->size(), 16U * 1024U);
+
+  management_response response;
+  response.transaction_id.bytes.back() = 4;
+  response.code                        = result_code::ok;
+  response.payload                     = table;
+  const auto encoded_response          = aper_codec::encode(response);
+  ASSERT_TRUE(encoded_response) << encoded_response.detail;
+  EXPECT_LT(encoded_response.value->size(), 16U * 1024U);
+
+  const auto decoded = aper_codec::decode_response(*encoded_response.value);
+  ASSERT_TRUE(decoded) << decoded.detail;
+  const auto* result = std::get_if<pusch_routing_result>(&decoded.value->payload);
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result->generation, 77U);
+  EXPECT_EQ(result->slots_per_hook, pusch_route_max_slots_per_hook);
+  EXPECT_EQ(result->default_target, table.default_target);
+  ASSERT_EQ(result->entries.size(), pusch_route_max_entries);
+  EXPECT_EQ(result->entries.back().cell_index, uint16_t{65534});
+  ASSERT_EQ(result->bindings.size(), table.bindings.size());
+  EXPECT_EQ(result->bindings.back().hook, pusch_route_hook::receiver);
+  EXPECT_EQ(result->bindings.back().slot, pusch_route_max_slots_per_hook - 1U);
+  EXPECT_EQ(result->unavailable_lookups, 123456789U);
+}
+
+TEST(dapp_e3_aper_codec, pusch_routing_rejects_values_outside_the_schema)
+{
+  pusch_routing request;
+  request.header.transaction_id.bytes.back() = 5;
+  request.action                             = pusch_routing_action::update;
+  request.entries                            = {{std::nullopt, 0, {}}};
+  EXPECT_FALSE(aper_codec::encode(management_request{request})) << "RNTI 0 is not a C-RNTI";
+  request.entries = {{std::nullopt, 0xFFF0, {}}};
+  EXPECT_FALSE(aper_codec::encode(management_request{request})) << "0xFFF0 is reserved";
+  request.entries.clear();
+  for (uint16_t rnti = 1; rnti <= pusch_route_max_entries + 1; ++rnti) {
+    request.entries.push_back({std::nullopt, rnti, {}});
+  }
+  EXPECT_FALSE(aper_codec::encode(management_request{request})) << "the table is bounded";
 }
 
 namespace {
@@ -872,4 +983,69 @@ TEST(dapp_e3_aper_codec, roundtrips_cell_info_and_dispatches_handover_and_gain_c
   response            = service.handle(gain);
   EXPECT_EQ(response.code, result_code::dry_run_ok);
   EXPECT_EQ(authority->gain_sets, 1U) << "dry-run must not touch the radio";
+}
+
+TEST(dapp_e3_management_service, pusch_routing_validates_applies_and_reports_the_table)
+{
+  auto               manager = make_manager();
+  embedded_agent     agent(*manager, 8, 32);
+  auto               table = std::make_shared<pusch_route_table>(2);
+  management_service without_routing(agent);
+  management_service service(agent, {}, {}, {}, {}, table);
+
+  pusch_routing query;
+  query.header.transaction_id = test_id(10);
+  EXPECT_EQ(without_routing.handle(management_request{query}).code, result_code::incompatible);
+  auto response = service.handle(management_request{query});
+  ASSERT_EQ(response.code, result_code::ok) << response.error_text;
+  const auto* state = std::get_if<pusch_routing_result>(&response.payload);
+  ASSERT_NE(state, nullptr);
+  EXPECT_EQ(state->slots_per_hook, 2U);
+  EXPECT_TRUE(state->entries.empty());
+
+  const identifier receiver = test_id(40);
+  pusch_routing    replace;
+  replace.header.transaction_id = test_id(11);
+  replace.action                = pusch_routing_action::replace;
+  replace.default_target        = pusch_route_target{pusch_route_target::kind::conventional, {}};
+  replace.entries               = {{std::nullopt, 0x4601, {pusch_route_target::kind::instance, receiver}}};
+  EXPECT_EQ(service.handle(management_request{replace}).code, result_code::not_found)
+      << "the instance is not active on a routable hook";
+
+  ASSERT_TRUE(table->bind(receiver, pusch_route_hook::receiver, 1));
+  const auto generation  = table->state().generation;
+  replace.header.dry_run = true;
+  response               = service.handle(management_request{replace});
+  EXPECT_EQ(response.code, result_code::dry_run_ok) << response.error_text;
+  EXPECT_EQ(table->state().generation, generation);
+  EXPECT_EQ(table->resolve(0, 0x4601), pusch_route::primary());
+
+  replace.header.dry_run = false;
+  response               = service.handle(management_request{replace});
+  ASSERT_EQ(response.code, result_code::ok) << response.error_text;
+  state = std::get_if<pusch_routing_result>(&response.payload);
+  ASSERT_NE(state, nullptr);
+  ASSERT_EQ(state->entries.size(), 1U);
+  ASSERT_EQ(state->bindings.size(), 1U);
+  EXPECT_EQ(state->bindings.front().slot, 1U);
+  EXPECT_EQ(table->resolve(0, 0x4601), pusch_route::instance(pusch_route_hook::receiver, 1));
+  EXPECT_EQ(table->resolve(0, 0x4602), pusch_route::conventional());
+
+  pusch_routing malformed = query;
+  malformed.entries       = replace.entries;
+  EXPECT_EQ(service.handle(management_request{malformed}).code, result_code::invalid_request)
+      << "query takes no entries";
+  malformed        = replace;
+  malformed.action = pusch_routing_action::update;
+  EXPECT_EQ(service.handle(management_request{malformed}).code, result_code::invalid_request)
+      << "only replace sets the default";
+  malformed                    = query;
+  malformed.header.instance_id = receiver;
+  EXPECT_EQ(service.handle(management_request{malformed}).code, result_code::invalid_request);
+
+  pusch_routing clear;
+  clear.header.transaction_id = test_id(12);
+  clear.action                = pusch_routing_action::clear;
+  ASSERT_EQ(service.handle(management_request{clear}).code, result_code::ok);
+  EXPECT_EQ(table->resolve(0, 0x4601), pusch_route::primary());
 }

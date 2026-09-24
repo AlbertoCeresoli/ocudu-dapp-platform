@@ -13,6 +13,7 @@
 #include "ocudu/dapp/e3/management_service.h"
 #include "ocudu/dapp/e3/telemetry_publisher.h"
 #include "ocudu/dapp/runtime/instance_manager.h"
+#include "ocudu/dapp/runtime/pusch_route_table.h"
 #ifdef OCUDU_DAPP_E3DP_CARRIER
 #include "ocudu/dapp/e3/e3dp_sctp_server.h"
 #endif
@@ -95,7 +96,9 @@ int main(int argc, char** argv)
     return 1;
   }
   auto               connections = std::make_shared<e3_connection_registry>();
-  management_service service(agent, {}, store.first, connections);
+  // Per-UE PUSCH routing with no bound instances: queries, validation and stock/primary routes only.
+  auto               pusch_routes = std::make_shared<pusch_route_table>(2);
+  management_service service(agent, {}, store.first, connections, {}, pusch_routes);
 
   telemetry_publisher_config publisher_config;
   publisher_config.store                          = store.first;

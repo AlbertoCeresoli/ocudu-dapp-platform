@@ -48,6 +48,11 @@ extern "C" {
 #include "OperationResult.h"
 #include "PackageRecord.h"
 #include "PuschProfile.h"
+#include "PuschRouteBinding.h"
+#include "PuschRouteEntry.h"
+#include "PuschRouteTarget.h"
+#include "PuschRouting.h"
+#include "PuschRoutingResult.h"
 #include "QuietReservationQuery.h"
 #include "QuietReservationRecord.h"
 #include "QuietReservationResult.h"
@@ -426,6 +431,121 @@ operation_result read_operation_result(const OperationResult_t& source)
   return result;
 }
 
+void set_route_target(PuschRouteTarget_t& destination, const pusch_route_target& source)
+{
+  switch (source.type) {
+    case pusch_route_target::kind::primary:
+      destination.present = PuschRouteTarget_PR_primary;
+      return;
+    case pusch_route_target::kind::conventional:
+      destination.present = PuschRouteTarget_PR_conventional;
+      return;
+    case pusch_route_target::kind::instance:
+      destination.present = PuschRouteTarget_PR_instance;
+      set_identifier(destination.choice.instance, source.instance_id);
+      return;
+  }
+  throw std::runtime_error("unsupported PUSCH route target");
+}
+
+pusch_route_target read_route_target(const PuschRouteTarget_t& source)
+{
+  switch (source.present) {
+    case PuschRouteTarget_PR_primary:
+      return {};
+    case PuschRouteTarget_PR_conventional:
+      return {pusch_route_target::kind::conventional, {}};
+    case PuschRouteTarget_PR_instance:
+      return {pusch_route_target::kind::instance, read_identifier(source.choice.instance)};
+    default:
+      throw std::runtime_error("unsupported PUSCH route target");
+  }
+}
+
+void set_route_entry(PuschRouteEntry_t& destination, const pusch_route_entry& source)
+{
+  set_optional_long(destination.cellIndex, source.cell_index);
+  destination.rnti   = source.rnti;
+  destination.target = make_asn<PuschRouteTarget_t>();
+  set_route_target(*destination.target, source.target);
+}
+
+pusch_route_entry read_route_entry(const PuschRouteEntry_t& source)
+{
+  pusch_route_entry entry;
+  if (source.cellIndex != nullptr) {
+    entry.cell_index = static_cast<uint16_t>(*source.cellIndex);
+  }
+  if (source.target == nullptr) {
+    throw std::runtime_error("PUSCH route entry has no target");
+  }
+  entry.rnti   = static_cast<uint16_t>(source.rnti);
+  entry.target = read_route_target(*source.target);
+  return entry;
+}
+
+template <typename List>
+std::vector<pusch_route_entry> read_route_entries(const List& entries)
+{
+  if (static_cast<std::size_t>(entries.list.count) > pusch_route_max_entries) {
+    throw std::runtime_error("PUSCH route list exceeds bound");
+  }
+  std::vector<pusch_route_entry> result;
+  result.reserve(entries.list.count);
+  for (int index = 0; index != entries.list.count; ++index) {
+    if (entries.list.array[index] == nullptr) {
+      throw std::runtime_error("null PUSCH route entry");
+    }
+    result.push_back(read_route_entry(*entries.list.array[index]));
+  }
+  return result;
+}
+
+void set_routing_result(PuschRoutingResult_t& destination, const pusch_routing_result& source)
+{
+  set_u64(destination.generation, source.generation);
+  destination.slotsPerHook  = source.slots_per_hook;
+  destination.defaultTarget = make_asn<PuschRouteTarget_t>();
+  set_route_target(*destination.defaultTarget, source.default_target);
+  for (const auto& entry : source.entries) {
+    set_route_entry(append_asn<PuschRouteEntry_t>(destination.entries), entry);
+  }
+  for (const auto& binding : source.bindings) {
+    auto& wire = append_asn<PuschRouteBinding_t>(destination.bindings);
+    set_identifier(wire.instanceId, binding.instance_id);
+    wire.hook = static_cast<long>(binding.hook);
+    wire.slot = binding.slot;
+  }
+  set_u64(destination.unavailableLookups, source.unavailable_lookups);
+}
+
+pusch_routing_result read_routing_result(const PuschRoutingResult_t& source)
+{
+  pusch_routing_result result;
+  result.generation = read_u64(source.generation);
+  if (source.defaultTarget == nullptr) {
+    throw std::runtime_error("PUSCH routing result has no default target");
+  }
+  result.slots_per_hook = static_cast<uint8_t>(source.slotsPerHook);
+  result.default_target = read_route_target(*source.defaultTarget);
+  result.entries        = read_route_entries(source.entries);
+  if (source.bindings.list.count > static_cast<int>(nof_pusch_route_hooks * pusch_route_max_slots_per_hook)) {
+    throw std::runtime_error("PUSCH route binding list exceeds bound");
+  }
+  for (int index = 0; index != source.bindings.list.count; ++index) {
+    const auto* binding = source.bindings.list.array[index];
+    if (binding == nullptr || binding->hook < PuschRouteHook_channelEstimator ||
+        binding->hook > PuschRouteHook_receiver) {
+      throw std::runtime_error("malformed PUSCH route binding");
+    }
+    result.bindings.push_back({read_identifier(binding->instanceId),
+                               static_cast<pusch_route_hook>(binding->hook),
+                               static_cast<uint8_t>(binding->slot)});
+  }
+  result.unavailable_lookups = read_u64(source.unavailableLookups);
+  return result;
+}
+
 } // namespace
 
 codec_result<std::vector<uint8_t>> aper_codec::encode(const management_request& request) noexcept
@@ -622,6 +742,22 @@ codec_result<std::vector<uint8_t>> aper_codec::encode(const management_request& 
             wire->operation->present             = ManagementOperation_PR_catalogAdmit;
             wire->operation->choice.catalogAdmit = make_asn<CatalogAdmit_t>();
             set_identifier(wire->operation->choice.catalogAdmit->packageId, operation.package_id);
+          } else if constexpr (std::is_same_v<operation_type, pusch_routing>) {
+            wire->operation->present             = ManagementOperation_PR_puschRouting;
+            wire->operation->choice.puschRouting = make_asn<PuschRouting_t>();
+            auto& value                          = *wire->operation->choice.puschRouting;
+            value.action                         = static_cast<long>(operation.action);
+            if (operation.default_target) {
+              value.defaultTarget = make_asn<PuschRouteTarget_t>();
+              set_route_target(*value.defaultTarget, *operation.default_target);
+            }
+            if (!operation.entries.empty()) {
+              using entry_list = std::remove_pointer_t<decltype(value.entries)>;
+              value.entries    = make_asn<entry_list>();
+              for (const auto& entry : operation.entries) {
+                set_route_entry(append_asn<PuschRouteEntry_t>(*value.entries), entry);
+              }
+            }
           }
         },
         request);
@@ -878,6 +1014,25 @@ codec_result<management_request> aper_codec::decode_request(ocudu::span<const ui
         catalog_admit result;
         result.header     = common;
         result.package_id = read_identifier(wire.choice.catalogAdmit->packageId);
+        return {management_request{std::move(result)}, {}};
+      }
+      case ManagementOperation_PR_puschRouting: {
+        if (wire.choice.puschRouting == nullptr) {
+          break;
+        }
+        const auto&   value = *wire.choice.puschRouting;
+        pusch_routing result;
+        result.header = common;
+        if (value.action < PuschRoutingAction_query || value.action > PuschRoutingAction_clear) {
+          return {std::nullopt, "unsupported PUSCH routing action"};
+        }
+        result.action = static_cast<pusch_routing_action>(value.action);
+        if (value.defaultTarget != nullptr) {
+          result.default_target = read_route_target(*value.defaultTarget);
+        }
+        if (value.entries != nullptr) {
+          result.entries = read_route_entries(*value.entries);
+        }
         return {management_request{std::move(result)}, {}};
       }
       default:
@@ -2175,7 +2330,11 @@ codec_result<std::vector<uint8_t>> aper_codec::encode(const management_response&
           using payload_type = std::decay_t<decltype(payload)>;
           if constexpr (!std::is_same_v<payload_type, std::monostate>) {
             wire->payload = make_asn<ManagementPayload_t>();
-            if constexpr (std::is_same_v<payload_type, cell_info_result>) {
+            if constexpr (std::is_same_v<payload_type, pusch_routing_result>) {
+              wire->payload->present             = ManagementPayload_PR_puschRouting;
+              wire->payload->choice.puschRouting = make_asn<PuschRoutingResult_t>();
+              set_routing_result(*wire->payload->choice.puschRouting, payload);
+            } else if constexpr (std::is_same_v<payload_type, cell_info_result>) {
               wire->payload->present         = ManagementPayload_PR_cellInfo;
               wire->payload->choice.cellInfo = make_asn<CellInfoResult_t>();
               set_cell_info_result(*wire->payload->choice.cellInfo, payload);
@@ -2288,6 +2447,12 @@ codec_result<management_response> aper_codec::decode_response(ocudu::span<const 
             break;
           }
           throw std::runtime_error("null cell info payload");
+        case ManagementPayload_PR_puschRouting:
+          if (wire.choice.puschRouting != nullptr) {
+            result.payload = read_routing_result(*wire.choice.puschRouting);
+            break;
+          }
+          throw std::runtime_error("null PUSCH routing payload");
         case ManagementPayload_PR_jobs:
           if (wire.choice.jobs != nullptr) {
             result.payload = read_job_result(*wire.choice.jobs);

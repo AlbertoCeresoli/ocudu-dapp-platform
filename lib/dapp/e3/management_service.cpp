@@ -5,6 +5,7 @@
 #include "ocudu/dapp/e3/e3_connection_registry.h"
 #include "ocudu/dapp/e3/embedded_agent.h"
 #include "ocudu/dapp/e3/portable_data_store.h"
+#include "ocudu/dapp/runtime/pusch_route_table.h"
 #include "ocudu/ran/du_cell_index.h"
 #include "ocudu/scheduler/dapp/quiet_reservation.h"
 #include <array>
@@ -508,6 +509,48 @@ management_response management_service::handle(const management_request& message
             result.detail = gain_action ? std::string(verb) + " applied on the radio unit"
                                         : std::string(verb) + " accepted for dispatch on the CU-CP control executor";
             return {request.transaction_id, result.code, {}, std::move(result), {}, {}};
+          } else if constexpr (std::is_same_v<operation_type, pusch_routing>) {
+            if (request.instance_id || request.expected_instance_generation || request.expected_inventory_generation) {
+              return failure(request, result_code::invalid_request, "PUSCH routing has unsupported header fields");
+            }
+            if (!pusch_routes) {
+              return failure(request, result_code::incompatible, "per-UE PUSCH routing is unavailable on this host");
+            }
+            const bool has_entries = !operation.entries.empty();
+            const bool shape_valid = operation.action == pusch_routing_action::replace ||
+                                     (operation.action == pusch_routing_action::update && !operation.default_target) ||
+                                     (!has_entries && !operation.default_target);
+            if (!shape_valid) {
+              return failure(request,
+                             result_code::invalid_request,
+                             "only replace takes a default; query and clear take no entries");
+            }
+            pusch_route_result applied{result_code::ok, {}, 0};
+            switch (operation.action) {
+              case pusch_routing_action::query:
+                break;
+              case pusch_routing_action::replace:
+                applied = pusch_routes->replace(
+                    operation.default_target.value_or(pusch_route_target{}), operation.entries, request.dry_run);
+                break;
+              case pusch_routing_action::update:
+                applied = pusch_routes->update(operation.entries, request.dry_run);
+                break;
+              case pusch_routing_action::clear:
+                if (!request.dry_run) {
+                  applied = pusch_routes->clear();
+                }
+                break;
+            }
+            if (!applied) {
+              return failure(request, applied.code, std::move(applied.detail));
+            }
+            management::operation_result result;
+            result.transaction_id = request.transaction_id;
+            result.code           = request.dry_run ? result_code::dry_run_ok : result_code::ok;
+            result.detail         = request.dry_run ? "PUSCH route table request is valid; nothing was applied"
+                                                    : "PUSCH route table is current";
+            return {request.transaction_id, result.code, {}, std::move(result), pusch_routes->state(), {}};
           }
         },
         message);

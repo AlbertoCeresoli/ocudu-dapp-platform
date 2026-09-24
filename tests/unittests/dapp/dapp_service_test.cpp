@@ -116,6 +116,36 @@ TEST(dapp_service, constructs_one_bounded_hook_topology_for_all_six_interfaces)
   created.service->stop();
 }
 
+TEST(dapp_service, pusch_route_slots_multiply_only_the_class_a_pusch_hooks)
+{
+  auto config              = service_config();
+  config.pusch_route_slots = 3;
+  auto created             = dapp_service::create(std::move(config));
+  ASSERT_TRUE(created) << created.detail;
+  auto registry = created.service->native_hooks();
+  ASSERT_NE(registry, nullptr);
+  for (uint32_t interface_id : {OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1,
+                                OCUDU_DAPP_INTERFACE_EQUALIZER_V1,
+                                OCUDU_DAPP_INTERFACE_RECEIVER_V1}) {
+    const auto slots = registry->find_all(interface_id);
+    ASSERT_EQ(slots.size(), 3U);
+    for (const auto& point : slots) {
+      EXPECT_EQ(point->lane_count(), 6U);
+    }
+  }
+  for (uint32_t interface_id :
+       {OCUDU_DAPP_INTERFACE_SPECTRUM_V1, OCUDU_DAPP_INTERFACE_SRS_ISAC_V1, OCUDU_DAPP_INTERFACE_SCHEDULER_V1}) {
+    EXPECT_EQ(registry->find_all(interface_id).size(), 1U);
+  }
+  created.service->stop();
+
+  for (unsigned invalid : {0U, 9U}) {
+    auto rejected              = service_config();
+    rejected.pusch_route_slots = invalid;
+    EXPECT_FALSE(dapp_service::create(std::move(rejected)));
+  }
+}
+
 TEST(dapp_service, rejects_ambiguous_or_unbounded_topologies_before_construction)
 {
   auto config = service_config();

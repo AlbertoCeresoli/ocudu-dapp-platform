@@ -281,6 +281,10 @@ bool ocudu::app_services::validate_dapp_service_config(const dapp_service_config
     fmt::print("dApp scheduler guardrail or backend mask is invalid.\n");
     return false;
   }
+  if (config.pusch_route_slots == 0 || config.pusch_route_slots > dapp::pusch_route_table::max_slots_per_hook) {
+    fmt::print("dApp pusch_route_slots must be between 1 and {}.\n", dapp::pusch_route_table::max_slots_per_hook);
+    return false;
+  }
   const auto& process     = config.class_c_process;
   const auto  ring_stride = (sizeof(ocudu_dapp_shared_ring_slot_v1) + uint64_t{process.payload_capacity_bytes} +
                             OCUDU_DAPP_SHARED_RING_ALIGNMENT_V1 - 1U) &

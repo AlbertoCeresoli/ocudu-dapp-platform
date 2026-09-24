@@ -69,6 +69,7 @@ TEST(dapp_config, yaml_roundtrip_preserves_only_operator_controlled_fields)
                                                                    dapp_initial_instance_target::shadow,
                                                                    std::chrono::milliseconds(900)}};
   config.max_scheduler_ul_prbs_avoided                         = 17;
+  config.pusch_route_slots                                     = 3;
   config.scheduler_evaluation_only                             = true;
   config.scheduler_allow_mcs                                   = true;
   config.scheduler_allow_prb_limits                            = true;
@@ -140,6 +141,7 @@ TEST(dapp_config, yaml_roundtrip_preserves_only_operator_controlled_fields)
   EXPECT_EQ(reparsed->maximum_queued_jobs, config.maximum_queued_jobs);
   EXPECT_EQ(reparsed->maximum_retained_jobs, config.maximum_retained_jobs);
   EXPECT_EQ(reparsed->max_scheduler_ul_prbs_avoided, config.max_scheduler_ul_prbs_avoided);
+  EXPECT_EQ(reparsed->pusch_route_slots, config.pusch_route_slots);
   EXPECT_EQ(reparsed->scheduler_evaluation_only, config.scheduler_evaluation_only);
   EXPECT_EQ(reparsed->scheduler_allow_mcs, config.scheduler_allow_mcs);
   EXPECT_EQ(reparsed->scheduler_allow_prb_limits, config.scheduler_allow_prb_limits);
@@ -296,6 +298,25 @@ TEST(dapp_config, validator_rejects_invalid_catalog_and_resource_bounds)
   config.quiet_reservation.maximum_source_prb_slots_per_window =
       config.quiet_reservation.maximum_prb_slots_per_window + 1;
   EXPECT_FALSE(validate_dapp_service_config(config));
+}
+
+TEST(dapp_config, pusch_route_slots_default_to_one_and_are_bounded)
+{
+  const std::string base     = "dapp:\n  catalog_root: /tmp\n  native_preflight_helper: /usr/bin/true\n";
+  const auto        defaults = parse_config(base);
+  ASSERT_TRUE(defaults);
+  EXPECT_EQ(defaults->pusch_route_slots, 1U);
+  const auto routed = parse_config(base + "  pusch_route_slots: 4\n");
+  ASSERT_TRUE(routed);
+  EXPECT_EQ(routed->pusch_route_slots, 4U);
+  EXPECT_ANY_THROW(parse_config(base + "  pusch_route_slots: 0\n"));
+  EXPECT_ANY_THROW(parse_config(base + "  pusch_route_slots: 9\n"));
+
+  auto config              = valid_config();
+  config.pusch_route_slots = 0;
+  EXPECT_FALSE(validate_dapp_service_config(config));
+  config.pusch_route_slots = 8;
+  EXPECT_TRUE(validate_dapp_service_config(config));
 }
 
 TEST(dapp_config, signature_policy_defaults_fail_closed_and_unsigned_development_is_explicit)

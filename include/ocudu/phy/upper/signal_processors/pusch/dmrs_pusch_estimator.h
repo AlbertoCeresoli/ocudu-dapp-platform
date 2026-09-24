@@ -11,6 +11,7 @@
 #include "ocudu/phy/upper/channel_state_information.h"
 #include "ocudu/phy/upper/dmrs_mapping.h"
 #include "ocudu/ran/cyclic_prefix.h"
+#include "ocudu/ran/rnti.h"
 #include "ocudu/ran/slot_point.h"
 #include <variant>
 
@@ -58,6 +59,8 @@ public:
   struct configuration {
     /// DU-local cell identifier used for dApp invocation attribution.
     uint32_t cell_id = 0;
+    /// C-RNTI of the transmitting UE, for per-UE dApp routing and attribution (not used by estimation).
+    rnti_t rnti = rnti_t::INVALID_RNTI;
     /// Slot context for sequence initialization.
     slot_point slot;
     /// Sequence generator configuration.

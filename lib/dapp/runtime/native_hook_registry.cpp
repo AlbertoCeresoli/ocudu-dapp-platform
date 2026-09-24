@@ -34,12 +34,25 @@ native_hook_registry_result native_hook_registry::register_point(std::shared_ptr
   }
   try {
     std::lock_guard<std::mutex> lock(mutex);
-    if (points.size() >= maximum_points) {
+    std::size_t                 registered = 0;
+    for (const auto& group : points) {
+      registered += group.second.size();
+    }
+    if (registered >= maximum_points) {
       return result(OCUDU_DAPP_RESOURCE_V1, "native hook point limit reached");
     }
-    if (!points.emplace(point->interface_id(), std::move(point)).second) {
+    auto group = points.find(point->interface_id());
+    if (group == points.end()) {
+      points[point->interface_id()].push_back(std::move(point));
+      return result(OCUDU_DAPP_OK_V1);
+    }
+    // Additional points of one interface exist only as route-table slots of a routable PUSCH hook.
+    const bool routable = pusch_route_hook_for_interface(point->interface_id()).has_value();
+    if (!routable || route_table == nullptr || group->second.size() >= route_table->slots_per_hook() ||
+        std::find(group->second.begin(), group->second.end(), point) != group->second.end()) {
       return result(OCUDU_DAPP_CONFLICT_V1, "native hook interface is already registered");
     }
+    group->second.push_back(std::move(point));
     return result(OCUDU_DAPP_OK_V1);
   } catch (const std::bad_alloc&) {
     return result(OCUDU_DAPP_RESOURCE_V1, "unable to register native hook point");
@@ -61,6 +74,54 @@ native_hook_registry::set_binding_observer(std::shared_ptr<native_hook_binding_o
   } catch (...) {
     return result(OCUDU_DAPP_EXCEPTION_V1, "native hook observer registration threw");
   }
+}
+
+native_hook_registry_result native_hook_registry::set_route_table(std::shared_ptr<pusch_route_table> table) noexcept
+{
+  try {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!bindings.empty()) {
+      return result(OCUDU_DAPP_CONFLICT_V1, "cannot change the route table while bindings exist");
+    }
+    for (const auto& group : points) {
+      if (group.second.size() > 1 && (table == nullptr || group.second.size() > table->slots_per_hook())) {
+        return result(OCUDU_DAPP_CONFLICT_V1, "registered hook slots exceed the route table");
+      }
+    }
+    route_table = std::move(table);
+    return result(OCUDU_DAPP_OK_V1);
+  } catch (...) {
+    return result(OCUDU_DAPP_EXCEPTION_V1, "route table registration threw");
+  }
+}
+
+bool native_hook_registry::bind_routes_locked(const management::identifier& instance_id,
+                                              const binding_record&         binding) const noexcept
+{
+  if (route_table == nullptr) {
+    return true;
+  }
+  // An instance is routed by its deepest routable hook: a receiver replaces equalization and
+  // estimation, an equalizer replaces estimation.
+  std::optional<pusch_route_hook> selected;
+  uint8_t                         slot = 0;
+  for (const auto& point : binding.points) {
+    const auto hook = pusch_route_hook_for_interface(point->interface_id());
+    if (!hook || (selected && *hook <= *selected)) {
+      continue;
+    }
+    const auto group = points.find(point->interface_id());
+    if (group == points.end()) {
+      return false;
+    }
+    const auto position = std::find(group->second.begin(), group->second.end(), point);
+    if (position == group->second.end()) {
+      return false;
+    }
+    selected = hook;
+    slot     = static_cast<uint8_t>(position - group->second.begin());
+  }
+  return !selected || route_table->bind(instance_id, *selected, slot);
 }
 
 native_hook_registry_result native_hook_registry::resolve(const std::vector<management::interface_record>& interfaces,
@@ -96,22 +157,25 @@ native_hook_registry_result native_hook_registry::resolve(const std::vector<mana
       }
       return result(OCUDU_DAPP_UNSUPPORTED_V1, "required native interface version or placement is not supported");
     }
-    auto point = points.find(interface.interface_id);
-    if (point == points.end()) {
+    auto group = points.find(interface.interface_id);
+    if (group == points.end() || group->second.empty()) {
       if (optional) {
         unavailable_optional_interfaces.push_back(interface.interface_id);
         continue;
       }
       return result(OCUDU_DAPP_UNSUPPORTED_V1, "native module requires an unavailable hook point");
     }
-    if (point->second->bound()) {
+    // The lowest free slot: with one slot this is the single-owner rule.
+    const auto free_point = std::find_if(
+        group->second.begin(), group->second.end(), [](const auto& candidate) { return !candidate->bound(); });
+    if (free_point == group->second.end()) {
       if (optional) {
         unavailable_optional_interfaces.push_back(interface.interface_id);
         continue;
       }
       return result(OCUDU_DAPP_CONFLICT_V1, "required native hook point is already owned by another instance");
     }
-    resolved.push_back(point->second);
+    resolved.push_back(*free_point);
     bound_interfaces.push_back(interface);
   }
   if (resolved.empty()) {
@@ -214,9 +278,16 @@ native_hook_registry_result native_hook_registry::commit(const management::ident
     if (binding == bindings.end() || binding->second.committed) {
       return result(OCUDU_DAPP_CONFLICT_V1, "native hook binding is absent or already committed");
     }
+    // Publish the route before the gate opens, so the first grant of a routed UE already sees it.
+    if (!bind_routes_locked(instance_id, binding->second)) {
+      return result(OCUDU_DAPP_RESOURCE_V1, "the per-UE route table could not publish the binding");
+    }
     if (binding_observer != nullptr) {
       const auto status = binding_observer->activated(instance_id, binding->second.interfaces);
       if (status != OCUDU_DAPP_OK_V1) {
+        if (route_table != nullptr) {
+          route_table->unbind(instance_id);
+        }
         return result(status, "native hook activation observer rejected the binding");
       }
     }
@@ -251,6 +322,9 @@ native_hook_registry_result native_hook_registry::deactivate(const management::i
         if (status != OCUDU_DAPP_OK_V1) {
           return result(status, "native hook deactivation observer rejected the binding");
         }
+      }
+      if (route_table != nullptr) {
+        route_table->unbind(instance_id);
       }
       bindings.erase(binding);
       return result(OCUDU_DAPP_OK_V1);
@@ -302,9 +376,16 @@ std::shared_ptr<native_hook_point> native_hook_registry::find(uint32_t interface
 {
   try {
     std::lock_guard<std::mutex> lock(mutex);
-    auto                        point = points.find(interface_id);
-    return point != points.end() ? point->second : nullptr;
+    auto                        group = points.find(interface_id);
+    return group != points.end() && !group->second.empty() ? group->second.front() : nullptr;
   } catch (...) {
     return {};
   }
+}
+
+std::vector<std::shared_ptr<native_hook_point>> native_hook_registry::find_all(uint32_t interface_id) const
+{
+  std::lock_guard<std::mutex> lock(mutex);
+  auto                        group = points.find(interface_id);
+  return group != points.end() ? group->second : std::vector<std::shared_ptr<native_hook_point>>{};
 }

@@ -5,6 +5,7 @@
 
 #include "ocudu/dapp/e3/portable_data_types.h"
 #include "ocudu/dapp/management/incidents.h"
+#include "ocudu/dapp/management/pusch_routes.h"
 #include "ocudu/dapp/management/types.h"
 #include "ocudu/dapp/use_cases/v1/coordination.h"
 #include <optional>
@@ -263,6 +264,21 @@ struct cell_info_result {
   ran_control_capabilities     capabilities;
 };
 
+/// Per-UE routing of Class-A PUSCH grants (see pusch_route_table). query returns the table; replace
+/// sets the default (primary when absent) and every entry; update inserts, overwrites or (with a
+/// primary target) removes entries; clear resets the table.
+enum class pusch_routing_action : uint8_t { query, replace, update, clear };
+
+struct pusch_routing {
+  request_header                    header;
+  pusch_routing_action              action{pusch_routing_action::query};
+  std::optional<pusch_route_target> default_target;
+  std::vector<pusch_route_entry>    entries;
+};
+
+/// The table after the request (every action answers with it).
+using pusch_routing_result = pusch_route_state;
+
 using management_request = std::variant<inventory_query,
                                         lifecycle_control,
                                         config_query,
@@ -277,7 +293,8 @@ using management_request = std::variant<inventory_query,
                                         data_poll_query,
                                         ran_control,
                                         cell_info_query,
-                                        catalog_admit>;
+                                        catalog_admit,
+                                        pusch_routing>;
 
 struct config_result {
   std::optional<uint64_t>                    generation;
@@ -328,7 +345,8 @@ using management_payload = std::variant<std::monostate,
                                         quiet_reservation_result,
                                         data_subscription_result,
                                         data_publication_result,
-                                        cell_info_result>;
+                                        cell_info_result,
+                                        pusch_routing_result>;
 
 struct management_response {
   management::identifier                      transaction_id;

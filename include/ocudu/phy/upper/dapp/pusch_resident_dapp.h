@@ -3,8 +3,9 @@
 
 #pragma once
 
-#include "ocudu/dapp/runtime/native_worker.h"
 #include "ocudu/dapp/runtime/native_control_context.h"
+#include "ocudu/dapp/runtime/native_worker.h"
+#include "ocudu/dapp/runtime/pusch_route_table.h"
 #include "ocudu/phy/upper/channel_processors/pusch/pusch_demodulator.h"
 #include <array>
 #include <chrono>
@@ -54,6 +55,16 @@ public:
   /// False means a previous receiver still owns those buffers: do not enqueue, reset its state, or fall back.
   /// This does not fence or reclaim pending work; the caller must retain its original dependency/processor.
   virtual bool begin_grant() noexcept { return true; }
+
+  /// Per-UE routing: the route of one grant (primary without a route table).
+  virtual dapp::pusch_route resolve_route(uint32_t /*cell_index*/, uint16_t /*rnti*/) const noexcept
+  {
+    return dapp::pusch_route::primary();
+  }
+  /// Selects the route of the current grant, after begin_grant() and before mode(); begin_grant()
+  /// resets it to the primary route. mode(), the invocations and their fallback and deadline
+  /// accounting then use the instance on that route.
+  virtual void select_route(const dapp::pusch_route& /*route*/) noexcept {}
 
   virtual pusch_resident_dapp_mode       mode() const noexcept = 0;
   /// Host admission may reject a grant before invoking the module. Account it

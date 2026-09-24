@@ -731,3 +731,99 @@ TEST(dapp_native_hook_registry, complete_hook_set_has_one_exclusive_native_owner
   ASSERT_TRUE(
       control(manager, *second.instance_id, 526, lifecycle_action::unload, second_inactive.instance_generation));
 }
+
+TEST(dapp_native_hook_registry, route_table_slots_let_one_hook_hold_several_instances)
+{
+  const auto make_point = [](uint32_t interface_id) {
+    auto created = native_hook_point::create(interface_id, 100, 1);
+    EXPECT_TRUE(created) << created.detail;
+    return std::shared_ptr<native_hook_point>(std::move(created.point));
+  };
+  {
+    // Without a route table an interface has exactly one point.
+    native_hook_registry plain;
+    ASSERT_TRUE(plain.register_point(make_point(OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1)));
+    EXPECT_EQ(plain.register_point(make_point(OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1)).status,
+              OCUDU_DAPP_CONFLICT_V1);
+  }
+
+  auto table    = std::make_shared<pusch_route_table>(2);
+  auto registry = std::make_shared<native_hook_registry>();
+  ASSERT_TRUE(registry->set_route_table(table));
+  auto slot0    = make_point(OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1);
+  auto slot1    = make_point(OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1);
+  auto spectrum = make_point(OCUDU_DAPP_INTERFACE_SPECTRUM_V1);
+  ASSERT_TRUE(registry->register_point(slot0));
+  ASSERT_TRUE(registry->register_point(slot1));
+  ASSERT_TRUE(registry->register_point(spectrum));
+  EXPECT_EQ(registry->register_point(make_point(OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1)).status,
+            OCUDU_DAPP_CONFLICT_V1)
+      << "the table bounds the slots";
+  EXPECT_EQ(registry->register_point(make_point(OCUDU_DAPP_INTERFACE_SPECTRUM_V1)).status, OCUDU_DAPP_CONFLICT_V1)
+      << "only Class-A PUSCH hooks are routable";
+  EXPECT_EQ(registry->find(OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1), slot0);
+  EXPECT_EQ(registry->find_all(OCUDU_DAPP_INTERFACE_CHANNEL_ESTIMATOR_V1).size(), 2U);
+
+  instance_manager manager(DAPP_TEST_CATALOG, host_info(), host_api(), 64, registry);
+  ASSERT_TRUE(manager.register_package(multi_package(true)));
+  std::array<fixture_control, 3> controls;
+  std::array<identifier, 3>      instances;
+  for (uint64_t index = 0; index != instances.size(); ++index) {
+    load_request load;
+    load.transaction_id = id(600 + index);
+    load.package_id     = id(1);
+    load.create_args    = &controls[index];
+    auto loaded         = manager.load(load);
+    ASSERT_TRUE(loaded && loaded.instance_id);
+    instances[index]   = *loaded.instance_id;
+    const uint64_t txn = 610 + 10 * index;
+    ASSERT_TRUE(control(manager, instances[index], txn, lifecycle_action::prepare, 1));
+    ASSERT_TRUE(control(manager, instances[index], txn + 1, lifecycle_action::arm, 2));
+    ASSERT_TRUE(control(manager, instances[index], txn + 2, lifecycle_action::enter_shadow, 3));
+  }
+
+  auto first = control(manager, instances[0], 700, lifecycle_action::activate, 4);
+  ASSERT_TRUE(first) << first.detail;
+  auto second = control(manager, instances[1], 701, lifecycle_action::activate, 4);
+  ASSERT_TRUE(second) << second.detail;
+  EXPECT_TRUE(slot0->active());
+  EXPECT_TRUE(slot1->active());
+  auto third = control(manager, instances[2], 702, lifecycle_action::activate, 4);
+  EXPECT_EQ(third.code, result_code::lifecycle_failed) << "every slot is owned";
+  EXPECT_EQ(third.state, OCUDU_DAPP_STATE_SHADOW_V1);
+
+  auto bindings = table->state().bindings;
+  ASSERT_EQ(bindings.size(), 2U);
+  EXPECT_EQ(bindings[0].instance_id, instances[0]);
+  EXPECT_EQ(bindings[0].slot, 0U);
+  EXPECT_EQ(bindings[1].instance_id, instances[1]);
+  EXPECT_EQ(bindings[1].slot, 1U);
+  EXPECT_EQ(bindings[1].hook, pusch_route_hook::channel_estimator);
+
+  ASSERT_TRUE(table->replace({}, {{std::nullopt, 0x4601, {pusch_route_target::kind::instance, instances[1]}}}));
+  EXPECT_EQ(table->resolve(0, 0x4601), pusch_route::instance(pusch_route_hook::channel_estimator, 1));
+
+  // The deactivated instance leaves the table under the registry mutex; the freed slot is reused.
+  auto first_inactive = control(manager, instances[0], 703, lifecycle_action::deactivate, first.instance_generation);
+  ASSERT_TRUE(first_inactive);
+  EXPECT_FALSE(slot0->active());
+  ASSERT_EQ(table->state().bindings.size(), 1U);
+  auto third_active = control(manager, instances[2], 704, lifecycle_action::activate, third.instance_generation);
+  ASSERT_TRUE(third_active) << third_active.detail;
+  bindings = table->state().bindings;
+  ASSERT_EQ(bindings.size(), 2U);
+  EXPECT_EQ(bindings.back().instance_id, instances[2]);
+  EXPECT_EQ(bindings.back().slot, 0U);
+  EXPECT_EQ(table->resolve(0, 0x4601), pusch_route::instance(pusch_route_hook::channel_estimator, 1));
+
+  auto second_inactive = control(manager, instances[1], 705, lifecycle_action::deactivate, second.instance_generation);
+  ASSERT_TRUE(second_inactive);
+  EXPECT_EQ(table->resolve(0, 0x4601), pusch_route::conventional()) << "a routed UE never falls to another instance";
+  auto third_inactive =
+      control(manager, instances[2], 706, lifecycle_action::deactivate, third_active.instance_generation);
+  ASSERT_TRUE(third_inactive);
+  EXPECT_TRUE(table->state().bindings.empty());
+  ASSERT_TRUE(control(manager, instances[0], 707, lifecycle_action::unload, first_inactive.instance_generation));
+  ASSERT_TRUE(control(manager, instances[1], 708, lifecycle_action::unload, second_inactive.instance_generation));
+  ASSERT_TRUE(control(manager, instances[2], 709, lifecycle_action::unload, third_inactive.instance_generation));
+}
