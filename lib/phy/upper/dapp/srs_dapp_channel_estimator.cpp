@@ -635,7 +635,8 @@ private:
   const uint32_t                                         lane;
   std::unique_ptr<low_papr_sequence_generator>           sequence_generator;
   const std::chrono::nanoseconds                         deadline;
-  const std::chrono::nanoseconds                         completion_deadline;
+  // Read by the CUDA backend only.
+  [[maybe_unused]] const std::chrono::nanoseconds        completion_deadline;
   const unsigned                                         max_sequence_length;
   std::vector<cf_t>                                      rx_symbols;
   std::vector<cf_t>                                      references;

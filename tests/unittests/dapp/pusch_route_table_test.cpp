@@ -54,7 +54,7 @@ TEST(dapp_pusch_route_table, rejects_slot_counts_outside_the_supported_range)
 {
   EXPECT_THROW(pusch_route_table(0), std::invalid_argument);
   EXPECT_THROW(pusch_route_table(pusch_route_table::max_slots_per_hook + 1), std::invalid_argument);
-  EXPECT_NO_THROW(pusch_route_table(pusch_route_table::max_slots_per_hook));
+  EXPECT_NO_THROW(pusch_route_table{pusch_route_table::max_slots_per_hook});
 }
 
 TEST(dapp_pusch_route_table, an_empty_table_is_the_host_without_routing)

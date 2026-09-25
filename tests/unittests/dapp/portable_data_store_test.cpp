@@ -87,10 +87,10 @@ TEST(portable_data_store_test, concurrent_removal_and_replacement_do_not_reclaim
   ASSERT_TRUE(store->subscribe(request(1)));
   const std::vector<uint8_t> metadata(16, 1), tensor(1024, 2);
   std::atomic<bool>          stop{false};
-  std::thread                producer([&] {
+  std::thread                producer([&, &producer_store = store] {
     uint64_t sequence = 1;
     while (!stop.load(std::memory_order_relaxed)) {
-      store->publish(publication(sequence++, metadata, tensor));
+      producer_store->publish(publication(sequence++, metadata, tensor));
     }
   });
   for (unsigned iteration = 0; iteration != 200; ++iteration) {
