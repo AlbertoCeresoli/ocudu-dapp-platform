@@ -6,6 +6,8 @@
 // (when built) the E3 data-profile endpoint. Synthetic PUSCH symbol, CRC, SRS
 // and gNB JSON telemetry is published every few milliseconds until stdin is
 // closed. The bound ports are printed as "e3ap_port N" / "e3dp_port N".
+// Both endpoints listen on 127.0.0.1 unless --bind-address names another
+// address (0.0.0.0 to serve other containers or hosts).
 
 #include "ocudu/dapp/e3/e3_connection_registry.h"
 #include "ocudu/dapp/e3/e3ap_sctp_server.h"
@@ -37,6 +39,7 @@ namespace {
 
 struct options {
   std::string catalog{"/tmp"};
+  std::string bind_address{"127.0.0.1"};
   uint16_t    e3ap_port{0};
   uint16_t    e3dp_port{0};
   unsigned    period_ms{10};
@@ -51,6 +54,8 @@ options parse(int argc, char** argv)
     const std::string value  = argv[index + 1];
     if (option == "--catalog") {
       result.catalog = value;
+    } else if (option == "--bind-address") {
+      result.bind_address = value;
     } else if (option == "--e3ap-port") {
       result.e3ap_port = static_cast<uint16_t>(std::stoul(value));
     } else if (option == "--e3dp-port") {
@@ -112,6 +117,7 @@ int main(int argc, char** argv)
   }
 
   e3ap_sctp_server_config e3ap_config;
+  e3ap_config.transport.bind_address = opts.bind_address;
   e3ap_config.transport.port         = opts.e3ap_port;
   e3ap_config.transport.timer_period = std::chrono::milliseconds(2);
   e3ap_config.ran_identifier         = "ocudu-e3-test-agent";
@@ -126,7 +132,8 @@ int main(int argc, char** argv)
   std::unique_ptr<e3dp_sctp_server> e3dp;
   if (opts.e3dp) {
     e3dp_sctp_server_config e3dp_config;
-    e3dp_config.transport.port = opts.e3dp_port;
+    e3dp_config.transport.bind_address = opts.bind_address;
+    e3dp_config.transport.port         = opts.e3dp_port;
     e3dp_config.cells          = {{0, 3'500'000'000ULL, 0}};
     auto created               = e3dp_sctp_server::create(service, store.first, e3dp_config);
     if (!created) {
