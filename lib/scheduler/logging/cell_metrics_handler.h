@@ -28,6 +28,11 @@ class cell_metrics_handler final : public sched_metrics_ue_configurator
   using msecs = std::chrono::milliseconds;
   using usecs = std::chrono::microseconds;
 
+  /// Length of the windows over which the per-period BLER minimum, mean and maximum are computed.
+  static constexpr std::chrono::milliseconds bler_window_ms{100};
+  /// Transport blocks a BLER window needs before it is closed, so a lone failure does not read as 100 % BLER.
+  static constexpr unsigned min_bler_window_tbs = 5;
+
   struct ue_metric_context {
     /// \brief In this struct we store all the metadata that is reset at every report.
     struct non_persistent_data {
@@ -88,6 +93,22 @@ class cell_metrics_handler final : public sched_metrics_ue_configurator
       sample_statistics<float> srs_ta;
       /// CQI statistics over the metrics report interval.
       sample_statistics<unsigned> cqi;
+      /// PH (dB, midpoint of the reported interval) of every PHR received in the report period.
+      sample_statistics<float> phr_stats;
+      /// MCS of every DL codeword and UL PUSCH grant scheduled in the report period.
+      sample_statistics<unsigned> dl_mcs_stats;
+      sample_statistics<unsigned> ul_mcs_stats;
+      /// SINR (dB) of every PUSCH CRC and PUCCH report received in the report period.
+      sample_statistics<float> pusch_snr_stats;
+      sample_statistics<float> pucch_snr_stats;
+      /// Transport blocks and failures of the BLER window being filled (see \ref bler_window_ms).
+      unsigned dl_window_tbs  = 0;
+      unsigned dl_window_noks = 0;
+      unsigned ul_window_tbs  = 0;
+      unsigned ul_window_noks = 0;
+      /// BLER of each closed BLER window of the report period.
+      sample_statistics<float> dl_window_bler;
+      sample_statistics<float> ul_window_bler;
       /// DL RI statistics over the metrics report interval.
       sample_statistics<unsigned> dl_ri;
       /// UL RI statistics over the metrics report interval.
@@ -119,6 +140,9 @@ class cell_metrics_handler final : public sched_metrics_ue_configurator
 
     scheduler_ue_metrics compute_report(std::chrono::milliseconds metric_report_period, unsigned nof_slots_per_sf);
     void                 reset();
+    /// Closes the BLER windows that hold at least \ref min_bler_window_tbs transport blocks; sparser windows keep
+    /// filling.
+    void close_bler_windows();
   };
 
   /// Counters for scheduler cell metrics that get reset on every report.
@@ -186,6 +210,8 @@ class cell_metrics_handler final : public sched_metrics_ue_configurator
 
   // Derived values.
   const unsigned nof_slots_per_sf;
+  /// Slots elapsed in the current BLER window, restarted with every report.
+  unsigned slots_in_bler_window = 0;
 
   /// Last slot indication handled.
   slot_point_extended last_slot_tx;

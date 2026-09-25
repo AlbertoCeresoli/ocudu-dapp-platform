@@ -114,6 +114,17 @@ struct scheduler_ue_metrics {
   std::optional<float>    last_dl_olla;
   std::optional<float>    last_ul_olla;
   std::optional<int>      last_phr;
+  /// PH (dB, midpoint of the reported interval) of the PHRs received over the metrics report interval.
+  sample_statistics<float> phr_stats;
+  /// MCS of every DL codeword and UL PUSCH grant scheduled over the metrics report interval.
+  sample_statistics<unsigned> dl_mcs_stats;
+  sample_statistics<unsigned> ul_mcs_stats;
+  /// SINR (dB) of every PUSCH CRC and PUCCH report over the metrics report interval.
+  sample_statistics<float> pusch_snr_stats;
+  sample_statistics<float> pucch_snr_stats;
+  /// BLER of each 100 ms window with at least 5 transport blocks over the metrics report interval.
+  sample_statistics<float> dl_window_bler_stats;
+  sample_statistics<float> ul_window_bler_stats;
   std::optional<unsigned> max_pdsch_distance_ms;
   std::optional<unsigned> max_pusch_distance_ms;
   /// Time advance statistics in seconds.

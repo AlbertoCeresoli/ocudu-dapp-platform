@@ -357,6 +357,19 @@ TEST(mac_ul_subpdu, decode_single_entry_phr)
   fmt::print("subPDU: {}\n", subpdu);
 }
 
+// PH index to dB interval, TS 38.133 Table 10.1.17.1-1: 1 dB steps up to PH_54, 2 dB steps from PH_55.
+TEST(mac_ul_subpdu, ph_index_maps_to_the_ts38133_intervals)
+{
+  EXPECT_EQ(ph_to_db_range(0), ph_db_range(-32, -32));
+  EXPECT_EQ(ph_to_db_range(1), ph_db_range(-32, -31));
+  EXPECT_EQ(ph_to_db_range(32), ph_db_range(-1, 0));
+  EXPECT_EQ(ph_to_db_range(54), ph_db_range(21, 22));
+  EXPECT_EQ(ph_to_db_range(55), ph_db_range(22, 24));
+  EXPECT_EQ(ph_to_db_range(56), ph_db_range(24, 26));
+  EXPECT_EQ(ph_to_db_range(62), ph_db_range(36, 38));
+  EXPECT_EQ(ph_to_db_range(63), ph_db_range(38, 38));
+}
+
 // Test the unpacking function for MAC subPDU with padding.
 TEST(mac_ul_subpdu, decode_subpdu_padding)
 {

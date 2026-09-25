@@ -263,6 +263,41 @@ TEST_F(scheduler_metrics_handler_tester, classified_crc_and_exact_resource_metri
   EXPECT_EQ(empty.report_sequence, sequence + 1);
 }
 
+TEST_F(scheduler_metrics_handler_tester, phr_statistics_cover_every_report_and_reset_each_period)
+{
+  get_next_metric();
+  const auto send_phr = [this](interval<int> ph) {
+    ul_phr_indication_message phr_ind{};
+    phr_ind.ue_index = test_ue_index;
+    phr_ind.rnti     = to_rnti(0x4601);
+    phr_ind.slot_rx  = next_sl_tx.without_hyper_sfn() - 1;
+    phr_ind.phr.set_se_phr({.serv_cell_id = SERVING_PCELL_IDX,
+                            .ph_type      = ph_field_type_t::type1,
+                            .ph           = ph,
+                            .p_cmax       = p_cmax_dbm_range{20, 21}});
+    metrics.handle_ul_phr_indication(phr_ind);
+  };
+  send_phr({4, 5});
+  send_phr({-6, -5});
+  send_phr({-1, 0});
+  get_next_metric();
+  const auto& result = metrics_notif.last_report.ue_metrics[0];
+  ASSERT_EQ(result.phr_stats.get_nof_observations(), 3U);
+  EXPECT_FLOAT_EQ(result.phr_stats.get_mean(), (4.5F - 5.5F - 0.5F) / 3.0F);
+  EXPECT_FLOAT_EQ(result.phr_stats.get_min(), -5.5F);
+  EXPECT_FLOAT_EQ(result.phr_stats.get_max(), 4.5F);
+  // The floor of the last interval's midpoint: [-1, 0) dB is -1, not 0.
+  ASSERT_TRUE(result.last_phr.has_value());
+  EXPECT_EQ(*result.last_phr, -1);
+
+  // The statistics restart every period; the last PHR persists until the next one.
+  get_next_metric();
+  const auto& empty = metrics_notif.last_report.ue_metrics[0];
+  EXPECT_EQ(empty.phr_stats.get_nof_observations(), 0U);
+  ASSERT_TRUE(empty.last_phr.has_value());
+  EXPECT_EQ(*empty.last_phr, -1);
+}
+
 TEST_F(scheduler_metrics_handler_tester, compute_mcs)
 {
   sch_mcs_index dl_mcs{test_rng::uniform_int<uint8_t>(1, 28)};
@@ -297,6 +332,106 @@ TEST_F(scheduler_metrics_handler_tester, compute_mcs)
   ASSERT_EQ(ue_metrics.rnti, to_rnti(0x4601));
   ASSERT_EQ(ue_metrics.dl_mcs, 0) << "DL MCS not reset";
   ASSERT_EQ(ue_metrics.ul_mcs, 0) << "UL MCS not reset";
+}
+
+TEST_F(scheduler_metrics_handler_tester, mcs_and_sinr_spread_over_the_period)
+{
+  get_next_metric();
+  sched_result res;
+  res.dl.nof_dl_symbols = 14;
+  res.ul.nof_ul_symbols = 14;
+  dl_msg_alloc& dl_msg  = res.dl.ue_grants.emplace_back();
+  dl_msg.pdsch_cfg.rnti = to_rnti(0x4601);
+  auto&          cw     = dl_msg.pdsch_cfg.codewords.emplace_back();
+  ul_sched_info& ul_msg = res.ul.puschs.emplace_back();
+  ul_msg.pusch_cfg.rnti = to_rnti(0x4601);
+  for (const unsigned mcs : {10U, 14U, 20U}) {
+    cw.mcs_index               = sch_mcs_index{static_cast<uint8_t>(mcs)};
+    ul_msg.pusch_cfg.mcs_index = sch_mcs_index{static_cast<uint8_t>(mcs + 1)};
+    run_slot(res);
+  }
+  ul_crc_pdu_indication crc{};
+  crc.rnti           = to_rnti(0x4601);
+  crc.ue_index       = test_ue_index;
+  crc.tb_crc_success = true;
+  for (const float sinr : {12.5F, 30.0F, 21.0F}) {
+    crc.ul_sinr_dB = sinr;
+    metrics.handle_crc_indication(next_sl_tx.without_hyper_sfn() - 1, crc, units::bytes{10});
+  }
+  get_next_metric();
+  const auto& result = metrics_notif.last_report.ue_metrics[0];
+  ASSERT_EQ(result.dl_mcs_stats.get_nof_observations(), 3U);
+  EXPECT_EQ(result.dl_mcs_stats.get_min(), 10U);
+  EXPECT_EQ(result.dl_mcs_stats.get_max(), 20U);
+  EXPECT_FLOAT_EQ(result.dl_mcs_stats.get_mean(), 44.0F / 3.0F);
+  ASSERT_EQ(result.ul_mcs_stats.get_nof_observations(), 3U);
+  EXPECT_EQ(result.ul_mcs_stats.get_min(), 11U);
+  EXPECT_EQ(result.ul_mcs_stats.get_max(), 21U);
+  ASSERT_EQ(result.pusch_snr_stats.get_nof_observations(), 3U);
+  EXPECT_FLOAT_EQ(result.pusch_snr_stats.get_min(), 12.5F);
+  EXPECT_FLOAT_EQ(result.pusch_snr_stats.get_max(), 30.0F);
+  EXPECT_FLOAT_EQ(result.pusch_snr_stats.get_mean(), 63.5F / 3.0F);
+
+  get_next_metric();
+  const auto& empty = metrics_notif.last_report.ue_metrics[0];
+  EXPECT_EQ(empty.dl_mcs_stats.get_nof_observations(), 0U);
+  EXPECT_EQ(empty.ul_mcs_stats.get_nof_observations(), 0U);
+  EXPECT_EQ(empty.pusch_snr_stats.get_nof_observations(), 0U);
+}
+
+class scheduler_metrics_handler_300ms_tester : public scheduler_metrics_handler_tester
+{
+protected:
+  scheduler_metrics_handler_300ms_tester() : scheduler_metrics_handler_tester(std::chrono::milliseconds{300}) {}
+
+  void send_crcs(unsigned ok, unsigned nok)
+  {
+    ul_crc_pdu_indication crc{};
+    crc.rnti     = to_rnti(0x4601);
+    crc.ue_index = test_ue_index;
+    for (unsigned i = 0; i != ok + nok; ++i) {
+      crc.tb_crc_success = i < ok;
+      metrics.handle_crc_indication(next_sl_tx.without_hyper_sfn() - 1, crc, units::bytes{10});
+    }
+  }
+
+  void run_slots(unsigned count)
+  {
+    sched_result res;
+    res.dl.nof_dl_symbols = 14;
+    res.ul.nof_ul_symbols = 14;
+    for (unsigned i = 0; i != count; ++i) {
+      run_slot(res);
+    }
+  }
+};
+
+TEST_F(scheduler_metrics_handler_300ms_tester, bler_spread_over_100ms_windows_with_enough_transport_blocks)
+{
+  // 15 kHz SCS: one slot per millisecond, three 100 ms windows per report.
+  get_next_metric();
+  send_crcs(5, 5);
+  run_slots(100);
+  send_crcs(10, 0);
+  run_slots(100);
+  // Three transport blocks are too few for a window: they do not count.
+  send_crcs(1, 2);
+  get_next_metric();
+  const auto& result = metrics_notif.last_report.ue_metrics[0];
+  ASSERT_EQ(result.ul_window_bler_stats.get_nof_observations(), 2U);
+  EXPECT_FLOAT_EQ(result.ul_window_bler_stats.get_min(), 0.0F);
+  EXPECT_FLOAT_EQ(result.ul_window_bler_stats.get_max(), 0.5F);
+  EXPECT_FLOAT_EQ(result.ul_window_bler_stats.get_mean(), 0.25F);
+  EXPECT_EQ(result.dl_window_bler_stats.get_nof_observations(), 0U);
+
+  // A sparse window keeps filling until it has enough transport blocks.
+  send_crcs(0, 3);
+  run_slots(100);
+  send_crcs(3, 0);
+  get_next_metric();
+  const auto& sparse = metrics_notif.last_report.ue_metrics[0];
+  ASSERT_EQ(sparse.ul_window_bler_stats.get_nof_observations(), 1U);
+  EXPECT_FLOAT_EQ(sparse.ul_window_bler_stats.get_mean(), 0.5F);
 }
 
 TEST_F(scheduler_metrics_handler_tester, compute_bitrate)

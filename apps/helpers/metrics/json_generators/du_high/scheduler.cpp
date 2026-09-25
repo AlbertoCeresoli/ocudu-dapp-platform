@@ -102,6 +102,26 @@ void to_json(nlohmann::json& json, const scheduler_ue_metrics& metrics)
     json["ul_olla_at_upper_limit"] = feedback.olla_enabled && feedback.offset_db >= feedback.max_offset_db;
   }
   json["last_phr"]                     = metrics.last_phr.has_value() ? metrics.last_phr : 0;
+  if (metrics.phr_stats.get_nof_observations() > 0) {
+    json["phr_avg_db"] = metrics.phr_stats.get_mean();
+    json["phr_min_db"] = metrics.phr_stats.get_min();
+    json["phr_max_db"] = metrics.phr_stats.get_max();
+    json["nof_phr"]    = metrics.phr_stats.get_nof_observations();
+  }
+  // Per-period spread: mean, minimum and maximum over every grant, report or BLER window.
+  const auto add_spread = [&json](const std::string& prefix, const auto& stats, const std::string& unit) {
+    if (stats.get_nof_observations() > 0) {
+      json[prefix + "_avg" + unit] = stats.get_mean();
+      json[prefix + "_min" + unit] = stats.get_min();
+      json[prefix + "_max" + unit] = stats.get_max();
+    }
+  };
+  add_spread("dl_mcs", metrics.dl_mcs_stats, "");
+  add_spread("ul_mcs", metrics.ul_mcs_stats, "");
+  add_spread("pusch_snr", metrics.pusch_snr_stats, "_db");
+  add_spread("pucch_snr", metrics.pucch_snr_stats, "_db");
+  add_spread("dl_bler_100ms", metrics.dl_window_bler_stats, "");
+  add_spread("ul_bler_100ms", metrics.ul_window_bler_stats, "");
   json["max_pusch_distance"]           = metrics.max_pusch_distance_ms.has_value() ? metrics.max_pusch_distance_ms : 0;
   json["max_pdsch_distance"]           = metrics.max_pdsch_distance_ms.has_value() ? metrics.max_pdsch_distance_ms : 0;
   json["bsr"]                          = metrics.bsr;
