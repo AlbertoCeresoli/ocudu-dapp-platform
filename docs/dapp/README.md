@@ -20,7 +20,7 @@ The [CUDA control-context boundary](receiver_control_context.md) describes
 exact PHY-stream binding, cold lifecycle ownership and its remaining device
 qualification requirements.
 
-**Read the papers first?** The quickstart repository ships two preview papers: the [architecture and tutorial paper](https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-quickstart/-/blob/main/papers/ocudu_dapp_tutorial.pdf) and the [measured interface study](https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-quickstart/-/blob/main/papers/ocudu_dapp_interface_study.pdf).
+**Read the papers first?** The [architecture and tutorial paper](https://arxiv.org/abs/2609.07843) (arXiv:2609.07843), the [measured interface study](https://arxiv.org/abs/2609.07805) (arXiv:2609.07805), and the [GPU-resident CUDA acceleration paper](https://arxiv.org/abs/2608.04338) for the CUDA L1 (arXiv:2608.04338).
 
 **New to the platform? Follow the step-by-step tutorials** — a guided path
 from an empty vendor repo to an LLM agent tuning a live cell. No radio needed:

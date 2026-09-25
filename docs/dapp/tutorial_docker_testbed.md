@@ -22,7 +22,9 @@ ocudu-docker/scripts/build.sh          # or: OCUDU_BUILD_VARIANT=cpu ...
 
 The platform repo must sit in a directory named `ocudu` and the testbed in
 `ocudu-docker` — the docker build and the cross-repo documentation links
-depend on those directory names.
+depend on those directory names. (Or clone only `ocudu-docker` into the
+workspace and run `ocudu-docker/scripts/fetch_sources.sh`, which clones the
+other two next to it.)
 
 This compiles the OCUDU host (dApp runtime + E3 + gNB + tools) and the full
 CPU SDK, **running every release gate during the build** — a green image is a
