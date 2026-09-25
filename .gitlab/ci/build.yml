@@ -595,7 +595,7 @@ dapp interoperability release gate:
     OCUDU_BUILD_DIR: build-dapp-interop-ci
     GIT_SUBMODULE_STRATEGY: recursive
     OCUDU_DAPP_SDK_URL: https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-sdk.git
-    OCUDU_DAPP_SDK_REF: 70ee0db287d72b4fdeabf2afbde705e0b8d283e6
+    OCUDU_DAPP_SDK_REF: a8948460e2a45d5bcd1f8f6c9abfc75f89c98982
   script:
     # E3AP, E3DP and the libe3 session run over SCTP; a runner whose kernel lacks the module fails
     # every one of those tests with "Protocol not supported". Say so once, up front.
