@@ -63,7 +63,10 @@ public:
     ::setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &buffer_bytes, sizeof(buffer_bytes));
     ::setsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &buffer_bytes, sizeof(buffer_bytes));
     connected = descriptor >= 0 && ::connect(descriptor, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
-    timeval timeout{2, 0};
+    // Longer than SCTP's initial retransmission timeout (3 s): the first
+    // message of a fresh association occasionally arrives only on
+    // retransmission (see test_server_config).
+    timeval timeout{5, 0};
     ::setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   }
   ~test_client()
@@ -193,7 +196,11 @@ e3ap_sctp_server_config test_server_config()
   config.transport.port         = 0;
   config.transport.idle_timeout = std::chrono::seconds(5);
   config.transport.timer_period = std::chrono::milliseconds(2);
-  config.setup_timeout          = std::chrono::milliseconds(500);
+  // The production default: a setup request that lands while accept() moves
+  // the association off the listener can go unacknowledged in the kernel and
+  // arrive only on retransmission, rto_initial (3 s) later; a shorter timeout
+  // closes that client before its setup is read.
+  config.setup_timeout          = std::chrono::milliseconds(5000);
   config.lease_us               = 2'000'000;
   config.maximum_payload_bytes  = 4 * 1024 * 1024;
   return config;
@@ -223,8 +230,10 @@ struct fixture {
   std::shared_ptr<telemetry_publisher>    publisher;
 };
 
+// The default outlasts SCTP's initial retransmission timeout (3 s): a chunk of
+// a fresh or closing association occasionally arrives only on retransmission.
 template <typename Predicate>
-bool wait_until(Predicate&& ready, std::chrono::milliseconds limit = std::chrono::seconds(2))
+bool wait_until(Predicate&& ready, std::chrono::milliseconds limit = std::chrono::seconds(5))
 {
   const auto deadline = std::chrono::steady_clock::now() + limit;
   while (std::chrono::steady_clock::now() < deadline) {

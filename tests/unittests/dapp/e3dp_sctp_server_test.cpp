@@ -37,7 +37,10 @@ public:
     address.sin_port   = htons(port);
     ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
     connected = descriptor >= 0 && ::connect(descriptor, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
-    timeval timeout{2, 0};
+    // Longer than SCTP's initial retransmission timeout (3 s): the first
+    // message of a fresh association occasionally arrives only on
+    // retransmission, when it lands while accept() moves the association.
+    timeval timeout{5, 0};
     ::setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   }
   ~test_client()
