@@ -666,7 +666,8 @@ pusch_demodulator_gpu_impl::pusch_demodulator_gpu_impl(std::unique_ptr<channel_e
                                                        bool                                     compute_post_eq_sinr_,
                                                        bool                                     compensate_cfo,
                                                        channel_equalizer_algorithm_type         equalizer_algorithm,
-                                                       int                                      nvcuda_device_id) :
+                                                       int                                      nvcuda_device_id,
+                                                       port_channel_estimator_td_interpolation_strategy td_interpolation_strategy) :
   equalizer(std::move(equalizer_)),
   precoder(std::move(precoder_)),
   demapper_fallback(std::move(demapper_fallback_)),
@@ -700,12 +701,18 @@ pusch_demodulator_gpu_impl::pusch_demodulator_gpu_impl(std::unique_ptr<channel_e
     fmt::print("[PUSCH GPU] Path tracing ENABLED via OCUDU_PUSCH_ACCELERATION_TRACE\n");
   }
 
-  // Time interpolation mode: average (default) or linear.
+  // Follow the configured channel estimator time strategy, as the CPU estimator does. OCUDU_TIME_INTERP=linear|average
+  // overrides it for A/B experiments.
+  time_interp_mode_ = (td_interpolation_strategy == port_channel_estimator_td_interpolation_strategy::interpolate) ? 1 : 0;
   const char* ti_env = std::getenv("OCUDU_TIME_INTERP");
   if (ti_env && std::string(ti_env) == "linear") {
     time_interp_mode_ = 1;
-    fmt::print("[PUSCH GPU] Time interpolation: linear (OCUDU_TIME_INTERP=linear)\n");
+  } else if (ti_env && std::string(ti_env) == "average") {
+    time_interp_mode_ = 0;
   }
+  ocudulog::fetch_basic_logger("PHY").info("PUSCH GPU channel estimator: time_interpolation={} cfo_compensation={}",
+                                           time_interp_mode_ == 1 ? "interpolate" : "average",
+                                           compensate_cfo_);
 
   // Noise estimation mode: 1 = pilot-residual (default), 0 = cross-validation.
   // OCUDU_NOISE_MODE=cv restores the old cross-validation mode for A/B testing.

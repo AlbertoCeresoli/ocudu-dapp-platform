@@ -102,6 +102,9 @@ struct pusch_demodulator_factory_accelerated_configuration {
   bool                                             enable_post_eq_sinr = false;
   bool                                             compensate_cfo      = true;
   channel_equalizer_algorithm_type                 equalizer_algorithm = channel_equalizer_algorithm_type::mmse;
+  /// Time interpolation used by the resident GPU channel estimator.
+  port_channel_estimator_td_interpolation_strategy td_interpolation_strategy =
+      port_channel_estimator_td_interpolation_strategy::average;
   /// NVIDIA CUDA device ID the accelerated demodulator binds to.
   int nvcuda_device_id = 0;
 };

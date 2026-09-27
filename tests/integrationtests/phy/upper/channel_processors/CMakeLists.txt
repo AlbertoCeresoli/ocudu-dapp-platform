@@ -43,6 +43,8 @@ gtest_discover_tests(pxsch_chain_test)
 add_executable(pusch_gpu_cpu_comparison_test pusch_gpu_cpu_comparison_test.cpp)
 target_link_libraries(pusch_gpu_cpu_comparison_test ocudu_pxsch_bler_test_helpers)
 add_test(pusch_gpu_cpu_comparison_test pusch_gpu_cpu_comparison_test -R 10)
+add_test(pusch_gpu_cpu_cfo_interpolation_test pusch_gpu_cpu_comparison_test -L -P 27 -R 10 -S 30 -N 1)
+add_test(pusch_gpu_cpu_sync_sinr_test pusch_gpu_cpu_comparison_test -L -H -P 27 -R 10 -S 30 -N 1)
 
 add_executable(pdsch_gpu_e2e_test pdsch_gpu_e2e_test.cpp)
 target_link_libraries(pdsch_gpu_e2e_test

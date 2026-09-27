@@ -1022,6 +1022,7 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
     accel_config.enable_post_eq_sinr  = enable_eq_sinr;
     accel_config.compensate_cfo       = config.pusch_channel_estimator_compensate_cfo;
     accel_config.equalizer_algorithm  = pusch_equalizer_algorithm_type;
+    accel_config.td_interpolation_strategy = pusch_chan_estimator_td_strategy;
     accel_config.nvcuda_device_id     = config.nvcuda_device_id;
     pusch_demod_factory               = create_pusch_demodulator_factory_accelerated(accel_config);
     ocudulog::fetch_basic_logger("PHY").info("Using accelerated PUSCH demodulator");

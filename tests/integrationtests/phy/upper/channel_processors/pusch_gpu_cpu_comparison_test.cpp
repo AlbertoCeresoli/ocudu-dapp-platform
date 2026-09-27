@@ -47,7 +47,7 @@
 using namespace ocudu;
 
 // Default test parameters
-static constexpr subcarrier_spacing scs                         = subcarrier_spacing::kHz30;
+static subcarrier_spacing scs                         = subcarrier_spacing::kHz30;
 static constexpr uint16_t           rnti                        = 0x1234;
 static constexpr unsigned           bwp_start_rb                = 0;
 static constexpr unsigned           nof_ofdm_symbols            = 14;
@@ -57,14 +57,16 @@ static constexpr dmrs_config_type   dmrs                        = dmrs_config_ty
 static constexpr unsigned           nof_cdm_groups_without_data = 2;
 static constexpr cyclic_prefix      cy_prefix                   = cyclic_prefix::NORMAL;
 static constexpr unsigned           rv                          = 0;
-static constexpr unsigned           n_id                        = 0;
-static constexpr unsigned           scrambling_id               = 0;
+static unsigned           n_id                        = 0;
+static unsigned           scrambling_id               = 0;
 static constexpr bool               n_scid                      = false;
 static constexpr bool               use_early_stop              = true;
 
 // Configurable test parameters
 static unsigned              max_nof_threads = std::min(8U, std::thread::hardware_concurrency());
 static unsigned              nof_repetitions = 100;
+static bool live_cfo_regression = false;
+static bool sync_sinr_regression = false;
 static std::vector<unsigned> prb_allocations = {3, 4, 5, 6};
 static std::vector<float>    sinr_values_dB  = {5.0F, 10.0F, 15.0F, 20.0F, 25.0F, 30.0F};
 static std::vector<unsigned> rx_port_counts  = {1, 2};
@@ -110,6 +112,7 @@ public:
 
   void run()
   {
+    report_error_if_not(!sync_sinr_regression || live_cfo_regression, "-H requires -L");
     print_header();
 
     // Run tests for each configuration
@@ -126,6 +129,24 @@ public:
     }
 
     print_summary();
+    if (live_cfo_regression) {
+      report_error_if_not(!all_results.empty(), "CFO regression has no results");
+      for (const auto& r : all_results) {
+        report_error_if_not(r.total_transmissions == nof_repetitions && r.cpu_crc_errors == 0 &&
+                            r.gpu_crc_errors == 0 && r.cpu_data_errors == 0 && r.gpu_data_errors == 0,
+                            "CFO regression CRC or payload mismatch");
+      }
+      if (sync_sinr_regression) {
+        for (const auto& r : all_results) {
+          report_error_if_not(r.cpu_sinr_stats.get_nof_observations() == nof_repetitions &&
+                              r.gpu_sinr_stats.get_nof_observations() == nof_repetitions &&
+                              std::abs(r.gpu_sinr_stats.get_mean() - r.cpu_sinr_stats.get_mean()) <= 0.5F,
+                              "Synchronous GPU post-equalization SINR disagrees with CPU");
+        }
+        fmt::print("Synchronous SINR regression: PASS (GPU demodulation, host-visible decode)\n");
+      }
+      fmt::print("CFO interpolation regression: PASS (CPU/GPU CRC and payload parity)\n");
+    }
   }
 
 private:
@@ -212,7 +233,8 @@ private:
     sch_mcs_description mcs_descr = pusch_mcs_get_config(mcs_table, mcs_index, false, false);
 
     // Frequency allocation
-    prb_interval freq_allocation = {bwp_start_rb, bwp_start_rb + nof_prb};
+    unsigned start_rb = live_cfo_regression ? 8 : bwp_start_rb;
+    prb_interval freq_allocation = {start_rb, start_rb + nof_prb};
 
     // Calculate transport block size
     tbs_calculator_configuration tbs_config = {};
@@ -243,8 +265,8 @@ private:
                                           nof_ldpc_iterations,
                                           use_early_stop,
                                           "auto",
-                                          port_channel_estimator_td_interpolation_strategy::average,
-                                          channel_equalizer_algorithm_type::zf);
+                                          live_cfo_regression ? port_channel_estimator_td_interpolation_strategy::interpolate : port_channel_estimator_td_interpolation_strategy::average,
+                                          live_cfo_regression ? channel_equalizer_algorithm_type::mmse : channel_equalizer_algorithm_type::zf);
     report_fatal_error_if_not(cpu_pusch_proc_factory, "Failed to create CPU PUSCH processor factory.");
 
     // Create GPU PUSCH processor factory
@@ -253,9 +275,9 @@ private:
                                           max_nof_threads + 1,
                                           nof_ldpc_iterations,
                                           use_early_stop,
-                                          "gpu",
-                                          port_channel_estimator_td_interpolation_strategy::average,
-                                          channel_equalizer_algorithm_type::zf);
+                                          sync_sinr_regression ? "gpu-demod" : "gpu",
+                                          live_cfo_regression ? port_channel_estimator_td_interpolation_strategy::interpolate : port_channel_estimator_td_interpolation_strategy::average,
+                                          live_cfo_regression ? channel_equalizer_algorithm_type::mmse : channel_equalizer_algorithm_type::zf);
     if (!gpu_pusch_proc_factory) {
       fmt::print("  [SKIP] GPU PUSCH processor not available\n");
       worker_pool->stop();
@@ -303,7 +325,7 @@ private:
     pdsch_config.context                     = std::nullopt;
     pdsch_config.slot                        = slot_point(to_numerology_value(scs), 0);
     pdsch_config.rnti                        = to_rnti(rnti);
-    pdsch_config.bwp_size_rb                 = nof_prb;
+    pdsch_config.bwp_size_rb                 = live_cfo_regression ? 106 : nof_prb;
     pdsch_config.bwp_start_rb                = bwp_start_rb;
     pdsch_config.cp                          = cy_prefix;
     pdsch_config.n_id                        = n_id;
@@ -331,7 +353,7 @@ private:
     pusch_processor::pdu_t pusch_config;
     pusch_config.slot               = slot_point(to_numerology_value(scs), 0);
     pusch_config.rnti               = to_rnti(rnti);
-    pusch_config.bwp_size_rb        = nof_prb;
+    pusch_config.bwp_size_rb        = live_cfo_regression ? 106 : nof_prb;
     pusch_config.bwp_start_rb       = bwp_start_rb;
     pusch_config.cp                 = cy_prefix;
     pusch_config.mcs_descr          = mcs_descr;
@@ -360,7 +382,7 @@ private:
     auto emulator = std::make_unique<channel_emulator>("single-tap",
                                                        "uniform-phase",
                                                        sinr_dB,
-                                                       0.0F, // CFO
+                                                       live_cfo_regression ? 400.0F : 0.0F, // CFO
                                                        0,    // corrupted RE
                                                        nof_layers,
                                                        nof_rx_ports,
@@ -375,6 +397,10 @@ private:
 
     // Run test iterations
     for (unsigned n = 0; n != nof_repetitions; ++n) {
+      if (live_cfo_regression) {
+        pdsch_config.slot = slot_point(to_numerology_value(scs), n);
+        pusch_config.slot = pdsch_config.slot;
+      }
       // Generate random data
       std::generate(tx_data.begin(), tx_data.end(), [&rgen]() { return static_cast<uint8_t>(rgen() & 0xff); });
 
@@ -590,6 +616,8 @@ static void usage(std::string_view prog)
   fmt::print("\t-P       Comma-separated list of PRB allocations. [Default 3,4,5,6]\n");
   fmt::print("\t-S       Comma-separated list of SINR values in dB. [Default 5,10,15,20,25,30]\n");
   fmt::print("\t-N       Comma-separated list of Rx port counts. [Default 1,2]\n");
+  fmt::print("\t-H       Exercise synchronous GPU SINR reporting with host-visible decoding (requires -L).\n");
+  fmt::print("\t-L       Live-style CFO decoding regression (15 kHz, offset PRB, interpolation, MMSE).\n");
   fmt::print("\t-h       Print this message.\n");
 }
 
@@ -620,8 +648,17 @@ static std::vector<float> parse_float_list(const char* str)
 static void parse_args(int argc, char** argv)
 {
   int opt = 0;
-  while ((opt = getopt(argc, argv, "R:P:S:N:h")) != -1) {
+  while ((opt = getopt(argc, argv, "R:P:S:N:LHh")) != -1) {
     switch (opt) {
+      case 'H':
+        sync_sinr_regression = true;
+        break;
+      case 'L':
+        live_cfo_regression = true;
+        scs = subcarrier_spacing::kHz15;
+        n_id = scrambling_id = 1;
+        mcs_index = 10;
+        break;
       case 'R':
         nof_repetitions = std::strtol(optarg, nullptr, 10);
         break;

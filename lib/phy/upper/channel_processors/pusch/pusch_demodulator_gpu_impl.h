@@ -66,7 +66,9 @@ public:
       bool                                     compute_post_eq_sinr_,
       bool                                     compensate_cfo_     = true,
       channel_equalizer_algorithm_type         equalizer_algorithm = channel_equalizer_algorithm_type::mmse,
-      int                                      nvcuda_device_id    = 0);
+      int                                      nvcuda_device_id    = 0,
+      port_channel_estimator_td_interpolation_strategy td_interpolation_strategy =
+          port_channel_estimator_td_interpolation_strategy::average);
 
   /// Destructor - releases CUDA resources.
   ~pusch_demodulator_gpu_impl() override;

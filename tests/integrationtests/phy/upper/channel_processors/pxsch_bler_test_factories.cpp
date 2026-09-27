@@ -310,6 +310,8 @@ ocudu::create_sw_pusch_processor_factory(task_executor&                         
     gpu_demod_config.max_nof_prb          = decoder_max_prb;
     gpu_demod_config.enable_post_eq_sinr  = true;
     gpu_demod_config.equalizer_algorithm  = equalizer_algorithm_type;
+    gpu_demod_config.compensate_cfo = compensate_cfo;
+    gpu_demod_config.td_interpolation_strategy = td_interpolation_strategy;
     pusch_demod_factory                   = create_pusch_demodulator_factory_accelerated(gpu_demod_config);
   }
   // Fall back to SW demodulator if GPU is not available or not requested.

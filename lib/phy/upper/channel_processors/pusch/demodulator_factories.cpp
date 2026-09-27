@@ -112,7 +112,8 @@ public:
     enable_post_eq_sinr(config.enable_post_eq_sinr),
     compensate_cfo(config.compensate_cfo),
     equalizer_algorithm(config.equalizer_algorithm),
-    nvcuda_device_id(config.nvcuda_device_id)
+    nvcuda_device_id(config.nvcuda_device_id),
+    td_interpolation_strategy(config.td_interpolation_strategy)
   {
     ocudu_assert(equalizer_factory, "Invalid equalizer factory.");
     ocudu_assert(precoder_factory, "Invalid transform precoder factory.");
@@ -138,7 +139,8 @@ public:
                                                                                 enable_post_eq_sinr,
                                                                                 compensate_cfo,
                                                                                 equalizer_algorithm,
-                                                                                nvcuda_device_id);
+                                                                                nvcuda_device_id,
+                                                                                td_interpolation_strategy);
     auto sw_demodulator          = std::make_unique<pusch_demodulator_impl>(equalizer_factory->create(),
                                                                    precoder_factory->create(),
                                                                    demodulation_factory->create(),
@@ -161,6 +163,7 @@ private:
   bool                                             compensate_cfo;
   channel_equalizer_algorithm_type                 equalizer_algorithm;
   int                                              nvcuda_device_id;
+  port_channel_estimator_td_interpolation_strategy td_interpolation_strategy;
 };
 
 } // namespace
