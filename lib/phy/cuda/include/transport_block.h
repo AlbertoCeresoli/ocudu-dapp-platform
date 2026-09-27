@@ -60,6 +60,9 @@ typedef struct {
   int nof_short_segments; // Number of CBs with E_short (0 = compute internally)
   int E_short;            // Rate-matched bits for short CBs (0 = compute internally)
   int E_long;             // Rate-matched bits for long CBs (0 = compute internally)
+
+  // Limited-buffer rate matching (TS 38.212 Section 5.4.2.1): upper bound on the circular buffer N_cb (0 = unlimited).
+  int N_ref;
 } tb_encoder_config_t;
 
 /**

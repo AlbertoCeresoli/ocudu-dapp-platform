@@ -435,6 +435,8 @@ pdsch_tb_encoder_gpu::config pdsch_block_processor_gpu_impl::make_encoder_config
   cfg.nof_short_segments = nof_short;
   cfg.E_short            = E_short;
   cfg.E_long             = E_long;
+  // Limited-buffer rate matching bounds the circular buffer, and with it the RV start positions k0.
+  cfg.N_ref = cb_meta.tb_common.Nref;
 
   full_nof_symbols = G / mod_order;
   return cfg;

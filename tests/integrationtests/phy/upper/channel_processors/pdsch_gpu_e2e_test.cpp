@@ -638,6 +638,81 @@ TEST_P(PdschGpuE2eFixture, CpuAndGpuResourceGridsMatch)
 }
 
 #ifdef ENABLE_CUDA
+// Limited-buffer rate matching bounds the circular buffer of large transport blocks (TS 38.212 Section 5.4.2.1): the MAC
+// always signals tbs_lbrm_default, which binds for transport blocks above ~80 kB (100 MHz, 4 layers, high MCS), and a
+// TBS_LBRM equal to the TBS binds for every multi-codeblock transport block. Every redundancy version starts at a k0
+// derived from the bounded N_cb, so all of them must match the CPU reference, not only RV 0.
+TEST_P(PdschGpuE2eFixture, LimitedBufferRateMatchingMatchesAcrossRedundancyVersions)
+{
+  pdsch_gpu_e2e_params params           = GetParam();
+  symbol_slot_mask     dmrs_symbol_mask = make_dmrs_symbol_mask(params.dmrs_symbols);
+  unsigned             nof_ports        = params.nof_ports == 0 ? params.nof_layers : params.nof_ports;
+  SCOPED_TRACE(format_params(params));
+
+  sch_mcs_description mcs_descr = pdsch_mcs_get_config(params.mcs_table, params.mcs_index);
+  unsigned            tbs       = calculate_tbs(mcs_descr,
+                               params.nof_prb,
+                               params.nof_layers,
+                               params.dmrs_cfg_type,
+                               dmrs_symbol_mask,
+                               params.nof_cdm_groups_without_data,
+                               params.nof_symbols);
+  ASSERT_EQ(tbs % 8, 0U);
+
+  std::vector<uint8_t> tx_data(tbs / 8);
+  std::mt19937         rgen(0x1b12a000U + tbs);
+  std::generate(tx_data.begin(), tx_data.end(), [&rgen]() { return static_cast<uint8_t>(rgen() & 0xff); });
+
+  std::unique_ptr<pdsch_processor> cpu_proc = cpu_proc_factory->create();
+  std::unique_ptr<pdsch_processor> gpu_proc = gpu_proc_factory->create();
+  ASSERT_NE(cpu_proc, nullptr);
+  ASSERT_NE(gpu_proc, nullptr);
+
+  std::vector<units::bytes> lbrm_sizes = {tbs_lbrm_default};
+  if (tbs >= 20000) {
+    lbrm_sizes.push_back(units::bytes(tbs / 8));
+  }
+  for (units::bytes tbs_lbrm : lbrm_sizes)
+  for (unsigned rv : {0U, 2U, 3U, 1U}) {
+    SCOPED_TRACE(fmt::format("rv={} tbs_lbrm={}", rv, tbs_lbrm.value()));
+    pdsch_processor::pdu_t pdu = build_pdsch_pdu(mcs_descr,
+                                                 params.nof_prb,
+                                                 params.nof_layers,
+                                                 nof_ports,
+                                                 rv,
+                                                 params.dmrs_cfg_type,
+                                                 dmrs_symbol_mask,
+                                                 params.nof_cdm_groups_without_data,
+                                                 tbs,
+                                                 params.rnti,
+                                                 params.n_id,
+                                                 params.scrambling_id,
+                                                 params.n_scid,
+                                                 params.slot_index,
+                                                 params.start_symbol,
+                                                 params.nof_symbols,
+                                                 params.pdu_scs);
+    pdu.tbs_lbrm = tbs_lbrm;
+
+    std::unique_ptr<resource_grid> cpu_grid = grid_factory->create(nof_ports, MAX_NSYMB_PER_SLOT, MAX_NOF_SUBCARRIERS);
+    std::unique_ptr<resource_grid> gpu_grid = grid_factory->create(nof_ports, MAX_NSYMB_PER_SLOT, MAX_NOF_SUBCARRIERS);
+    ASSERT_NE(cpu_grid, nullptr);
+    ASSERT_NE(gpu_grid, nullptr);
+
+    pdsch_processor_notifier_adaptor cpu_notifier;
+    pdsch_processor_notifier_adaptor gpu_notifier;
+    cpu_proc->process(cpu_grid->get_writer(), cpu_notifier, {shared_transport_block(tx_data)}, pdu);
+    gpu_proc->process(gpu_grid->get_writer(), gpu_notifier, {shared_transport_block(tx_data)}, pdu);
+    cpu_notifier.wait_for_completion();
+    gpu_notifier.wait_for_completion();
+
+    grid_diff_stats diff = compare_resource_grids(cpu_grid->get_reader(), gpu_grid->get_reader());
+    ASSERT_EQ(diff.nof_mismatches, 0U) << "max_abs_error=" << diff.max_abs_error << " at port=" << diff.port
+                                       << " symbol=" << diff.symbol << " subcarrier=" << diff.subcarrier
+                                       << " cpu=" << diff.cpu_value << " gpu=" << diff.gpu_value;
+  }
+}
+
 TEST(PdschGpuIssueProfile, ManagedGridMatchesHostAcrossHarqRvsAndRepeatedSlots)
 {
   if (!is_pdsch_block_processor_acceleration_available()) {

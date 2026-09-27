@@ -49,6 +49,7 @@ public:
     unsigned nof_short_segments; ///< Number of CBs with E_short from segmenter.
     unsigned E_short;            ///< Rate-matched bits for short CBs from segmenter.
     unsigned E_long;             ///< Rate-matched bits for long CBs from segmenter.
+    unsigned N_ref = 0;          ///< Limited-buffer rate matching bound on N_cb from segmenter (0 = unlimited).
 
     friend bool operator==(const config& left, const config& right)
     {
@@ -58,7 +59,7 @@ public:
              (left.cw_index == right.cw_index) && (left.base_graph == right.base_graph) &&
              (left.nof_codeblocks == right.nof_codeblocks) && (left.lifting_size == right.lifting_size) &&
              (left.nof_filler_bits == right.nof_filler_bits) && (left.nof_short_segments == right.nof_short_segments) &&
-             (left.E_short == right.E_short) && (left.E_long == right.E_long);
+             (left.E_short == right.E_short) && (left.E_long == right.E_long) && (left.N_ref == right.N_ref);
     }
 
     /// LDPC/rate-match/modulation shape only (excludes scrambling identity).
@@ -71,7 +72,7 @@ public:
              (left.rv == right.rv) && (left.cw_index == right.cw_index) && (left.base_graph == right.base_graph) &&
              (left.nof_codeblocks == right.nof_codeblocks) && (left.lifting_size == right.lifting_size) &&
              (left.nof_filler_bits == right.nof_filler_bits) && (left.nof_short_segments == right.nof_short_segments) &&
-             (left.E_short == right.E_short) && (left.E_long == right.E_long);
+             (left.E_short == right.E_short) && (left.E_long == right.E_long) && (left.N_ref == right.N_ref);
     }
 
     friend bool operator!=(const config& left, const config& right) { return !(left == right); }

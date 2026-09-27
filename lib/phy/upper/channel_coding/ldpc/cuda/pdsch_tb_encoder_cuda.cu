@@ -112,6 +112,7 @@ tb_encoder_config_t make_tb_encoder_config(const pdsch_tb_encoder_gpu::config& c
   tb_cfg.nof_short_segments  = static_cast<int>(cfg.nof_short_segments);
   tb_cfg.E_short             = static_cast<int>(cfg.E_short);
   tb_cfg.E_long              = static_cast<int>(cfg.E_long);
+  tb_cfg.N_ref               = static_cast<int>(cfg.N_ref);
   return tb_cfg;
 }
 

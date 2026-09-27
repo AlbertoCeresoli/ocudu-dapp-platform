@@ -2537,6 +2537,10 @@ static nr_ldpc_status_t tb_encoder_encode_uncaptured(tb_encoder_handle_t handle,
     int N_cols = (handle->tb_cfg.ldpc_cfg.base_graph == 1) ? 68 : 52;
     int N_full = N_cols * Z;
     int N_cb = N_full - 2 * Z;
+    // Limited-buffer rate matching (TS 38.212 Section 5.4.2.1), as the CPU rate matcher applies it.
+    if ((handle->config.N_ref > 0) && (handle->config.N_ref < N_cb)) {
+        N_cb = handle->config.N_ref;
+    }
     int F = handle->tb_cfg.ldpc_cfg.num_filler_bits;
     // Kd = position where filler bits start in circular buffer
     // CPU filler range is [K - F, K) where K = (Kb-2)*Z
@@ -3737,6 +3741,10 @@ static nr_ldpc_status_t tb_batch_encoder_encode_to_symbols_int8_uncaptured(tb_ba
     int N_cols = (handle->tb_cfg.ldpc_cfg.base_graph == 1) ? 68 : 52;
     int N_full = N_cols * Z;
     int N_cb = N_full - 2 * Z;
+    // Limited-buffer rate matching (TS 38.212 Section 5.4.2.1), as the CPU rate matcher applies it.
+    if ((handle->config.tb_cfg.N_ref > 0) && (handle->config.tb_cfg.N_ref < N_cb)) {
+        N_cb = handle->config.tb_cfg.N_ref;
+    }
     int F = handle->tb_cfg.ldpc_cfg.num_filler_bits;
     int Kd = Kb * Z - 2 * Z - F;
     int puncture_offset = 2 * Z;
