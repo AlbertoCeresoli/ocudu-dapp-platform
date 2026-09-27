@@ -48,6 +48,7 @@ add_test(pusch_gpu_cpu_sync_sinr_test pusch_gpu_cpu_comparison_test -L -H -P 27 
 
 add_executable(pdsch_gpu_e2e_test pdsch_gpu_e2e_test.cpp)
 target_link_libraries(pdsch_gpu_e2e_test
+        ocudu_upper_phy
         ocudu_ran
         ocudu_channel_processors
         ocudu_phy_support

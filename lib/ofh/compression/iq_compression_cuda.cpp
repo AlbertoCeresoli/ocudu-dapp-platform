@@ -475,14 +475,21 @@ bool iq_compression_cuda::compress_device_symbol(span<uint8_t>                bu
   }
 
   void* stream = ocudu_ofh_compression_get_stream(handle);
-  if (!grid.prepare_device_grid_reading(stream)) {
+  const bool live_read = grid.prepare_device_grid_reading(stream);
+  if (!live_read &&
+      (!grid.stage_owned_snapshot_from_host() || !grid.prepare_owned_device_snapshot_reading(stream))) {
     release_handle(handle);
     return false;
   }
+  // A host consumer may have migrated a managed grid since its GPU producer.
+  // Read a synchronized private snapshot in that case, without bypassing the
+  // live-allocation residency guard. The backend completes its D2H before
+  // returning, so both kinds of read hold can be released synchronously.
+  const void* input = live_read ? grid.get_device_grid_cbf16() : grid.get_owned_device_snapshot_cbf16();
   bool success = ocudu_ofh_compress_device_grid(handle,
                                                 to_cuda_compression_type(type),
                                                 buffer.data(),
-                                                grid.get_device_grid_cbf16(),
+                                                input,
                                                 grid.get_nof_symbols(),
                                                 grid.get_nof_subc(),
                                                 port,
@@ -491,6 +498,16 @@ bool iq_compression_cuda::compress_device_symbol(span<uint8_t>                bu
                                                 nof_prbs,
                                                 params.data_width,
                                                 iq_scaling) != 0;
+  if (!success) {
+    // An error after enqueue must not release the grid while earlier work is
+    // still reading it. Drain the handle before relinquishing either hold.
+    (void)ocudu_ofh_compression_synchronize(handle);
+  }
+  if (live_read) {
+    grid.release_device_grid_reading();
+  } else {
+    grid.release_owned_device_snapshot_reading();
+  }
   if (success) {
     release_handle(handle);
   } else {
@@ -559,6 +576,12 @@ bool iq_compression_cuda::compress_device_symbols(span<uint8_t>                b
                                                       nof_prbs,
                                                       params.data_width,
                                                       iq_scaling) != 0;
+  // The backends complete their device-to-host copy before returning; drain on error so no enqueued read outlives
+  // the hold, then release it. A leaked hold stalls every later host access to the grid.
+  if (!success) {
+    (void)ocudu_ofh_compression_synchronize(handle);
+  }
+  grid.release_device_grid_reading();
   if (success) {
     release_handle(handle);
   } else {
@@ -633,6 +656,12 @@ bool iq_compression_cuda::compress_device_symbols_to_buffers(span<span<uint8_t>>
                                                                       nof_prbs,
                                                                       params.data_width,
                                                                       iq_scaling) != 0;
+  // The backends complete their device-to-host copy before returning; drain on error so no enqueued read outlives
+  // the hold, then release it. A leaked hold stalls every later host access to the grid.
+  if (!success) {
+    (void)ocudu_ofh_compression_synchronize(handle);
+  }
+  grid.release_device_grid_reading();
   if (success) {
     release_handle(handle);
   } else {
@@ -709,6 +738,12 @@ bool iq_compression_cuda::compress_device_symbol_batch(span<uint8_t>            
                                                              nof_prbs,
                                                              params.data_width,
                                                              iq_scaling) != 0;
+  // The backends complete their device-to-host copy before returning; drain on error so no enqueued read outlives
+  // the hold, then release it. A leaked hold stalls every later host access to the grid.
+  if (!success) {
+    (void)ocudu_ofh_compression_synchronize(handle);
+  }
+  grid.release_device_grid_reading();
   if (success) {
     release_handle(handle);
   } else {
@@ -792,6 +827,12 @@ bool iq_compression_cuda::compress_device_symbol_batch_to_buffers(span<span<uint
                                                                              nof_prbs,
                                                                              params.data_width,
                                                                              iq_scaling) != 0;
+  // The backends complete their device-to-host copy before returning; drain on error so no enqueued read outlives
+  // the hold, then release it. A leaked hold stalls every later host access to the grid.
+  if (!success) {
+    (void)ocudu_ofh_compression_synchronize(handle);
+  }
+  grid.release_device_grid_reading();
   if (success) {
     release_handle(handle);
   } else {

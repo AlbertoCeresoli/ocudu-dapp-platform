@@ -806,6 +806,12 @@ TEST(PdschGpuIssueProfile, ManagedGridMatchesHostAcrossHarqRvsAndRepeatedSlots)
     cpu_notifier.wait_for_completion();
     gpu_notifier.wait_for_completion();
 
+    // Exercise the live-device path before compare_resource_grids migrates
+    // pages to the CPU. Its read hold must be released or that host read hangs.
+    std::vector<uint8_t> direct_compressed(compressed_symbol_bytes);
+    ASSERT_TRUE(gpu_compressor->compress_device_symbol(
+        direct_compressed, gpu_grid->get_reader(), 0, 0, 0, nof_prb, compression_params));
+
     grid_diff_stats diff = compare_resource_grids(cpu_grid->get_reader(), gpu_grid->get_reader());
     ASSERT_EQ(diff.nof_mismatches, 0U) << "max_abs_error=" << diff.max_abs_error << " at port=" << diff.port
                                        << " symbol=" << diff.symbol << " subcarrier=" << diff.subcarrier
@@ -821,6 +827,9 @@ TEST(PdschGpuIssueProfile, ManagedGridMatchesHostAcrossHarqRvsAndRepeatedSlots)
         ASSERT_TRUE(gpu_compressor->compress_device_symbol(
             gpu_compressed, gpu_grid->get_reader(), port, symbol, 0, nof_prb, compression_params));
         ASSERT_EQ(cpu_compressed, gpu_compressed);
+        if (port == 0 && symbol == 0) {
+          ASSERT_EQ(cpu_compressed, direct_compressed);
+        }
       }
     }
   }
