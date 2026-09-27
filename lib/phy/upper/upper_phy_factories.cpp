@@ -33,6 +33,7 @@
 #include "diagnostics/srs_diagnostic_decorator.h"
 #include "diagnostics/zmq_diag_publisher.h"
 #include "ocudu/phy/upper/diagnostics/phy_diagnostics.h"
+#include "ocudu/support/executors/inline_task_executor.h"
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
@@ -1021,8 +1022,8 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
     accel_config.max_nof_prb          = config.ul_bw_rb;
     accel_config.enable_post_eq_sinr  = enable_eq_sinr;
     accel_config.compensate_cfo       = config.pusch_channel_estimator_compensate_cfo;
-    accel_config.equalizer_algorithm  = pusch_equalizer_algorithm_type;
     accel_config.td_interpolation_strategy = pusch_chan_estimator_td_strategy;
+    accel_config.equalizer_algorithm  = pusch_equalizer_algorithm_type;
     accel_config.nvcuda_device_id     = config.nvcuda_device_id;
     pusch_demod_factory               = create_pusch_demodulator_factory_accelerated(accel_config);
     ocudulog::fetch_basic_logger("PHY").info("Using accelerated PUSCH demodulator");
@@ -1449,9 +1450,19 @@ ocudu::create_downlink_processor_factory_sw(const downlink_processor_factory_sw_
   report_fatal_error_if_not(pdcch_proc_factory, "Invalid PDCCH processor factory.");
 
   const bool pdsch_acceleration_requested = (config.pdsch_acceleration_mode == "enabled");
+  // ZMQ deliberately omits a codeblock executor to require synchronous PHY
+  // processing. Forced CUDA PDSCH already uses synchronous codeblock batches;
+  // provide an inline executor for that case without introducing a task queue.
+  static inline_task_executor synchronous_pdsch_executor;
+  upper_phy_executor pdsch_codeblock_executor = dependencies.pdsch_codeblock_executor;
+  if (pdsch_acceleration_requested && !pdsch_codeblock_executor.is_valid() &&
+      std::holds_alternative<pdsch_processor_flexible_configuration>(config.pdsch_processor)) {
+    pdsch_codeblock_executor = {&synchronous_pdsch_executor, 1};
+    ocudulog::fetch_basic_logger("PHY").info("PDSCH CUDA synchronous executor selected for sequential PHY.");
+  }
   const bool pdsch_uses_flexible_processor =
       std::holds_alternative<pdsch_processor_flexible_configuration>(config.pdsch_processor) &&
-      dependencies.pdsch_codeblock_executor.is_valid();
+      pdsch_codeblock_executor.is_valid();
   if (pdsch_acceleration_requested && !pdsch_uses_flexible_processor) {
     report_fatal_error(
         "Accelerated PDSCH block processor requested but no block-processor capable PDSCH configuration is active");
@@ -1510,10 +1521,10 @@ ocudu::create_downlink_processor_factory_sw(const downlink_processor_factory_sw_
   // Create channel processors - PDSCH
   std::shared_ptr<pdsch_processor_factory> pdsch_proc_factory;
   unsigned                                 pdsch_processor_pool_size = config.pdsch_executor.max_concurrency;
-  const unsigned pdsch_codeblock_concurrency  = std::max(1U, dependencies.pdsch_codeblock_executor.max_concurrency);
+  const unsigned pdsch_codeblock_concurrency  = std::max(1U, pdsch_codeblock_executor.max_concurrency);
   unsigned       pdsch_acceleration_nof_lanes = 0;
   if (std::holds_alternative<pdsch_processor_generic_configuration>(config.pdsch_processor) ||
-      !dependencies.pdsch_codeblock_executor.is_valid()) {
+      !pdsch_codeblock_executor.is_valid()) {
     pdsch_proc_factory = create_pdsch_processor_factory_sw(
         pdsch_enc_factory, pdsch_mod_factory, dmrs_pdsch_proc_factory, ptrs_pdsch_gen_factory);
     report_fatal_error_if_not(pdsch_proc_factory, "Invalid generic PDSCH processor factory.");
@@ -1564,7 +1575,7 @@ ocudu::create_downlink_processor_factory_sw(const downlink_processor_factory_sw_
           config.pdsch_executor.max_concurrency,
           pdsch_processor_pool_size);
     }
-    report_fatal_error_if_not(dependencies.pdsch_codeblock_executor.max_concurrency >= 1,
+    report_fatal_error_if_not(pdsch_codeblock_executor.max_concurrency >= 1,
                               "The number of threads (i.e., {}) must be equal to or greater than 1.");
 
     // Create a flexible PDSCH processor factory.
@@ -1574,8 +1585,8 @@ ocudu::create_downlink_processor_factory_sw(const downlink_processor_factory_sw_
         pdsch_rg_mapper_factory,
         dmrs_pdsch_proc_factory,
         ptrs_pdsch_gen_factory,
-        *dependencies.pdsch_codeblock_executor.executor,
-        use_pdsch_acceleration ? pdsch_acceleration_nof_lanes : dependencies.pdsch_codeblock_executor.max_concurrency,
+        *pdsch_codeblock_executor.executor,
+        use_pdsch_acceleration ? pdsch_acceleration_nof_lanes : pdsch_codeblock_executor.max_concurrency,
         cb_batch_length);
 
     // The number of required processors in the pool must be equal to the maximum number of PDSCH that can be enqueued
