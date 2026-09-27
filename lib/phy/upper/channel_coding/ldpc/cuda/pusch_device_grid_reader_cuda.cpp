@@ -13,13 +13,13 @@ using namespace ocudu;
 
 pusch_device_grid_reader_cuda::pusch_device_grid_reader_cuda(const resource_grid_reader& host_reader_,
                                                              grid_allocation_mode        allocation_mode_) :
-  host_reader(host_reader_), allocation_mode(allocation_mode_)
+  host_reader(&host_reader_), allocation_mode(allocation_mode_)
 {
   cudaEvent_t event = nullptr;
   if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) == cudaSuccess) {
     grid_ready_event = event;
   }
-  resize(host_reader.get_nof_ports(), host_reader.get_nof_symbols(), host_reader.get_nof_subc());
+  resize(host_reader->get_nof_ports(), host_reader->get_nof_symbols(), host_reader->get_nof_subc());
 }
 
 pusch_device_grid_reader_cuda::~pusch_device_grid_reader_cuda()
@@ -72,7 +72,7 @@ bool pusch_device_grid_reader_cuda::resize(unsigned nof_ports_, unsigned nof_sym
 bool pusch_device_grid_reader_cuda::stage_host_grid_async(void* stream)
 {
   if (!supports_device_grid_reading() ||
-      !resize(host_reader.get_nof_ports(), host_reader.get_nof_symbols(), host_reader.get_nof_subc())) {
+      !resize(host_reader->get_nof_ports(), host_reader->get_nof_symbols(), host_reader->get_nof_subc())) {
     return false;
   }
 
@@ -83,7 +83,7 @@ bool pusch_device_grid_reader_cuda::stage_host_grid_async(void* stream)
   if (allocation_mode == grid_allocation_mode::managed) {
     for (unsigned port = 0; port != device_grid_nof_ports; ++port) {
       for (unsigned symbol = 0; symbol != device_grid_nof_symbols; ++symbol) {
-        span<const cbf16_t> src = host_reader.get_view(port, symbol);
+        span<const cbf16_t> src = host_reader->get_view(port, symbol);
         auto*    dst    = static_cast<cbf16_t*>(d_grid_bf16) + port * grid_stride + symbol * device_grid_nof_subc;
         unsigned nof_re = std::min<unsigned>(device_grid_nof_subc, src.size());
         std::memcpy(dst, src.data(), nof_re * sizeof(cbf16_t));
@@ -92,10 +92,10 @@ bool pusch_device_grid_reader_cuda::stage_host_grid_async(void* stream)
 
   } else {
     for (unsigned port = 0; port != device_grid_nof_ports; ++port) {
-      span<const cbf16_t> first_view    = host_reader.get_view(port, 0);
+      span<const cbf16_t> first_view    = host_reader->get_view(port, 0);
       bool                is_contiguous = first_view.size() >= device_grid_nof_subc;
       for (unsigned symbol = 1; symbol != device_grid_nof_symbols && is_contiguous; ++symbol) {
-        span<const cbf16_t> view = host_reader.get_view(port, symbol);
+        span<const cbf16_t> view = host_reader->get_view(port, symbol);
         is_contiguous            = (view.data() == first_view.data() + symbol * device_grid_nof_subc);
       }
 
@@ -107,7 +107,7 @@ bool pusch_device_grid_reader_cuda::stage_host_grid_async(void* stream)
                         cuda_stream);
       } else {
         for (unsigned symbol = 0; symbol != device_grid_nof_symbols; ++symbol) {
-          span<const cbf16_t> src    = host_reader.get_view(port, symbol);
+          span<const cbf16_t> src    = host_reader->get_view(port, symbol);
           size_t              offset = (port * grid_stride + symbol * device_grid_nof_subc) * sizeof(cbf16_t);
           cudaMemcpyAsync(device_bytes + offset,
                           src.data(),

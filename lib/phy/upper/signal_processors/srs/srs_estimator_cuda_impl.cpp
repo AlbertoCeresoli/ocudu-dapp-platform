@@ -355,25 +355,38 @@ srs_estimator_result srs_estimator_cuda_impl::estimate(const resource_grid_reade
     gpu_configured        = true;
   }
 
-  // Class-C / ISAC already consume the owned fade snapshot. SRS must do the
-  // same: a GPU load of the live managed UL VA Xid 31's FAULT_PTE @ 0x140000
-  // on GB10 after any host migrate (or even without one, on a late stream).
-  const void* d_grid_cbf16  = nullptr;
-  const void* owned         = grid.get_owned_device_snapshot_cbf16();
-  void*       owned_ready   = grid.get_owned_device_snapshot_ready_event();
-  if (owned == nullptr || owned_ready == nullptr) {
-    if (grid.stage_owned_snapshot_from_host()) {
-      owned       = grid.get_owned_device_snapshot_cbf16();
-      owned_ready = grid.get_owned_device_snapshot_ready_event();
+  // Managed live grids must retain their owned-snapshot path. Ordinary host
+  // grids (including the discrete-GPU pinned factory) have no snapshot API;
+  // stage those into the estimator's private cudaMalloc buffer instead.
+  const void* d_grid_cbf16 = nullptr;
+  if (!grid.supports_device_grid_reading()) {
+    // Uplink grids come from a pool: rebind the one staging reader so its device buffer and event are allocated once.
+    if (!staged_grid_reader) {
+      staged_grid_reader = std::make_unique<pusch_device_grid_reader_cuda>(grid);
+    } else {
+      staged_grid_reader->rebind(grid);
     }
-  }
-  if (owned != nullptr && owned_ready != nullptr &&
-      cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), static_cast<cudaEvent_t>(owned_ready), 0) ==
-          cudaSuccess) {
-    d_grid_cbf16 = owned;
+    if (!staged_grid_reader->stage_host_grid_async(stream)) {
+      return {};
+    }
+    d_grid_cbf16 = staged_grid_reader->get_device_grid_cbf16();
   } else {
-    static_cast<void>(cudaGetLastError());
-    return {};
+    const void* owned       = grid.get_owned_device_snapshot_cbf16();
+    void*       owned_ready = grid.get_owned_device_snapshot_ready_event();
+    if (owned == nullptr || owned_ready == nullptr) {
+      if (grid.stage_owned_snapshot_from_host()) {
+        owned       = grid.get_owned_device_snapshot_cbf16();
+        owned_ready = grid.get_owned_device_snapshot_ready_event();
+      }
+    }
+    if (owned != nullptr && owned_ready != nullptr &&
+        cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), static_cast<cudaEvent_t>(owned_ready), 0) ==
+            cudaSuccess) {
+      d_grid_cbf16 = owned;
+    } else {
+      static_cast<void>(cudaGetLastError());
+      return {};
+    }
   }
 
   srs_estimator_metrics_t        metrics            = {};
