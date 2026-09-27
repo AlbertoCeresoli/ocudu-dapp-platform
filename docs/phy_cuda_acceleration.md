@@ -229,7 +229,7 @@ Upper-PHY options under `expert_phy`:
 
 | Option | Values | Effect |
 | --- | --- | --- |
-| `pusch_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA resident PUSCH demodulator/decoder path when available. |
+| `pusch_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA resident PUSCH demodulator/decoder path when available. The GPU channel estimator follows `pusch_channel_estimator_td_strategy` (default `interpolate`), as the CPU estimator does. |
 | `ul_cuda_visible_grid_mode` | `auto`, `managed`, `pinned` | Selects UL resource-grid memory. `auto` uses managed memory on integrated GPUs and pinned host memory otherwise; `managed` requires a CUDA managed grid suitable for direct OFH-to-PUSCH GPU processing. |
 | `srs_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA SRS estimator when available. |
 | `pdsch_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects the CUDA PDSCH block processor when the PDSCH processor type is `auto` or `flexible`. On a discrete CUDA device, `auto` prefers host unless the downlink grid is CUDA-visible or `OCUDU_PDSCH_AUTO_ENABLE_DISCRETE=1`; use `enabled` to require CUDA. |
@@ -241,7 +241,7 @@ Split-8 SDR lower-PHY options under `ru_sdr.expert_cfg`:
 
 | Option | Values | Effect |
 | --- | --- | --- |
-| `low_phy_tx_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects CUDA lower-PHY TX baseband processing. |
+| `low_phy_tx_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects CUDA lower-PHY TX baseband processing. The modulator reads the downlink grid directly on the device only on fully coherent parts (GH200 class); elsewhere, including GB10 and discrete GPUs, it stages the host grid every slot and logs `Lower-PHY TX GPU path selected: host resource-grid staging fallback.` once. |
 | `low_phy_rx_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects CUDA PUxCH RX OFDM demodulation. |
 | `low_phy_prach_demodulation_acceleration_mode` | `auto`, `enabled`, `disabled` | Selects CUDA PRACH OFDM demodulation in the lower PHY. |
 
@@ -512,35 +512,35 @@ bash tests/benchmarks/ofh/run_ofh_compression_matrix.sh \
 
 ## Validation Run
 
-The following validation was run on the DGX Spark build after the performance
-tuning script and benchmark captures.
-
-CUDA PHY subset:
+Build every target the validation uses first. `ctest -R` exits 0 when the regex matches nothing, so a target that
+was not built silently drops out of the run; `--no-tests=error` turns that into a failure.
 
 ```bash
-ctest --test-dir build --output-on-failure -j1 -R \
-'^(ofdm_demodulator_cuda_test|ofdm_prach_demodulator_cuda_test|pdxch_baseband_modulator_cuda_test|ldpc_encoder_gpu_cpu_test|ldpc_decoder_gpu_cpu_test|prach_detector_cuda_test|pusch_gpu_cpu_comparison_test|pdsch_gpu_e2e_test|pusch_e2e_pipeline_test|pusch_resident_dematch_scramble_test|srs_estimator_gpu_latency_baseline_4x4_n4|srs_estimator_gpu_sensitivity_baseline_4x4_n4)$'
+cmake --build build -j 8 --target \
+  ofdm_demodulator_cuda_test ofdm_prach_demodulator_cuda_test pdxch_baseband_modulator_cuda_test \
+  ldpc_encoder_gpu_cpu_test ldpc_decoder_gpu_cpu_test prach_detector_cuda_test prach_detector_geometry_test \
+  vkfft_kernel_cache_test pusch_gpu_cpu_comparison_test pdsch_gpu_e2e_test pusch_e2e_pipeline_test \
+  pusch_resident_dematch_scramble_test srs_estimator_gpu_latency_benchmark srs_estimator_gpu_sensitivity_sweep \
+  srs_estimator_gpu_thread_safety_test ofh_iq_compression_cuda_test pusch_resident_dapp_adapter_test
 ```
 
-Result:
-
-```text
-100% tests passed, 0 tests failed out of 12
-Total Test time (real) = 252.53 sec
-```
-
-OFH CUDA compression reference tests:
+CUDA PHY, Open Fronthaul compression and resident-receiver subset:
 
 ```bash
-ctest --test-dir build --output-on-failure -j1 -R '^ofh_iq_compression_cuda/'
+ctest --test-dir build --output-on-failure --no-tests=error -j1 -R \
+'^(ofdm_demodulator_cuda_test|ofdm_prach_demodulator_cuda_test|pdxch_baseband_modulator_cuda_test|ldpc_encoder_gpu_cpu_test|ldpc_decoder_gpu_cpu_test|prach_detector_cuda_test|prach_detector_geometry_test|vkfft_kernel_cache_test|pusch_gpu_cpu_comparison_test|pdsch_gpu_e2e_test|pusch_e2e_pipeline_test|pusch_resident_dematch_scramble_test|srs_estimator_gpu_latency_baseline_4x4_n4|srs_estimator_gpu_sensitivity_baseline_4x4_n4|pusch_gpu_cpu_cfo_interpolation_test|pusch_gpu_cpu_sync_sinr_test|srs_estimator_gpu_thread_safety_host)$|^ofh_iq_compression_cuda/|pusch_resident_dapp_adapter'
 ```
 
-Result:
+Result on DGX Spark (GB10), 2026-09-27:
 
 ```text
-100% tests passed, 0 tests failed out of 8
-Total Test time (real) = 2.80 sec
+100% tests passed, 0 tests failed out of 63
+Total Test time (real) = 410.00 sec
 ```
+
+The subset includes the field-derived regressions: CPU/GPU PUSCH parity with 400 Hz CFO and time interpolation,
+synchronous-path post-equalization SINR, PDSCH grid equivalence for every redundancy version under limited-buffer
+rate matching, codebook-precoded PDSCH on host and managed grids, and 16 OFH compression cases.
 
 Total CUDA-focused tests available in this build:
 
