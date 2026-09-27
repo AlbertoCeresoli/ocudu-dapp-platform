@@ -408,9 +408,21 @@ static bool try_map_device_grid(resource_grid_mapper::symbol_buffer&            
 
   float    weight_real = 0.0F;
   unsigned nof_layers  = prg_weights.get_nof_layers();
-  if (!is_same_real_weight_one_layer(prg_weights, weight_real) &&
-      !is_same_real_weight_diagonal(prg_weights, weight_real)) {
-    return false;
+  // Scalar and diagonal weights take the real-weight kernel; any other wideband matrix (a PMI codebook entry) is
+  // precoded on the device, so the host neither precodes nor writes the grid.
+  const bool real_weight = is_same_real_weight_one_layer(prg_weights, weight_real) ||
+                           is_same_real_weight_diagonal(prg_weights, weight_real);
+  static_vector<cf_t, precoding_constants::MAX_NOF_PORTS * precoding_constants::MAX_NOF_LAYERS> weights;
+  if (!real_weight) {
+    if ((nof_ports > precoding_constants::MAX_NOF_PORTS) || (nof_layers > nof_ports)) {
+      return false;
+    }
+    for (unsigned i_port = 0; i_port != nof_ports; ++i_port) {
+      span<const cf_t> port_coeff = prg_weights.get_port_coefficients(i_port);
+      for (unsigned i_layer = 0; i_layer != nof_layers; ++i_layer) {
+        weights.push_back(port_coeff[i_layer]);
+      }
+    }
   }
 
   if ((nof_layers == 0) || ((buffer.get_max_block_size() % nof_layers) != 0)) {
@@ -450,12 +462,14 @@ static bool try_map_device_grid(resource_grid_mapper::symbol_buffer&            
   if (writer_device_mapping_prepared && !writer.prepare_device_grid_mapping(mapping_stream)) {
     return false;
   }
-  if (!buffer.map_to_device_grid(span<const uint32_t>(re_offsets.data(), re_offset_count),
-                                 device_grid,
-                                 nof_ports,
-                                 nof_layers,
-                                 nof_grid_symbols * nof_grid_subc,
-                                 weight_real)) {
+  const span<const uint32_t> offsets(re_offsets.data(), re_offset_count);
+  const bool                 mapped =
+      real_weight
+                          ? buffer.map_to_device_grid(
+                offsets, device_grid, nof_ports, nof_layers, nof_grid_symbols * nof_grid_subc, weight_real)
+                          : buffer.map_to_device_grid_precoded(
+                offsets, device_grid, nof_ports, nof_layers, nof_grid_symbols * nof_grid_subc, weights);
+  if (!mapped) {
     if (writer_device_mapping_prepared) {
       writer.cancel_device_grid_mapping();
     }
@@ -662,8 +676,7 @@ void resource_grid_mapper_impl::map(resource_grid_writer&           writer,
 
   // The device-grid mapping fast path maps onto ports [0, nof_antennas) implicitly and does not honor an arbitrary
   // 'ports' remapping. All current callers pass an identity port list (ports[i] == i), so this is equivalent.
-  if ((use_single_layer_direct_map || use_diagonal_direct_map) && should_try_device_grid_mapping(writer) &&
-      (precoding.get_nof_prg() == 1) &&
+  if (should_try_device_grid_mapping(writer) && (precoding.get_nof_prg() == 1) &&
       try_map_device_grid(buffer,
                           writer,
                           allocation,

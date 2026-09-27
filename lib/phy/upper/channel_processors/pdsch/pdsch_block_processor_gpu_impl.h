@@ -67,7 +67,25 @@ private:
                           float                weight_real) override;
 
   // See interface for documentation.
+  bool map_to_device_grid_precoded(span<const uint32_t> re_offsets,
+                                   void*                d_grid_bf16,
+                                   unsigned             nof_ports,
+                                   unsigned             nof_layers,
+                                   unsigned             nof_grid_re_per_port,
+                                   span<const cf_t>     weights) override;
+
+  // See interface for documentation.
   void* get_device_grid_mapping_stream() const override;
+
+  /// Maps onto a device grid with a real weight on the layer-to-port identity, or with a wideband precoding matrix
+  /// (row-major by port) when \c weights is not empty.
+  bool map_to_device_grid_impl(span<const uint32_t> re_offsets,
+                               void*                d_grid_bf16,
+                               unsigned             nof_ports,
+                               unsigned             nof_layers,
+                               unsigned             nof_grid_re_per_port,
+                               float                weight_real,
+                               span<const cf_t>     weights);
 
   /// Processes transport block using GPU.
   void process_batch_gpu();

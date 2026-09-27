@@ -89,6 +89,15 @@ bool is_direct_grid_encode_enabled()
   return enabled;
 }
 
+bool is_device_precoding_enabled()
+{
+  static const bool enabled = []() {
+    const char* value = std::getenv("OCUDU_PDSCH_DEVICE_PRECODING");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
 } // namespace
 
 pdsch_block_processor_gpu_impl::pdsch_block_processor_gpu_impl(std::unique_ptr<pdsch_tb_encoder_gpu> tb_encoder_,
@@ -195,8 +204,15 @@ bool pdsch_block_processor_gpu_impl::can_reuse_cached_encode(const pdsch_tb_enco
 
 bool pdsch_block_processor_gpu_impl::supports_device_grid_mapping() const
 {
-  return !is_gpu_mapper_disabled(device_id_) && (nof_layers >= 1) && (nof_layers <= 4) &&
-         ((nof_layers == 1) || (nof_layers == nof_ports));
+  // Scalar or diagonal weights map any layer count equal to the port count; a general wideband precoding matrix maps
+  // up to four layers onto up to four ports (OCUDU_PDSCH_DEVICE_PRECODING=0 keeps those on the host mapper).
+  if (is_gpu_mapper_disabled(device_id_) || (nof_layers < 1) || (nof_layers > 4)) {
+    return false;
+  }
+  if ((nof_layers == 1) || (nof_layers == nof_ports)) {
+    return true;
+  }
+  return is_device_precoding_enabled() && (nof_ports <= pdsch_device_precoding_max_ports) && (nof_layers <= nof_ports);
 }
 
 bool pdsch_block_processor_gpu_impl::map_to_device_grid(span<const uint32_t> re_offsets,
@@ -206,8 +222,36 @@ bool pdsch_block_processor_gpu_impl::map_to_device_grid(span<const uint32_t> re_
                                                         unsigned             nof_grid_re_per_port,
                                                         float                weight_real)
 {
+  return map_to_device_grid_impl(
+      re_offsets, d_grid_bf16, mapped_nof_ports, mapped_nof_layers, nof_grid_re_per_port, weight_real, {});
+}
+
+bool pdsch_block_processor_gpu_impl::map_to_device_grid_precoded(span<const uint32_t> re_offsets,
+                                                                 void*                d_grid_bf16,
+                                                                 unsigned             mapped_nof_ports,
+                                                                 unsigned             mapped_nof_layers,
+                                                                 unsigned             nof_grid_re_per_port,
+                                                                 span<const cf_t>     weights)
+{
+  if ((weights.size() != static_cast<size_t>(mapped_nof_ports) * mapped_nof_layers) ||
+      (mapped_nof_ports > pdsch_device_precoding_max_ports) || (mapped_nof_layers > mapped_nof_ports)) {
+    return false;
+  }
+  return map_to_device_grid_impl(
+      re_offsets, d_grid_bf16, mapped_nof_ports, mapped_nof_layers, nof_grid_re_per_port, 0.0F, weights);
+}
+
+bool pdsch_block_processor_gpu_impl::map_to_device_grid_impl(span<const uint32_t> re_offsets,
+                                                             void*                d_grid_bf16,
+                                                             unsigned             mapped_nof_ports,
+                                                             unsigned             mapped_nof_layers,
+                                                             unsigned             nof_grid_re_per_port,
+                                                             float                weight_real,
+                                                             span<const cf_t>     weights)
+{
+  const bool precoded = !weights.empty();
   if (!supports_device_grid_mapping() || re_offsets.empty() || (mapped_nof_ports != nof_ports) ||
-      (mapped_nof_layers != nof_layers)) {
+      (mapped_nof_layers != nof_layers) || (!precoded && (nof_layers != 1) && (nof_layers != nof_ports))) {
     return false;
   }
   if ((nof_layers > 1) && ((start_i_cb != 0) || (last_i_cb + 1 != segment_buffer->get_nof_codeblocks()))) {
@@ -280,7 +324,7 @@ bool pdsch_block_processor_gpu_impl::map_to_device_grid(span<const uint32_t> re_
   pdsch_tb_encoder_gpu::config cfg                 = make_encoder_config(first_symbol_offset, full_nof_symbols);
   bool full_tb_slice = (first_symbol_offset == 0) && (total_symbols == full_nof_symbols) && (start_i_cb == 0) &&
                        (last_i_cb + 1 == segment_buffer->get_nof_codeblocks());
-  if (!batch_processed && full_tb_slice && is_direct_grid_encode_enabled()) {
+  if (!precoded && !batch_processed && full_tb_slice && is_direct_grid_encode_enabled()) {
     tb_encoder->set_defer_symbol_download(true);
     unsigned result_symbols = tb_encoder->encode_to_device_grid(transport_block,
                                                                 cfg,
@@ -352,15 +396,28 @@ bool pdsch_block_processor_gpu_impl::map_to_device_grid(span<const uint32_t> re_
   if (timing_enabled) {
     cudaEventRecord(static_cast<cudaEvent_t>(gpu_mapper_start_event), stream);
   }
-  bool launch_ok = pdsch_map_layers_int8_to_bf16_real_grid(d_symbols + current_slice_symbol_offset * 2U,
-                                                           static_cast<const uint32_t*>(d_mapper_re_offsets),
-                                                           static_cast<uint16_t*>(d_grid_bf16_dest),
-                                                           re_offsets.size(),
-                                                           nof_ports,
-                                                           nof_layers,
-                                                           nof_grid_re_per_port,
-                                                           weight_real,
-                                                           stream);
+  bool launch_ok = false;
+  if (precoded) {
+    launch_ok = pdsch_map_precoded_int8_to_bf16_real_grid(d_symbols + current_slice_symbol_offset * 2U,
+                                                          static_cast<const uint32_t*>(d_mapper_re_offsets),
+                                                          static_cast<uint16_t*>(d_grid_bf16_dest),
+                                                          re_offsets.size(),
+                                                          nof_ports,
+                                                          nof_layers,
+                                                          nof_grid_re_per_port,
+                                                          reinterpret_cast<const float*>(weights.data()),
+                                                          stream);
+  } else {
+    launch_ok = pdsch_map_layers_int8_to_bf16_real_grid(d_symbols + current_slice_symbol_offset * 2U,
+                                                        static_cast<const uint32_t*>(d_mapper_re_offsets),
+                                                        static_cast<uint16_t*>(d_grid_bf16_dest),
+                                                        re_offsets.size(),
+                                                        nof_ports,
+                                                        nof_layers,
+                                                        nof_grid_re_per_port,
+                                                        weight_real,
+                                                        stream);
+  }
   if (!launch_ok) {
     return false;
   }

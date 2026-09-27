@@ -86,4 +86,27 @@ bool pdsch_map_layers_int8_to_bf16_real_grid(const int8_t*   d_symbols_int8,
                                              float           weight_real,
                                              void*           stream);
 
+
+/// Maximum number of ports and layers of \ref pdsch_map_precoded_int8_to_bf16_real_grid.
+constexpr unsigned pdsch_device_precoding_max_ports = 4;
+
+/// \brief Maps INT8 PDSCH symbols into real device resource-grid coordinates through a wideband precoding matrix.
+///
+/// Same layouts as \ref pdsch_map_layers_int8_to_bf16_real_grid. Every output port receives
+/// `sum_layer W[port][layer] * symbols[re * nof_layers + layer]`, evaluated with the operation order and rounding of
+/// the host NEON precoder (no fused multiply-add), then rounded to BF16 to nearest even.
+///
+/// \param[in]  weights_re_im        Precoding weights, row-major by port, interleaved (real, imag):
+///                                  `weights_re_im[2 * (port * nof_layers + layer) + {0, 1}]`.
+/// \return True if the CUDA launch was accepted.
+bool pdsch_map_precoded_int8_to_bf16_real_grid(const int8_t*   d_symbols_int8,
+                                               const uint32_t* d_re_offsets,
+                                               uint16_t*       d_grid_bf16,
+                                               unsigned        nof_re,
+                                               unsigned        nof_ports,
+                                               unsigned        nof_layers,
+                                               unsigned        nof_grid_re_per_port,
+                                               const float*    weights_re_im,
+                                               void*           stream);
+
 } // namespace ocudu

@@ -68,6 +68,27 @@ public:
       return false;
     }
 
+    /// \brief Optionally maps device-resident symbols into a device resource grid through a wideband precoding matrix.
+    ///
+    /// Same RE offsets as \ref map_to_device_grid. \c weights holds the precoding coefficients row-major by port,
+    /// \c nof_ports rows of \c nof_layers coefficients each. Returns false if the buffer cannot precode on the
+    /// device, in which case nothing is mapped.
+    virtual bool map_to_device_grid_precoded(span<const uint32_t> re_offsets,
+                                             void*                device_grid,
+                                             unsigned             nof_ports,
+                                             unsigned             nof_layers,
+                                             unsigned             nof_grid_re_per_port,
+                                             span<const cf_t>     weights)
+    {
+      (void)re_offsets;
+      (void)device_grid;
+      (void)nof_ports;
+      (void)nof_layers;
+      (void)nof_grid_re_per_port;
+      (void)weights;
+      return false;
+    }
+
     /// Returns the opaque execution stream used by \ref map_to_device_grid.
     virtual void* get_device_grid_mapping_stream() const { return nullptr; }
   };
