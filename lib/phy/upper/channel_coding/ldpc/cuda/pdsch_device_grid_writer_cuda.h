@@ -30,6 +30,10 @@ public:
   pdsch_device_grid_writer_cuda(const pdsch_device_grid_writer_cuda&)            = delete;
   pdsch_device_grid_writer_cuda& operator=(const pdsch_device_grid_writer_cuda&) = delete;
 
+  /// Delegates to another host grid and prepares the device grid for its dimensions. The device allocation and events
+  /// are kept, so an adaptor can serve a pool of grids without allocating in the slot path.
+  bool rebind(resource_grid_writer& host_writer_);
+
   /// Reallocates the device grid if the requested dimensions exceed the current capacity.
   bool resize(unsigned nof_ports_, unsigned nof_symbols_, unsigned nof_subc_);
 
@@ -43,13 +47,13 @@ public:
   size_t get_device_grid_size_bytes() const { return device_grid_bytes; }
 
   // See interface for documentation.
-  unsigned get_nof_ports() const override { return host_writer.get_nof_ports(); }
+  unsigned get_nof_ports() const override { return host_writer->get_nof_ports(); }
 
   // See interface for documentation.
-  unsigned get_nof_subc() const override { return host_writer.get_nof_subc(); }
+  unsigned get_nof_subc() const override { return host_writer->get_nof_subc(); }
 
   // See interface for documentation.
-  unsigned get_nof_symbols() const override { return host_writer.get_nof_symbols(); }
+  unsigned get_nof_symbols() const override { return host_writer->get_nof_symbols(); }
 
   // See interface for documentation.
   span<const cf_t> put(unsigned                                   port,
@@ -98,7 +102,7 @@ public:
 private:
   void* get_next_grid_ready_event_locked();
 
-  resource_grid_writer& host_writer;
+  resource_grid_writer* host_writer;
   grid_allocation_mode  allocation_mode         = grid_allocation_mode::device;
   void*                 d_grid_bf16             = nullptr;
   void*                 clear_event             = nullptr;
@@ -112,7 +116,8 @@ private:
   unsigned              device_grid_nof_ports   = 0;
   unsigned              device_grid_nof_symbols = 0;
   unsigned              device_grid_nof_subc    = 0;
-  std::vector<uint16_t> host_grid_words;
+  uint32_t*             host_grid_words         = nullptr; ///< Pinned staging copy of the device grid, one word per RE.
+  size_t                host_grid_capacity      = 0;
   std::vector<void*>    grid_ready_events;
   std::vector<void*>    pending_grid_ready_events;
   mutable std::mutex    grid_ready_mutex;

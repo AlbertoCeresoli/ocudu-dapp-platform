@@ -49,7 +49,7 @@ public:
 
   void configure(const resource_grid_context& context, shared_resource_grid& grid) override
   {
-    device_grid_writer.reset();
+    sidecar_active = false;
 
     if (use_device_grid_writer && grid.is_valid()) {
       resource_grid_writer& writer = grid.get_writer();
@@ -58,14 +58,23 @@ public:
         return;
       }
 
-      device_grid_writer = std::make_unique<pdsch_device_grid_writer_cuda>(writer);
-      if (!device_grid_writer->supports_device_grid_mapping()) {
+      // The sidecar writer is created once and rebound to each slot's grid: allocating (and freeing, which
+      // synchronizes the whole device) a device grid and its events per slot stalls every stream on the GPU.
+      bool ready = false;
+      if (!device_grid_writer) {
+        device_grid_writer = std::make_unique<pdsch_device_grid_writer_cuda>(writer);
+        ready              = device_grid_writer->supports_device_grid_mapping();
+      } else {
+        ready = device_grid_writer->rebind(writer) && device_grid_writer->supports_device_grid_mapping();
+      }
+      if (!ready) {
         logger.warning(context.slot.sfn(),
                        context.slot.slot_index(),
                        "Failed to allocate PDSCH device-grid writer; falling back to host PDSCH grid mapping.");
         device_grid_writer.reset();
         return;
       }
+      sidecar_active = true;
 
       log_sidecar_path(context, writer.supports_device_grid_mapping());
       return;
@@ -78,7 +87,7 @@ public:
 
   resource_grid_writer& get_pdsch_writer(shared_resource_grid& grid) override
   {
-    if (device_grid_writer) {
+    if (sidecar_active) {
       return *device_grid_writer;
     }
     return grid.get_writer();
@@ -86,11 +95,11 @@ public:
 
   void before_send_grid() override
   {
-    if (device_grid_writer) {
+    if (sidecar_active) {
       report_fatal_error_if_not(device_grid_writer->materialize_nonzero_device_grid_to_host(),
                                 "Failed to materialize PDSCH device grid into host resource grid before transmission.");
     }
-    device_grid_writer.reset();
+    sidecar_active = false;
   }
 
 private:
@@ -144,6 +153,7 @@ private:
   ocudulog::basic_logger&                        logger;
   bool                                           use_device_grid_writer;
   std::unique_ptr<pdsch_device_grid_writer_cuda> device_grid_writer;
+  bool                                           sidecar_active = false;
   bool                                           logged_direct_grid_path  = false;
   bool                                           logged_sidecar_grid_path = false;
   bool                                           logged_host_grid_path    = false;

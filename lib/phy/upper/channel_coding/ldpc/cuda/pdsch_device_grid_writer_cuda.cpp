@@ -12,13 +12,13 @@ using namespace ocudu;
 
 pdsch_device_grid_writer_cuda::pdsch_device_grid_writer_cuda(resource_grid_writer& host_writer_,
                                                              grid_allocation_mode  allocation_mode_) :
-  host_writer(host_writer_), allocation_mode(allocation_mode_)
+  host_writer(&host_writer_), allocation_mode(allocation_mode_)
 {
   cudaEvent_t event = nullptr;
   if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) == cudaSuccess) {
     clear_event = event;
   }
-  resize(host_writer.get_nof_ports(), host_writer.get_nof_symbols(), host_writer.get_nof_subc());
+  resize(host_writer->get_nof_ports(), host_writer->get_nof_symbols(), host_writer->get_nof_subc());
 }
 
 pdsch_device_grid_writer_cuda::~pdsch_device_grid_writer_cuda()
@@ -37,6 +37,20 @@ pdsch_device_grid_writer_cuda::~pdsch_device_grid_writer_cuda()
     cudaFree(d_grid_bf16);
     d_grid_bf16 = nullptr;
   }
+  if (host_grid_words != nullptr) {
+    cudaFreeHost(host_grid_words);
+    host_grid_words = nullptr;
+  }
+}
+
+bool pdsch_device_grid_writer_cuda::rebind(resource_grid_writer& host_writer_)
+{
+  // Mapping of the previous slot must be complete before its device grid is cleared for the next one.
+  if (!synchronize_device_grid_ready()) {
+    return false;
+  }
+  host_writer = &host_writer_;
+  return resize(host_writer->get_nof_ports(), host_writer->get_nof_symbols(), host_writer->get_nof_subc());
 }
 
 bool pdsch_device_grid_writer_cuda::resize(unsigned nof_ports_, unsigned nof_symbols_, unsigned nof_subc_)
@@ -66,7 +80,19 @@ bool pdsch_device_grid_writer_cuda::resize(unsigned nof_ports_, unsigned nof_sym
   device_grid_nof_ports   = nof_ports_;
   device_grid_nof_symbols = nof_symbols_;
   device_grid_nof_subc    = nof_subc_;
-  host_grid_words.resize(device_grid_bytes / sizeof(uint16_t));
+  if (required_bytes > host_grid_capacity) {
+    if (host_grid_words != nullptr) {
+      cudaFreeHost(host_grid_words);
+      host_grid_words = nullptr;
+    }
+    void* pinned = nullptr;
+    if (cudaMallocHost(&pinned, required_bytes) != cudaSuccess) {
+      host_grid_capacity = 0;
+      return false;
+    }
+    host_grid_words    = static_cast<uint32_t*>(pinned);
+    host_grid_capacity = required_bytes;
+  }
   {
     std::lock_guard<std::mutex> lock(grid_ready_mutex);
     pending_grid_ready_events.clear();
@@ -205,28 +231,36 @@ bool pdsch_device_grid_writer_cuda::materialize_nonzero_device_grid_to_host()
     return false;
   }
 
-  if (host_grid_words.size() * sizeof(uint16_t) < device_grid_bytes) {
-    host_grid_words.resize(device_grid_bytes / sizeof(uint16_t));
+  if ((host_grid_words == nullptr) || (host_grid_capacity < device_grid_bytes)) {
+    return false;
   }
   if (allocation_mode == grid_allocation_mode::managed) {
-    std::memcpy(host_grid_words.data(), d_grid_bf16, device_grid_bytes);
-  } else if (cudaMemcpy(host_grid_words.data(), d_grid_bf16, device_grid_bytes, cudaMemcpyDeviceToHost) !=
-             cudaSuccess) {
+    std::memcpy(host_grid_words, d_grid_bf16, device_grid_bytes);
+  } else if (cudaMemcpy(host_grid_words, d_grid_bf16, device_grid_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
     return false;
   }
 
-  static_assert(sizeof(cbf16_t) == 2U * sizeof(uint16_t), "Unexpected cbf16_t layout.");
+  // Each RE is one 32-bit word (BF16 real and imaginary parts). The device grid is cleared before mapping, so a zero
+  // word is an RE PDSCH did not map; keep whatever the host grid holds there (DM-RS, PDCCH, CSI-RS, ...). Symbols
+  // PDSCH did not touch are skipped, and the select is branchless so the compiler vectorizes it.
+  static_assert(sizeof(cbf16_t) == sizeof(uint32_t), "Unexpected cbf16_t layout.");
   const unsigned nof_re_per_port = device_grid_nof_symbols * device_grid_nof_subc;
   for (unsigned port = 0; port != device_grid_nof_ports; ++port) {
     for (unsigned symbol = 0; symbol != device_grid_nof_symbols; ++symbol) {
-      span<cbf16_t> host_symbol = host_writer.get_view(port, symbol);
-      unsigned      symbol_base = (port * nof_re_per_port + symbol * device_grid_nof_subc) * 2U;
+      const uint32_t* src = host_grid_words + static_cast<size_t>(port) * nof_re_per_port +
+                            static_cast<size_t>(symbol) * device_grid_nof_subc;
+      uint32_t any = 0;
       for (unsigned subc = 0; subc != device_grid_nof_subc; ++subc) {
-        unsigned word_index = symbol_base + subc * 2U;
-        if ((host_grid_words[word_index] != 0U) || (host_grid_words[word_index + 1] != 0U)) {
-          host_symbol[subc].real = bf16_t(host_grid_words[word_index]);
-          host_symbol[subc].imag = bf16_t(host_grid_words[word_index + 1]);
-        }
+        any |= src[subc];
+      }
+      if (any == 0) {
+        continue;
+      }
+      span<cbf16_t> dst_symbol = host_writer->get_view(port, symbol);
+      auto*         dst        = reinterpret_cast<uint32_t*>(dst_symbol.data());
+      for (unsigned subc = 0; subc != device_grid_nof_subc; ++subc) {
+        const uint32_t d = src[subc];
+        dst[subc]        = (d != 0U) ? d : dst[subc];
       }
     }
   }
@@ -263,7 +297,7 @@ span<const cf_t> pdsch_device_grid_writer_cuda::put(unsigned                    
                                                     const bounded_bitset<MAX_NOF_SUBCARRIERS>& mask,
                                                     span<const cf_t>                           symbols)
 {
-  return host_writer.put(port, l, k_init, mask, symbols);
+  return host_writer->put(port, l, k_init, mask, symbols);
 }
 
 span<const cbf16_t> pdsch_device_grid_writer_cuda::put(unsigned                                   port,
@@ -272,12 +306,12 @@ span<const cbf16_t> pdsch_device_grid_writer_cuda::put(unsigned                 
                                                        const bounded_bitset<MAX_NOF_SUBCARRIERS>& mask,
                                                        span<const cbf16_t>                        symbols)
 {
-  return host_writer.put(port, l, k_init, mask, symbols);
+  return host_writer->put(port, l, k_init, mask, symbols);
 }
 
 void pdsch_device_grid_writer_cuda::put(unsigned port, unsigned l, unsigned k_init, span<const cf_t> symbols)
 {
-  host_writer.put(port, l, k_init, symbols);
+  host_writer->put(port, l, k_init, symbols);
 }
 
 void pdsch_device_grid_writer_cuda::put(unsigned            port,
@@ -286,10 +320,10 @@ void pdsch_device_grid_writer_cuda::put(unsigned            port,
                                         unsigned            stride,
                                         span<const cbf16_t> symbols)
 {
-  host_writer.put(port, l, k_init, stride, symbols);
+  host_writer->put(port, l, k_init, stride, symbols);
 }
 
 span<cbf16_t> pdsch_device_grid_writer_cuda::get_view(unsigned port, unsigned l)
 {
-  return host_writer.get_view(port, l);
+  return host_writer->get_view(port, l);
 }
