@@ -8,6 +8,7 @@
 
 #include "ocudu/dapp/e3/e3ap_codec.h"
 #include "ocudu/dapp/e3/e3ap_libe3_codec.h"
+#include "ocudu/dapp/e3/e3ap_v2_codec.h"
 #include <cstdlib>
 #include <fstream>
 #include <gtest/gtest.h>
@@ -67,7 +68,7 @@ TEST(dapp_e3ap_libe3_codec, round_trips_every_procedure_of_the_libe3_module)
 {
   e3ap_setup_request setup;
   setup.dapp_name    = "libe3-dapp";
-  setup.dapp_version = "0.1.3";
+  setup.dapp_version = "0.2.1";
   setup.vendor       = "Northeastern";
   auto setup_back    = round_trip(setup, 1, 1756800000000000000LL);
   EXPECT_EQ(setup_back.dapp_name, "libe3-dapp");
@@ -81,7 +82,7 @@ TEST(dapp_e3ap_libe3_codec, round_trips_every_procedure_of_the_libe3_module)
   response.dapp_identifier       = 3;
   e3ap_ran_function_definition function;
   function.ran_function_identifier = e3ap_ran_function_telemetry;
-  function.telemetry_identifiers   = {1, 2, 3, 400}; // 400 is not nameable in libe3 and is left out
+  function.telemetry_identifiers   = {1, 2, 3, 400}; // 400: nameable since libe3 0.2 (1..65535)
   function.ran_function_data       = {0x01, 0x02};
   response.ran_functions.push_back(function);
   response.ran_functions_present = true;
@@ -90,7 +91,7 @@ TEST(dapp_e3ap_libe3_codec, round_trips_every_procedure_of_the_libe3_module)
   auto response_back             = round_trip(response, 1);
   EXPECT_EQ(response_back.dapp_identifier, std::optional<uint16_t>(3));
   ASSERT_EQ(response_back.ran_functions.size(), 1U);
-  EXPECT_EQ(response_back.ran_functions[0].telemetry_identifiers, (std::vector<uint16_t>{1, 2, 3}));
+  EXPECT_EQ(response_back.ran_functions[0].telemetry_identifiers, (std::vector<uint16_t>{1, 2, 3, 400}));
   EXPECT_FALSE(response_back.cause.has_value());
   EXPECT_TRUE(response_back.detail.empty());
 
@@ -135,19 +136,30 @@ TEST(dapp_e3ap_libe3_codec, round_trips_every_procedure_of_the_libe3_module)
   control.ran_function_identifier = e3ap_ran_function_management;
   control.control_identifier      = e3ap_management_control_request;
   control.action_data             = {0x10, 0x20, 0x30};
-  EXPECT_EQ(round_trip(control, 5).action_data, control.action_data);
+  auto control_back               = round_trip(control, 5);
+  EXPECT_EQ(control_back.action_data, control.action_data);
+  EXPECT_FALSE(control_back.sequence_identifier.has_value()) << "a control the dApp decided itself";
+  control.sequence_identifier = 3000000000U; // a re-issued xApp control (libe3 0.2 optional sequenceId)
+  EXPECT_EQ(round_trip(control, 5).sequence_identifier, std::optional<uint32_t>(3000000000U));
 
   e3ap_dapp_report report;
-  report.dapp_identifier         = 3;
+  report.dapp_identifier         = 300; // beyond the libe3 0.1.x 1..100 range
   report.ran_function_identifier = e3ap_ran_function_telemetry;
   report.report_data             = {0x7F};
-  EXPECT_EQ(round_trip(report, 6).report_data, report.report_data);
+  report.sequence_identifier     = 4242;
+  auto report_back               = round_trip(report, 6);
+  EXPECT_EQ(report_back.report_data, report.report_data);
+  EXPECT_EQ(report_back.dapp_identifier, 300);
+  EXPECT_EQ(report_back.sequence_identifier, std::optional<uint32_t>(4242));
 
   e3ap_xapp_control_action xapp;
-  xapp.dapp_identifier         = 3;
+  xapp.dapp_identifier         = 40000;
   xapp.ran_function_identifier = e3ap_ran_function_telemetry;
   xapp.xapp_control_data       = {0x01};
-  EXPECT_EQ(round_trip(xapp, 7).xapp_control_data, xapp.xapp_control_data);
+  xapp.sequence_identifier     = 70000;
+  auto xapp_back               = round_trip(xapp, 4000000000U); // 32-bit message id since libe3 0.2
+  EXPECT_EQ(xapp_back.xapp_control_data, xapp.xapp_control_data);
+  EXPECT_EQ(xapp_back.sequence_identifier, std::optional<uint32_t>(70000));
 
   e3ap_release_message release;
   release.dapp_identifier = 3;
@@ -172,9 +184,37 @@ TEST(dapp_e3ap_libe3_codec, refuses_values_the_libe3_module_cannot_carry)
   };
   e3ap_release_message release;
   release.dapp_identifier = 3;
-  EXPECT_TRUE(rejects(release, 1001)) << "message id above 1000";
-  release.dapp_identifier = 101;
-  EXPECT_TRUE(rejects(release)) << "dApp identifier above 100";
+  EXPECT_TRUE(rejects(release, 0)) << "message id 0 (E3-MessageID is 1..4294967295)";
+  EXPECT_FALSE(rejects(release, 0xFFFFFFFFU));
+  release.dapp_identifier = 0;
+  EXPECT_TRUE(rejects(release)) << "dApp identifier 0 (E3-DAppID is 1..65535)";
+  release.dapp_identifier = 65535;
+  EXPECT_FALSE(rejects(release));
+
+  // libe3 0.2: E3-SequenceID is mandatory on E3-DAppReport and E3-XAppControlAction.
+  e3ap_dapp_report report;
+  report.dapp_identifier         = 3;
+  report.ran_function_identifier = 10;
+  report.report_data             = {1};
+  EXPECT_TRUE(rejects(report)) << "report without a sequence identifier";
+  report.sequence_identifier = 1;
+  EXPECT_FALSE(rejects(report));
+  e3ap_xapp_control_action xapp;
+  xapp.dapp_identifier         = 3;
+  xapp.ran_function_identifier = 10;
+  xapp.xapp_control_data       = {1};
+  EXPECT_TRUE(rejects(xapp)) << "xApp control without a sequence identifier";
+  xapp.sequence_identifier = 0;
+  EXPECT_TRUE(rejects(xapp)) << "sequence identifier 0";
+
+  // Identifier lists hold up to 1000 entries since libe3 0.2.
+  e3ap_subscription_request subscription;
+  subscription.dapp_identifier         = 3;
+  subscription.ran_function_identifier = 10;
+  subscription.telemetry_identifiers.assign(1000, 1);
+  EXPECT_FALSE(rejects(subscription));
+  subscription.telemetry_identifiers.assign(1001, 1);
+  EXPECT_TRUE(rejects(subscription)) << "identifier list above 1000 entries";
 
   e3ap_indication_message indication;
   indication.dapp_identifier         = 3;
@@ -203,30 +243,39 @@ TEST(dapp_e3ap_libe3_codec, refuses_values_the_libe3_module_cannot_carry)
   EXPECT_TRUE(rejects(setup));
 }
 
-TEST(dapp_e3ap_libe3_codec, native_module_does_not_decode_libe3_bytes_and_vice_versa)
+TEST(dapp_e3ap_libe3_codec, ocudu_and_libe3_setups_are_the_same_bytes_at_every_id_width)
 {
+  // One module: an OCUDU setup without additions is libe3's setup, whatever the id width and with or
+  // without the envelope timestamp; with the OCUDU profile requested, the libe3 profile still reads it.
   e3ap_pdu pdu;
-  pdu.id = 1;
   e3ap_setup_request setup;
   setup.dapp_name    = "x";
   setup.dapp_version = "0";
   setup.vendor       = "v";
   pdu.message        = setup;
-  auto libe3_bytes   = e3ap_libe3_codec::encode(pdu);
-  auto native_bytes  = e3ap_codec::encode(pdu);
-  ASSERT_TRUE(libe3_bytes && native_bytes);
-  EXPECT_NE(*libe3_bytes.value, *native_bytes.value);
-  // The agent relies on this: a setup request either decodes natively or,
-  // failing that, under the libe3 module. Neither module may accept the
-  // other's bytes as a well-formed setup request.
-  auto cross_a = e3ap_codec::decode(*libe3_bytes.value);
-  auto cross_b = e3ap_libe3_codec::decode(*native_bytes.value);
-  EXPECT_TRUE(!cross_a || !std::holds_alternative<e3ap_setup_request>(cross_a.value->message));
-  EXPECT_TRUE(!cross_b || !std::holds_alternative<e3ap_setup_request>(cross_b.value->message));
+  for (uint32_t id : {1U, 7U, 256U, 257U, 1000U, 65536U, 70000U, 16777217U, 4000000000U, 4294967295U}) {
+    for (bool stamped : {false, true}) {
+      pdu.id           = id;
+      pdu.timestamp_ns = stamped ? std::optional<int64_t>(1756800000123456789LL) : std::nullopt;
+      auto libe3_wire  = e3ap_libe3_codec::encode(pdu);
+      auto ocudu_wire  = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);
+      ASSERT_TRUE(libe3_wire && ocudu_wire);
+      EXPECT_EQ(*libe3_wire.value, *ocudu_wire.value) << "id " << id;
+      auto requested                                     = pdu;
+      std::get<e3ap_setup_request>(requested.message).ocudu_profile = e3ap_ocudu_profile_version;
+      auto with_profile                                  = e3ap_v2_codec::encode(requested, e3ap_profile::ocudu);
+      ASSERT_TRUE(with_profile) << with_profile.detail;
+      auto seen = e3ap_libe3_codec::decode(*with_profile.value);
+      ASSERT_TRUE(seen) << seen.detail;
+      auto seen_bytes = e3ap_libe3_codec::encode(*seen.value);
+      ASSERT_TRUE(seen_bytes);
+      EXPECT_EQ(*seen_bytes.value, *libe3_wire.value) << "id " << id;
+    }
+  }
 }
 
-// Vectors emitted by the upstream libe3 encoder (Asn1E3Encoder, libe3 0.1.3 at
-// 6f44b6f, asn1c mouse07410 844f9ca). Regenerate with
+// Vectors emitted by the upstream libe3 encoder (Asn1E3Encoder, libe3 0.2.1 at
+// f2329e0 (tag 0.2.1), asn1c mouse07410 844f9ca). Regenerate with scripts/regen_libe3_vectors.py, i.e.
 //   tests/interop/libe3/libe3_interop_vectors encode
 // and update python/tests/fixtures/libe3_vectors.json together with this table.
 struct libe3_vector {

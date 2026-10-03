@@ -5,16 +5,18 @@
 // upstream libe3 only (never an OCUDU codec, whose asn1c symbols would clash),
 // and speaks JSON lines on stdout:
 //
-//   libe3_interop_vectors encode
-//       one {"name": <procedure>, "hex": <APER bytes>} per libe3 E3AP 1.0.0
-//       procedure, encoded by libe3's own Asn1E3Encoder with fixed content
-//       (message id 42, timestamp 1756800000123456789);
-//   libe3_interop_vectors decode <hex>
+//   libe3_interop_vectors encode [asn1|protobuf]
+//       one {"name": <procedure>, "hex": <bytes>} per libe3 E3AP 1.0.0
+//       procedure, encoded by libe3's own Asn1E3Encoder (APER, the default) or
+//       ProtobufE3Encoder with fixed content (message id 42, timestamp
+//       1756800000123456789);
+//   libe3_interop_vectors decode <hex> [asn1|protobuf]
 //       {"name": ..., "id": ..., "timestamp": ..., <procedure fields>} for the
 //       PDU libe3's decoder reads from those bytes.
 //
-// OCUDU's e3ap_libe3_codec must decode the encode output and reproduce it byte
-// for byte, and libe3 must decode what e3ap_libe3_codec (and asn1tools) emit.
+// OCUDU's e3ap_libe3_codec (APER) and e3ap_protobuf_codec (Protobuf) must
+// decode the encode output and reproduce it byte for byte, and libe3 must
+// decode what they (and asn1tools) emit.
 
 #include <cstdio>
 #include <cstring>
@@ -88,7 +90,7 @@ std::vector<Pdu> vectors()
     SetupRequest request;
     request.e3ap_protocol_version = "1.0.0";
     request.dapp_name             = "vector-dapp";
-    request.dapp_version          = "0.1.3";
+    request.dapp_version          = "0.2.1";
     request.vendor                = "wineslab";
     Pdu pdu                       = make(PduType::SETUP_REQUEST);
     pdu.choice                    = request;
@@ -157,24 +159,27 @@ std::vector<Pdu> vectors()
     control.ran_function_identifier = 1;
     control.control_identifier      = 1;
     control.action_data             = {0xAA, 0xBB};
+    control.sequence_id             = 3000000000U; // optional field, present (a re-issued xApp control)
     Pdu pdu                         = make(PduType::DAPP_CONTROL_ACTION);
     pdu.choice                      = control;
     result.push_back(pdu);
   }
   {
     DAppReport report;
-    report.dapp_identifier         = 7;
-    report.ran_function_identifier = 1;
+    report.dapp_identifier         = 300;  // beyond the 0.1.x 1..100 range
+    report.ran_function_identifier = 1000; // likewise
     report.report_data             = {0xCC};
+    report.sequence_id             = 4242;
     Pdu pdu                        = make(PduType::DAPP_REPORT);
     pdu.choice                     = report;
     result.push_back(pdu);
   }
   {
     XAppControlAction xapp;
-    xapp.dapp_identifier         = 7;
+    xapp.dapp_identifier         = 40000;
     xapp.ran_function_identifier = 1;
     xapp.xapp_control_data       = {0xEE, 0xFF};
+    xapp.sequence_id             = 70000;
     Pdu pdu                      = make(PduType::XAPP_CONTROL_ACTION);
     pdu.choice                   = xapp;
     result.push_back(pdu);
@@ -256,14 +261,17 @@ std::string describe(const Pdu& pdu)
     text += ", \"dAppIdentifier\": " + std::to_string(body->dapp_identifier) +
             ", \"ranFunctionIdentifier\": " + std::to_string(body->ran_function_identifier) +
             ", \"controlIdentifier\": " + std::to_string(body->control_identifier) +
+            (body->sequence_id != 0 ? ", \"sequenceId\": " + std::to_string(body->sequence_id) : std::string()) +
             ", \"actionData\": " + json_string(hex_of(body->action_data));
   } else if (const auto* body = pdu.get_if<DAppReport>()) {
     text += ", \"dAppIdentifier\": " + std::to_string(body->dapp_identifier) +
             ", \"ranFunctionIdentifier\": " + std::to_string(body->ran_function_identifier) +
+            ", \"sequenceId\": " + std::to_string(body->sequence_id) +
             ", \"reportData\": " + json_string(hex_of(body->report_data));
   } else if (const auto* body = pdu.get_if<XAppControlAction>()) {
     text += ", \"dAppIdentifier\": " + std::to_string(body->dapp_identifier) +
             ", \"ranFunctionIdentifier\": " + std::to_string(body->ran_function_identifier) +
+            ", \"sequenceId\": " + std::to_string(body->sequence_id) +
             ", \"xAppControlData\": " + json_string(hex_of(body->xapp_control_data));
   } else if (const auto* body = pdu.get_if<ReleaseMessage>()) {
     text += ", \"dAppIdentifier\": " + std::to_string(body->dapp_identifier);
@@ -279,12 +287,17 @@ std::string describe(const Pdu& pdu)
 int main(int argc, char** argv)
 {
   Logger::instance().set_level(LogLevel::ERROR);
-  auto encoder = create_encoder(EncodingFormat::ASN1);
-  if (!encoder) {
-    std::fprintf(stderr, "libe3 was built without the ASN.1 encoder\n");
+  const std::string mode     = argc > 1 ? argv[1] : "";
+  const std::string encoding = mode == "encode" ? (argc > 2 ? argv[2] : "asn1") : (argc > 3 ? argv[3] : "asn1");
+  if (encoding != "asn1" && encoding != "protobuf") {
+    std::fprintf(stderr, "unknown encoding %s (asn1 | protobuf)\n", encoding.c_str());
     return 2;
   }
-  const std::string mode = argc > 1 ? argv[1] : "";
+  auto encoder = create_encoder(encoding == "protobuf" ? EncodingFormat::PROTOBUF : EncodingFormat::ASN1);
+  if (!encoder) {
+    std::fprintf(stderr, "libe3 was built without the %s encoder\n", encoding.c_str());
+    return 2;
+  }
   if (mode == "encode") {
     for (const Pdu& pdu : vectors()) {
       auto encoded = encoder->encode(pdu);
@@ -307,6 +320,6 @@ int main(int argc, char** argv)
     std::cout << describe(*decoded) << "\n";
     return 0;
   }
-  std::fprintf(stderr, "usage: %s encode | decode <hex>\n", argv[0]);
+  std::fprintf(stderr, "usage: %s encode [asn1|protobuf] | decode <hex> [asn1|protobuf]\n", argv[0]);
   return 2;
 }

@@ -37,7 +37,7 @@ returns the radio to stock behavior, never to silence.
 Everything is controlled and observed over **E3**: an embedded management
 agent speaks a project-defined ASN.1 APER service model
 (`E3SM-OCUDU-DAPP-MGMT-V1`) over a credentialed local socket and over SCTP
-(`E3AP-OCUDU-V1`), and a telemetry service model (`OCUDU-TELEMETRY-SM`)
+(`E3AP-OCUDU-V2`, libe3 E3AP 1.0.0 with OCUDU extension additions, APER or Protobuf), and a telemetry service model (`OCUDU-TELEMETRY-SM`)
 streams per-UE PHY records, gNB metrics, and Class-C snapshots to
 out-of-process consumers. The same agent exposes inventory, lifecycle jobs,
 typed configuration, model staging, metrics, incidents, health, quiet
@@ -395,7 +395,7 @@ Three carriers front the same `management_service` and portable data store
 | Carrier | Transport | Authentication |
 |---------|-----------|----------------|
 | `dapp.local_e3` | `AF_UNIX` `SOCK_SEQPACKET`, one APER PDU per datagram | **Credentialed**: `SO_PEERCRED` UID equality on a mode-0600 socket |
-| `dapp.e3ap_sctp` | SCTP, `E3AP-OCUDU-V1` envelope, default port 36423, 64 KiB fragments up to 16 MiB payloads | **None** — peers are admitted by literal address (`allowed_peers`; empty admits all). Loopback by default; a peer holds full management authority. See [security_model.md](security_model.md) |
+| `dapp.e3ap_sctp` | SCTP, `E3AP-OCUDU-V2` (libe3 E3AP 1.0.0 + OCUDU additions, APER or Protobuf; libe3 ZMQ link layer optional), default port 36423, 32 KiB fragments up to 16 MiB payloads | **None** — peers are admitted by literal address (`allowed_peers`; empty admits all). Loopback by default; a peer holds full management authority. See [security_model.md](security_model.md) |
 | `dapp.e3dp_sctp` | Size-prefixed FlatBuffers `E3DP`, default port 38472 | **None** — same address-only admission; serves only `dataSubscriptions`/`dataPoll` for the standalone reference client |
 
 Clients: `python/ocudu_e3` (`python3 -m ocudu_e3` — catalog, telemetry

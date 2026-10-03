@@ -5,7 +5,7 @@
 
 A small, dependency-light client for the embedded OCUDU E3 agent:
 
-- **E3AP over SCTP** (`E3AP-OCUDU-V1`): setup, telemetry subscriptions with
+- **E3AP over SCTP** (`E3AP-OCUDU-V2`, libe3 E3AP 1.0.0 with OCUDU additions): setup, telemetry subscriptions with
   transparent fragment reassembly, release, and the dApp management service
   model carried as control actions.
 - **Telemetry decoding** (`OCUDU-TELEMETRY-SM`): typed records for PUSCH

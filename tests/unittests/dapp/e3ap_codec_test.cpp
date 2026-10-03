@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #include "ocudu/dapp/e3/e3ap_codec.h"
+#include "ocudu/dapp/e3/e3ap_v2_codec.h"
 #include "ocudu/dapp/e3/telemetry_types.h"
 #include <cmath>
 #include <cstring>
@@ -39,9 +40,9 @@ TEST(dapp_e3ap_codec, setup_procedure_round_trips_with_ran_functions)
   setup.dapp_version = "0.1.0";
   setup.vendor       = "DeepSig";
   request.message    = setup;
-  auto encoded       = e3ap_codec::encode(request);
+  auto encoded       = e3ap_v2_codec::encode(request, e3ap_profile::ocudu);
   ASSERT_TRUE(encoded) << encoded.detail;
-  auto decoded = e3ap_codec::decode(*encoded.value);
+  auto decoded = e3ap_v2_codec::decode(*encoded.value, e3ap_profile::ocudu);
   ASSERT_TRUE(decoded) << decoded.detail;
   EXPECT_EQ(decoded.value->id, 7U);
   EXPECT_EQ(body<e3ap_setup_request>(decoded).dapp_name, "example-dash");
@@ -79,11 +80,11 @@ TEST(dapp_e3ap_codec, setup_procedure_round_trips_with_ran_functions)
   definition.ran_function_name       = "OCUDU-TELEMETRY-SM";
   setup_response.ran_functions.push_back(definition);
   setup_response.maximum_payload_bytes  = 4 * 1024 * 1024;
-  setup_response.maximum_fragment_bytes = 65536;
+  setup_response.maximum_fragment_bytes = 32768;
   response.message                      = setup_response;
-  encoded                               = e3ap_codec::encode(response);
+  encoded                               = e3ap_v2_codec::encode(response, e3ap_profile::ocudu);
   ASSERT_TRUE(encoded) << encoded.detail;
-  decoded = e3ap_codec::decode(*encoded.value);
+  decoded = e3ap_v2_codec::decode(*encoded.value, e3ap_profile::ocudu);
   ASSERT_TRUE(decoded) << decoded.detail;
   const auto& back = body<e3ap_setup_response>(decoded);
   EXPECT_EQ(back.response_code, e3ap_response_code::positive);
@@ -93,12 +94,13 @@ TEST(dapp_e3ap_codec, setup_procedure_round_trips_with_ran_functions)
   EXPECT_EQ(back.ran_functions[0].telemetry_identifiers.size(), 7U);
   EXPECT_EQ(back.ran_functions[0].ran_function_data, *function_bytes.value);
   ASSERT_TRUE(back.maximum_fragment_bytes);
-  EXPECT_EQ(*back.maximum_fragment_bytes, 65536U);
+  EXPECT_EQ(*back.maximum_fragment_bytes, 32768U);
 }
 
 TEST(dapp_e3ap_codec, setup_request_matches_the_python_golden_vector)
 {
-  // python/tests/test_e3ap_client.py pins the same bytes; a change here is a wire change.
+  // python/tests/test_e3ap_client.py pins the same bytes, which are libe3's setup request (a setup
+  // without OCUDU additions); a change here is a wire change.
   e3ap_pdu pdu;
   pdu.id = 1;
   e3ap_setup_request setup;
@@ -106,10 +108,9 @@ TEST(dapp_e3ap_codec, setup_request_matches_the_python_golden_vector)
   setup.dapp_version = "0";
   setup.vendor       = "v";
   pdu.message        = setup;
-  auto encoded       = e3ap_codec::encode(pdu);
+  auto encoded       = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);
   ASSERT_TRUE(encoded) << encoded.detail;
-  const std::vector<uint8_t> golden = {
-      0x00, 0x00, 0x00, 0x80, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00, 0x78, 0x00, 0x30, 0x00, 0x76};
+  const std::vector<uint8_t> golden = {0x00, 0x00, 0x01, 0x00, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00, 0x78, 0x00, 0x30, 0x00, 0x76};
   EXPECT_EQ(*encoded.value, golden);
 }
 
@@ -142,9 +143,9 @@ TEST(dapp_e3ap_codec, subscription_and_control_messages_round_trip)
   subscription.periodicity_ms          = 50;
   subscription.subscription_data       = *data_bytes.value;
   pdu.message                          = subscription;
-  auto encoded                         = e3ap_codec::encode(pdu);
+  auto encoded                         = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);
   ASSERT_TRUE(encoded) << encoded.detail;
-  auto decoded = e3ap_codec::decode(*encoded.value);
+  auto decoded = e3ap_v2_codec::decode(*encoded.value, e3ap_profile::ocudu);
   ASSERT_TRUE(decoded) << decoded.detail;
   EXPECT_EQ(body<e3ap_subscription_request>(decoded).telemetry_identifiers.size(), 3U);
   EXPECT_EQ(body<e3ap_subscription_request>(decoded).subscription_data, *data_bytes.value);
@@ -158,9 +159,9 @@ TEST(dapp_e3ap_codec, subscription_and_control_messages_round_trip)
   action.fragment_count          = 2;
   action.payload_bytes           = 8;
   pdu.message                    = action;
-  encoded                        = e3ap_codec::encode(pdu);
+  encoded                        = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);
   ASSERT_TRUE(encoded) << encoded.detail;
-  decoded = e3ap_codec::decode(*encoded.value);
+  decoded = e3ap_v2_codec::decode(*encoded.value, e3ap_profile::ocudu);
   ASSERT_TRUE(decoded) << decoded.detail;
   EXPECT_EQ(body<e3ap_dapp_control_action>(decoded).fragment_index, 1U);
   EXPECT_EQ(body<e3ap_dapp_control_action>(decoded).fragment_count, 2U);
@@ -176,9 +177,9 @@ TEST(dapp_e3ap_codec, subscription_and_control_messages_round_trip)
   outcome.cause                   = e3ap_cause::invalid_request;
   outcome.detail                  = "rejected";
   pdu.message                     = outcome;
-  encoded                         = e3ap_codec::encode(pdu);
+  encoded                         = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);
   ASSERT_TRUE(encoded) << encoded.detail;
-  decoded = e3ap_codec::decode(*encoded.value);
+  decoded = e3ap_v2_codec::decode(*encoded.value, e3ap_profile::ocudu);
   ASSERT_TRUE(decoded) << decoded.detail;
   EXPECT_EQ(body<e3ap_control_response>(decoded).detail, "rejected");
   ASSERT_TRUE(body<e3ap_control_response>(decoded).cause);
@@ -188,9 +189,9 @@ TEST(dapp_e3ap_codec, subscription_and_control_messages_round_trip)
   ack.request_id    = 9;
   ack.response_code = e3ap_response_code::positive;
   pdu.message       = ack;
-  encoded           = e3ap_codec::encode(pdu);
+  encoded           = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);
   ASSERT_TRUE(encoded) << encoded.detail;
-  decoded = e3ap_codec::decode(*encoded.value);
+  decoded = e3ap_v2_codec::decode(*encoded.value, e3ap_profile::ocudu);
   ASSERT_TRUE(decoded) << decoded.detail;
   EXPECT_EQ(body<e3ap_message_ack>(decoded).request_id, 9U);
 }
@@ -200,21 +201,21 @@ TEST(dapp_e3ap_codec, rejects_invalid_identifiers_and_malformed_pdus)
   e3ap_pdu pdu;
   pdu.id      = 0;
   pdu.message = e3ap_release_message{1};
-  EXPECT_FALSE(e3ap_codec::encode(pdu));
+  EXPECT_FALSE(e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu));
   pdu.id      = 1;
   pdu.message = e3ap_release_message{0};
-  EXPECT_FALSE(e3ap_codec::encode(pdu));
+  EXPECT_FALSE(e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu));
 
   e3ap_indication_message indication;
   indication.dapp_identifier         = 1;
   indication.ran_function_identifier = 10;
   indication.protocol_data           = std::vector<uint8_t>(e3ap_maximum_fragment_bytes + 1, 0x11);
   pdu.message                        = indication;
-  EXPECT_FALSE(e3ap_codec::encode(pdu));
+  EXPECT_FALSE(e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu));
 
   const uint8_t garbage[] = {0xff, 0xfe, 0xfd, 0x00};
-  EXPECT_FALSE(e3ap_codec::decode(garbage));
-  EXPECT_FALSE(e3ap_codec::decode({}));
+  EXPECT_FALSE(e3ap_v2_codec::decode(garbage, e3ap_profile::ocudu));
+  EXPECT_FALSE(e3ap_v2_codec::decode({}, e3ap_profile::ocudu));
   EXPECT_FALSE(e3ap_codec::decode_telemetry(garbage));
 }
 
@@ -445,8 +446,7 @@ TEST(dapp_e3ap_codec, converts_packed_store_metadata_into_records)
 
 TEST(dapp_e3ap_codec, envelope_timestamp_round_trips_and_matches_the_python_golden_vector)
 {
-  // Native timestamps are extensions; libe3 retains its separate root layout.
-  // python/tests/test_e3ap_client.py pins the same bytes.
+  // The timestamp is libe3's root OPTIONAL field. python/tests/test_e3ap_client.py pins the same bytes.
   e3ap_pdu pdu;
   pdu.id           = 1;
   pdu.timestamp_ns = 1756800000000000000LL;
@@ -455,24 +455,22 @@ TEST(dapp_e3ap_codec, envelope_timestamp_round_trips_and_matches_the_python_gold
   setup.dapp_version = "0";
   setup.vendor       = "v";
   pdu.message        = setup;
-  auto encoded       = e3ap_codec::encode(pdu);
+  auto encoded       = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);
   ASSERT_TRUE(encoded) << encoded.detail;
-  const std::vector<uint8_t> golden = {0x80, 0x00, 0x00, 0x80, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00, 0x78, 0x00, 0x30,
-                                       0x00, 0x76, 0x01, 0x09, 0x08, 0x18, 0x61, 0x68, 0x4a, 0xc5, 0x68, 0x00, 0x00};
+  const std::vector<uint8_t> golden = {0x40, 0x00, 0x08, 0x18, 0x61, 0x68, 0x4a, 0xc5, 0x68, 0x00, 0x00, 0x01, 0x00, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00, 0x78, 0x00, 0x30, 0x00, 0x76};
   EXPECT_EQ(*encoded.value, golden);
-  auto decoded = e3ap_codec::decode(*encoded.value);
+  auto decoded = e3ap_v2_codec::decode(*encoded.value, e3ap_profile::ocudu);
   ASSERT_TRUE(decoded) << decoded.detail;
   ASSERT_TRUE(decoded.value->timestamp_ns);
   EXPECT_EQ(*decoded.value->timestamp_ns, 1756800000000000000LL);
 
-  // Without a timestamp the envelope is byte-identical to the pre-timestamp wire.
+  // Without a timestamp the presence bit is clear and the rest is unchanged.
   pdu.timestamp_ns.reset();
-  auto plain = e3ap_codec::encode(pdu);
+  auto plain = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);
   ASSERT_TRUE(plain) << plain.detail;
-  const std::vector<uint8_t> plain_golden = {
-      0x00, 0x00, 0x00, 0x80, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00, 0x78, 0x00, 0x30, 0x00, 0x76};
+  const std::vector<uint8_t> plain_golden = {0x00, 0x00, 0x01, 0x00, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00, 0x78, 0x00, 0x30, 0x00, 0x76};
   EXPECT_EQ(*plain.value, plain_golden);
-  auto plain_decoded = e3ap_codec::decode(*plain.value);
+  auto plain_decoded = e3ap_v2_codec::decode(*plain.value, e3ap_profile::ocudu);
   ASSERT_TRUE(plain_decoded) << plain_decoded.detail;
   EXPECT_FALSE(plain_decoded.value->timestamp_ns);
 }
@@ -489,9 +487,9 @@ TEST(dapp_e3ap_codec, by_reference_descriptors_and_regions_round_trip)
   request.delivery_mode              = e3ap_delivery_mode::by_reference;
   request.minimum_by_reference_bytes = 4096;
   pdu.message                        = request;
-  auto encoded                       = e3ap_codec::encode(pdu);
+  auto encoded                       = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);
   ASSERT_TRUE(encoded) << encoded.detail;
-  auto decoded = e3ap_codec::decode(*encoded.value);
+  auto decoded = e3ap_v2_codec::decode(*encoded.value, e3ap_profile::ocudu);
   ASSERT_TRUE(decoded) << decoded.detail;
   const auto& back = std::get<e3ap_subscription_request>(decoded.value->message);
   ASSERT_TRUE(back.delivery_mode);
@@ -512,9 +510,9 @@ TEST(dapp_e3ap_codec, by_reference_descriptors_and_regions_round_trip)
   region.nof_rows        = 4;
   response.shared_region = region;
   pdu.message            = response;
-  encoded                = e3ap_codec::encode(pdu);
+  encoded                = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);
   ASSERT_TRUE(encoded) << encoded.detail;
-  decoded = e3ap_codec::decode(*encoded.value);
+  decoded = e3ap_v2_codec::decode(*encoded.value, e3ap_profile::ocudu);
   ASSERT_TRUE(decoded) << decoded.detail;
   const auto& response_back = std::get<e3ap_subscription_response>(decoded.value->message);
   ASSERT_TRUE(response_back.shared_region);
@@ -544,9 +542,9 @@ TEST(dapp_e3ap_codec, by_reference_descriptors_and_regions_round_trip)
   descriptor.lease_expiry_ns = 123456789ULL;
   indication.by_reference    = descriptor;
   pdu.message                = indication;
-  encoded                    = e3ap_codec::encode(pdu);
+  encoded                    = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);
   ASSERT_TRUE(encoded) << encoded.detail;
-  decoded = e3ap_codec::decode(*encoded.value);
+  decoded = e3ap_v2_codec::decode(*encoded.value, e3ap_profile::ocudu);
   ASSERT_TRUE(decoded) << decoded.detail;
   const auto& indication_back = std::get<e3ap_indication_message>(decoded.value->message);
   ASSERT_TRUE(indication_back.by_reference);
@@ -585,9 +583,9 @@ TEST(dapp_e3ap_codec, by_reference_descriptors_and_regions_round_trip)
   descriptor.byte_strides.clear();
   indication.by_reference = descriptor;
   pdu.message             = indication;
-  encoded                 = e3ap_codec::encode(pdu);
+  encoded                 = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);
   ASSERT_TRUE(encoded) << encoded.detail;
-  decoded = e3ap_codec::decode(*encoded.value);
+  decoded = e3ap_v2_codec::decode(*encoded.value, e3ap_profile::ocudu);
   ASSERT_TRUE(decoded) << decoded.detail;
   const auto& ipc_back = std::get<e3ap_indication_message>(decoded.value->message);
   ASSERT_TRUE(ipc_back.by_reference);

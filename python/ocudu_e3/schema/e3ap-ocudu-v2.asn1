@@ -1,0 +1,337 @@
+-- SPDX-FileCopyrightText: Copyright (c) 2026 Northeastern University
+-- SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- E3AP-OCUDU-V2: the libe3 E3AP 1.0.0 module (wineslab/libe3
+-- messages/asn1/V1/e3ap-1.0.0.asn1, tag 0.2.1, vendored in
+-- schemas/e3/interop/libe3) with OCUDU additions.
+--
+-- Rule: everything before each extension marker ("...") is libe3's module,
+-- type for type, field for field, constraint for constraint
+-- (python/tests/test_libe3_interop.py checks it). OCUDU adds only extension
+-- additions after those markers, new types those additions use, and one
+-- extension alternative of the PDU CHOICE (controlResponse). Consequences:
+--
+--  * A PDU without OCUDU additions is a libe3 PDU, bit for bit: the same
+--    asn1c-generated codec serves libe3 peers (additions omitted) and OCUDU
+--    peers (additions carried).
+--  * libe3 reads OCUDU PDUs of its own procedures: APER extension additions
+--    are length-wrapped open types that a receiver skips. Only an
+--    E3-ControlResponse would reach libe3 as an unknown CHOICE extension, and
+--    it is never sent to a libe3 peer.
+--  * A dApp asks for OCUDU procedures (fragmentation, by-reference delivery,
+--    E3-ControlResponse, causes) with E3-SetupRequest.ocuduProfile; without it
+--    the association runs the libe3 procedures.
+--
+-- Where OCUDU needs more than a libe3 root range allows (subscription time,
+-- periodicity), the root keeps libe3's range and a wider value travels in an
+-- addition. schemas/e3/protobuf/e3ap-ocudu-v2.proto carries the same fields.
+--
+-- Service-model bodies are opaque APER OCTET STRINGs selected by
+-- ranFunctionIdentifier: 10 OCUDU-TELEMETRY-SM, 11 E3SM-OCUDU-DAPP-MGMT-V1.
+-- Payloads larger than one 32 KiB fragment are split into ordered fragments
+-- (fragmentIndex/fragmentCount/payloadBytes) and reassembled by PDU id
+-- (control) or subscriptionId + sequence (indication).
+
+E3AP-OCUDU-V2 DEFINITIONS AUTOMATIC TAGS ::= BEGIN
+
+    -- =======================================================================
+    -- libe3 E3AP 1.0.0 root, with OCUDU extension additions
+    -- =======================================================================
+
+    E3-SetupRequest ::= SEQUENCE {
+        e3apProtocolVersion  E3-Version,
+        dAppName             UTF8String (SIZE (1..64)),
+        dAppVersion          E3-Version,
+        vendor               UTF8String (SIZE (1..64)),
+        ...,
+        -- OCUDU: present selects the OCUDU procedures (value: profile version, 1).
+        ocuduProfile         INTEGER (1..255) OPTIONAL,
+        -- OCUDU: stable identity a reconnecting dApp presents.
+        dAppInstance         E3-Identifier OPTIONAL
+    }
+
+    E3-SetupResponse ::= SEQUENCE {
+        requestId            E3-MessageID,
+        responseCode         E3-ResponseCode,
+        ranIdentifier        UTF8String (SIZE (1..64)),
+        e3apProtocolVersion  E3-Version OPTIONAL,
+        dAppIdentifier       E3-DAppID OPTIONAL,
+        ranFunctionList      SEQUENCE OF E3-RanFunctionDefinition OPTIONAL,
+        ...,
+        -- OCUDU: echoes the request's ocuduProfile when the OCUDU procedures run.
+        ocuduProfile         INTEGER (1..255) OPTIONAL,
+        cause                E3-Cause OPTIONAL,
+        detail               E3-Text OPTIONAL,
+        ranInstance          E3-Identifier OPTIONAL,
+        -- Largest reassembled service-model payload the RAN accepts or produces.
+        maximumPayloadBytes  INTEGER (1..maxE3PayloadBytes) OPTIONAL,
+        -- Fragmentation threshold; larger payloads arrive in fragments.
+        maximumFragmentBytes INTEGER (1..maxE3FragmentBytes) OPTIONAL
+    }
+
+    E3-SubscriptionRequest ::= SEQUENCE {
+        dAppIdentifier          E3-DAppID,
+        ranFunctionIdentifier   INTEGER (1..65535),
+        telemetryIdentifierList SEQUENCE (SIZE (0..1000)) OF INTEGER (1..65535),
+        controlIdentifierList   SEQUENCE (SIZE (0..1000)) OF INTEGER (1..65535),
+        subscriptionTime        INTEGER (0..3600) OPTIONAL,
+        periodicity             INTEGER (0..1000) OPTIONAL,
+        ...,
+        -- OCUDU: service-model subscription parameters (Telemetry-SubscriptionData).
+        subscriptionData        OCTET STRING (SIZE (1..maxE3FunctionData)) OPTIONAL,
+        -- OCUDU: ask for bulk tensors by reference; the response advertises the region.
+        deliveryMode            E3-DeliveryMode OPTIONAL,
+        -- OCUDU: objects whose tensor is smaller than this stay in band.
+        minimumByReferenceBytes INTEGER (0..maxE3PayloadBytes) OPTIONAL,
+        -- OCUDU: values beyond the root ranges above (the root field is then absent).
+        subscriptionTimeLong    INTEGER (0..86400) OPTIONAL,
+        periodicityLong         INTEGER (0..60000) OPTIONAL
+    }
+
+    E3-SubscriptionDelete ::= SEQUENCE {
+        dAppIdentifier        E3-DAppID,
+        subscriptionId        INTEGER (1..65535),
+        ...
+    }
+
+    E3-SubscriptionResponse ::= SEQUENCE {
+        requestId            E3-MessageID,
+        dAppIdentifier       E3-DAppID,
+        responseCode         E3-ResponseCode,
+        subscriptionId       INTEGER (1..65535) OPTIONAL,
+        telemetryIdentifierList SEQUENCE (SIZE (0..1000)) OF INTEGER (1..65535) OPTIONAL,
+        controlIdentifierList   SEQUENCE (SIZE (0..1000)) OF INTEGER (1..65535) OPTIONAL,
+        ...,
+        cause                E3-Cause OPTIONAL,
+        detail               E3-Text OPTIONAL,
+        -- OCUDU: present when deliveryMode byReference was granted.
+        sharedRegion         E3-SharedRegion OPTIONAL
+    }
+
+    E3-RanFunctionDefinition ::= SEQUENCE {
+        ranFunctionIdentifier   INTEGER (1..65535),
+        telemetryIdentifierList SEQUENCE (SIZE (0..1000)) OF INTEGER (1..65535),
+        controlIdentifierList   SEQUENCE (SIZE (0..1000)) OF INTEGER (1..65535),
+        ranFunctionData         OCTET STRING (SIZE (1..32768)),
+        ...,
+        ranFunctionName         E3-Name OPTIONAL,
+        ranFunctionVersion      E3-Version OPTIONAL
+    }
+
+    E3-IndicationMessage ::= SEQUENCE {
+        dAppIdentifier          E3-DAppID,
+        ranFunctionIdentifier   INTEGER (1..65535),
+        protocolData            OCTET STRING (SIZE (1..32768)),
+        ...,
+        subscriptionId          INTEGER (1..65535) OPTIONAL,
+        telemetryIdentifier     INTEGER (1..65535) OPTIONAL,
+        sequence                E3-Unsigned64 OPTIONAL,
+        -- Absent: 0 and 1 (a whole payload). OPTIONAL rather than DEFAULT so a
+        -- whole payload carries no extension group at all, as in libe3.
+        fragmentIndex           INTEGER (0..65535) OPTIONAL,
+        fragmentCount           INTEGER (1..65536) OPTIONAL,
+        payloadBytes            INTEGER (1..maxE3PayloadBytes) OPTIONAL,
+        -- OCUDU: present when the record's bulk field was delivered by reference.
+        byReference             E3-TensorDescriptor OPTIONAL
+    }
+
+    E3-DAppControlAction ::= SEQUENCE {
+        dAppIdentifier          E3-DAppID,
+        ranFunctionIdentifier   INTEGER (1..65535),
+        controlIdentifier       INTEGER (1..65535),
+        -- Present only when the dApp is re-issuing a control it received as an
+        -- E3-XAppControlAction, carrying that action's sequenceId back down so the
+        -- RAN can match the applied control to the xApp procedure that asked for
+        -- it. Absent on a control the dApp decided on its own.
+        sequenceId              E3-SequenceID OPTIONAL,
+        actionData              OCTET STRING (SIZE (1..32768)),
+        ...,
+        -- Absent: 0 and 1 (a whole payload).
+        fragmentIndex           INTEGER (0..65535) OPTIONAL,
+        fragmentCount           INTEGER (1..65536) OPTIONAL,
+        payloadBytes            INTEGER (1..maxE3PayloadBytes) OPTIONAL
+    }
+
+    E3-DAppReport ::= SEQUENCE {
+        dAppIdentifier          E3-DAppID,
+        ranFunctionIdentifier   INTEGER (1..65535),
+        -- Assigned by the dApp. A report is the head of the E2-E3 loop, so this is
+        -- the identifier every later message in that procedure carries: the RAN
+        -- copies it into the E2SM-DAPP indication header as sequence-id, and an
+        -- xApp reacting to this report echoes it on its control.
+        sequenceId              E3-SequenceID,
+        reportData              OCTET STRING (SIZE (1..32768)),
+        ...
+    }
+
+    E3-XAppControlAction ::= SEQUENCE {
+        dAppIdentifier          E3-DAppID,
+        ranFunctionIdentifier   INTEGER (1..65535),
+        -- Copied by the RAN's E2-E3 bridge from the E2SM-DAPP control header's
+        -- sequence-id. Mandatory: a relayed xApp control that carried no id could
+        -- never be matched to the control acknowledge the RAN owes the xApp.
+        sequenceId              E3-SequenceID,
+        xAppControlData         OCTET STRING (SIZE (1..32768)),
+        ...
+    }
+
+    E3-ReleaseMessage ::= SEQUENCE {
+        dAppIdentifier       E3-DAppID,
+        ...
+    }
+
+    E3-MessageAck ::= SEQUENCE {
+        requestId            E3-MessageID,
+        responseCode         E3-ResponseCode,
+        ...,
+        cause                E3-Cause OPTIONAL,
+        detail               E3-Text OPTIONAL
+    }
+
+    E3-SequenceID ::= INTEGER (1..4294967295)
+
+    E3-DAppID ::= INTEGER (1..65535)
+    E3-MessageID ::= INTEGER (1..4294967295)
+    E3-Version ::= UTF8String (SIZE (1..11))
+    -- Deliberately not extensible (libe3): adding a response code is a wire change.
+    E3-ResponseCode ::= ENUMERATED { positive(0), negative(1) }
+
+    -- Nanoseconds since the Unix epoch on the realtime (UTC) clock. Absent means
+    -- "no producer reference". Unconstrained on purpose (see libe3's module):
+    -- asn1c renders it as a native integer and APER length-prefixes it.
+    E3-Timestamp ::= INTEGER
+
+    E3-PDU ::= SEQUENCE {
+        id        E3-MessageID,
+        timestamp E3-Timestamp OPTIONAL,
+        msg       CHOICE {
+            setupRequest          [0]  E3-SetupRequest,
+            setupResponse         [1]  E3-SetupResponse,
+            subscriptionRequest   [2]  E3-SubscriptionRequest,
+            subscriptionDelete    [3]  E3-SubscriptionDelete,
+            subscriptionResponse  [4]  E3-SubscriptionResponse,
+            indicationMessage     [5]  E3-IndicationMessage,
+            dAppControlAction     [6]  E3-DAppControlAction,
+            dAppReport            [7]  E3-DAppReport,
+            xAppControlAction     [8]  E3-XAppControlAction,
+            releaseMessage        [9]  E3-ReleaseMessage,
+            messageAck            [10] E3-MessageAck,
+            ...,
+            -- OCUDU profile only.
+            controlResponse       [11] E3-ControlResponse
+        },
+        ...
+    }
+
+    -- =======================================================================
+    -- OCUDU types (used only by the additions above)
+    -- =======================================================================
+
+    maxE3Text          INTEGER ::= 512
+    -- Largest reassembled opaque service-model payload (16 MiB).
+    maxE3PayloadBytes  INTEGER ::= 16777216
+    -- Largest payload fragment: libe3's 32 KiB root payload bound.
+    maxE3FragmentBytes INTEGER ::= 32768
+    -- Largest service-model subscription blob.
+    maxE3FunctionData  INTEGER ::= 262144
+
+    E3-Name ::= UTF8String (SIZE (1..64))
+    E3-Text ::= UTF8String (SIZE (0..maxE3Text))
+    E3-Identifier ::= OCTET STRING (SIZE (16))
+    E3-Unsigned64 ::= OCTET STRING (SIZE (8))
+
+    E3-Cause ::= ENUMERATED {
+        unspecified(0), protocolError(1), setupRequired(2), setupAlreadyComplete(3),
+        unsupportedProtocolVersion(4), unsupportedRanFunction(5), unsupportedIdentifier(6),
+        invalidRequest(7), notFound(8), duplicate(9), resourceExhausted(10),
+        authorizationRejected(11), payloadTooLarge(12), transportOverrun(13),
+        shuttingDown(14), ...
+    }
+
+    -- Outcome of a dApp control action carrying a service-model response body.
+    -- libe3 answers control actions with E3-MessageAck only; OCUDU sends the ack
+    -- when the request is accepted for processing and this message when the
+    -- service model produces a result.
+    E3-ControlResponse ::= SEQUENCE {
+        requestId             E3-MessageID,
+        dAppIdentifier        E3-DAppID,
+        ranFunctionIdentifier INTEGER (1..65535),
+        controlIdentifier     INTEGER (1..65535),
+        responseCode          E3-ResponseCode,
+        cause                 E3-Cause OPTIONAL,
+        detail                E3-Text OPTIONAL,
+        controlOutcome        OCTET STRING (SIZE (1..maxE3FragmentBytes)) OPTIONAL,
+        fragmentIndex         INTEGER (0..65535) DEFAULT 0,
+        fragmentCount         INTEGER (1..65536) DEFAULT 1,
+        payloadBytes          INTEGER (0..maxE3PayloadBytes) DEFAULT 0,
+        ...
+    }
+
+    -- By-reference bulk data: the RAN maps one shared region per subscription,
+    -- advertises it in the subscription response, writes each tensor into the
+    -- next row and sends an indication whose protocolData carries the record
+    -- with its bulk field empty plus an E3-TensorDescriptor. Enumerators mirror
+    -- the Class-C OCC3 metadata (class-c-publication-v1.fbs).
+    E3-DeliveryMode ::= ENUMERATED { inBand(0), byReference(1), ... }
+
+    E3-MemoryDomain ::= ENUMERATED {
+        host(0), hostPinned(1), acceleratorDevice(2), managedCoherent(3),
+        posixShared(4), acceleratorIpcExport(5), ...
+    }
+
+    E3-ElementType ::= ENUMERATED {
+        int8(0), uint8(1), int16(2), uint16(3), int32(4), fp16(5), bf16(6), fp32(7),
+        complexInt16(8), complexBf16(9), complexFp16(10), complexFp32(11), ...
+    }
+
+    -- A 64-byte region header followed by nofRows rows of rowBytes; each row
+    -- starts with a 64-byte row header (seqlock generation, publication sequence,
+    -- byte length) followed by the tensor bytes. Readers re-check the generation.
+    E3-SharedRegion ::= SEQUENCE {
+        memoryDomain  E3-MemoryDomain,
+        regionName    E3-Name,
+        regionBytes   E3-Unsigned64,
+        headerBytes   INTEGER (0..65535),
+        rowBytes      E3-Unsigned64,
+        nofRows       INTEGER (1..65535),
+        layoutVersion INTEGER (0..65535),
+        ...
+    }
+
+    -- A shared-region row (CPU consumers) or an accelerator IPC export (GPU
+    -- consumers; opaque 64-byte handles, as in the Class-C CUDA export slot).
+    E3-TensorLocation ::= CHOICE {
+        posixShared SEQUENCE {
+            regionName E3-Name,
+            rowIndex   INTEGER (0..65535),
+            byteOffset E3-Unsigned64,
+            ...
+        },
+        acceleratorIpc SEQUENCE {
+            deviceOrdinal    INTEGER (0..65535),
+            allocationId     E3-Unsigned64,
+            memoryHandle     OCTET STRING (SIZE (64)),
+            readyEventHandle OCTET STRING (SIZE (64)) OPTIONAL,
+            byteOffset       E3-Unsigned64,
+            ...
+        },
+        ...
+    }
+
+    E3-TensorDescriptor ::= SEQUENCE {
+        memoryDomain  E3-MemoryDomain,
+        location      E3-TensorLocation,
+        byteLength    E3-Unsigned64,
+        -- Row (or slot) generation at publication; a reader that observes a
+        -- different value after copying has read a torn row and must discard it.
+        generation    E3-Unsigned64,
+        elementType   E3-ElementType OPTIONAL,
+        dimensions    SEQUENCE (SIZE (1..8)) OF INTEGER (0..4294967295) OPTIONAL,
+        byteStrides   SEQUENCE (SIZE (1..8)) OF E3-Unsigned64 OPTIONAL,
+        layoutId      INTEGER (0..65535) OPTIONAL,
+        leaseExpiryNs E3-Unsigned64 OPTIONAL,
+        ...
+    }
+
+END

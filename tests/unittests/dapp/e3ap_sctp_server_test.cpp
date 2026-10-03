@@ -6,6 +6,8 @@
 #include "ocudu/dapp/e3/e3_connection_registry.h"
 #include "ocudu/dapp/e3/e3ap_codec.h"
 #include "ocudu/dapp/e3/e3ap_libe3_codec.h"
+#include "ocudu/dapp/e3/e3ap_protobuf_codec.h"
+#include "ocudu/dapp/e3/e3ap_v2_codec.h"
 #include "ocudu/dapp/e3/e3ap_sctp_server.h"
 #include "ocudu/dapp/e3/embedded_agent.h"
 #include "ocudu/dapp/e3/management_service.h"
@@ -37,11 +39,19 @@ using namespace ocudu::dapp::e3;
 
 namespace {
 
+/// What a test client speaks. ocudu_aper is E3AP-OCUDU-V2 APER with the OCUDU profile; libe3_aper
+/// the same module without additions (what libe3 sends).
+enum class client_wire { ocudu_aper, libe3_aper, libe3_protobuf, ocudu_protobuf };
+
 /// Minimal blocking E3AP client over a one-to-one SCTP association.
 class test_client
 {
 public:
-  explicit test_client(uint16_t port, bool libe3_ = false) : libe3(libe3_)
+  explicit test_client(uint16_t port, bool libe3_ = false) :
+    test_client(port, libe3_ ? client_wire::libe3_aper : client_wire::ocudu_aper)
+  {
+  }
+  test_client(uint16_t port, client_wire wire_) : wire(wire_)
   {
     descriptor = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_SCTP);
     sockaddr_in address{};
@@ -80,7 +90,10 @@ public:
 
   bool send(const e3ap_pdu& pdu)
   {
-    auto encoded = libe3 ? e3ap_libe3_codec::encode(pdu) : e3ap_codec::encode(pdu);
+    auto encoded = wire == client_wire::ocudu_aper    ? e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu)
+                   : wire == client_wire::libe3_aper     ? e3ap_libe3_codec::encode(pdu)
+                   : wire == client_wire::libe3_protobuf ? e3ap_protobuf_codec::encode(pdu, e3ap_profile::libe3)
+                                                         : e3ap_protobuf_codec::encode(pdu, e3ap_profile::ocudu);
     if (!encoded) {
       return false;
     }
@@ -109,7 +122,11 @@ public:
         break;
       }
     }
-    auto decoded = libe3 ? e3ap_libe3_codec::decode(message) : e3ap_codec::decode(message);
+    auto decoded = wire == client_wire::ocudu_aper  ? e3ap_v2_codec::decode(message, e3ap_profile::ocudu)
+                   : wire == client_wire::libe3_aper   ? e3ap_libe3_codec::decode(message)
+                   : wire == client_wire::libe3_protobuf
+                       ? e3ap_protobuf_codec::decode(message, e3ap_profile::libe3)
+                       : e3ap_protobuf_codec::decode(message, e3ap_profile::ocudu);
     if (!decoded) {
       ADD_FAILURE() << decoded.detail;
       return std::nullopt;
@@ -142,7 +159,10 @@ public:
     request.dapp_name    = "test-dapp";
     request.dapp_version = "0.0.1";
     request.vendor       = "DeepSig";
-    pdu.message          = request;
+    if (ocudu_profile()) {
+      request.ocudu_profile = e3ap_ocudu_profile_version;
+    }
+    pdu.message = request;
     if (!send(pdu)) {
       return std::nullopt;
     }
@@ -156,11 +176,16 @@ public:
 
   e3ap_setup_response last_setup;
 
+  /// The client runs the OCUDU procedures (and asks for them at setup).
+  bool ocudu_profile() const
+  {
+    return wire == client_wire::ocudu_aper || wire == client_wire::ocudu_protobuf;
+  }
+
 private:
   int  descriptor{-1};
   bool connected{};
-  /// Speak the upstream libe3 E3AP 1.0.0 module instead of E3AP-OCUDU-V1.
-  bool libe3{};
+  client_wire wire{client_wire::ocudu_aper};
 };
 
 std::unique_ptr<instance_manager> make_manager()
@@ -243,6 +268,21 @@ bool wait_until(Predicate&& ready, std::chrono::milliseconds limit = std::chrono
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
   return ready();
+}
+
+/// Publishes one PUSCH CRC record and retries until the store takes it. The store never blocks the
+/// (real-time) producer: a publication that meets the agent's poll holding the subscription queue is
+/// dropped as busy, which is right for a live stream but would lose a test's only record.
+void publish_crc(telemetry_publisher& publisher, const pusch_crc_diagnostic& event)
+{
+  const uint64_t before = publisher.metrics().published;
+  for (int attempt = 0; attempt != 200 && publisher.metrics().published == before; ++attempt) {
+    publisher.on_pusch_crc(event);
+    if (publisher.metrics().published == before) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  ASSERT_GT(publisher.metrics().published, before) << "the store never accepted the record";
 }
 
 } // namespace
@@ -353,7 +393,7 @@ TEST(dapp_e3ap_sctp_server, streams_fragmented_telemetry_indications_to_subscrib
   ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_symbols, 0x4602));
   f.publisher->on_pusch_symbols(event);
   ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_crc, 0x4601));
-  f.publisher->on_pusch_crc({0x4601, slot_point{1, 20, 3}, true});
+  publish_crc(*f.publisher, {0x4601, slot_point{1, 20, 3}, true});
 
   struct assembly {
     std::vector<uint8_t> bytes;
@@ -695,6 +735,7 @@ TEST(dapp_e3ap_sctp_server, hands_dapp_reports_to_the_handler_and_keeps_recent_o
   report.dapp_identifier         = *dapp_id;
   report.ran_function_identifier = 1; // a Spectrum-style service model
   report.report_data             = {0xAA, 0xBB, 0xCC};
+  report.sequence_identifier     = 31; // mandatory (libe3's root field)
   pdu.message                    = report;
   ASSERT_TRUE(client.send(pdu));
   auto ack = client.receive_as<e3ap_message_ack>();
@@ -815,7 +856,7 @@ TEST(dapp_e3ap_sctp_server, delivers_large_tensors_by_reference_through_a_shared
   ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_symbols, 0x4601));
   f.publisher->on_pusch_symbols(event);
   ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_crc, 0x4601));
-  f.publisher->on_pusch_crc({0x4601, slot_point{1, 20, 3}, true});
+  publish_crc(*f.publisher, {0x4601, slot_point{1, 20, 3}, true});
 
   bool saw_symbols = false;
   bool saw_crc     = false;
@@ -1114,6 +1155,135 @@ TEST(dapp_e3ap_sctp_server, by_reference_delivery_is_faster_than_in_band_for_lar
   EXPECT_LT(by_ref[objects / 2], in_band[objects / 2]);
 }
 
+TEST(dapp_e3ap_sctp_server, serves_every_encoding_and_profile_on_one_port)
+{
+  fixture f;
+  auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config(), f.connections);
+  ASSERT_TRUE(server) << server.detail;
+
+  // Four peers, four wire formats, one port: each association is bound by its setup request.
+  test_client native(server.server->port(), client_wire::ocudu_aper);
+  test_client libe3_aper(server.server->port(), client_wire::libe3_aper);
+  test_client libe3_protobuf(server.server->port(), client_wire::libe3_protobuf);
+  test_client ocudu_protobuf(server.server->port(), client_wire::ocudu_protobuf);
+  for (auto* client : {&native, &libe3_aper, &libe3_protobuf, &ocudu_protobuf}) {
+    ASSERT_TRUE(client->ok());
+  }
+  auto native_id         = native.setup();
+  auto libe3_aper_id     = libe3_aper.setup();
+  auto libe3_protobuf_id = libe3_protobuf.setup();
+  auto ocudu_protobuf_id = ocudu_protobuf.setup();
+  ASSERT_TRUE(native_id && libe3_aper_id && libe3_protobuf_id && ocudu_protobuf_id);
+  EXPECT_TRUE(wait_until([&] { return server.server->metrics().setups_completed == 4; }));
+  EXPECT_EQ(server.server->metrics().libe3_setups_completed, 2U);
+  EXPECT_EQ(server.server->metrics().protobuf_setups_completed, 2U);
+  // OCUDU-profile peers are told the OCUDU procedures run; libe3 peers never see the field.
+  EXPECT_EQ(native.last_setup.ocudu_profile, std::optional<uint8_t>(e3ap_ocudu_profile_version));
+  EXPECT_EQ(ocudu_protobuf.last_setup.ocudu_profile, std::optional<uint8_t>(e3ap_ocudu_profile_version));
+  EXPECT_FALSE(libe3_aper.last_setup.ocudu_profile);
+  EXPECT_FALSE(libe3_protobuf.last_setup.ocudu_profile);
+
+  // The libe3 Protobuf peer runs the libe3 procedures: libe3 identifiers, no OCUDU fields.
+  EXPECT_LE(*libe3_protobuf_id, e3ap_libe3_codec::dapp_identifier_pool);
+  EXPECT_FALSE(libe3_protobuf.last_setup.maximum_payload_bytes) << "OCUDU fields do not reach a libe3 peer";
+  ASSERT_EQ(libe3_protobuf.last_setup.ran_functions.size(), 2U);
+  // The OCUDU-profile peer runs the native procedures over Protobuf.
+  EXPECT_GT(*ocudu_protobuf_id, e3ap_libe3_codec::dapp_identifier_pool);
+  EXPECT_EQ(ocudu_protobuf.last_setup.maximum_payload_bytes, native.last_setup.maximum_payload_bytes);
+  EXPECT_EQ(ocudu_protobuf.last_setup.ran_instance.has_value(), native.last_setup.ran_instance.has_value());
+  ASSERT_EQ(ocudu_protobuf.last_setup.ran_functions.size(), 2U);
+  EXPECT_EQ(ocudu_protobuf.last_setup.ran_functions[0].ran_function_data,
+            native.last_setup.ran_functions[0].ran_function_data);
+
+  // Both Protobuf peers subscribe to the CRC stream and receive the same indication.
+  e3ap_pdu pdu;
+  pdu.id = 5;
+  e3ap_subscription_request subscription;
+  subscription.ran_function_identifier = e3ap_ran_function_telemetry;
+  subscription.telemetry_identifiers   = {telemetry_id_pusch_crc};
+  subscription.dapp_identifier         = *libe3_protobuf_id;
+  pdu.message                          = subscription;
+  ASSERT_TRUE(libe3_protobuf.send(pdu));
+  subscription.dapp_identifier = *ocudu_protobuf_id;
+  pdu.message                  = subscription;
+  ASSERT_TRUE(ocudu_protobuf.send(pdu));
+  auto libe3_granted = libe3_protobuf.receive_as<e3ap_subscription_response>();
+  auto ocudu_granted = ocudu_protobuf.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(libe3_granted && ocudu_granted);
+  EXPECT_EQ(libe3_granted->response_code, e3ap_response_code::positive);
+  EXPECT_EQ(ocudu_granted->response_code, e3ap_response_code::positive);
+  EXPECT_FALSE(libe3_granted->telemetry_identifiers) << "libe3's Protobuf SubscriptionResponse has no lists";
+  EXPECT_EQ(ocudu_granted->telemetry_identifiers,
+            std::optional<std::vector<uint16_t>>(std::vector<uint16_t>{telemetry_id_pusch_crc}));
+  EXPECT_TRUE(wait_until([&] { return f.store->has_active(telemetry_stream_pusch_crc); }));
+  ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_crc, 0x4602));
+  // Two subscribers: a record one of them meets busy is lost to it alone, so publish a short burst.
+  for (int burst = 0; burst != 8; ++burst) {
+    publish_crc(*f.publisher, {0x4602, slot_point{1, 21, 3}, true});
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  }
+  auto libe3_indication = libe3_protobuf.receive_as<e3ap_indication_message>();
+  auto ocudu_indication = ocudu_protobuf.receive_as<e3ap_indication_message>();
+  ASSERT_TRUE(libe3_indication && ocudu_indication);
+  for (const auto* indication : {&*libe3_indication, &*ocudu_indication}) {
+    auto record = e3ap_codec::decode_telemetry(indication->protocol_data);
+    ASSERT_TRUE(record) << record.detail;
+    EXPECT_EQ(record.value->telemetry_id, telemetry_id_pusch_crc);
+    EXPECT_TRUE(std::get<pusch_crc_record>(record.value->object).crc_ok);
+  }
+  EXPECT_FALSE(libe3_indication->subscription_id);
+  EXPECT_EQ(ocudu_indication->subscription_id, ocudu_granted->subscription_id) << "OCUDU fields reach OCUDU peers";
+
+  // A management control action: the libe3 peer gets one MessageAck with the outcome, the OCUDU
+  // peer the ack and then the ControlResponse that libe3 cannot carry.
+  inventory_query query;
+  query.header.transaction_id.bytes[15] = 0x44;
+  auto request_bytes                    = aper_codec::encode(management_request{query});
+  ASSERT_TRUE(request_bytes) << request_bytes.detail;
+  pdu.id = 11;
+  e3ap_dapp_control_action action;
+  action.ran_function_identifier = e3ap_ran_function_management;
+  action.control_identifier      = e3ap_management_control_request;
+  action.action_data             = *request_bytes.value;
+  action.dapp_identifier         = *libe3_protobuf_id;
+  pdu.message                    = action;
+  ASSERT_TRUE(libe3_protobuf.send(pdu));
+  auto libe3_ack = libe3_protobuf.receive_as<e3ap_message_ack>();
+  ASSERT_TRUE(libe3_ack);
+  EXPECT_EQ(libe3_ack->request_id, 11U);
+  EXPECT_EQ(libe3_ack->response_code, e3ap_response_code::positive);
+  action.dapp_identifier = *ocudu_protobuf_id;
+  action.payload_bytes   = static_cast<uint32_t>(request_bytes.value->size());
+  pdu.message            = action;
+  ASSERT_TRUE(ocudu_protobuf.send(pdu));
+  auto ocudu_ack = ocudu_protobuf.receive_as<e3ap_message_ack>();
+  ASSERT_TRUE(ocudu_ack);
+  EXPECT_EQ(ocudu_ack->response_code, e3ap_response_code::positive) << ocudu_ack->detail;
+  auto outcome = ocudu_protobuf.receive_as<e3ap_control_response>();
+  ASSERT_TRUE(outcome);
+  EXPECT_EQ(outcome->request_id, 11U);
+  EXPECT_EQ(outcome->response_code, e3ap_response_code::positive) << outcome->detail;
+  EXPECT_TRUE(aper_codec::decode_response(outcome->control_outcome));
+
+  // A report from each Protobuf peer reaches the agent.
+  e3ap_dapp_report report;
+  report.ran_function_identifier = e3ap_ran_function_telemetry;
+  report.report_data             = {0x01};
+  report.dapp_identifier         = *libe3_protobuf_id;
+  report.sequence_identifier     = 77;
+  pdu.id                         = 12;
+  pdu.message                    = report;
+  ASSERT_TRUE(libe3_protobuf.send(pdu));
+  report.dapp_identifier     = *ocudu_protobuf_id;
+  report.sequence_identifier = 78;
+  pdu.message                = report;
+  ASSERT_TRUE(ocudu_protobuf.send(pdu));
+  EXPECT_TRUE(wait_until([&] { return server.server->metrics().reports_received == 2; }));
+
+  // The APER peers were never affected.
+  EXPECT_EQ(server.server->metrics().protocol_errors, 0U);
+}
+
 TEST(dapp_e3ap_sctp_server, serves_libe3_module_peers_on_the_same_port_beside_native_ones)
 {
   fixture f;
@@ -1131,7 +1301,7 @@ TEST(dapp_e3ap_sctp_server, serves_libe3_module_peers_on_the_same_port_beside_na
   auto dapp_id = peer.setup();
   ASSERT_TRUE(dapp_id);
   EXPECT_GE(*dapp_id, 1U);
-  EXPECT_LE(*dapp_id, e3ap_libe3_codec::maximum_identifier);
+  EXPECT_LE(*dapp_id, e3ap_libe3_codec::dapp_identifier_pool);
   EXPECT_EQ(peer.last_setup.ran_identifier, "ocudu-gnb");
   EXPECT_EQ(peer.last_setup.e3ap_protocol_version, std::optional<std::string>("1.0.0"));
   EXPECT_FALSE(peer.last_setup.cause.has_value()) << "OCUDU-only fields do not reach a libe3 peer";
@@ -1163,7 +1333,7 @@ TEST(dapp_e3ap_sctp_server, serves_libe3_module_peers_on_the_same_port_beside_na
   EXPECT_TRUE(wait_until([&] { return f.store->has_active(telemetry_stream_pusch_crc); }));
 
   ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_crc, 0x4601));
-  f.publisher->on_pusch_crc({0x4601, slot_point{1, 20, 3}, true});
+  publish_crc(*f.publisher, {0x4601, slot_point{1, 20, 3}, true});
   auto indication = peer.receive_as<e3ap_indication_message>();
   ASSERT_TRUE(indication);
   EXPECT_EQ(indication->dapp_identifier, *dapp_id);
@@ -1194,6 +1364,7 @@ TEST(dapp_e3ap_sctp_server, serves_libe3_module_peers_on_the_same_port_beside_na
   report.dapp_identifier         = *dapp_id;
   report.ran_function_identifier = e3ap_ran_function_telemetry;
   report.report_data             = {0x01, 0x02};
+  report.sequence_identifier     = 4242; // mandatory on the libe3 >= 0.2 wire
   pdu.message                    = report;
   ASSERT_TRUE(peer.send(pdu));
   auto first = peer.receive();
@@ -1277,7 +1448,7 @@ TEST(dapp_e3ap_sctp_server, drops_indications_the_libe3_module_cannot_carry)
   ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_symbols, 0x4601));
   f.publisher->on_pusch_symbols(event);
   ASSERT_TRUE(f.publisher->should_collect(phy_diagnostic_stream::pusch_crc, 0x4601));
-  f.publisher->on_pusch_crc({0x4601, slot_point{1, 20, 3}, false});
+  publish_crc(*f.publisher, {0x4601, slot_point{1, 20, 3}, false});
   auto indication = peer.receive_as<e3ap_indication_message>();
   ASSERT_TRUE(indication);
   auto record = e3ap_codec::decode_telemetry(indication->protocol_data);
@@ -1301,7 +1472,7 @@ TEST(dapp_e3ap_sctp_server, native_and_libe3_identifiers_remain_disjoint_during_
     test_client native(server.server->port());
     auto        id = native.setup();
     ASSERT_TRUE(id);
-    EXPECT_GT(*id, e3ap_libe3_codec::maximum_identifier);
+    EXPECT_GT(*id, e3ap_libe3_codec::dapp_identifier_pool);
     EXPECT_NE(*id, *foreign_id);
     EXPECT_FALSE(server.server->send_xapp_control_action(*id, 10, {0}, UINT64_MAX));
     ASSERT_TRUE(server.server->send_xapp_control_action(*id, 10, {1, 2, 3}));

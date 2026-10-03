@@ -597,15 +597,20 @@ dapp interoperability release gate:
     OCUDU_DAPP_SDK_URL: https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-sdk.git
     OCUDU_DAPP_SDK_REF: a8948460e2a45d5bcd1f8f6c9abfc75f89c98982
   script:
-    # E3AP, E3DP and the libe3 session run over SCTP; a runner whose kernel lacks the module fails
-    # every one of those tests with "Protocol not supported". Say so once, up front.
-    - python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP).close()" || { echo "This runner cannot open SCTP sockets; run this job on a runner with the sctp kernel module (set OCUDU_INTEROP_RUNNER_TAG)."; exit 1; }
+    # E3AP, E3DP and the agent's SCTP carrier need kernel SCTP. Without it this job is skipped (it passes
+    # and says so); libe3 interoperability is still exercised over ZMQ by "libe3 interoperability report".
+    - |
+      if ! python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP).close()"; then
+        echo "SKIPPED: this runner's kernel cannot open SCTP sockets (no sctp module); the SCTP E3 gate did not run."
+        echo "Run it on a runner with the sctp kernel module by setting OCUDU_INTEROP_RUNNER_TAG."
+        exit 0
+      fi
     - apt-get update
-    - apt-get install --no-install-recommends -y autoconf automake libtool bison flex libsctp-dev flatbuffers-compiler libflatbuffers-dev clang python3-pip
+    - apt-get install --no-install-recommends -y autoconf automake libtool bison flex libsctp-dev libzmq3-dev libprotobuf-dev protobuf-compiler flatbuffers-compiler libflatbuffers-dev clang python3-pip
     - python3 -m pip install --break-system-packages 'asn1tools>=0.166,<1' numpy h5py flatbuffers
     - >-
       builder.sh -b "${OCUDU_BUILD_DIR}" -c gcc
-      -m "-j${CPU_JOBS} dapp_runtime_test dapp_telemetry_allocation_test e3ap_test_server libe3_interop_dapp libe3_interop_vectors ocudu-dappctl ocudu-pusch-replay"
+      -m "-j${CPU_JOBS} dapp_runtime_test dapp_e3ap_protobuf_conformance_test dapp_telemetry_allocation_test e3ap_test_server libe3_interop_dapp libe3_interop_vectors ocudu-dappctl ocudu-pusch-replay"
       -DCMAKE_BUILD_TYPE=Release -DENABLE_DAPP=ON -DENABLE_E3=ON
       -DENABLE_E3_ASN1_CODEC=ON -DOCUDU_DAPP_LIBE3_INTEROP=ON -DENABLE_UHD=OFF .
     - python3 scripts/check_dapp_interop_gate.py --build "${OCUDU_BUILD_DIR}"
@@ -632,10 +637,14 @@ dapp interoperability release gate:
     expire_in: 30 days
 
 # libe3 interoperability, as a report. Builds the host gate targets and the
-# pinned upstream libe3 (submodules), runs the fail-closed host gate through
-# scripts/libe3_interop_report.py and publishes the rendered report (Markdown
-# and PDF) beside the JUnit results, exposed on the merge request. The job
-# fails with the gate; the report of a failed run is still published.
+# pinned upstream libe3 (submodules, with ZMQ, Protobuf and the SCTP association
+# link layer), runs the fail-closed gate through scripts/libe3_interop_report.py and
+# publishes the rendered report (Markdown and PDF) beside the JUnit results,
+# exposed on the merge request. Runs on every runner: with kernel SCTP the gate
+# covers both libe3 link layers (profile host); without it, the ZMQ link layer
+# (profile zmq) and the report records SCTP as skipped. Every link layer runs in
+# both libe3 encodings (APER and Protobuf). The job fails with the
+# gate; the report of a failed run is still published.
 libe3 interoperability report:
   extends: .build_and_unit_template
   stage: build and unit tests
@@ -651,21 +660,25 @@ libe3 interoperability report:
     OCUDU_BUILD_DIR: build-dapp-libe3-ci
     GIT_SUBMODULE_STRATEGY: recursive
   script:
-    # E3AP, E3DP and the libe3 session run over SCTP; a runner whose kernel lacks the module fails
-    # every one of those tests with "Protocol not supported". Say so once, up front.
-    - python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP).close()" || { echo "This runner cannot open SCTP sockets; run this job on a runner with the sctp kernel module (set OCUDU_INTEROP_RUNNER_TAG)."; exit 1; }
+    - |
+      if python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP).close()"; then
+        export LIBE3_GATE_PROFILE=host
+      else
+        echo "No kernel SCTP on this runner: the libe3 SCTP link layer is skipped, ZMQ is tested."
+        export LIBE3_GATE_PROFILE=zmq
+      fi
     - apt-get update
     - >-
-      apt-get install --no-install-recommends -y autoconf automake libtool bison flex libsctp-dev
-      flatbuffers-compiler libflatbuffers-dev clang python3-pip
+      apt-get install --no-install-recommends -y autoconf automake libtool bison flex libsctp-dev libzmq3-dev
+      libprotobuf-dev protobuf-compiler flatbuffers-compiler libflatbuffers-dev clang python3-pip
       texlive-latex-base texlive-latex-recommended texlive-latex-extra texlive-fonts-recommended cm-super
     - python3 -m pip install --break-system-packages 'asn1tools>=0.166,<1' numpy
     - >-
       builder.sh -b "${OCUDU_BUILD_DIR}" -c gcc
-      -m "-j${CPU_JOBS} dapp_runtime_test dapp_telemetry_allocation_test e3ap_test_server libe3_interop_dapp libe3_interop_vectors ocudu-dappctl"
+      -m "-j${CPU_JOBS} dapp_runtime_test dapp_e3ap_protobuf_conformance_test dapp_telemetry_allocation_test e3ap_test_server libe3_interop_dapp libe3_interop_vectors ocudu-dappctl"
       -DCMAKE_BUILD_TYPE=Release -DENABLE_DAPP=ON -DENABLE_E3=ON
       -DENABLE_E3_ASN1_CODEC=ON -DOCUDU_DAPP_LIBE3_INTEROP=ON -DENABLE_UHD=OFF .
-    - python3 scripts/libe3_interop_report.py --build "${OCUDU_BUILD_DIR}" --out libe3-interop-report
+    - python3 scripts/libe3_interop_report.py --build "${OCUDU_BUILD_DIR}" --out libe3-interop-report --profile "${LIBE3_GATE_PROFILE}"
     - test -f libe3-interop-report/libe3_interop_report.pdf
   artifacts:
     when: always

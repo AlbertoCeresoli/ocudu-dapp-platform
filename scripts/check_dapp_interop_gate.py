@@ -15,10 +15,20 @@ import sys
 import xml.etree.ElementTree as ET
 
 REQUIRED = {
+    # SCTP-capable runners: everything, both libe3 link layers, both libe3 encodings.
     "host": {
-        "dapp_e3ap_libe3.e2e", "dapp_e3ap_libe3.interop",
+        "dapp_e3ap_libe3.e2e_sctp", "dapp_e3ap_libe3.e2e_zmq", "dapp_e3ap_libe3.interop",
         "dapp_e3ap_python.cross_language", "dapp_e3_shared_region.validation",
         "dapp_e3ap_libe3_codec.decodes_and_reproduces_vectors_from_the_upstream_libe3_encoder",
+        "dapp_e3ap_sctp_server.serves_every_encoding_and_profile_on_one_port",
+        # Protobuf: libe3's ProtobufE3Encoder vectors against the hand-written codec, and the codec against
+        # libprotobuf on both schemas (only built with libprotobuf, so a build without it fails here).
+        "dapp_e3ap_protobuf_codec.decodes_and_reproduces_vectors_from_the_upstream_libe3_protobuf_encoder",
+        "dapp_e3ap_protobuf_conformance.ocudu_schema_is_a_wire_superset_of_the_libe3_schema",
+        "dapp_e3ap_protobuf_conformance.random_pdus_encode_exactly_as_libprotobuf_serialises_them",
+        # E3AP-OCUDU-V2: one protocol with libe3, the same in APER and Protobuf.
+        "dapp_e3ap_v2_codec.aper_and_protobuf_carry_the_same_protocol_in_both_profiles",
+        "dapp_e3ap_v2_codec.every_ocudu_addition_round_trips_and_libe3_peers_see_the_libe3_message",
         "portable_data_store_test.fanout_copy_budget_drops_whole_objects_and_rotates_admission",
         "portable_data_store_test.concurrent_removal_and_replacement_do_not_reclaim_a_borrowed_producer_slot",
         "dapp_telemetry_isolation.no_producer_allocation",
@@ -26,6 +36,22 @@ REQUIRED = {
         "dapp_package_signature.runtime_policy_reload_is_monotonic_and_keeps_original_immutable",
         "dapp_package_signature.runtime_catalog_verifies_then_admits_without_loading_and_replays_transactions",
         "dapp_package_signature.special_files_never_wait_for_a_fifo_writer",
+    },
+    # Any runner (no kernel SCTP needed): libe3 interop over the ZMQ link layer (APER and Protobuf),
+    # libe3's encoder vectors against our codecs, and the schema-level checks.
+    "zmq": {
+        "dapp_e3ap_libe3.e2e_zmq", "dapp_e3ap_libe3.interop",
+        "dapp_e3ap_libe3_codec.decodes_and_reproduces_vectors_from_the_upstream_libe3_encoder",
+        "dapp_e3ap_libe3_codec.round_trips_every_procedure_of_the_libe3_module",
+        "dapp_e3ap_libe3_codec.refuses_values_the_libe3_module_cannot_carry",
+        # Protobuf: libe3's ProtobufE3Encoder vectors against the hand-written codec, and the codec against
+        # libprotobuf on both schemas (only built with libprotobuf, so a build without it fails here).
+        "dapp_e3ap_protobuf_codec.decodes_and_reproduces_vectors_from_the_upstream_libe3_protobuf_encoder",
+        "dapp_e3ap_protobuf_conformance.ocudu_schema_is_a_wire_superset_of_the_libe3_schema",
+        "dapp_e3ap_protobuf_conformance.random_pdus_encode_exactly_as_libprotobuf_serialises_them",
+        # E3AP-OCUDU-V2: one protocol with libe3, the same in APER and Protobuf.
+        "dapp_e3ap_v2_codec.aper_and_protobuf_carry_the_same_protocol_in_both_profiles",
+        "dapp_e3ap_v2_codec.every_ocudu_addition_round_trips_and_libe3_peers_see_the_libe3_message",
     },
     "sdk": {
         "contract.ref_channel_estimator_cpu", "contract.ref_equalizer_cpu",
@@ -43,8 +69,14 @@ def main():
     args = parser.parse_args()
     build = args.build.resolve()
     base = ["ctest", "--test-dir", str(build)]
-    selection = (["-R", r"^dapp_e3|^dapp_portable_data_store|^portable_data_store_test|^dapp_telemetry_isolation|^dapp_package_signature",
-                  "-E", "by_reference_delivery_is_faster_than_in_band"] if args.profile == "host" else [])
+    selections = {
+        "host": ["-R", r"^dapp_e3|^dapp_portable_data_store|^portable_data_store_test|^dapp_telemetry_isolation|^dapp_package_signature",
+                 "-E", "by_reference_delivery_is_faster_than_in_band"],
+        # Only what runs without kernel SCTP: the agent's SCTP carrier tests stay in the host profile.
+        "zmq": ["-R", r"^dapp_e3ap_libe3\.(e2e_zmq|interop)$|^dapp_e3ap_libe3_codec\.|^dapp_e3ap_protobuf_(codec|conformance)\.|^dapp_e3ap_v2_codec\."],
+        "sdk": [],
+    }
+    selection = selections[args.profile]
     inventory = json.loads(subprocess.check_output(base + selection + ["--show-only=json-v1"], text=True))
     tests = {test["name"] for test in inventory["tests"]}
     missing = REQUIRED[args.profile] - tests

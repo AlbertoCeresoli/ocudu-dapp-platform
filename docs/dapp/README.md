@@ -108,7 +108,8 @@ cmake --build <ocudu-build> --target doxygen
 | Schema | Role |
 |--------|------|
 | `schemas/e3/e3sm-ocudu-dapp-mgmt-v1.asn1` | Management service model (APER) |
-| `schemas/e3/e3ap-ocudu-v1.asn1` | E3AP envelope for the SCTP carrier (APER) |
+| `schemas/e3/e3ap-ocudu-v2.asn1` | E3AP for the SCTP carrier: libe3 E3AP 1.0.0 + OCUDU extension additions (APER) |
+| `schemas/e3/protobuf/e3ap-ocudu-v2.proto` | The same messages in Protobuf |
 | `schemas/e3/e3sm-ocudu-telemetry-v1.asn1` | Telemetry service model: PUSCH/SRS/DM-RS records, gNB JSON, Class-C snapshots |
 | `schemas/e3/e3sm-ocudu-dapp-mgmt-carrier-v1.asn1` | Management RAN-function capability advertisement |
 | `schemas/dapp/e3-data-profile-v1.fbs` | FlatBuffers data profile served to the E3 SCTP reference client |
@@ -158,11 +159,12 @@ enable-and-check recipe (`ctest -R dapp`, `python3 -m ocudu_e3 catalog`,
 
 ## libe3 interoperability
 
-The E3AP agent speaks the upstream [libe3](https://github.com/wineslab/libe3)
-E3AP 1.0.0 module beside its native one on the same SCTP port; the dialect is
-fixed per association by the setup request (see the
-[libe3 dialect](e3_wire.md#the-libe3-dialect-of-the-e3ap-agent) section for the
-identifier, payload and control-response limits a libe3 peer has).
+OCUDU's E3AP module, E3AP-OCUDU-V2, is the upstream
+[libe3](https://github.com/wineslab/libe3) E3AP 1.0.0 module with OCUDU
+extension additions, in APER or Protobuf, so libe3 peers and OCUDU peers speak
+one protocol on the same port; a peer that does not ask for the OCUDU profile
+at setup runs libe3's procedures (see
+[libe3 peers and the libe3 profile](e3_wire.md#libe3-peers-and-the-libe3-profile)).
 `tests/interop/libe3` builds the pinned upstream library from the
 `third_party/libe3` submodule and drives a real libe3 dApp through a complete
 session against the agent; libe3's own encoder output is pinned as byte-exact

@@ -19,6 +19,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import textwrap
@@ -31,8 +32,6 @@ PINNED = REPO / "python" / "tests" / "fixtures" / "libe3_vectors.json"
 PATCHES = REPO / "tests" / "interop" / "libe3" / "patches"
 PROCEDURES = ["SetupRequest", "SetupResponse", "SubscriptionRequest", "SubscriptionResponse", "SubscriptionDelete",
               "IndicationMessage", "DAppControlAction", "DAppReport", "XAppControlAction", "ReleaseMessage", "MessageAck"]
-# asn1tools and asn1c disagree on constrained UTF8String, the documented divergence (test_libe3_interop.py).
-UTF8_DIVERGENCE = {"SetupRequest", "SetupResponse"}
 # Which summary flags of the end-to-end session exercise which procedures on the wire.
 SESSION_STEPS = [
     ("setup", "setup completed", ["SetupRequest", "SetupResponse"]),
@@ -45,17 +44,23 @@ SESSION_STEPS = [
     ("released", "release accepted", ["ReleaseMessage"]),
 ]
 CATEGORIES = [
-    (r"^dapp_e3ap_libe3\.e2e$", "End to end against the upstream libe3 library"),
-    (r"^dapp_e3ap_libe3\.interop$", "Schema-level interoperability (asn1tools on the vendored libe3 module)"),
-    (r"^dapp_e3ap_libe3_codec\.", "libe3 APER codec (generated from the upstream module)"),
-    (r"^dapp_e3ap_sctp_server\..*libe3", "E3AP SCTP agent, libe3 dialect"),
-    (r"^dapp_e3ap_sctp_server\.", "E3AP SCTP agent, native dialect and shared regions"),
+    (r"^dapp_e3ap_libe3\.e2e_sctp$", "End to end against the upstream libe3 library, SCTP link layer"),
+    (r"^dapp_e3ap_libe3\.e2e_zmq$", "End to end against the upstream libe3 library, ZMQ link layer (ipc and tcp)"),
+    (r"^dapp_e3ap_libe3\.interop$", "Schema-level interoperability and Python (ocudu_e3.libe3) against libe3's encoder"),
+    (r"^dapp_e3ap_v2_codec\.", "E3AP-OCUDU-V2 APER codec (libe3's module + OCUDU additions; APER = Protobuf)"),
+    (r"^dapp_e3ap_libe3_codec\.", "libe3 profile of the E3AP-OCUDU-V2 APER codec against libe3's own vectors"),
+    (r"^dapp_e3ap_protobuf_codec\.", "E3AP Protobuf codec (hand-written; libe3 and OCUDU profiles)"),
+    (r"^dapp_e3ap_protobuf_conformance\.", "E3AP Protobuf codec against libprotobuf (libe3 and OCUDU schemas)"),
+    (r"^dapp_e3ap_sctp_server\..*libe3", "E3AP SCTP agent, libe3 profile"),
+    (r"^dapp_e3ap_sctp_server\..*protobuf", "E3AP SCTP agent, Protobuf peers (libe3 and OCUDU profiles)"),
+    (r"^dapp_e3ap_sctp_server\.", "E3AP SCTP agent, OCUDU profile and shared regions"),
     (r"^dapp_e3ap_codec\.|^dapp_e3_aper_codec\.|^dapp_e3_python_codec\.", "Native E3AP and service-model codecs"),
     (r"cross_language|python_codec", "Cross-language wire checks (Python client against the C++ agent)"),
     (r"shared_region", "Shared-memory region validation"),
     (r"telemetry_isolation|portable_data_store", "Telemetry store and producer isolation"),
 ]
-OUTPUT_TESTS = re.compile(r"libe3|cross_language|shared_region\.validation")
+OUTPUT_TESTS = re.compile(r"libe3|cross_language|shared_region\.validation|protobuf_conformance\.random")
+ENCODINGS = [("asn1", "APER"), ("protobuf", "Protobuf")]
 MAX_OUTPUT_LINES = 90
 
 
@@ -101,18 +106,19 @@ def provenance(build: Path) -> dict:
             "cmake": sh("cmake", "--version").splitlines()[0] if sh("cmake", "--version") else "",
             "python": platform.python_version(),
             "asn1tools": sh(sys.executable, "-c", "import asn1tools; print(asn1tools.__version__)"),
+            "protoc": sh("protoc", "--version") if shutil.which("protoc") else "not found",
             "pdflatex": "available" if shutil.which("pdflatex") else "not found",
         },
         "binaries": binaries,
     }
 
 
-def run_gate(build: Path, summary_file: Path) -> tuple[int, str]:
+def run_gate(build: Path, summary_file: Path, profile: str) -> tuple[int, str]:
     env = dict(os.environ, OCUDU_LIBE3_E2E_SUMMARY=str(summary_file))
     if summary_file.exists():
         summary_file.unlink()
-    completed = subprocess.run([sys.executable, str(GATE), "--build", str(build)], env=env, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True)
+    completed = subprocess.run([sys.executable, str(GATE), "--build", str(build), "--profile", profile], env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     return completed.returncode, completed.stdout
 
 
@@ -142,24 +148,35 @@ def load_summaries(summary_file: Path) -> list[dict]:
 
 def coverage(tests: list[dict], summaries: list[dict]) -> list[dict]:
     passed = {t["name"] for t in tests if t["status"] == "passed"}
-    vectors = {v["name"]: v for v in json.loads(PINNED.read_text())["vectors"]} if PINNED.exists() else {}
+    pinned = json.loads(PINNED.read_text()) if PINNED.exists() else {}
+    vectors = {v["name"]: v for v in pinned.get("vectors", [])}
+    protobuf_vectors = {v["name"]: v for v in pinned.get("protobuf_vectors", [])}
     codec_ok = "dapp_e3ap_libe3_codec.decodes_and_reproduces_vectors_from_the_upstream_libe3_encoder" in passed
-    e2e_ok = "dapp_e3ap_libe3.e2e" in passed
-    full = [s for s in summaries if s.get("test") == "test_full_session_over_one_sctp_association"]
-    on_wire: set[str] = set()
-    for s in full:
+    protobuf_ok = ("dapp_e3ap_protobuf_codec.decodes_and_reproduces_vectors_from_the_upstream_libe3_protobuf_encoder"
+                   in passed)
+    e2e_ok = bool({"dapp_e3ap_libe3.e2e_sctp", "dapp_e3ap_libe3.e2e_zmq"} & passed)
+    # Which link layers carried each procedure in a full session ("<transport>:test_full_session").
+    on_wire: dict[str, set[str]] = {}
+    for s in summaries:
+        if not str(s.get("test", "")).endswith(":test_full_session"):
+            continue
         for key, _, procs in SESSION_STEPS:
             value = s.get(key)
             if value and value != "negative":
-                on_wire.update(procs)
+                for proc in procs:
+                    on_wire.setdefault(proc, set()).add(f"{s.get('transport', '?')}/{s.get('encoding', 'asn1')}")
     rows = []
     for name in PROCEDURES:
         rows.append({
             "procedure": name,
             "vector": f"{len(vectors[name]['hex']) // 2} B" if name in vectors else "none",
             "codec": "yes" if codec_ok and name in vectors else "no",
-            "asn1tools": ("documented divergence" if name in UTF8_DIVERGENCE else "yes" if e2e_ok else "no"),
-            "session": "yes" if name in on_wire else ("codec and vectors only" if e2e_ok else "no"),
+            "protobuf": (f"yes ({len(protobuf_vectors[name]['hex']) // 2} B)" if protobuf_ok and name in protobuf_vectors
+                         else "no"),
+            # Python (ocudu_e3.libe3, asn1c-equivalent) reproduces libe3's vector and libe3 decodes Python's bytes.
+            "asn1tools": "yes" if e2e_ok and "dapp_e3ap_libe3.interop" in passed else "no",
+            "session": (", ".join(sorted(on_wire[name])) if name in on_wire
+                        else ("codec and vectors only" if e2e_ok else "no")),
         })
     return rows
 
@@ -196,13 +213,66 @@ def clip(output: str) -> str:
     return "\n".join(lines)
 
 
+def kernel_has_sctp() -> bool:
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP)
+    except OSError:
+        return False
+    probe.close()
+    return True
+
+
+def link_layers(tests: list[dict], summaries: list[dict], profile: str, kernel_sctp: bool) -> list[dict]:
+    """One row per libe3 link layer: what ran against the OCUDU agent, and if not, why."""
+    status = {t["name"]: t["status"] for t in tests}
+    sessions = {}
+    for s in summaries:
+        transport = s.get("transport")
+        if transport:
+            entry = sessions.setdefault((transport, s.get("encoding", "asn1")), [0, 0])
+            entry[0] += 1
+            entry[1] += 1 if s.get("ok") else 0
+
+    def row(name, libe3_side, agent_side, test, transport, encoding, label):
+        state = status.get(test)
+        if state is None:
+            reason = (("this runner's kernel has no SCTP (zmq gate profile)" if not kernel_sctp
+                       else "zmq gate profile selected") if profile == "zmq" and test.endswith("sctp") else "not run")
+            verdict = "SKIPPED" if profile == "zmq" and test.endswith("sctp") else "NOT RUN"
+        else:
+            verdict, reason = state.upper(), ""
+        done, ok = sessions.get((transport, encoding), [0, 0])
+        if verdict == "PASSED" and not done:
+            # The suite passed but this encoding never ran in it (libe3 built without Protobuf).
+            verdict, reason = "NOT RUN", f"no {label} session recorded"
+        return {"layer": name, "encoding": label, "libe3": libe3_side, "agent": agent_side, "verdict": verdict,
+                "sessions": f"{ok}/{done} sessions ok" if done else "-", "reason": reason}
+
+    layers = [
+        ("SCTP association", "E3LinkLayer::SCTP_ASSOCIATION (OCUDU patch 0001)", "SCTP carrier, port 36423",
+         "dapp_e3ap_libe3.e2e_sctp", "sctp"),
+        ("ZMQ over ipc://", "E3LinkLayer::ZMQ, stock connector", "libe3 ZMQ carrier (REP/PUB/SUB)",
+         "dapp_e3ap_libe3.e2e_zmq", "zmq-ipc"),
+        ("ZMQ over tcp://", "E3LinkLayer::ZMQ, stock connector", "libe3 ZMQ carrier (REP/PUB/SUB)",
+         "dapp_e3ap_libe3.e2e_zmq", "zmq-tcp"),
+    ]
+    return [row(name, libe3_side, agent_side, test, transport, encoding, label)
+            for name, libe3_side, agent_side, test, transport in layers for encoding, label in ENCODINGS]
+
+
 def render_markdown(ctx: dict) -> str:
     p, tests = ctx["provenance"], ctx["tests"]
     counts = {k: sum(t["status"] == k for t in tests) for k in ("passed", "failed", "skipped")}
     out = [f"# OCUDU <-> libe3 interoperability report", "",
            f"**Result: {ctx['verdict']}** ({counts['passed']} passed, {counts['failed']} failed, "
-           f"{counts['skipped']} skipped of {len(tests)} required host tests). Generated {p['generated']} on {p['host']}.",
-           "", "## Provenance", "",
+           f"{counts['skipped']} skipped of {len(tests)} required tests, gate profile `{ctx['profile']}`). "
+           f"Generated {p['generated']} on {p['host']} (kernel SCTP: {'yes' if ctx['kernel_sctp'] else 'no'}).",
+           "", "## Link layers", "",
+           "| link layer | encoding | libe3 side | OCUDU agent side | result | full sessions | note |",
+           "|---|---|---|---|---|---|---|"]
+    out += [f"| {r['layer']} | {r['encoding']} | {r['libe3']} | {r['agent']} | **{r['verdict']}** | {r['sessions']} "
+            f"| {r['reason']} |" for r in ctx["link_layers"]]
+    out += ["", "## Provenance", "",
            f"- ocudu `{p['ocudu_commit']}` ({p['ocudu_branch']}, uncommitted changes: {p['ocudu_dirty']})"]
     out += [f"- {k} `{v}`" for k, v in p["submodules"].items()]
     out += [f"- libe3 patches applied: {', '.join(p['patches']) or 'none'}",
@@ -210,9 +280,10 @@ def render_markdown(ctx: dict) -> str:
             "- Toolchain: " + ", ".join(f"{k} {v}" for k, v in p["toolchain"].items() if v),
             "- Binaries: " + ", ".join(f"{k} {v}" for k, v in p["binaries"].items()), "",
             "## libe3 E3AP 1.0.0 procedure coverage", "",
-            "| procedure | pinned libe3 vector | OCUDU codec decodes and reproduces | asn1tools <-> libe3 | on the wire in the E2E session |",
-            "|---|---|---|---|---|"]
-    out += [f"| {r['procedure']} | {r['vector']} | {r['codec']} | {r['asn1tools']} | {r['session']} |" for r in ctx["coverage"]]
+            "| procedure | pinned libe3 APER vector | OCUDU APER codec decodes and reproduces | OCUDU Protobuf codec reproduces libe3's Protobuf vector | Python (ocudu_e3.libe3) <-> libe3 | on the wire in the E2E session (link layer/encoding) |",
+            "|---|---|---|---|---|---|"]
+    out += [f"| {r['procedure']} | {r['vector']} | {r['codec']} | {r['protobuf']} | {r['asn1tools']} | {r['session']} |"
+            for r in ctx["coverage"]]
     out += ["", "## End-to-end sessions reported by the libe3 dApp", ""]
     for s in ctx["summaries"]:
         out.append(f"- `{s['test']}` args `{brief_args(s['args'])}`: " + ", ".join(
@@ -244,7 +315,20 @@ def render_latex(ctx: dict) -> str:
          r"\section*{Result: \textcolor{" + colour + "}{" + ctx["verdict"] + "}}",
          f"{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped of {len(tests)} required host "
          f"tests (the fail-closed gate \\texttt{{check\\_dapp\\_interop\\_gate.py}}: every required test must exist, run and "
-         f"not skip). Host {esc(p['host'])}.",
+         f"not skip; profile \\texttt{{{esc(ctx['profile'])}}}). Host {esc(p['host'])}, kernel SCTP: "
+         f"{'yes' if ctx['kernel_sctp'] else 'no'}.",
+         r"\Needspace*{10\baselineskip}\section*{Link layers}",
+         r"Each libe3 link layer exercised end to end between the real upstream libe3 dApp and the OCUDU E3 agent.",
+         r"\small\begin{longtable}{@{}>{\raggedright\arraybackslash}p{2.2cm}>{\raggedright\arraybackslash}p{1.4cm}"
+         r">{\raggedright\arraybackslash}p{3.6cm}>{\raggedright\arraybackslash}p{3.0cm}>{\raggedright\arraybackslash}p{1.6cm}"
+         r">{\raggedright\arraybackslash}p{1.7cm}>{\raggedright\arraybackslash}p{2.3cm}@{}}\toprule",
+         r"link layer & encoding & libe3 side & OCUDU agent side & result & full sessions & note\\\midrule\endhead"]
+    L += [" & ".join([esc(r["layer"]), esc(r["encoding"]), path(r["libe3"]), esc(r["agent"]),
+                      r"\textbf{\textcolor{" + ("green!50!black" if r["verdict"] == "PASSED" else
+                                                 "orange!80!black" if r["verdict"] == "SKIPPED" else "red!70!black")
+                      + "}{" + r["verdict"] + "}}", esc(r["sessions"]), esc(r["reason"])]) + r"\\"
+          for r in ctx["link_layers"]]
+    L += [r"\bottomrule\end{longtable}\normalsize",
          r"\Needspace*{8\baselineskip}\section*{Provenance}", r"\begin{itemize}\raggedright\setlength{\itemsep}{0pt}",
          r"\item ocudu \texttt{" + esc(p["ocudu_commit"]) + "} (" + esc(p["ocudu_branch"]) + ", uncommitted changes: "
          + p["ocudu_dirty"] + ")"]
@@ -256,13 +340,19 @@ def render_latex(ctx: dict) -> str:
           r"\end{itemize}",
           r"\Needspace*{12\baselineskip}\section*{libe3 E3AP 1.0.0 procedure coverage}",
           r"Every procedure of the upstream module: the pinned vector is what libe3's own encoder produced; the OCUDU "
-          r"libe3 codec must decode it and reproduce the bytes; asn1tools on the vendored grammar must cross to libe3 "
-          r"field for field (SetupRequest/SetupResponse carry constrained UTF8String, the documented asn1tools/asn1c "
-          r"divergence); the last column says whether the real libe3 dApp exchanged the procedure with the OCUDU agent "
-          r"in the end-to-end session.",
-          r"\small\begin{longtable}{@{}lllll@{}}\toprule",
-          r"procedure & pinned vector & codec decodes + reproduces & asn1tools $\leftrightarrow$ libe3 & on the wire (E2E)\\\midrule\endhead"]
-    L += [" & ".join(esc(r[k]) for k in ("procedure", "vector", "codec", "asn1tools", "session")) + r"\\" for r in ctx["coverage"]]
+          r"libe3 codec must decode it and reproduce the bytes; the Python codec (ocudu\_e3.libe3, the vendored grammar "
+          r"compiled the way asn1c encodes constrained UTF8String) must reproduce it and libe3 must decode what Python "
+          r"emits, field for field; the Protobuf column says the hand-written OCUDU Protobuf codec decodes libe3's own "
+          r"ProtobufE3Encoder output and reproduces it byte for byte (that codec is further checked against libprotobuf "
+          r"on random PDUs of both the libe3 schema and the OCUDU superset schema); the last column says over which link "
+          r"layer and encoding the real libe3 dApp exchanged the procedure with the OCUDU agent in the end-to-end session.",
+          r"\small\begin{longtable}{@{}>{\raggedright\arraybackslash}p{2.9cm}>{\raggedright\arraybackslash}p{1.3cm}"
+          r">{\raggedright\arraybackslash}p{1.6cm}>{\raggedright\arraybackslash}p{1.8cm}>{\raggedright\arraybackslash}p{1.6cm}"
+          r">{\raggedright\arraybackslash}p{6.4cm}@{}}\toprule",
+          r"procedure & APER vector & APER codec reproduces & Protobuf codec reproduces & Python $\leftrightarrow$ libe3 & "
+          r"on the wire (E2E, link layer/encoding)\\\midrule\endhead"]
+    L += [" & ".join(esc(r[k]) for k in ("procedure", "vector", "codec", "protobuf", "asn1tools", "session")) + r"\\"
+          for r in ctx["coverage"]]
     L += [r"\bottomrule\end{longtable}\normalsize", r"\Needspace*{8\baselineskip}\section*{End-to-end sessions reported by the libe3 dApp}"]
     if ctx["summaries"]:
         L += [r"\small\begin{longtable}{@{}>{\raggedright\arraybackslash}p{4.4cm}>{\raggedright\arraybackslash}p{11.6cm}@{}}\toprule session & what the libe3 dApp reported\\\midrule\endhead"]
@@ -298,6 +388,8 @@ def main() -> int:
     parser.add_argument("--build", type=Path, required=True, help="build tree configured with OCUDU_DAPP_LIBE3_INTEROP=ON")
     parser.add_argument("--out", type=Path, help="output directory (default <build>/dapp-interop-report)")
     parser.add_argument("--no-run", action="store_true", help="render from the last gate run instead of running it")
+    parser.add_argument("--profile", choices=("host", "zmq"), default="host",
+                        help="gate profile: host (SCTP runner: SCTP and ZMQ legs) or zmq (any runner: ZMQ leg only)")
     args = parser.parse_args()
     build = args.build.resolve()
     out = (args.out or build / "dapp-interop-report").resolve()
@@ -306,11 +398,14 @@ def main() -> int:
     if args.no_run:
         rc, log = 0, (build / "dapp-interop.log").read_text() if (build / "dapp-interop.log").exists() else ""
     else:
-        rc, log = run_gate(build, summary_file)
+        rc, log = run_gate(build, summary_file, args.profile)
     tests = load_tests(build)
     ctx = {"provenance": provenance(build), "tests": tests, "summaries": load_summaries(summary_file),
            "gate_log": plain(log), "verdict": "PASSED" if rc == 0 and tests and all(t["status"] == "passed" for t in tests) else "FAILED"}
     ctx["coverage"] = coverage(tests, ctx["summaries"])
+    ctx["profile"] = args.profile
+    ctx["kernel_sctp"] = kernel_has_sctp()
+    ctx["link_layers"] = link_layers(tests, ctx["summaries"], args.profile, ctx["kernel_sctp"])
     (out / "libe3_interop_report.md").write_text(render_markdown(ctx))
     (out / "libe3_interop_report.tex").write_text(render_latex(ctx))
     for name in ("dapp-interop.xml", "dapp-interop.log"):

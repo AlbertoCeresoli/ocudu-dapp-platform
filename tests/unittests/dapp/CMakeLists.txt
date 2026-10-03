@@ -86,6 +86,8 @@ if (ENABLE_E3)
       local_connector_test.cpp
       e3ap_codec_test.cpp
       e3ap_libe3_codec_test.cpp
+      e3ap_protobuf_codec_test.cpp
+      e3ap_v2_codec_test.cpp
       telemetry_publisher_test.cpp
       e3ap_sctp_server_test.cpp)
     target_link_libraries(dapp_runtime_test
@@ -136,6 +138,39 @@ if (ENABLE_E3)
           LABELS "dapp;e3;python;interop")
       endif ()
     endif ()
+    # The hand-written E3AP Protobuf codec against libprotobuf built from the vendored libe3 schema
+    # and the OCUDU superset schema (needs libprotobuf-dev and protobuf-compiler; the gNB itself
+    # never links libprotobuf).
+    find_package(Protobuf QUIET)
+    if (Protobuf_FOUND AND Protobuf_PROTOC_EXECUTABLE)
+      set(DAPP_E3AP_PROTO_OUT ${CMAKE_CURRENT_BINARY_DIR}/e3ap_proto)
+      set(DAPP_E3AP_LIBE3_PROTO ${PROJECT_SOURCE_DIR}/schemas/e3/interop/libe3/e3ap-1.0.0.proto)
+      set(DAPP_E3AP_OCUDU_PROTO ${PROJECT_SOURCE_DIR}/schemas/e3/protobuf/e3ap-ocudu-v2.proto)
+      file(MAKE_DIRECTORY ${DAPP_E3AP_PROTO_OUT})
+      add_custom_command(
+        OUTPUT ${DAPP_E3AP_PROTO_OUT}/e3ap-1.0.0.pb.cc ${DAPP_E3AP_PROTO_OUT}/e3ap-1.0.0.pb.h
+               ${DAPP_E3AP_PROTO_OUT}/e3ap-ocudu-v2.pb.cc ${DAPP_E3AP_PROTO_OUT}/e3ap-ocudu-v2.pb.h
+        COMMAND ${Protobuf_PROTOC_EXECUTABLE} --cpp_out=${DAPP_E3AP_PROTO_OUT}
+                -I ${PROJECT_SOURCE_DIR}/schemas/e3/interop/libe3 ${DAPP_E3AP_LIBE3_PROTO}
+        COMMAND ${Protobuf_PROTOC_EXECUTABLE} --cpp_out=${DAPP_E3AP_PROTO_OUT}
+                -I ${PROJECT_SOURCE_DIR}/schemas/e3/protobuf ${DAPP_E3AP_OCUDU_PROTO}
+        DEPENDS ${DAPP_E3AP_LIBE3_PROTO} ${DAPP_E3AP_OCUDU_PROTO}
+        COMMENT "protoc: E3AP libe3 and OCUDU schemas")
+      add_library(dapp_e3ap_proto_messages STATIC
+        ${DAPP_E3AP_PROTO_OUT}/e3ap-1.0.0.pb.cc ${DAPP_E3AP_PROTO_OUT}/e3ap-ocudu-v2.pb.cc)
+      target_include_directories(dapp_e3ap_proto_messages SYSTEM PUBLIC ${DAPP_E3AP_PROTO_OUT})
+      target_link_libraries(dapp_e3ap_proto_messages PUBLIC protobuf::libprotobuf)
+      # Generated code: libprotobuf wants RTTI and is not held to the project's warning set.
+      target_compile_options(dapp_e3ap_proto_messages PRIVATE -w -frtti)
+      add_executable(dapp_e3ap_protobuf_conformance_test e3ap_protobuf_conformance_test.cpp)
+      target_compile_options(dapp_e3ap_protobuf_conformance_test PRIVATE -frtti)
+      target_link_libraries(dapp_e3ap_protobuf_conformance_test
+        dapp_e3ap_proto_messages ocudu_dapp_e3ap_codec GTest::gtest ocudu_gtest_main)
+      gtest_discover_tests(dapp_e3ap_protobuf_conformance_test PROPERTIES LABELS "dapp;e3;interop;protobuf")
+    else ()
+      message(WARNING "E3AP Protobuf conformance test not built: install libprotobuf-dev and protobuf-compiler")
+    endif ()
+
     # End-to-end tests against the real upstream libe3 (opt-in, see the README there).
     add_subdirectory(${PROJECT_SOURCE_DIR}/tests/interop/libe3 ${CMAKE_CURRENT_BINARY_DIR}/interop/libe3)
   endif ()

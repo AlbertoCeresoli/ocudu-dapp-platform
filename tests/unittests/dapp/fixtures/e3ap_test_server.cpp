@@ -44,6 +44,12 @@ struct options {
   uint16_t    e3dp_port{0};
   unsigned    period_ms{10};
   bool        e3dp{true};
+  /// libe3 ZMQ link layer instead of SCTP: an ipc directory (setup/e3_socket/dapp_socket inside it) or
+  /// a TCP base port (setup = base, publisher = base + 1, subscriber = base + 9, as libe3's 9990/9991/9999).
+  std::string zmq_ipc_dir;
+  uint16_t    zmq_tcp_port{0};
+  /// ZMQ link encoding: "asn1" (APER, default) or "protobuf". SCTP detects it per association.
+  std::string zmq_encoding{"asn1"};
 };
 
 options parse(int argc, char** argv)
@@ -62,6 +68,16 @@ options parse(int argc, char** argv)
       result.e3dp_port = static_cast<uint16_t>(std::stoul(value));
     } else if (option == "--period-ms") {
       result.period_ms = static_cast<unsigned>(std::stoul(value));
+    } else if (option == "--zmq-ipc-dir") {
+      result.zmq_ipc_dir = value;
+    } else if (option == "--zmq-tcp-port") {
+      result.zmq_tcp_port = static_cast<uint16_t>(std::stoul(value));
+    } else if (option == "--zmq-encoding") {
+      if (value != "asn1" && value != "protobuf") {
+        std::fprintf(stderr, "--zmq-encoding must be asn1 or protobuf\n");
+        std::exit(2);
+      }
+      result.zmq_encoding = value;
     } else if (option == "--e3dp") {
       result.e3dp = value != "0" && value != "off";
     } else {
@@ -122,15 +138,44 @@ int main(int argc, char** argv)
   e3ap_config.transport.timer_period = std::chrono::milliseconds(2);
   e3ap_config.ran_identifier         = "ocudu-e3-test-agent";
   e3ap_config.cell_ids               = {0};
+  const bool zmq                     = !opts.zmq_ipc_dir.empty() || opts.zmq_tcp_port != 0;
+  if (!opts.zmq_ipc_dir.empty()) {
+    zmq_carrier_config zmq_config;
+    zmq_config.setup_endpoint      = "ipc://" + opts.zmq_ipc_dir + "/setup";
+    zmq_config.publisher_endpoint  = "ipc://" + opts.zmq_ipc_dir + "/e3_socket";
+    zmq_config.subscriber_endpoint = "ipc://" + opts.zmq_ipc_dir + "/dapp_socket";
+    zmq_config.timer_period        = std::chrono::milliseconds(2);
+    zmq_config.encoding = opts.zmq_encoding == "protobuf" ? e3ap_encoding::protobuf : e3ap_encoding::aper;
+    e3ap_config.zmq                = zmq_config;
+  } else if (opts.zmq_tcp_port != 0) {
+    const std::string  bind = "tcp://" + opts.bind_address + ":";
+    zmq_carrier_config zmq_config;
+    zmq_config.setup_endpoint      = bind + std::to_string(opts.zmq_tcp_port);
+    zmq_config.publisher_endpoint  = bind + std::to_string(opts.zmq_tcp_port + 1);
+    zmq_config.subscriber_endpoint = bind + std::to_string(opts.zmq_tcp_port + 9);
+    zmq_config.timer_period        = std::chrono::milliseconds(2);
+    zmq_config.encoding = opts.zmq_encoding == "protobuf" ? e3ap_encoding::protobuf : e3ap_encoding::aper;
+    e3ap_config.zmq                = zmq_config;
+  }
   auto e3ap                          = e3ap_sctp_server::create(&service, store.first, e3ap_config, connections);
   if (!e3ap) {
     std::fprintf(stderr, "e3ap: %s\n", e3ap.detail.c_str());
     return 1;
   }
+  std::printf("e3ap_transport %s\n", zmq ? "zmq" : "sctp");
   std::printf("e3ap_port %u\n", e3ap.server->port());
+  // Reports surface on stdout so interop tests can check what the RAN decoded (e.g. the libe3 sequenceId).
+  e3ap.server->set_dapp_report_handler([](const e3ap_dapp_report_event& event) {
+    std::printf("report %u %u %u %zu\n",
+                static_cast<unsigned>(event.dapp_identifier),
+                static_cast<unsigned>(event.ran_function_identifier),
+                static_cast<unsigned>(event.sequence_identifier.value_or(0)),
+                event.report_data.size());
+    std::fflush(stdout);
+  });
 #ifdef OCUDU_DAPP_E3DP_CARRIER
   std::unique_ptr<e3dp_sctp_server> e3dp;
-  if (opts.e3dp) {
+  if (opts.e3dp && !zmq) {
     e3dp_sctp_server_config e3dp_config;
     e3dp_config.transport.bind_address = opts.bind_address;
     e3dp_config.transport.port         = opts.e3dp_port;
@@ -216,15 +261,19 @@ int main(int argc, char** argv)
       break;
     }
     if (line.rfind("xapp ", 0) == 0) {
-      unsigned    dapp_id = 0, ran_function = 0;
+      unsigned    dapp_id = 0, ran_function = 0, sequence = 0;
       std::string hex;
-      std::istringstream(line.substr(5)) >> dapp_id >> ran_function >> hex;
+      std::istringstream(line.substr(5)) >> dapp_id >> ran_function >> hex >> sequence;
       std::vector<uint8_t> data;
       for (std::size_t index = 0; index + 1 < hex.size(); index += 2) {
         data.push_back(static_cast<uint8_t>(std::stoul(hex.substr(index, 2), nullptr, 16)));
       }
-      const bool sent = e3ap.server->send_xapp_control_action(static_cast<uint16_t>(dapp_id),
-                                                              static_cast<uint16_t>(ran_function), std::move(data));
+      const bool sent =
+          e3ap.server->send_xapp_control_action(static_cast<uint16_t>(dapp_id),
+                                                static_cast<uint16_t>(ran_function),
+                                                std::move(data),
+                                                0,
+                                                sequence != 0 ? std::optional<uint32_t>(sequence) : std::nullopt);
       std::cout << (sent ? "xapp sent" : "xapp refused") << std::endl;
     }
   }

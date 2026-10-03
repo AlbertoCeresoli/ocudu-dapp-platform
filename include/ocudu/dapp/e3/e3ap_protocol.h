@@ -14,14 +14,15 @@
 
 namespace ocudu::dapp::e3 {
 
-/// Transport-neutral C++ representation of E3AP-OCUDU-V1 and the two
+/// Transport-neutral C++ representation of E3AP (E3AP-OCUDU-V2: libe3 E3AP 1.0.0 with OCUDU
+/// extension additions, in APER or Protobuf) and the two
 /// service models it carries. Service-model bodies stay opaque at the E3AP
 /// layer: control payloads are APER E3SM-OCUDU-DAPP-MGMT-V1 messages and
 /// indication payloads are APER OCUDU-TELEMETRY-SM messages, each possibly
 /// split into fragments.
 constexpr const char* e3ap_version_string         = "1.0.0";
 constexpr uint32_t    e3ap_maximum_payload_bytes  = 16U * 1024U * 1024U;
-constexpr uint32_t    e3ap_maximum_fragment_bytes = 64U * 1024U;
+constexpr uint32_t    e3ap_maximum_fragment_bytes = 32U * 1024U;
 constexpr uint32_t    e3ap_maximum_function_data  = 256U * 1024U;
 constexpr uint32_t    e3ap_payload_protocol_id    = 0x00E3A001U;
 constexpr uint16_t    e3ap_procedure_stream       = 0;
@@ -35,6 +36,19 @@ constexpr uint16_t e3ap_ran_function_management = 11;
 constexpr uint16_t e3ap_management_control_request = 1;
 
 enum class e3ap_response_code : uint8_t { positive, negative };
+
+/// Which procedures and fields a peer of the libe3-rooted wire (E3AP-OCUDU-V2 APER, or Protobuf) uses.
+/// The two encodings carry the same messages and the same profiles.
+enum class e3ap_profile : uint8_t {
+  /// libe3 E3AP 1.0.0 exactly: OCUDU additions are neither sent nor read.
+  libe3,
+  /// libe3's messages plus the OCUDU additions (fragmentation, by-reference delivery, causes,
+  /// E3-ControlResponse). Selected by a setup request carrying \c ocudu_profile.
+  ocudu
+};
+
+/// Value of \c ocudu_profile this implementation speaks.
+constexpr uint8_t e3ap_ocudu_profile_version = 1;
 
 enum class e3ap_cause : uint8_t {
   unspecified,
@@ -155,6 +169,8 @@ struct e3ap_setup_request {
   std::string vendor;
   /// Optional stable identity a reconnecting dApp presents.
   std::optional<management::identifier> dapp_instance;
+  /// OCUDU profile requested (\ref e3ap_ocudu_profile_version); absent: the libe3 procedures.
+  std::optional<uint8_t> ocudu_profile;
 };
 
 /// Positive responses assign the dApp identifier the client must echo on
@@ -177,8 +193,10 @@ struct e3ap_setup_response {
   /// (4 MiB by default, bounded by the portable store's maximum object size;
   /// the protocol ceiling is \ref e3ap_maximum_payload_bytes).
   std::optional<uint32_t> maximum_payload_bytes;
-  /// Fragmentation threshold (64 KiB); larger payloads arrive in fragments.
+  /// Fragmentation threshold (32 KiB); larger payloads arrive in fragments.
   std::optional<uint32_t> maximum_fragment_bytes;
+  /// Echo of the request's OCUDU profile when the association runs the OCUDU procedures.
+  std::optional<uint8_t> ocudu_profile;
 };
 
 /// Subscribes to telemetry streams of one RAN function. Only RAN function 10
@@ -240,9 +258,12 @@ struct e3ap_indication_message {
 };
 
 struct e3ap_dapp_control_action {
-  uint16_t                dapp_identifier{};
-  uint16_t                ran_function_identifier{};
-  uint16_t                control_identifier{};
+  uint16_t dapp_identifier{};
+  uint16_t ran_function_identifier{};
+  uint16_t control_identifier{};
+  /// libe3 E3-SequenceID: present when the dApp re-issues a control it received as an
+  /// E3-XAppControlAction.
+  std::optional<uint32_t> sequence_identifier;
   std::vector<uint8_t>    action_data;
   uint16_t                fragment_index{};
   uint32_t                fragment_count{1};
@@ -267,12 +288,17 @@ struct e3ap_dapp_report {
   uint16_t             dapp_identifier{};
   uint16_t             ran_function_identifier{};
   std::vector<uint8_t> report_data;
+  /// E3-SequenceID: assigned by the dApp per detection and
+  /// carried by every later message of the E2-E3 procedure. Mandatory on the E3AP-OCUDU-V2 wire.
+  std::optional<uint32_t> sequence_identifier;
 };
 
 struct e3ap_xapp_control_action {
   uint16_t             dapp_identifier{};
   uint16_t             ran_function_identifier{};
   std::vector<uint8_t> xapp_control_data;
+  /// libe3 E3-SequenceID (mandatory on the libe3 wire): copied from the E2SM-DAPP control header.
+  std::optional<uint32_t> sequence_identifier;
 };
 
 struct e3ap_release_message {

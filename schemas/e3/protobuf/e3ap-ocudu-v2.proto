@@ -1,0 +1,301 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+//
+// E3AP-OCUDU-V2 in Protobuf: libe3's messages/proto/V1/e3ap-1.0.0.proto
+// (package libe3.e3ap.v1, libe3 0.2.1) plus the OCUDU additions, the same
+// message set as schemas/e3/e3ap-ocudu-v2.asn1 in APER (the agent's APER and
+// Protobuf codecs are checked to translate into each other byte for byte).
+//
+// Compatibility rules, checked in CI (tests/unittests/dapp/
+// e3ap_protobuf_conformance_test.cpp):
+//  * Every libe3 message, field number, field type, label and enum value
+//    appears here unchanged. Field numbers 1..99 belong to libe3.
+//  * OCUDU additions use field numbers >= 100 (and E3Pdu.msg alternatives
+//    >= 100). libe3 peers skip them as unknown fields, so an OCUDU-profile
+//    PDU of a libe3 message type still decodes in libe3.
+//  * A PDU whose E3Pdu.msg is an OCUDU-only alternative (ControlResponse) is
+//    never sent to a libe3 peer: libe3 would see an empty oneof.
+//  * A dApp selects the OCUDU profile by setting SetupRequest.ocudu_profile;
+//    the RAN echoes it in SetupResponse. Without it the association runs the
+//    libe3 procedures and the RAN sends no field >= 100.
+//  * Bounds are E3AP-OCUDU-V2's: libe3's root bounds (versions 11 bytes,
+//    names 64, payload fragments and RAN function data 32 KiB, identifiers
+//    1..65535, message and sequence ids 1..2^32-1, report and xApp control
+//    sequence ids mandatory) for every profile.
+//
+// OCUDU ships no generated code for this file: the agent's codec is
+// hand-written (lib/dapp/e3/e3ap_protobuf_codec.cpp) and is checked
+// byte-for-byte against libprotobuf built from this schema.
+
+syntax = "proto3";
+
+package ocudu.e3ap.v2;
+
+// ---------------------------------------------------------------------------
+// libe3 1.0.0 (field numbers 1..99, unchanged)
+// ---------------------------------------------------------------------------
+
+enum ResponseCode {
+  RESPONSE_CODE_POSITIVE = 0;
+  RESPONSE_CODE_NEGATIVE = 1;
+}
+
+message SetupRequest {
+  string e3ap_protocol_version = 1;
+  string dapp_name = 2;
+  string dapp_version = 3;
+  string vendor = 4;
+
+  // OCUDU: profile version (1); its presence selects the OCUDU profile.
+  optional uint32 ocudu_profile = 100;
+  // OCUDU: stable 16-byte identity a reconnecting dApp presents.
+  bytes dapp_instance = 101;
+}
+
+message RanFunctionDef {
+  uint32 ran_function_identifier = 1;
+  repeated uint32 telemetry_identifier_list = 2;
+  repeated uint32 control_identifier_list = 3;
+  bytes ran_function_data = 4;
+
+  string ran_function_name = 100;
+  string ran_function_version = 101;
+}
+
+message SetupResponse {
+  uint32 request_id = 1;
+  ResponseCode response_code = 2;
+  optional string e3ap_protocol_version = 3;
+  optional uint32 dapp_identifier = 4;
+  string ran_identifier = 5;
+  repeated RanFunctionDef ran_function_list = 6;
+
+  optional uint32 ocudu_profile = 100;
+  optional Cause cause = 101;
+  string detail = 102;
+  // 16-byte RAN instance identity.
+  bytes ran_instance = 103;
+  optional uint32 maximum_payload_bytes = 104;
+  optional uint32 maximum_fragment_bytes = 105;
+  // Distinguishes an empty RAN function list from an absent one.
+  bool ran_function_list_present = 106;
+}
+
+message SubscriptionRequest {
+  uint32 dapp_identifier = 1;
+  uint32 ran_function_identifier = 2;
+  repeated uint32 telemetry_identifier_list = 3;
+  repeated uint32 control_identifier_list = 4;
+  optional uint32 subscription_time = 5;
+  optional uint32 periodicity = 6;
+
+  // Opaque APER Telemetry-SubscriptionData.
+  bytes subscription_data = 100;
+  optional DeliveryMode delivery_mode = 101;
+  optional uint32 minimum_by_reference_bytes = 102;
+}
+
+message SubscriptionDelete {
+  uint32 dapp_identifier = 1;
+  uint32 subscription_id = 2;
+}
+
+message SubscriptionResponse {
+  uint32 request_id = 1;
+  uint32 dapp_identifier = 2;
+  ResponseCode response_code = 3;
+  optional uint32 subscription_id = 4;
+
+  // Granted identifier lists (absent = not reported).
+  IdentifierList telemetry_identifier_list = 100;
+  IdentifierList control_identifier_list = 101;
+  optional Cause cause = 102;
+  string detail = 103;
+  SharedRegion shared_region = 104;
+}
+
+message IndicationMessage {
+  uint32 dapp_identifier = 1;
+  uint32 ran_function_identifier = 2;
+  bytes protocol_data = 3;
+
+  optional uint32 subscription_id = 100;
+  optional uint32 telemetry_identifier = 101;
+  optional uint64 sequence = 102;
+  uint32 fragment_index = 103;
+  // Absent = 1 (whole payload).
+  optional uint32 fragment_count = 104;
+  optional uint32 payload_bytes = 105;
+  TensorDescriptor by_reference = 106;
+}
+
+message DAppControlAction {
+  uint32 dapp_identifier = 1;
+  uint32 ran_function_identifier = 2;
+  uint32 control_identifier = 3;
+  bytes action_data = 4;
+  uint32 sequence_id = 5;
+
+  uint32 fragment_index = 100;
+  optional uint32 fragment_count = 101;
+  optional uint32 payload_bytes = 102;
+}
+
+message DAppReport {
+  uint32 dapp_identifier = 1;
+  uint32 ran_function_identifier = 2;
+  bytes report_data = 3;
+  uint32 sequence_id = 4;
+}
+
+message XAppControlAction {
+  uint32 dapp_identifier = 1;
+  uint32 ran_function_identifier = 2;
+  bytes xapp_control_data = 3;
+  uint32 sequence_id = 4;
+}
+
+message ReleaseMessage {
+  uint32 dapp_identifier = 1;
+}
+
+message MessageAck {
+  uint32 request_id = 1;
+  ResponseCode response_code = 2;
+
+  optional Cause cause = 100;
+  string detail = 101;
+}
+
+message E3Pdu {
+  uint32 id = 1;
+  uint64 timestamp = 2;
+  oneof msg {
+    SetupRequest setup_request = 3;
+    SetupResponse setup_response = 4;
+    SubscriptionRequest subscription_request = 5;
+    SubscriptionDelete subscription_delete = 6;
+    SubscriptionResponse subscription_response = 7;
+    IndicationMessage indication_message = 8;
+    DAppControlAction dapp_control_action = 9;
+    DAppReport dapp_report = 10;
+    XAppControlAction xapp_control_action = 11;
+    ReleaseMessage release_message = 12;
+    MessageAck message_ack = 13;
+
+    // OCUDU profile only.
+    ControlResponse control_response = 100;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// OCUDU additions
+// ---------------------------------------------------------------------------
+
+enum Cause {
+  CAUSE_UNSPECIFIED = 0;
+  CAUSE_PROTOCOL_ERROR = 1;
+  CAUSE_SETUP_REQUIRED = 2;
+  CAUSE_SETUP_ALREADY_COMPLETE = 3;
+  CAUSE_UNSUPPORTED_PROTOCOL_VERSION = 4;
+  CAUSE_UNSUPPORTED_RAN_FUNCTION = 5;
+  CAUSE_UNSUPPORTED_IDENTIFIER = 6;
+  CAUSE_INVALID_REQUEST = 7;
+  CAUSE_NOT_FOUND = 8;
+  CAUSE_DUPLICATE = 9;
+  CAUSE_RESOURCE_EXHAUSTED = 10;
+  CAUSE_AUTHORIZATION_REJECTED = 11;
+  CAUSE_PAYLOAD_TOO_LARGE = 12;
+  CAUSE_TRANSPORT_OVERRUN = 13;
+  CAUSE_SHUTTING_DOWN = 14;
+}
+
+enum DeliveryMode {
+  DELIVERY_MODE_IN_BAND = 0;
+  DELIVERY_MODE_BY_REFERENCE = 1;
+}
+
+enum MemoryDomain {
+  MEMORY_DOMAIN_HOST = 0;
+  MEMORY_DOMAIN_HOST_PINNED = 1;
+  MEMORY_DOMAIN_ACCELERATOR_DEVICE = 2;
+  MEMORY_DOMAIN_MANAGED_COHERENT = 3;
+  MEMORY_DOMAIN_POSIX_SHARED = 4;
+  MEMORY_DOMAIN_ACCELERATOR_IPC_EXPORT = 5;
+}
+
+enum ElementType {
+  ELEMENT_TYPE_INT8 = 0;
+  ELEMENT_TYPE_UINT8 = 1;
+  ELEMENT_TYPE_INT16 = 2;
+  ELEMENT_TYPE_UINT16 = 3;
+  ELEMENT_TYPE_INT32 = 4;
+  ELEMENT_TYPE_FP16 = 5;
+  ELEMENT_TYPE_BF16 = 6;
+  ELEMENT_TYPE_FP32 = 7;
+  ELEMENT_TYPE_COMPLEX_INT16 = 8;
+  ELEMENT_TYPE_COMPLEX_BF16 = 9;
+  ELEMENT_TYPE_COMPLEX_FP16 = 10;
+  ELEMENT_TYPE_COMPLEX_FP32 = 11;
+}
+
+message IdentifierList {
+  repeated uint32 identifiers = 1;
+}
+
+// One POSIX shared-memory region mapped for a by-reference subscription.
+message SharedRegion {
+  MemoryDomain memory_domain = 1;
+  string region_name = 2;
+  uint64 region_bytes = 3;
+  uint32 header_bytes = 4;
+  uint64 row_bytes = 5;
+  uint32 nof_rows = 6;
+  uint32 layout_version = 7;
+}
+
+message PosixSharedLocation {
+  string region_name = 1;
+  uint32 row_index = 2;
+  uint64 byte_offset = 3;
+}
+
+// Class-C CUDA export slot: opaque 64-byte handles.
+message AcceleratorIpcLocation {
+  uint32 device_ordinal = 1;
+  uint64 allocation_id = 2;
+  bytes memory_handle = 3;
+  optional bytes ready_event_handle = 4;
+  uint64 byte_offset = 5;
+}
+
+message TensorDescriptor {
+  MemoryDomain memory_domain = 1;
+  oneof location {
+    PosixSharedLocation posix_shared = 2;
+    AcceleratorIpcLocation accelerator_ipc = 3;
+  }
+  uint64 byte_length = 4;
+  uint64 generation = 5;
+  optional ElementType element_type = 6;
+  repeated uint32 dimensions = 7;
+  repeated uint64 byte_strides = 8;
+  optional uint32 layout_id = 9;
+  optional uint64 lease_expiry_ns = 10;
+}
+
+// Outcome of a dApp control action carrying a service-model response body
+// (libe3 peers get E3-MessageAck only).
+message ControlResponse {
+  uint32 request_id = 1;
+  uint32 dapp_identifier = 2;
+  uint32 ran_function_identifier = 3;
+  uint32 control_identifier = 4;
+  ResponseCode response_code = 5;
+  optional Cause cause = 6;
+  string detail = 7;
+  bytes control_outcome = 8;
+  uint32 fragment_index = 9;
+  optional uint32 fragment_count = 10;
+  uint32 payload_bytes = 11;
+}

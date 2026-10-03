@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 MANAGEMENT_SCHEMA = "e3sm-ocudu-dapp-mgmt-v1.asn1"
-E3AP_SCHEMA = "e3ap-ocudu-v1.asn1"
+# E3AP-OCUDU-V2: libe3's E3AP 1.0.0 module with OCUDU extension additions (one protocol with libe3).
+E3AP_SCHEMA = "e3ap-ocudu-v2.asn1"
 TELEMETRY_SCHEMA = "e3sm-ocudu-telemetry-v1.asn1"
 MANAGEMENT_CARRIER_SCHEMA = "e3sm-ocudu-dapp-mgmt-carrier-v1.asn1"
 ALL_SCHEMAS = (E3AP_SCHEMA, TELEMETRY_SCHEMA, MANAGEMENT_CARRIER_SCHEMA, MANAGEMENT_SCHEMA)
@@ -44,7 +45,10 @@ STORE_INTERFACES = {
 }
 
 E3AP_DEFAULT_PORT = 36423
-E3AP_MAX_FRAGMENT_BYTES = 65536
+# libe3's 32 KiB payload bound: larger service-model payloads travel in fragments.
+E3AP_MAX_FRAGMENT_BYTES = 32768
+# E3-SetupRequest.ocuduProfile this client asks for (the OCUDU procedures).
+E3AP_OCUDU_PROFILE = 1
 E3AP_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 
 
@@ -95,7 +99,13 @@ class E3Codec:
         except ImportError as error:  # pragma: no cover - environment dependent
             raise RuntimeError("the OCUDU E3 client requires the asn1tools package") from error
         self.paths = [Path(path) for path in paths]
-        self._codec = asn1tools.compile_files([str(path) for path in self.paths], "per")
+        # E3AP-OCUDU-V2 keeps libe3's SIZE-constrained UTF8String fields, which asn1c (the agent and
+        # libe3) encodes with a PER-visible length; compile them the same way (see ocudu_e3.libe3).
+        # Text fields therefore cross this API as UTF-8 bytes, as they always have.
+        from .libe3 import asn1c_equivalent_grammar
+
+        texts = [asn1c_equivalent_grammar(path.read_text()) for path in self.paths]
+        self._codec = asn1tools.compile_string("\n".join(texts), "per")
 
     def encode(self, type_name: str, value) -> bytes:
         return self._codec.encode(type_name, value)

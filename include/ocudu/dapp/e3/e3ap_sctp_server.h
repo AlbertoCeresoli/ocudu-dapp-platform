@@ -6,9 +6,11 @@
 #include "ocudu/dapp/e3/e3ap_protocol.h"
 #include "ocudu/dapp/e3/portable_data_store.h"
 #include "ocudu/dapp/e3/sctp_association_server.h"
+#include "ocudu/dapp/e3/zmq_association_server.h"
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <sys/types.h>
 #include <vector>
@@ -53,15 +55,24 @@ struct e3ap_sctp_server_config {
   uint64_t maximum_shared_region_bytes{128ULL * 1024 * 1024};
   /// Objects smaller than this stay in band unless the subscriber asks otherwise.
   uint32_t default_minimum_by_reference_bytes{e3ap_maximum_fragment_bytes};
-  /// Accept peers that speak the upstream libe3 E3AP 1.0.0 module on the same
-  /// port. The dialect is fixed per association by its setup request: a PDU
-  /// that decodes under E3AP-OCUDU-V1 selects the native module, one that
-  /// decodes only under the libe3 module selects libe3. libe3 peers get dApp
-  /// identifiers 1..100, message identifiers 1..1000, whole (unfragmented)
-  /// payloads of at most 32 KiB, and E3-MessageAck in place of
-  /// E3-ControlResponse; indications that do not fit are counted in
-  /// \c libe3_indications_dropped.
+  /// Wire: E3AP-OCUDU-V2 (schemas/e3/e3ap-ocudu-v2.asn1) is libe3's E3AP 1.0.0 module with OCUDU
+  /// extension additions, in APER or in Protobuf (schemas/e3/protobuf), so libe3 peers and OCUDU
+  /// peers speak the same protocol. The encoding is detected per association from its setup
+  /// request; the profile comes from the request's ocuduProfile: present selects the OCUDU
+  /// procedures (fragmentation, by-reference delivery, E3-ControlResponse, causes), absent the libe3
+  /// procedures: dApp identifiers 1..100 (any 1..65535 is valid on the wire), whole payloads of at
+  /// most 32 KiB, E3-MessageAck in place of E3-ControlResponse; indications that do not fit are
+  /// counted in \c libe3_indications_dropped.
+  ///
+  /// Accept libe3-profile peers (setup requests without ocuduProfile).
   bool libe3_profile{true};
+  /// Accept Protobuf-encoded peers on the same port (libe3 built with LIBE3_ENABLE_PROTOBUF, and
+  /// OCUDU Protobuf peers).
+  bool protobuf_profile{true};
+  /// When set, serve libe3 peers over libe3's own ZMQ link layer instead of SCTP
+  /// (\ref transport is then unused). The libe3 module is spoken there in
+  /// \c zmq->encoding (Protobuf peers may also select the OCUDU profile).
+  std::optional<zmq_carrier_config> zmq;
 };
 
 /// Default store queue depth per telemetry stream; large-object streams use the
@@ -89,6 +100,8 @@ struct e3ap_sctp_server_metrics {
   uint64_t libe3_setups_completed{};
   /// Indications to libe3 peers dropped because the libe3 module cannot carry them.
   uint64_t libe3_indications_dropped{};
+  /// Associations that completed setup in Protobuf (either profile).
+  uint64_t protobuf_setups_completed{};
 };
 
 /// One E3-DAppReport received from a dApp, handed to the report handler on the
@@ -99,7 +112,10 @@ struct e3ap_dapp_report_event {
   uint16_t               ran_function_identifier{};
   std::vector<uint8_t>   report_data;
   std::optional<int64_t> timestamp_ns;
-  uint64_t               received_ns{};
+  /// libe3 E3-SequenceID of the report (the head of an E2-E3 procedure); the E2SM-DAPP bridge
+  /// copies it into the indication header and back onto the xApp control it provokes.
+  std::optional<uint32_t> sequence_identifier;
+  uint64_t                received_ns{};
   /// Host session identity; pass this when replying to avoid ID reuse races.
   uint64_t association_id{};
 };
@@ -112,7 +128,8 @@ struct e3ap_sctp_server_create_result {
   explicit                          operator bool() const noexcept { return server != nullptr; }
 };
 
-/// E3AP-OCUDU-V1 endpoint over SCTP for out-of-process dApps and observers.
+/// E3AP endpoint (E3AP-OCUDU-V2 in APER or Protobuf, libe3 or OCUDU profile) over
+/// SCTP, or libe3's ZMQ link layer, for out-of-process dApps and observers.
 ///
 /// The transport core accepts associations and frames PDUs; this class runs
 /// the E3AP procedures (setup, subscription, control, release), forwards
@@ -150,10 +167,13 @@ public:
   bool send_xapp_control_action(uint16_t             dapp_identifier,
                                 uint16_t             ran_function_identifier,
                                 std::vector<uint8_t> data) noexcept;
-  bool send_xapp_control_action(uint16_t             dapp_identifier,
-                                uint16_t             ran_function_identifier,
-                                std::vector<uint8_t> data,
-                                uint64_t             expected_association_id) noexcept;
+  /// \p sequence_identifier is the E2SM-DAPP control header's sequence-id; libe3 peers require one,
+  /// so when it is absent the server assigns a fresh one.
+  bool send_xapp_control_action(uint16_t                dapp_identifier,
+                                uint16_t                ran_function_identifier,
+                                std::vector<uint8_t>    data,
+                                uint64_t                expected_association_id,
+                                std::optional<uint32_t> sequence_identifier = std::nullopt) noexcept;
 
 private:
   struct implementation;

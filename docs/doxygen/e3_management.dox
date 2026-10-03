@@ -14,7 +14,7 @@ The embedded OCUDU E3 agent offers three carriers that share one
 
 - \c dapp.local_e3: same-host credentialed management socket (APER over
   \c AF_UNIX).
-- \c dapp.e3ap_sctp: E3AP-OCUDU-V1 over SCTP for out-of-process dApps and
+- \c dapp.e3ap_sctp: E3AP-OCUDU-V2 (libe3 E3AP + OCUDU additions) over SCTP for out-of-process dApps and
   dashboards; adds push telemetry subscriptions and carries management as
   control actions (\ref ocudu::dapp::e3::e3ap_sctp_server).
 - \c dapp.e3dp_sctp: FlatBuffers E3 data profile for the standalone reference

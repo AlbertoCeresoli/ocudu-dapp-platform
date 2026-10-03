@@ -27,7 +27,7 @@ Working version **v1**.
 ```text
    Operator / automation          Out-of-process dApps, dashboards        Reference
    ocudu-dappctl / Python         python -m ocudu_e3, dappctl --sctp      SCTP client
-            | APER, AF_UNIX                 | E3AP-OCUDU-V1, SCTP                | E3DP FlatBuffers, SCTP
+            | APER, AF_UNIX                 | E3AP-OCUDU-V2, SCTP                | E3DP FlatBuffers, SCTP
             v                               v                                    v
 +------------------------------------------------------------------------------------------+
 | DU process                                                                                |

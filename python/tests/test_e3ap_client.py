@@ -33,25 +33,33 @@ from ocudu_e3.telemetry import (  # noqa: E402
 )
 
 SERVER = os.environ.get("OCUDU_E3AP_TEST_SERVER")
-# APER bytes of {id 1, setupRequest{"1.0.0","x","0","v"}}; the C++ codec test pins the same vector.
-SETUP_GOLDEN_HEX = "00000080312e302e30007800300076"
-# The same PDU with the optional libe3-style envelope timestamp 1756800000000000000 ns.
-SETUP_TS_GOLDEN_HEX = "80000080312e302e300078003000760109081861684ac5680000"
+# E3AP-OCUDU-V2 APER bytes of {id 1, setupRequest{"1.0.0","x","0","v"}}: a setup without OCUDU
+# additions is libe3's setup, bit for bit (checked against the libe3 module below).
+SETUP_GOLDEN_HEX = "00000100312e302e30007800300076"
+# The same PDU with the envelope timestamp 1756800000000000000 ns (libe3's root field).
+SETUP_TS_GOLDEN_HEX = "4000081861684ac56800000100312e302e30007800300076"
 
 
 class OfflineCodecTests(unittest.TestCase):
-    def test_legacy_native_wire_at_every_id_width(self):
-        import asn1tools
-        legacy = asn1tools.compile_files(str(Path(__file__).parent / "fixtures/e3ap-ocudu-v1-pre-timestamp.asn1"), "per")
+    def test_native_wire_is_the_libe3_module_at_every_id_width(self):
+        """E3AP-OCUDU-V2 without additions is libe3's E3AP 1.0.0, whatever the id width."""
+        from ocudu_e3.libe3 import Libe3Codec
+
+        libe3 = Libe3Codec()
         body = {"e3apProtocolVersion": b"1.0.0", "dAppName": b"x", "dAppVersion": b"0", "vendor": b"v"}
+        text = {key: value.decode() for key, value in body.items()}
         for pdu_id in (1, 256, 257, 65536, 65537, 16777216, 16777217, 4294967295):
-            with self.subTest(pdu_id=pdu_id):
-                expected = {"id": pdu_id, "msg": ("setupRequest", body)}
-                encoded = self.codec.encode_pdu(pdu_id, "setupRequest", body)
-                self.assertEqual(encoded, legacy.encode("E3-PDU", expected))
-                self.assertEqual(self.codec.decode_pdu(encoded), (pdu_id, "setupRequest", body))
-                stamped = self.codec.encode_pdu(pdu_id, "setupRequest", body, timestamp_ns=1756800000000000000)
-                self.assertEqual(legacy.decode("E3-PDU", stamped), expected)
+            for timestamp in (None, 1756800000000000000):
+                with self.subTest(pdu_id=pdu_id, timestamp=timestamp):
+                    encoded = self.codec.encode_pdu(pdu_id, "setupRequest", body, timestamp_ns=timestamp)
+                    reference = {"id": pdu_id, "msg": ("setupRequest", text)}
+                    if timestamp is not None:
+                        reference["timestamp"] = timestamp
+                    self.assertEqual(encoded, libe3.encode(reference))
+                    self.assertEqual(libe3.decode(encoded), reference)
+        # With the OCUDU profile requested, libe3 still reads the setup (and skips the addition).
+        encoded = self.codec.encode_pdu(1, "setupRequest", {**body, "ocuduProfile": 1})
+        self.assertEqual(libe3.decode(encoded), {"id": 1, "msg": ("setupRequest", text)})
 
     def setUp(self):
         self.codec = ocudu_e3.load_codec()
@@ -159,19 +167,22 @@ class OfflineCodecTests(unittest.TestCase):
 
 @unittest.skipUnless(SERVER, "set OCUDU_E3AP_TEST_SERVER or pass --server to run live tests")
 class LiveAgentTests(unittest.TestCase):
-    def test_legacy_client_large_ids_against_cpp_agent(self):
-        import asn1tools
-        legacy = asn1tools.compile_files(str(Path(__file__).parent / "fixtures/e3ap-ocudu-v1-pre-timestamp.asn1"), "per")
+    def test_plain_libe3_peer_at_large_ids_gets_the_libe3_profile(self):
+        """A peer speaking libe3's module (no OCUDU additions) is served libe3's procedures."""
+        from ocudu_e3.libe3 import Libe3Codec
+
+        libe3 = Libe3Codec()
         for pdu_id in (257, 65537, 4294967295):
             with self.subTest(pdu_id=pdu_id), socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP) as peer:
                 peer.settimeout(3)
                 peer.connect(("127.0.0.1", self.e3ap_port))
-                body = {"e3apProtocolVersion": b"1.0.0", "dAppName": b"legacy", "dAppVersion": b"0", "vendor": b"v"}
-                peer.sendall(legacy.encode("E3-PDU", {"id": pdu_id, "msg": ("setupRequest", body)}))
-                kind, response = legacy.decode("E3-PDU", peer.recv(65536))["msg"]
+                body = {"e3apProtocolVersion": "1.0.0", "dAppName": "libe3-peer", "dAppVersion": "0", "vendor": "v"}
+                peer.sendall(libe3.encode({"id": pdu_id, "msg": ("setupRequest", body)}))
+                kind, response = libe3.decode(peer.recv(65536))["msg"]
                 self.assertEqual(kind, "setupResponse")
                 self.assertEqual(response["responseCode"], "positive")
                 self.assertEqual(response["requestId"], pdu_id)
+                self.assertLessEqual(response["dAppIdentifier"], 100, "libe3-profile identifiers")
 
     process: subprocess.Popen
     e3ap_port: int

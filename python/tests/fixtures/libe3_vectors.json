@@ -1,24 +1,24 @@
 {
- "source": "libe3 0.1.3 (wineslab/libe3 6f44b6f) Asn1E3Encoder via tests/interop/libe3/libe3_interop_vectors encode; asn1c mouse07410 844f9ca",
+ "source": "libe3 0.2.1 (wineslab/libe3 f2329e0) Asn1E3Encoder and ProtobufE3Encoder via tests/interop/libe3/libe3_interop_vectors encode; asn1c mouse07410 844f9caa",
  "message_id": 42,
  "timestamp": 1756800000123456789,
  "vectors": [
   {
    "name": "SetupRequest",
-   "hex": "400029081861684accc3cd150100312e302e3028766563746f722d6461707040302e312e331c77696e65736c6162",
+   "hex": "4029081861684accc3cd150100312e302e3028766563746f722d6461707040302e322e311c77696e65736c6162",
    "fields": {
     "name": "SetupRequest",
     "id": 42,
     "timestamp": 1756800000123456789,
     "e3apProtocolVersion": "1.0.0",
     "dAppName": "vector-dapp",
-    "dAppVersion": "0.1.3",
+    "dAppVersion": "0.2.1",
     "vendor": "wineslab"
    }
   },
   {
    "name": "SetupResponse",
-   "hex": "400029081861684accc3cd150b80002912766563746f722d72616e40312e302e300c010004000810000001dead",
+   "hex": "4029081861684accc3cd150b802912766563746f722d72616e40312e302e30000601000000000200000001000100000001dead",
    "fields": {
     "name": "SetupResponse",
     "id": 42,
@@ -45,7 +45,7 @@
   },
   {
    "name": "SubscriptionRequest",
-   "hex": "400029081861684accc3cd15130c0010002000003c0064",
+   "hex": "4029081861684accc3cd1513000600000002000000010000003c0064",
    "fields": {
     "name": "SubscriptionRequest",
     "id": 42,
@@ -63,7 +63,7 @@
   },
   {
    "name": "SubscriptionDelete",
-   "hex": "400029081861684accc3cd15183000",
+   "hex": "4029081861684accc3cd151800060000",
    "fields": {
     "name": "SubscriptionDelete",
     "id": 42,
@@ -74,7 +74,7 @@
   },
   {
    "name": "SubscriptionResponse",
-   "hex": "400029081861684accc3cd15220000290c00",
+   "hex": "4029081861684accc3cd152200290006000000",
    "fields": {
     "name": "SubscriptionResponse",
     "id": 42,
@@ -87,7 +87,7 @@
   },
   {
    "name": "IndicationMessage",
-   "hex": "400029081861684accc3cd15283000000f0102030405060708090a0b0c0d0e0f10",
+   "hex": "4029081861684accc3cd152800060000000f0102030405060708090a0b0c0d0e0f10",
    "fields": {
     "name": "IndicationMessage",
     "id": 42,
@@ -99,7 +99,7 @@
   },
   {
    "name": "DAppControlAction",
-   "hex": "400029081861684accc3cd15303000000001aabb",
+   "hex": "4029081861684accc3cd1532000600000000c0b2d05dff0001aabb",
    "fields": {
     "name": "DAppControlAction",
     "id": 42,
@@ -107,36 +107,39 @@
     "dAppIdentifier": 7,
     "ranFunctionIdentifier": 1,
     "controlIdentifier": 1,
+    "sequenceId": 3000000000,
     "actionData": "aabb"
    }
   },
   {
    "name": "DAppReport",
-   "hex": "400029081861684accc3cd153830000000cc",
+   "hex": "4029081861684accc3cd1538012b03e74010910000cc",
    "fields": {
     "name": "DAppReport",
     "id": 42,
     "timestamp": 1756800000123456789,
-    "dAppIdentifier": 7,
-    "ranFunctionIdentifier": 1,
+    "dAppIdentifier": 300,
+    "ranFunctionIdentifier": 1000,
+    "sequenceId": 4242,
     "reportData": "cc"
    }
   },
   {
    "name": "XAppControlAction",
-   "hex": "400029081861684accc3cd154030000001eeff",
+   "hex": "4029081861684accc3cd15409c3f00008001116f0001eeff",
    "fields": {
     "name": "XAppControlAction",
     "id": 42,
     "timestamp": 1756800000123456789,
-    "dAppIdentifier": 7,
+    "dAppIdentifier": 40000,
     "ranFunctionIdentifier": 1,
+    "sequenceId": 70000,
     "xAppControlData": "eeff"
    }
   },
   {
    "name": "ReleaseMessage",
-   "hex": "400029081861684accc3cd154830",
+   "hex": "4029081861684accc3cd15480006",
    "fields": {
     "name": "ReleaseMessage",
     "id": 42,
@@ -146,7 +149,164 @@
   },
   {
    "name": "MessageAck",
-   "hex": "400029081861684accc3cd1550002980",
+   "hex": "4029081861684accc3cd15502980",
+   "fields": {
+    "name": "MessageAck",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "requestId": 42,
+    "responseCode": "negative"
+   }
+  }
+ ],
+ "protobuf_vectors": [
+  {
+   "name": "SetupRequest",
+   "hex": "082a10959a8fe6ac89dab0181a250a05312e302e30120b766563746f722d646170701a05302e322e31220877696e65736c6162",
+   "fields": {
+    "name": "SetupRequest",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "e3apProtocolVersion": "1.0.0",
+    "dAppName": "vector-dapp",
+    "dAppVersion": "0.2.1",
+    "vendor": "wineslab"
+   }
+  },
+  {
+   "name": "SetupResponse",
+   "hex": "082a10959a8fe6ac89dab0182226082a1a05312e302e3020072a0a766563746f722d72616e320d0801120201021a01012202dead",
+   "fields": {
+    "name": "SetupResponse",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "requestId": 42,
+    "responseCode": "positive",
+    "ranIdentifier": "vector-ran",
+    "e3apProtocolVersion": "1.0.0",
+    "dAppIdentifier": 7,
+    "ranFunctionList": [
+     {
+      "ranFunctionIdentifier": 1,
+      "telemetryIdentifierList": [
+       1,
+       2
+      ],
+      "controlIdentifierList": [
+       1
+      ],
+      "ranFunctionData": "dead"
+     }
+    ]
+   }
+  },
+  {
+   "name": "SubscriptionRequest",
+   "hex": "082a10959a8fe6ac89dab0182a0c080710011a020102283c3064",
+   "fields": {
+    "name": "SubscriptionRequest",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 7,
+    "ranFunctionIdentifier": 1,
+    "telemetryIdentifierList": [
+     1,
+     2
+    ],
+    "controlIdentifierList": [],
+    "subscriptionTime": 60,
+    "periodicity": 100
+   }
+  },
+  {
+   "name": "SubscriptionDelete",
+   "hex": "082a10959a8fe6ac89dab018320408071001",
+   "fields": {
+    "name": "SubscriptionDelete",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 7,
+    "subscriptionId": 1
+   }
+  },
+  {
+   "name": "SubscriptionResponse",
+   "hex": "082a10959a8fe6ac89dab0183a06082a10072001",
+   "fields": {
+    "name": "SubscriptionResponse",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "requestId": 42,
+    "dAppIdentifier": 7,
+    "responseCode": "positive",
+    "subscriptionId": 1
+   }
+  },
+  {
+   "name": "IndicationMessage",
+   "hex": "082a10959a8fe6ac89dab0184216080710011a100102030405060708090a0b0c0d0e0f10",
+   "fields": {
+    "name": "IndicationMessage",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 7,
+    "ranFunctionIdentifier": 1,
+    "protocolData": "0102030405060708090a0b0c0d0e0f10"
+   }
+  },
+  {
+   "name": "DAppControlAction",
+   "hex": "082a10959a8fe6ac89dab0184a100807100118012202aabb2880bcc1960b",
+   "fields": {
+    "name": "DAppControlAction",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 7,
+    "ranFunctionIdentifier": 1,
+    "controlIdentifier": 1,
+    "sequenceId": 3000000000,
+    "actionData": "aabb"
+   }
+  },
+  {
+   "name": "DAppReport",
+   "hex": "082a10959a8fe6ac89dab018520c08ac0210e8071a01cc209221",
+   "fields": {
+    "name": "DAppReport",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 300,
+    "ranFunctionIdentifier": 1000,
+    "sequenceId": 4242,
+    "reportData": "cc"
+   }
+  },
+  {
+   "name": "XAppControlAction",
+   "hex": "082a10959a8fe6ac89dab0185a0e08c0b80210011a02eeff20f0a204",
+   "fields": {
+    "name": "XAppControlAction",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 40000,
+    "ranFunctionIdentifier": 1,
+    "sequenceId": 70000,
+    "xAppControlData": "eeff"
+   }
+  },
+  {
+   "name": "ReleaseMessage",
+   "hex": "082a10959a8fe6ac89dab01862020807",
+   "fields": {
+    "name": "ReleaseMessage",
+    "id": 42,
+    "timestamp": 1756800000123456789,
+    "dAppIdentifier": 7
+   }
+  },
+  {
+   "name": "MessageAck",
+   "hex": "082a10959a8fe6ac89dab0186a04082a1001",
    "fields": {
     "name": "MessageAck",
     "id": 42,

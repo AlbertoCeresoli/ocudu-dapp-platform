@@ -72,7 +72,6 @@ if (ENABLE_E3)
   # compiled into the same asn1c library so the codecs share one runtime.
   set(E3_SCHEMAS
     ${E3_SCHEMA}
-    ${PROJECT_SOURCE_DIR}/schemas/e3/e3ap-ocudu-v1.asn1
     ${PROJECT_SOURCE_DIR}/schemas/e3/e3sm-ocudu-telemetry-v1.asn1
     ${PROJECT_SOURCE_DIR}/schemas/e3/e3sm-ocudu-dapp-mgmt-carrier-v1.asn1)
   find_program(ASN1TOOLS_EXECUTABLE asn1tools)
@@ -107,6 +106,16 @@ if (ENABLE_E3)
         message(FATAL_ERROR "schemas/e3/interop/libe3/e3ap-1.0.0.asn1 differs from third_party/libe3; re-vendor it")
       endif ()
     endif ()
+    # Likewise its Protobuf schema (schemas/e3/protobuf/e3ap-ocudu-v2.proto is a wire superset of it).
+    set(E3_LIBE3_SUBMODULE_PROTO ${PROJECT_SOURCE_DIR}/third_party/libe3/messages/proto/V1/e3ap-1.0.0.proto)
+    if (EXISTS ${E3_LIBE3_SUBMODULE_PROTO})
+      file(READ ${E3_LIBE3_SUBMODULE_PROTO} E3_LIBE3_UPSTREAM_PROTO)
+      file(READ ${PROJECT_SOURCE_DIR}/schemas/e3/interop/libe3/e3ap-1.0.0.proto E3_LIBE3_VENDORED_PROTO)
+      string(FIND "${E3_LIBE3_VENDORED_PROTO}" "${E3_LIBE3_UPSTREAM_PROTO}" E3_LIBE3_VENDORED_PROTO_MATCH)
+      if (E3_LIBE3_VENDORED_PROTO_MATCH EQUAL -1)
+        message(FATAL_ERROR "schemas/e3/interop/libe3/e3ap-1.0.0.proto differs from third_party/libe3; re-vendor it")
+      endif ()
+    endif ()
 
     set(E3_ASN1_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/e3sm_asn1)
     math(EXPR E3_ASN1_LONG_BITS "${CMAKE_SIZEOF_VOID_P} * 8")
@@ -122,7 +131,7 @@ if (ENABLE_E3)
     execute_process(
       COMMAND ${ASN1C_EXECUTABLE}
         -pdu=ManagementRequest -pdu=ManagementResponse
-        -pdu=E3-PDU -pdu=Telemetry-IndicationData -pdu=Telemetry-RanFunctionData
+        -pdu=Telemetry-IndicationData -pdu=Telemetry-RanFunctionData
         -pdu=Telemetry-SubscriptionData -pdu=Mgmt-RanFunctionData
         -gen-APER -no-gen-UPER -no-gen-JER -no-gen-BER -no-gen-XER
         -no-gen-CBOR -no-gen-OER -no-gen-print -no-gen-random-fill
@@ -148,13 +157,15 @@ if (ENABLE_E3)
     target_compile_options(ocudu_dapp_e3sm_asn1 PRIVATE -w)
     target_link_libraries(ocudu_dapp_e3sm_asn1 PUBLIC m)
 
-    # Upstream libe3 E3AP 1.0.0 module (schemas/e3/interop/libe3), generated
-    # verbatim with a type prefix so its E3-PDU family links beside OCUDU's.
-    # Only the prefixed module files are compiled here; the asn1c runtime is
-    # shared with ocudu_dapp_e3sm_asn1 (same generator, same skeletons), except
-    # for the few runtime units the OCUDU modules never needed (UTF8String).
-    set(E3_LIBE3_SCHEMA ${PROJECT_SOURCE_DIR}/schemas/e3/interop/libe3/e3ap-1.0.0.asn1)
-    set(E3_LIBE3_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/e3ap_libe3_asn1)
+    # E3AP-OCUDU-V2 (schemas/e3/e3ap-ocudu-v2.asn1): the upstream libe3 E3AP
+    # 1.0.0 module with OCUDU extension additions, generated with a type prefix
+    # (E3V2_) so its names never meet the service-model modules'. One codec
+    # serves libe3 peers (additions omitted) and OCUDU peers. Only the prefixed
+    # module files are compiled here; the asn1c runtime is shared with
+    # ocudu_dapp_e3sm_asn1 (same generator, same skeletons), except for the few
+    # runtime units the service models never needed (UTF8String).
+    set(E3_LIBE3_SCHEMA ${PROJECT_SOURCE_DIR}/schemas/e3/e3ap-ocudu-v2.asn1)
+    set(E3_LIBE3_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/e3ap_v2_asn1)
     file(MAKE_DIRECTORY ${E3_LIBE3_GENERATED_DIR})
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${E3_LIBE3_SCHEMA})
     file(GLOB E3_LIBE3_STALE ${E3_LIBE3_GENERATED_DIR}/*.c ${E3_LIBE3_GENERATED_DIR}/*.h)
@@ -168,18 +179,18 @@ if (ENABLE_E3)
         -no-gen-CBOR -no-gen-OER -no-gen-print -no-gen-random-fill
         -fgen-only-pdu-deps -fno-include-deps -fcompound-names
         -findirect-choice -flong-size=${E3_ASN1_LONG_BITS} -no-gen-example
-        -fprefix=LIBE3_
+        -fprefix=E3V2_
         -D ${E3_LIBE3_GENERATED_DIR} ${E3_LIBE3_SCHEMA}
       RESULT_VARIABLE E3_LIBE3_ASN1C_RESULT
       OUTPUT_QUIET ERROR_VARIABLE E3_LIBE3_ASN1C_ERROR)
     if (NOT E3_LIBE3_ASN1C_RESULT EQUAL 0)
-      message(FATAL_ERROR "asn1c failed to generate the libe3 E3AP codec: ${E3_LIBE3_ASN1C_ERROR}")
+      message(FATAL_ERROR "asn1c failed to generate the E3AP-OCUDU-V2 codec: ${E3_LIBE3_ASN1C_ERROR}")
     endif ()
-    file(GLOB E3_LIBE3_MODULE_SOURCES CONFIGURE_DEPENDS ${E3_LIBE3_GENERATED_DIR}/LIBE3_*.c)
+    file(GLOB E3_LIBE3_MODULE_SOURCES CONFIGURE_DEPENDS ${E3_LIBE3_GENERATED_DIR}/E3V2_*.c)
     file(GLOB E3_LIBE3_RUNTIME_SOURCES CONFIGURE_DEPENDS ${E3_LIBE3_GENERATED_DIR}/*.c)
     foreach (runtime_source ${E3_LIBE3_RUNTIME_SOURCES})
       get_filename_component(runtime_name ${runtime_source} NAME)
-      if (runtime_name MATCHES "^LIBE3_" OR EXISTS ${E3_ASN1_GENERATED_DIR}/${runtime_name})
+      if (runtime_name MATCHES "^E3V2_" OR EXISTS ${E3_ASN1_GENERATED_DIR}/${runtime_name})
         continue()
       endif ()
       list(APPEND E3_LIBE3_MODULE_SOURCES ${runtime_source})
@@ -221,9 +232,12 @@ if (ENABLE_E3)
     target_include_directories(ocudu_dapp_e3_local PUBLIC ${PROJECT_SOURCE_DIR}/include)
     target_link_libraries(ocudu_dapp_e3_local PUBLIC ocudu_dapp_e3_codec PRIVATE ocudu_dapp_runtime fmt)
 
-    # E3AP-OCUDU-V1 codec: envelope plus the telemetry and management-carrier
+    # E3AP codecs: E3AP-OCUDU-V2 (libe3 module + additions) in APER and Protobuf,
+    # plus the telemetry and management-carrier
     # service models. Independent clients may link it without the runtime.
-    add_library(ocudu_dapp_e3ap_codec STATIC e3/e3ap_codec.cpp e3/e3ap_libe3_codec.cpp e3/e3ap_protocol.cpp)
+    add_library(ocudu_dapp_e3ap_codec STATIC
+      e3/e3ap_codec.cpp e3/e3ap_v2_codec.cpp e3/e3ap_libe3_codec.cpp e3/e3ap_protobuf_codec.cpp
+      e3/e3ap_protocol.cpp)
     set_target_properties(ocudu_dapp_e3ap_codec PROPERTIES
       EXPORT_NAME DAppE3apCodec
       POSITION_INDEPENDENT_CODE ON)
@@ -240,10 +254,18 @@ if (ENABLE_E3)
     add_library(ocudu_dapp_e3_sctp STATIC
       e3/sctp_association_server.cpp
       e3/e3ap_sctp_server.cpp
+      e3/zmq_association_server.cpp
       e3/shared_region.cpp
       e3/telemetry_publisher.cpp)
     target_include_directories(ocudu_dapp_e3_sctp PUBLIC ${PROJECT_SOURCE_DIR}/include)
     target_link_libraries(ocudu_dapp_e3_sctp PUBLIC ocudu_dapp_e3ap_codec ocudu_dapp_e3_codec PRIVATE ocudu_dapp_runtime)
+    # libe3's ZMQ link layer (RAN side), for libe3 dApps that do not speak SCTP. Compiled in only with
+    # libzmq; instantiated only when the E3AP server configuration asks for it.
+    if (ZEROMQ_FOUND)
+      target_compile_definitions(ocudu_dapp_e3_sctp PRIVATE OCUDU_DAPP_E3_HAVE_ZMQ=1)
+      target_include_directories(ocudu_dapp_e3_sctp SYSTEM PRIVATE ${ZEROMQ_INCLUDE_DIRS})
+      target_link_libraries(ocudu_dapp_e3_sctp PRIVATE ${ZEROMQ_LIBRARIES})
+    endif ()
 
   endif ()
 endif ()

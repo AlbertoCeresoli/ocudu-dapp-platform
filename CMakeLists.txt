@@ -817,14 +817,18 @@ if(ENABLE_DAPP)
       COMPONENT dapp_sdk)
     install(FILES
       ${PROJECT_SOURCE_DIR}/schemas/e3/e3sm-ocudu-dapp-mgmt-v1.asn1
-      ${PROJECT_SOURCE_DIR}/schemas/e3/e3ap-ocudu-v1.asn1
+      ${PROJECT_SOURCE_DIR}/schemas/e3/e3ap-ocudu-v2.asn1
       ${PROJECT_SOURCE_DIR}/schemas/e3/e3sm-ocudu-telemetry-v1.asn1
       ${PROJECT_SOURCE_DIR}/schemas/e3/e3sm-ocudu-dapp-mgmt-carrier-v1.asn1
       ${PROJECT_SOURCE_DIR}/schemas/dapp/e3-data-profile-v1.fbs
       DESTINATION ${OCUDU_DAPP_SCHEMA_DIR}
       COMPONENT dapp_sdk)
     install(FILES ${PROJECT_SOURCE_DIR}/schemas/e3/interop/libe3/e3ap-1.0.0.asn1
+      ${PROJECT_SOURCE_DIR}/schemas/e3/interop/libe3/e3ap-1.0.0.proto
       DESTINATION ${OCUDU_DAPP_SCHEMA_DIR}/interop/libe3
+      COMPONENT dapp_sdk)
+    install(FILES ${PROJECT_SOURCE_DIR}/schemas/e3/protobuf/e3ap-ocudu-v2.proto
+      DESTINATION ${OCUDU_DAPP_SCHEMA_DIR}/protobuf
       COMPONENT dapp_sdk)
     # Python E3 client: independent dApps import it from
     # <prefix>/share/ocudu/dapp/python and find the schemas one level up.

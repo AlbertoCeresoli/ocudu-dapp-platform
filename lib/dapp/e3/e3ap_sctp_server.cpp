@@ -6,6 +6,9 @@
 #include "ocudu/dapp/e3/e3_connection_registry.h"
 #include "ocudu/dapp/e3/e3ap_codec.h"
 #include "ocudu/dapp/e3/e3ap_libe3_codec.h"
+#include "ocudu/dapp/e3/e3ap_protobuf_codec.h"
+#include "ocudu/dapp/e3/e3ap_v2_codec.h"
+#include "ocudu/dapp/e3/zmq_association_server.h"
 #include "ocudu/dapp/e3/management_service.h"
 #include "ocudu/dapp/e3/shared_region.h"
 #include <algorithm>
@@ -116,6 +119,36 @@ std::optional<e3ap_element_type> element_type_of(uint32_t interface_id) noexcept
   return std::nullopt;
 }
 
+/// Encoding (and module) a peer speaks, fixed by its setup request.
+enum class wire_format : uint8_t {
+  /// E3AP-OCUDU-V2 in APER: libe3's module with OCUDU extension additions.
+  v2_aper,
+  /// The same messages in Protobuf (libe3's schema plus OCUDU fields >= 100).
+  protobuf
+};
+
+codec_result<e3ap_pdu> decode_as(wire_format wire, e3ap_profile profile, ocudu::span<const uint8_t> message) noexcept
+{
+  switch (wire) {
+    case wire_format::v2_aper:
+      return e3ap_v2_codec::decode(message, profile);
+    case wire_format::protobuf:
+      return e3ap_protobuf_codec::decode(message, profile);
+  }
+  return {std::nullopt, "unknown wire format"};
+}
+
+codec_result<std::vector<uint8_t>> encode_as(wire_format wire, e3ap_profile profile, const e3ap_pdu& pdu) noexcept
+{
+  switch (wire) {
+    case wire_format::v2_aper:
+      return e3ap_v2_codec::encode(pdu, profile);
+    case wire_format::protobuf:
+      return e3ap_protobuf_codec::encode(pdu, profile);
+  }
+  return {std::nullopt, "unknown wire format"};
+}
+
 struct dapp_session {
   uint64_t    association_id{};
   uint64_t    opened_ns{};
@@ -124,11 +157,19 @@ struct dapp_session {
   /// The peer stamped its setup request, so it decodes the timestamp field;
   /// a peer built against the pre-timestamp module cannot, and gets none.
   bool peer_timestamps{};
-  /// The peer speaks the upstream libe3 E3AP 1.0.0 module (fixed at setup).
-  bool                                   libe3{};
-  uint16_t                               dapp_id{};
-  std::string                            dapp_name;
-  uint32_t                               next_pdu_id{1};
+  /// Encoding and profile (fixed at setup).
+  wire_format  wire{wire_format::v2_aper};
+  e3ap_profile profile{e3ap_profile::ocudu};
+  /// The peer runs the upstream libe3 E3AP 1.0.0 procedures (libe3 profile of V2 APER or Protobuf).
+  bool         libe3{};
+  /// A setup request selected \ref wire.
+  bool        wire_bound{};
+  uint16_t    dapp_id{};
+  std::string dapp_name;
+  uint32_t    next_pdu_id{1};
+  /// ZMQ carrier: every session's PDUs share one PUB stream and E3-MessageAck names no dApp, so ids
+  /// come from one server-wide counter there and never repeat across sessions.
+  std::atomic<uint32_t>*                 shared_pdu_ids{};
   uint16_t                               next_subscription_id{1};
   std::map<uint16_t, subscription_state> subscriptions;
   std::optional<control_assembly>        control;
@@ -136,16 +177,30 @@ struct dapp_session {
 
   uint32_t take_pdu_id() noexcept
   {
+    if (shared_pdu_ids != nullptr) {
+      uint32_t id = shared_pdu_ids->fetch_add(1, std::memory_order_relaxed);
+      if (id == 0) { // wrapped: 0 is not a valid E3-MessageID
+        id = shared_pdu_ids->fetch_add(1, std::memory_order_relaxed);
+      }
+      return id;
+    }
     const uint32_t id   = next_pdu_id;
     const uint32_t last = libe3 ? e3ap_libe3_codec::maximum_message_id : 0xFFFFFFFFU;
     next_pdu_id         = next_pdu_id >= last ? 1 : next_pdu_id + 1;
     return id;
   }
 
-  /// Encodes with the module the peer speaks.
+  /// Encodes with the module and encoding the peer speaks.
   codec_result<std::vector<uint8_t>> encode(const e3ap_pdu& pdu) const noexcept
   {
-    return libe3 ? e3ap_libe3_codec::encode(pdu) : e3ap_codec::encode(pdu);
+    return encode_as(wire, profile, pdu);
+  }
+
+  void bind(wire_format format, e3ap_profile profile_) noexcept
+  {
+    wire    = format;
+    profile = profile_;
+    libe3   = profile == e3ap_profile::libe3;
   }
 };
 
@@ -230,32 +285,35 @@ struct e3ap_sctp_server::implementation {
   }
 
   struct pending_xapp_control {
-    uint16_t             dapp_identifier{};
-    uint16_t             ran_function_identifier{};
-    std::vector<uint8_t> data;
-    uint64_t             association_id{};
+    uint16_t                dapp_identifier{};
+    uint16_t                ran_function_identifier{};
+    std::vector<uint8_t>    data;
+    uint64_t                association_id{};
+    std::optional<uint32_t> sequence_identifier;
   };
   static constexpr std::size_t maximum_pending_xapp_controls = 64;
-  static constexpr std::size_t maximum_recent_reports        = 16;
+  /// Sequence ids the server assigns to xApp controls that arrive without one (never 0).
+  uint32_t                     next_sequence_identifier{1};
+  static constexpr std::size_t maximum_recent_reports = 16;
 
   /// One namespace, partitioned by wire bounds. Protected by cross_thread_mutex.
   /// Each ID is bound to a non-reused transport association, including queued controls.
   std::array<uint64_t, 65536> dapp_associations{};
-  uint16_t                    next_native_id{e3ap_libe3_codec::maximum_identifier + 1};
+  uint16_t                    next_native_id{e3ap_libe3_codec::dapp_identifier_pool + 1};
   uint64_t                    shared_region_bytes{};
 
   std::optional<uint16_t> allocate_dapp_id(const dapp_session& session) noexcept
   {
     std::lock_guard<std::mutex> lock(cross_thread_mutex);
     if (session.libe3) {
-      for (uint16_t id = e3ap_libe3_codec::maximum_identifier; id >= 1; --id) {
+      for (uint16_t id = e3ap_libe3_codec::dapp_identifier_pool; id >= 1; --id) {
         if (dapp_associations[id] == 0) {
           dapp_associations[id] = session.association_id;
           return id;
         }
       }
     } else {
-      constexpr uint16_t first = e3ap_libe3_codec::maximum_identifier + 1;
+      constexpr uint16_t first = e3ap_libe3_codec::dapp_identifier_pool + 1;
       for (uint32_t remaining = 65536U - first; remaining != 0; --remaining) {
         const uint16_t id = next_native_id;
         next_native_id    = id == 65535 ? first : id + 1;
@@ -294,6 +352,7 @@ struct e3ap_sctp_server::implementation {
     event.ran_function_identifier = body.ran_function_identifier;
     event.report_data             = body.report_data;
     event.timestamp_ns            = timestamp_ns;
+    event.sequence_identifier     = body.sequence_identifier;
     event.received_ns             = monotonic_ns();
     event.association_id          = session.association_id;
     reports_received.fetch_add(1, std::memory_order_relaxed);
@@ -336,6 +395,7 @@ struct e3ap_sctp_server::implementation {
         action.dapp_identifier         = item.dapp_identifier;
         action.ran_function_identifier = item.ran_function_identifier;
         action.xapp_control_data       = std::move(item.data);
+        action.sequence_identifier     = item.sequence_identifier;
         delivered                      = send_pdu(*association, *session, std::move(action), e3ap_procedure_stream);
         break;
       }
@@ -535,6 +595,13 @@ struct e3ap_sctp_server::implementation {
       session.setup_done = true;
       if (session.libe3) {
         libe3_setups_completed.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (session.wire == wire_format::protobuf) {
+        protobuf_setups_completed.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (!session.libe3) {
+        // The OCUDU procedures run: say so, so the dApp may use the additions.
+        response.ocudu_profile = e3ap_ocudu_profile_version;
       }
       session.dapp_name               = request.dapp_name;
       response.response_code          = e3ap_response_code::positive;
@@ -1208,6 +1275,8 @@ struct e3ap_sctp_server::implementation {
   std::shared_ptr<e3_connection_registry>  connections;
   management::identifier                   ran_instance;
   std::unique_ptr<sctp_association_server> transport;
+  std::unique_ptr<zmq_association_server>  zmq_transport;
+  std::atomic<uint32_t>                    zmq_pdu_ids{1};
   std::atomic<uint64_t>                    setups_completed{0};
   std::atomic<uint64_t>                    setups_rejected{0};
   std::atomic<uint64_t>                    subscriptions_created{0};
@@ -1224,6 +1293,7 @@ struct e3ap_sctp_server::implementation {
   std::atomic<uint64_t>                    xapp_controls_dropped{0};
   std::atomic<uint64_t>                    libe3_setups_completed{0};
   std::atomic<uint64_t>                    libe3_indications_dropped{0};
+  std::atomic<uint64_t>                    protobuf_setups_completed{0};
   std::atomic<uint32_t>                    live_subscriptions{0};
 };
 
@@ -1237,6 +1307,13 @@ void e3ap_sctp_server::on_opened(sctp_association& association)
   session->association_id = association.id();
   session->opened_ns      = monotonic_ns();
   session->peer_address   = association.peer_address();
+  if (state->config.zmq) {
+    session->shared_pdu_ids = &state->zmq_pdu_ids;
+    // Until a setup binds it, a ZMQ session speaks the link's libe3 encoding.
+    session->bind(state->config.zmq->encoding == e3ap_encoding::protobuf ? wire_format::protobuf
+                                                                          : wire_format::v2_aper,
+                  e3ap_profile::libe3);
+  }
   association.set_context(session);
   state->publish_connection(*session);
 }
@@ -1248,24 +1325,71 @@ void e3ap_sctp_server::on_message(sctp_association& association, ocudu::span<con
     association.close();
     return;
   }
-  // The dialect is fixed by the setup request: until setup completes a PDU
-  // that fails the native module is retried under the libe3 module, and a
-  // libe3 setup request binds the association to that module for good.
-  codec_result<e3ap_pdu> decoded = session->libe3 ? e3ap_libe3_codec::decode(message) : e3ap_codec::decode(message);
-  if (!session->setup_done && !session->libe3 && state->config.libe3_profile) {
-    auto       alternative  = e3ap_libe3_codec::decode(message);
-    const bool native_setup = decoded && std::holds_alternative<e3ap_setup_request>(decoded.value->message);
-    const bool libe3_setup  = alternative && std::holds_alternative<e3ap_setup_request>(alternative.value->message);
-    // A foreign setup can parse as a DIFFERENT native procedure. Successful
-    // decoding alone is not profile negotiation; only a setup can select it.
-    if (native_setup && libe3_setup) {
-      state->protocol_errors.fetch_add(1, std::memory_order_relaxed);
-      association.close();
-      return;
+  codec_result<e3ap_pdu> decoded;
+  if (session->setup_done || session->wire_bound) {
+    decoded = decode_as(session->wire, session->profile, message);
+  } else {
+    // The encoding is fixed by the setup request, and the profile by its ocuduProfile field. Until
+    // setup completes every enabled format is tried, and the one that reads a setup request binds
+    // the association for good. A foreign setup can parse as a DIFFERENT procedure of another
+    // format: successful decoding alone is not negotiation; only a setup can select a format.
+    const auto& zmq           = state->config.zmq;
+    const bool  protobuf_link = zmq && zmq->encoding == e3ap_encoding::protobuf;
+    std::array<wire_format, 2> formats{};
+    std::size_t                count = 0;
+    if (!protobuf_link) {
+      formats[count++] = wire_format::v2_aper;
     }
-    if (libe3_setup) {
-      session->libe3 = true;
-      decoded        = std::move(alternative);
+    if (protobuf_link || (!zmq && state->config.protobuf_profile)) {
+      formats[count++] = wire_format::protobuf;
+    }
+    std::array<std::pair<wire_format, codec_result<e3ap_pdu>>, 2> setups;
+    std::size_t                                                   nof_setups = 0;
+    for (std::size_t index = 0; index != count; ++index) {
+      // Read with every addition, to see the setup's ocuduProfile.
+      auto attempt = decode_as(formats[index], e3ap_profile::ocudu, message);
+      if (attempt && std::holds_alternative<e3ap_setup_request>(attempt.value->message)) {
+        setups[nof_setups++] = {formats[index], std::move(attempt)};
+      }
+    }
+    if (nof_setups > 1) {
+      // Short APER can look like a Protobuf setup and the reverse. Both encodings are canonical:
+      // only the format the peer actually used re-encodes its decoded PDU to the very same bytes.
+      std::size_t exact = 0;
+      for (std::size_t index = 0; index != nof_setups; ++index) {
+        auto encoded = encode_as(setups[index].first, e3ap_profile::ocudu, *setups[index].second.value);
+        if (encoded && encoded.value->size() == message.size() &&
+            std::equal(encoded.value->begin(), encoded.value->end(), message.begin())) {
+          if (exact != index) {
+            setups[exact] = std::move(setups[index]);
+          }
+          ++exact;
+        }
+      }
+      if (exact != 1) {
+        state->protocol_errors.fetch_add(1, std::memory_order_relaxed);
+        association.close();
+        return;
+      }
+      nof_setups = 1;
+    }
+    if (nof_setups == 1) {
+      const auto& setup   = std::get<e3ap_setup_request>(setups[0].second.value->message);
+      const auto  profile = setup.ocudu_profile ? e3ap_profile::ocudu : e3ap_profile::libe3;
+      if (profile == e3ap_profile::libe3 && !state->config.libe3_profile) {
+        state->protocol_errors.fetch_add(1, std::memory_order_relaxed);
+        association.close();
+        return;
+      }
+      session->bind(setups[0].first, profile);
+      session->wire_bound = true;
+      decoded             = std::move(setups[0].second);
+      if (session->libe3) {
+        // A libe3 peer's setup carries no additions; drop anything read beyond libe3's module.
+        decoded = decode_as(session->wire, session->profile, message);
+      }
+    } else {
+      decoded = decode_as(session->wire, session->profile, message);
     }
   }
   if (!decoded) {
@@ -1387,14 +1511,23 @@ e3ap_sctp_server_create_result e3ap_sctp_server::create(management_service*     
     config.transport.payload_protocol_id = e3ap_payload_protocol_id;
     config.transport.nof_streams         = std::max<uint16_t>(config.transport.nof_streams, 2);
     config.transport.maximum_message_bytes =
-        std::max<std::size_t>(config.transport.maximum_message_bytes, e3ap_codec::maximum_pdu_bytes);
+        std::max<std::size_t>(config.transport.maximum_message_bytes, e3ap_v2_codec::maximum_pdu_bytes);
 
     auto state =
         std::make_unique<implementation>(management, std::move(store), std::move(config), std::move(connections));
     const uint64_t seed = monotonic_ns();
     std::memcpy(state->ran_instance.bytes.data(), "OCUDUE3A", 8);
     std::memcpy(state->ran_instance.bytes.data() + 8, &seed, sizeof(seed));
-    auto server    = std::unique_ptr<e3ap_sctp_server>(new e3ap_sctp_server(std::move(state)));
+    auto server = std::unique_ptr<e3ap_sctp_server>(new e3ap_sctp_server(std::move(state)));
+    if (server->state->config.zmq) {
+      server->state->config.libe3_profile = true;
+      auto zmq                            = zmq_association_server::create(*server, *server->state->config.zmq);
+      if (!zmq) {
+        return {nullptr, std::move(zmq.detail)};
+      }
+      server->state->zmq_transport = std::move(zmq.server);
+      return {std::move(server), {}};
+    }
     auto transport = sctp_association_server::create(*server, server->state->config.transport);
     if (!transport) {
       return {nullptr, std::move(transport.detail)};
@@ -1418,6 +1551,9 @@ void e3ap_sctp_server::stop() noexcept
   if (state != nullptr && state->transport != nullptr) {
     state->transport->stop();
   }
+  if (state != nullptr && state->zmq_transport != nullptr) {
+    state->zmq_transport->stop();
+  }
 }
 
 uint16_t e3ap_sctp_server::port() const noexcept
@@ -1433,6 +1569,9 @@ e3ap_sctp_server_metrics e3ap_sctp_server::metrics() const noexcept
   }
   if (state->transport != nullptr) {
     result.transport = state->transport->metrics();
+  }
+  if (state->zmq_transport != nullptr) {
+    result.transport = state->zmq_transport->metrics();
   }
   result.setups_completed          = state->setups_completed.load(std::memory_order_relaxed);
   result.setups_rejected           = state->setups_rejected.load(std::memory_order_relaxed);
@@ -1451,6 +1590,7 @@ e3ap_sctp_server_metrics e3ap_sctp_server::metrics() const noexcept
   result.xapp_controls_dropped     = state->xapp_controls_dropped.load(std::memory_order_relaxed);
   result.libe3_setups_completed    = state->libe3_setups_completed.load(std::memory_order_relaxed);
   result.libe3_indications_dropped = state->libe3_indications_dropped.load(std::memory_order_relaxed);
+  result.protobuf_setups_completed = state->protobuf_setups_completed.load(std::memory_order_relaxed);
   return result;
 }
 
@@ -1478,13 +1618,14 @@ bool e3ap_sctp_server::send_xapp_control_action(uint16_t             dapp_identi
                                                 uint16_t             ran_function_identifier,
                                                 std::vector<uint8_t> data) noexcept
 {
-  return send_xapp_control_action(dapp_identifier, ran_function_identifier, std::move(data), 0);
+  return send_xapp_control_action(dapp_identifier, ran_function_identifier, std::move(data), 0, std::nullopt);
 }
 
-bool e3ap_sctp_server::send_xapp_control_action(uint16_t             dapp_identifier,
-                                                uint16_t             ran_function_identifier,
-                                                std::vector<uint8_t> data,
-                                                uint64_t             expected_association_id) noexcept
+bool e3ap_sctp_server::send_xapp_control_action(uint16_t                dapp_identifier,
+                                                uint16_t                ran_function_identifier,
+                                                std::vector<uint8_t>    data,
+                                                uint64_t                expected_association_id,
+                                                std::optional<uint32_t> sequence_identifier) noexcept
 {
   if (state == nullptr || data.empty() || data.size() > e3ap_maximum_fragment_bytes) {
     return false;
@@ -1498,7 +1639,13 @@ bool e3ap_sctp_server::send_xapp_control_action(uint16_t             dapp_identi
     return false;
   }
   try {
-    state->pending_xapp_controls.push_back({dapp_identifier, ran_function_identifier, std::move(data), association_id});
+    if (!sequence_identifier) {
+      sequence_identifier = state->next_sequence_identifier;
+      state->next_sequence_identifier =
+          state->next_sequence_identifier == 0xFFFFFFFFU ? 1U : state->next_sequence_identifier + 1;
+    }
+    state->pending_xapp_controls.push_back(
+        {dapp_identifier, ran_function_identifier, std::move(data), association_id, sequence_identifier});
   } catch (...) {
     return false;
   }

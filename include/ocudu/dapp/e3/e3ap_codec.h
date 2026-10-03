@@ -9,18 +9,12 @@
 
 namespace ocudu::dapp::e3 {
 
-/// Generated ASN.1 aligned-PER bindings for E3AP-OCUDU-V1, OCUDU-TELEMETRY-SM
-/// and OCUDU-DAPP-MGMT-CARRIER-SM. The codec owns decoded storage and returns
+/// Generated ASN.1 aligned-PER bindings for the service models E3AP carries: OCUDU-TELEMETRY-SM and
+/// OCUDU-DAPP-MGMT-CARRIER-SM (the E3AP envelope itself is e3ap_v2_codec / e3ap_protobuf_codec). The codec owns decoded storage and returns
 /// plain C++ values; it never touches sockets or the data store.
 class e3ap_codec
 {
 public:
-  /// Largest single E3-PDU accepted on the wire (one fragment plus envelope).
-  static constexpr std::size_t maximum_pdu_bytes = e3ap_maximum_fragment_bytes + 4096;
-
-  static codec_result<std::vector<uint8_t>> encode(const e3ap_pdu& pdu) noexcept;
-  static codec_result<e3ap_pdu>             decode(ocudu::span<const uint8_t> bytes) noexcept;
-
   static codec_result<std::vector<uint8_t>>        encode(const telemetry_indication& indication) noexcept;
   static codec_result<telemetry_indication>        decode_telemetry(ocudu::span<const uint8_t> bytes) noexcept;
   static codec_result<std::vector<uint8_t>>        encode(const telemetry_ran_function_data& data) noexcept;

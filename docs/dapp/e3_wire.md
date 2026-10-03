@@ -21,24 +21,27 @@ honor. Prefer the shipped clients (`ocudu-dappctl`, `apps/tools/dappctl/ocudu_da
 | Carrier | Transport | Encoding | Direction | Purpose |
 |---------|-----------|----------|-----------|---------|
 | **Local management** (`dapp.local_e3`) | `AF_UNIX` `SOCK_SEQPACKET`, one datagram per PDU | APER `E3SM-OCUDU-DAPP-MGMT-V1` | request/response | Same-host, credentialed dApp lifecycle, configuration, metrics, incidents, pull-based portable data |
-| **E3AP** (`dapp.e3ap_sctp`) | SCTP one-to-one association, one PDU per SCTP message | APER `E3AP-OCUDU-V1` envelope; service-model bodies opaque APER | procedures + **push** indications | Out-of-process dApps and observers: setup, telemetry subscriptions, fragmented indications, management as control actions |
+| **E3AP** (`dapp.e3ap_sctp`) | SCTP one-to-one association, one PDU per SCTP message (or libe3's ZMQ link layer) | `E3AP-OCUDU-V2` (libe3 E3AP 1.0.0 + OCUDU additions) in APER or Protobuf; service-model bodies opaque APER | procedures + **push** indications | Out-of-process dApps and observers: setup, telemetry subscriptions, fragmented indications, management as control actions |
 | **E3 data profile** (`dapp.e3dp_sctp`) | SCTP one-to-one association, one message per request/response | Size-prefixed FlatBuffers `E3DP` | request/response (poll) | Compatibility endpoint for the standalone E3 SCTP reference client (`dataSubscriptions` / `dataPoll` only) |
 
 All three carriers dispatch into the same `management_service` and the same
 bounded `portable_data_store`; a subscription made on one carrier is visible to
 the others through `dataSubscriptions list`.
 
-The E3AP module is a **standalone DeepSig definition**. Its procedure set and
-field vocabulary deliberately mirror E3AP 1.0.0 as implemented by the
-Northeastern University libe3 project (setup, subscription, indication, dApp
-control action, dApp report, xApp control action, release, message ack) so dApp
-logic ports between stacks, but the two are **not byte-compatible**: OCUDU uses
-extensible sequences, production-sized identifier ranges, payloads up to the
-protocol maximum of 16 MiB with explicit fragmentation (the embedded server
+The E3AP module, **E3AP-OCUDU-V2** (`schemas/e3/e3ap-ocudu-v2.asn1`), is the
+Northeastern University libe3 E3AP 1.0.0 module (`messages/asn1/V1/e3ap-1.0.0.asn1`,
+libe3 0.2.1) with OCUDU **extension additions**: everything before each of
+libe3's extension markers is libe3's module, type for type, and OCUDU adds only
+after them. A message without additions is therefore a libe3 message, bit for
+bit, and libe3 reads OCUDU's messages of its own procedures (it skips the
+additions). The additions carry what OCUDU needs beyond libe3: payloads up to
+the protocol maximum of 16 MiB in 32 KiB fragments (the embedded server
 advertises its own `maximumPayloadBytes` in the setup response — 4 MiB by
-default, tied to the portable store's `maximum_object_bytes`), and a control
-response that carries a service-model outcome. See
-[Interoperability notes](#interoperability-notes).
+default, tied to the portable store's `maximum_object_bytes`), by-reference
+delivery through shared memory, causes and detail text, and a control response
+that carries a service-model outcome. The same message set is defined in
+Protobuf (`schemas/e3/protobuf/e3ap-ocudu-v2.proto`: libe3's schema plus fields
+numbered from 100). See [Interoperability notes](#interoperability-notes).
 
 ## Local management carrier
 
@@ -115,7 +118,7 @@ by `(routeEpoch, publicationSequence)` with contiguous `chunkIndex`. Interfaces:
 | `0x00010002` SRS-ISAC | Class-C SRS route | `OCC3` | channel estimates |
 | `0x00020001` … `0x00020006` telemetry | upper-PHY telemetry publisher | packed `telemetry_metadata_header` record (below) | binary32 I/Q pairs, one CRC byte, or UTF-8 JSON |
 
-## E3AP carrier (`E3AP-OCUDU-V1`)
+## E3AP carrier (`E3AP-OCUDU-V2`)
 
 ### Transport discipline
 
@@ -126,7 +129,7 @@ by `(routeEpoch, publicationSequence)` with contiguous `chunkIndex`. Interfaces:
 | Framing | **SCTP message boundaries.** Send each `E3-PDU` with one `send`/`sendmsg`; receive with `recvmsg` accumulating partial deliveries until `MSG_EOR`. No length prefix. |
 | Streams | Stream 0 carries procedures; stream 1 carries indications. Clients may send everything on stream 0. |
 | PPID | `0x00E3A001` (project-private, informational) |
-| Largest PDU | 64 KiB fragment + envelope (`e3ap_codec::maximum_pdu_bytes`) |
+| Largest PDU | 32 KiB fragment + envelope (64 KiB bound, `e3ap_v2_codec::maximum_pdu_bytes`) |
 | Idle close | Associations quiet longer than `idle_timeout_ms` (default 30 s) are closed; an association that has not completed setup within `setup_timeout_ms` (default 5 s) is closed |
 | Admission | Optional `allowed_peers` list of literal addresses; `maximum_associations` (default 8) |
 | Event notifications | Not subscribed; receivers skip `MSG_NOTIFICATION` deliveries defensively |
@@ -143,7 +146,7 @@ indications: the send buffer defaults to 16 KiB (`net.sctp.sctp_wmem`), the
 receive window is fixed from `SO_RCVBUF` when the association is established,
 and SACKs are delayed by 200 ms. With those defaults at most one chunk is in
 flight and every chunk waits for the SACK timer: a ~1.7 MB object in 64 KiB
-fragments takes 5-16 s over loopback. Measured on Linux 6.11 (DGX Spark):
+fragments took 5-16 s over loopback (measured before the move to 32 KiB fragments, Linux 6.11, DGX Spark):
 
 | Server buffers preset | Client buffers preset | Delayed SACK off | ~1.7 MB object |
 |---|---|---|---|
@@ -166,45 +169,44 @@ sends a fragment larger than it.
 ### Envelope
 
 ```text
-E3-PDU ::= SEQUENCE {
+E3-PDU ::= SEQUENCE {                    -- libe3's envelope, unchanged
   id        E3-MessageID,                -- request id; responses echo it as requestId
-  msg CHOICE {
-    setupRequest         E3-SetupRequest,
-    setupResponse        E3-SetupResponse,
-    subscriptionRequest  E3-SubscriptionRequest,
-    subscriptionDelete   E3-SubscriptionDelete,
-    subscriptionResponse E3-SubscriptionResponse,
-    indicationMessage    E3-IndicationMessage,
-    dAppControlAction    E3-DAppControlAction,
-    dAppReport           E3-DAppReport,
-    xAppControlAction    E3-XAppControlAction,
-    releaseMessage       E3-ReleaseMessage,
-    messageAck           E3-MessageAck,
-    controlResponse      E3-ControlResponse,
-    ...
+  timestamp E3-Timestamp OPTIONAL,       -- realtime ns
+  msg       CHOICE {
+    setupRequest          [0]  E3-SetupRequest,
+    setupResponse         [1]  E3-SetupResponse,
+    subscriptionRequest   [2]  E3-SubscriptionRequest,
+    subscriptionDelete    [3]  E3-SubscriptionDelete,
+    subscriptionResponse  [4]  E3-SubscriptionResponse,
+    indicationMessage     [5]  E3-IndicationMessage,
+    dAppControlAction     [6]  E3-DAppControlAction,
+    dAppReport            [7]  E3-DAppReport,
+    xAppControlAction     [8]  E3-XAppControlAction,
+    releaseMessage        [9]  E3-ReleaseMessage,
+    messageAck            [10] E3-MessageAck,
+    ...,
+    controlResponse       [11] E3-ControlResponse  -- OCUDU addition (OCUDU profile only)
   },
-  ...,
-  timestamp E3-Timestamp OPTIONAL       -- native extension; realtime ns
+  ...
 }
 ```
 
 The agent stamps every outbound PDU with `CLOCK_REALTIME` at send time **for
-peers whose setup request carried a timestamp**, and decodes a peer's
-timestamp when present (`e3ap_pdu::timestamp_ns`). A PDU without a timestamp
-encodes byte-for-byte as before the field existed, including ID-width boundaries
-above 256. A conforming old decoder skips the timestamp extension. A peer that
-does not stamp its setup is still answered without timestamps.
-The Python client stamps by default (`E3Client.stamp_timestamps`) and falls
-back to an unstamped setup when an older agent rejects it. The field mirrors
-libe3's timestamp semantics (unconstrained INTEGER, nanoseconds), not its root
-placement. The separate libe3 codec retains `id, timestamp, msg`; native E3 keeps
-`id, msg, ..., timestamp` to preserve its existing wire. The short-lived
-pre-release native root-timestamp layout is not a supported third dialect.
+peers whose setup request carried a timestamp**, and decodes a peer's timestamp
+when present (`e3ap_pdu::timestamp_ns`). The Python client stamps by default
+(`E3Client.stamp_timestamps`).
 
-Native dApp IDs use 101..65535; libe3 IDs use 1..100. Live IDs are never reused.
-Queued xApp controls capture their association identity, and callers with a
-report/discovery context should use the expected-association overload to reject
-stale IDs before enqueue. Subscription alias wrap skips all live aliases.
+**Profiles.** A dApp that wants the OCUDU procedures sets the setup request's
+`ocuduProfile` addition (value 1); the agent echoes it in the setup response.
+Without it the association runs libe3's procedures (see
+[the libe3 profile](#libe3-peers-and-the-libe3-profile)). `ocudu_e3` and the
+C++ test clients always ask for it.
+
+OCUDU-profile dApp IDs use 101..65535; libe3-profile IDs use 1..100. Live IDs
+are never reused. Queued xApp controls capture their association identity, and
+callers with a report/discovery context should use the expected-association
+overload to reject stale IDs before enqueue. Subscription alias wrap skips all
+live aliases.
 
 ### dApp reports and xApp control
 
@@ -221,7 +223,7 @@ delivers relayed actions to `E3Client.on_xapp_control` and sends reports with
 ### By-reference bulk data (shared memory)
 
 A subscription may ask for `deliveryMode byReference` (optionally with
-`minimumByReferenceBytes`; default one fragment, 64 KiB). The agent then maps
+`minimumByReferenceBytes`; default one fragment, 32 KiB). The agent then maps
 one POSIX shared-memory region for the subscription, named
 `<shared_region_name_prefix>-<pid>-<association>-<subscription>` (default prefix
 `/ocudu-e3`, mode `shared_region_mode`, default 0640), with
@@ -284,13 +286,15 @@ negative responses carry an optional `E3-Cause` and `detail`.
 
 ### Procedures
 
-1. **Setup.** `E3-SetupRequest { e3apProtocolVersion "1.x", dAppName, dAppVersion, vendor, dAppInstance? }`.
+1. **Setup.** `E3-SetupRequest { e3apProtocolVersion "1.x", dAppName, dAppVersion (1..11 bytes), vendor, ocuduProfile?, dAppInstance? }`.
    The agent answers `E3-SetupResponse` with the assigned `dAppIdentifier`,
    its `ranIdentifier`, `ranInstance`, payload/fragment bounds, and the
    `ranFunctionList`. A second setup on the same association is refused with
    `setupAlreadyComplete`; every other procedure before setup fails with
    `setupRequired`.
-2. **Subscription.** `E3-SubscriptionRequest { dAppIdentifier, ranFunctionIdentifier, telemetryIdentifierList, controlIdentifierList, subscriptionTime?, periodicity?, subscriptionData? }`.
+2. **Subscription.** `E3-SubscriptionRequest { dAppIdentifier, ranFunctionIdentifier, telemetryIdentifierList, controlIdentifierList, subscriptionTime? (0..3600 s), periodicity? (0..1000 ms), subscriptionData?, deliveryMode?, minimumByReferenceBytes?, subscriptionTimeLong? (0..86400), periodicityLong? (0..60000) }`.
+   Values beyond libe3's root ranges travel in the `...Long` additions with the
+   root field absent.
    Only RAN function 10 (telemetry) accepts subscriptions; `controlIdentifierList`
    must be empty. `periodicity` (ms) is the per-RNTI capture interval requested
    for every telemetry in the request (`0` = every event; absent = the stream's
@@ -311,19 +315,21 @@ negative responses carry an optional `E3-Cause` and `detail`.
    `controlOutcome` is the APER `ManagementResponse`, fragmented when large.
 5. **Release.** `E3-ReleaseMessage` removes every subscription of the dApp and
    closes the association after a positive `E3-MessageAck`.
-6. `E3-DAppReport` is accepted and acknowledged (no consumer yet);
+6. `E3-DAppReport` (its `sequenceId` is mandatory, as in libe3) is accepted and acknowledged (no consumer yet);
    `E3-XAppControlAction` is RAN→dApp only and is refused with `protocolError`.
    A PDU that does not decode is answered with one negative ack and the
    association is closed, because the stream state can no longer be trusted.
 
 ### Fragmentation
 
-Any payload larger than `maximumFragmentBytes` (64 KiB, advertised in the
-setup response) is split into ordered fragments. Receivers reassemble
-fragments that share the PDU `id` (control) or `subscriptionId` + `sequence`
-(indication) in `fragmentIndex` order and verify the reassembled length against
-`payloadBytes` before decoding. `fragmentIndex` defaults to 0 and
-`fragmentCount` to 1, so unfragmented payloads omit them.
+Any payload larger than `maximumFragmentBytes` (32 KiB, libe3's root payload
+bound, advertised in the setup response) is split into ordered fragments.
+Receivers reassemble fragments that share the PDU `id` (control) or
+`subscriptionId` + `sequence` (indication) in `fragmentIndex` order and verify
+the reassembled length against `payloadBytes` before decoding. `fragmentIndex`
+and `fragmentCount` are `OPTIONAL` additions meaning 0 and 1 when absent, so a
+whole payload carries no extension group and is byte-identical to libe3's
+message.
 
 ### RAN functions
 
@@ -384,7 +390,7 @@ publication unchanged: the `OCC3` FlatBuffers envelope (radio time, cell,
 carrier reference frequency, bandwidth, tensor descriptor, expected uplink use
 per symbol × PRB) as `metadata` and the complete tensor as `tensor`. The tensor
 is an APER `OCTET STRING` — length prefix plus raw bytes, fragmented above
-64 KiB at the E3AP level — so bulk data is never re-encoded; on the reference
+32 KiB at the E3AP level — so bulk data is never re-encoded; on the reference
 cell a Python subscriber sustains the full ~120 grids/s (~4 MB/s) with ~120 µs
 per decode (`ocudu_e3.classc.decode_spectrum`). The SDK's
 `examples/e3_spectrum_sensing/emitter_detector.py` is an out-of-process
@@ -481,63 +487,136 @@ route exactly as a management-socket subscription would.
 
 | Topic | OCUDU | libe3 (Northeastern) | NVIDIA cuSense |
 |-------|-------|----------------------|----------------|
-| Encoding | ASN.1 APER | ASN.1 APER, JSON, or Protobuf (run-time selected) | JSON |
-| Transport | SCTP, message boundaries, streams | ZMQ (IPC/TCP), POSIX sockets with a 4-byte length prefix (three channels), or, with the patch in `tests/interop/libe3/patches`, one native SCTP association with message boundaries (`E3LinkLayer::SCTP_ASSOCIATION`) | ZMQ REQ/REP + PUB/SUB |
-| Envelope | Native `E3-PDU { id, msg CHOICE, ..., timestamp OPTIONAL }`; separate libe3 codec | `E3-PDU { id, timestamp OPTIONAL, msg CHOICE }` (libe3 0.0.11+; 0.0.5/0.0.6 lack the timestamp and extension markers) | `common_headers { type, message_id, timestamp }` |
-| Identifier ranges | 1..65535 (ids), 1..2^32-1 (message id) | 1..100 (dApp, RAN function, telemetry), 1..1000 (message id) | strings / 32-bit |
-| Payload bound | 16 MiB with E3AP fragmentation, or by reference through a shared region | 32 KiB `OCTET STRING`, no fragmentation | out-of-band shared memory |
-| Control outcome | `E3-ControlResponse` with service-model body | `E3-MessageAck` only | `e3_control_response` JSON |
-| Extensibility | `...` on every SEQUENCE and ENUMERATED | `...` on every SEQUENCE and the PDU CHOICE since 0.0.11 (`E3-ResponseCode` deliberately closed) | JSON additive |
+| Module | E3AP-OCUDU-V2 = libe3 E3AP 1.0.0 + extension additions | E3AP 1.0.0 (0.2.1) | JSON messages |
+| Encoding | ASN.1 APER or Protobuf (same messages, same profiles) | ASN.1 APER, JSON, or Protobuf (run-time selected) | JSON |
+| Transport | SCTP, message boundaries, streams; libe3's ZMQ link layer for libe3 peers | ZMQ (IPC/TCP), POSIX sockets with a 4-byte length prefix (three channels), or, with the patch in `tests/interop/libe3/patches`, one native SCTP association with message boundaries (`E3LinkLayer::SCTP_ASSOCIATION`) | ZMQ REQ/REP + PUB/SUB |
+| Envelope | `E3-PDU { id, timestamp OPTIONAL, msg CHOICE }` (libe3's) | the same | `common_headers { type, message_id, timestamp }` |
+| Identifier ranges | 1..65535 (ids), 1..2^32-1 (message and sequence id), lists up to 1000 | the same | strings / 32-bit |
+| Procedure correlation | `E3-SequenceID`: mandatory on report and xApp control, optional on control | the same | - |
+| Payload bound | 32 KiB per PDU; 16 MiB with fragmentation (addition) or by reference through a shared region | 32 KiB, no fragmentation | out-of-band shared memory |
+| Control outcome | `E3-ControlResponse` (CHOICE addition) with service-model body; `E3-MessageAck` to libe3 peers | `E3-MessageAck` only | `e3_control_response` JSON |
+| Extensibility | libe3's markers; OCUDU additions behind them | `...` on every SEQUENCE and the PDU CHOICE (`E3-ResponseCode` deliberately closed) | JSON additive |
 
-### The libe3 dialect of the E3AP agent
+### libe3 peers and the libe3 profile
 
-The E3AP SCTP agent speaks both modules on the same port
-(`e3ap_sctp_server_config::libe3_profile`, on by default). The dialect is fixed
-per association by its setup request: a PDU that decodes under
-`E3AP-OCUDU-V1` selects the native module; one that decodes only under the
-upstream libe3 `e3ap-1.0.0.asn1` (vendored in `schemas/e3/interop/libe3`,
-compiled with `asn1c -fprefix=LIBE3_` into `e3ap_libe3_codec`) binds the
-association to libe3 for good. The two modules do not accept each other's
-setup bytes (a unit test pins that). A libe3 peer then gets:
+The E3AP agent serves libe3 peers and OCUDU peers on the same port with the
+same codecs. The encoding is fixed per association by its setup request (every
+enabled format is tried; when more than one reads a setup, only the one that
+re-encodes the decoded setup to the very same bytes is kept, and an ambiguous
+setup is refused); the profile by the request's `ocuduProfile`. A setup without
+it (what libe3 sends) runs the libe3 profile
+(`e3ap_sctp_server_config::libe3_profile`, on by default): the agent writes no
+OCUDU addition, so every byte it sends is what libe3's own encoder would send,
+and it ignores additions on receipt. A libe3-profile peer then gets:
 
-| Aspect | libe3 peer | Native peer |
-|--------|------------|-------------|
-| dApp identifier | 1..100, from a pool handed out from 100 downward and returned on close | association-derived, 1..65535 |
-| Message identifiers | 1..1000 (the agent wraps its own at 1000) | 1..2^32-1 |
-| RAN functions | 10 and 11 as usual; list entries above 100 are left out | full lists |
-| Subscriptions | plain libe3 request (no `subscriptionData`); subscription identifiers 1..100 | full request |
+| Aspect | libe3 profile | OCUDU profile |
+|--------|---------------|---------------|
+| dApp identifier | 1..100 (any 1..65535 is valid on the wire), from a pool handed out from 100 downward and returned on close | association-derived, 101..65535 |
+| Message identifiers | 1..2^32-1 (per session over SCTP; one server-wide counter over ZMQ, where every session shares the PUB stream and `E3-MessageAck` names no dApp) | 1..2^32-1 |
+| Sequence identifiers | report: the dApp's `sequenceId` is handed to the report handler (`e3ap_dapp_report_event::sequence_identifier`); xApp control: the caller's E2SM-DAPP sequence-id, or one the agent assigns | the same |
+| RAN functions | 10 and 11 | 10 and 11, with names and versions |
+| Subscriptions | plain request (no `subscriptionData`) | full request |
 | Indications | whole payloads of at most 32 KiB; larger objects and by-reference rows are dropped and counted in `libe3_indications_dropped` (PUSCH CRC, SRS, DM-RS, JSON metrics fit; PUSCH symbols and grids do not) | fragmented up to 16 MiB or by reference |
-| Control | one `E3-MessageAck` carrying the outcome after the service model ran (libe3 has no control response) | ack on acceptance plus `E3-ControlResponse` with the body |
+| Control | one `E3-MessageAck` carrying the outcome after the service model ran | ack on acceptance plus `E3-ControlResponse` with the body |
 | Subscription delete | confirmed by `E3-SubscriptionResponse` echoing the subscription identifier (what libe3's dApp state machine waits for) | `E3-MessageAck` |
-| Timestamp | the same compatibility rule: stamped when the peer stamped its setup | same |
-| OCUDU-only fields | causes, detail text, instance identifiers, fragment bookkeeping and descriptors are dropped on encode and absent on decode | carried |
+| Timestamp | stamped when the peer stamped its setup | the same |
+| OCUDU additions | not sent, ignored on receipt | carried |
 
-Metrics: `libe3_setups_completed`, `libe3_indications_dropped`.
+`e3ap_libe3_codec` is the APER codec in the libe3 profile
+(`e3ap_v2_codec::encode(pdu, e3ap_profile::libe3)`), pinned against eleven
+vectors from libe3's own `Asn1E3Encoder`. Metrics: `libe3_setups_completed`,
+`libe3_indications_dropped`.
+
+### Protobuf
+
+libe3 built with `LIBE3_ENABLE_PROTOBUF` encodes E3AP with Protocol Buffers
+(`messages/proto/V1/e3ap-1.0.0.proto`, vendored in `schemas/e3/interop/libe3`
+and checked against the submodule at configure time). The agent accepts those
+peers on the same SCTP port (`e3ap_sctp_server_config::protobuf_profile`, on by
+default) and over ZMQ (`zmq_carrier_config::encoding = e3ap_encoding::protobuf`;
+libe3 fixes the encoding in its configuration, never on the wire, so a ZMQ
+carrier serves one encoding). On SCTP the encoding is detected with the module
+from the setup request, under the same canonical re-encode rule: every enabled
+format (APER, Protobuf) is tried and the one that reads a
+setup request, and re-encodes it to the same bytes if several do, binds the
+association; the profile comes from `ocudu_profile` as in APER.
+
+`schemas/e3/protobuf/e3ap-ocudu-v2.proto` is E3AP-OCUDU-V2 in Protobuf, a
+strict wire superset of libe3's schema: every libe3 message, field number, type and
+enum value is unchanged, and OCUDU adds fields numbered 100 and up (causes,
+detail text, instance identifiers, RAN function names, payload and fragment
+bounds, subscription data and delivery mode, granted identifier lists, shared
+regions, indication bookkeeping, fragmentation, by-reference tensor
+descriptors) plus one `E3Pdu.msg` alternative, `ControlResponse = 100`. A libe3
+parser skips the additions as unknown fields, so an OCUDU-profile PDU of any
+libe3 message type still reads as the libe3 message; only a `ControlResponse`
+would reach libe3 as an empty oneof, and it is never sent to a libe3 peer.
+
+| Protobuf peer | How it is recognised | Procedures | On the wire |
+|---------------|----------------------|------------|-------------|
+| libe3 (`EncodingFormat::PROTOBUF`) | `SetupRequest` without `ocudu_profile` | the libe3 dialect above (identifiers 1..100, whole payloads up to 32 KiB, `MessageAck` for control) | byte-identical to libe3's `ProtobufE3Encoder`; no field >= 100 is sent |
+| OCUDU profile | `SetupRequest.ocudu_profile = 1` (echoed in the response) | the OCUDU procedures (fragmentation, by-reference delivery, `ControlResponse`) | the superset schema |
+
+The codec (`e3ap_protobuf_codec`) is hand-written, so the gNB links no
+libprotobuf: canonical libprotobuf output on encode (ascending field numbers,
+proto3 defaults omitted, `optional` fields written when set, packed repeated
+scalars, one size pass and one copy of each payload), any valid proto3
+serialisation on decode (any field order, packed or unpacked, repeated message
+fields merged, unknown fields skipped). Each profile enforces the bounds of the
+module it mirrors, so a libe3 association behaves the same over APER and
+Protobuf. proto3 cannot mark an implicit zero as present, so an identifier,
+message identifier or sequence identifier of 0 means "absent" (all are 1..N on
+both modules). Unlike libe3, which reads an unknown `ResponseCode` as
+`POSITIVE`, the codec refuses it. The ZMQ carrier routes Protobuf PDUs with an
+allocation-free read of the identifiers (`e3ap_protobuf_codec::peek`) instead
+of a decode.
+
+Metrics: `protobuf_setups_completed` (either profile; libe3-profile setups also
+count in `libe3_setups_completed`).
+
+### Python peers and libe3's text fields
+
+libe3's grammar (and so V2's root) types names and versions as
+`UTF8String (SIZE (..))`. asn1c, which generates both libe3 and OCUDU's codec
+from one pinned commit, writes their length as a constrained bit field; a strict
+X.691 encoder (plain asn1tools) writes an octet-aligned length, so it cannot
+read or produce libe3's `E3-SetupRequest`/`E3-SetupResponse`. `ocudu_e3`
+compiles V2 (and `ocudu_e3.libe3` the vendored libe3 grammar) with those fields
+read the way asn1c encodes them, so Python peers produce libe3's bytes exactly:
+`ocudu_e3`'s own codec reproduces all eleven libe3 vectors, and libe3 decodes
+what it emits (both directions are tests). Text crosses `ocudu_e3`'s E3AP API as
+UTF-8 bytes.
+
+### libe3 over ZMQ
+
+libe3 dApps that use libe3's own ZMQ link layer (`E3LinkLayer::ZMQ`, unpatched)
+are served when `e3ap_sctp_server_config::zmq` is set: the agent binds libe3's
+three sockets (REP for setup, PUB for everything it sends, SUB for everything
+dApps send; `ipc://` or `tcp://`, libe3's defaults 9990/9991/9999 or
+`/tmp/dapps/{setup,e3_socket,dapp_socket}`) and drives the same E3AP procedure
+code through one virtual association per dApp session (`zmq_association_server`).
+It speaks the libe3 module in the configured encoding (APER or Protobuf; a
+Protobuf dApp may also select the OCUDU profile). Inbound PDUs are routed by the dApp identifier
+they carry (an `E3-MessageAck`, which carries none, by the message identifier it
+answers). Compiled in only with libzmq and instantiated only when configured;
+the encoder's buffers are handed to ZMQ without a copy and nothing is decoded
+twice while a single dApp is attached. It exists for libe3 interoperability
+(`dapp_e3ap_libe3.e2e_zmq`); the gNB's E3 endpoint stays SCTP.
 
 ### Automated interoperability tests
 
 | Test | Needs | Checks |
 |------|-------|--------|
-| `dapp_e3ap_libe3_codec.*` (gtest, always built) | nothing | every libe3 procedure round-trips through `e3ap_libe3_codec`; the module's bounds are enforced; the native and libe3 modules do not decode each other's setup; the eleven vectors produced by **libe3's own encoder** (pinned in `python/tests/fixtures/libe3_vectors.json` / `e3ap_libe3_vectors.inc`) decode and re-encode byte for byte |
-| `dapp_e3ap_sctp_server.serves_libe3_module_peers_*`, `drops_indications_the_libe3_module_cannot_carry` (gtest) | nothing | a libe3-module peer runs setup, subscription, indication, control, report, delete and release beside a native peer on one port; oversize objects are dropped and counted |
-| `dapp_e3ap_libe3.interop` (`python/tests/test_libe3_interop.py`) | asn1tools | structural alignment of the two modules (PDU order, envelope, root fields, extensibility, range supersets, the exact documented divergence set) and the pinned upstream vectors |
-| `dapp_e3ap_libe3.e2e` (`python/tests/test_libe3_e2e.py`, `-DOCUDU_DAPP_LIBE3_INTEROP=ON`) | network or a libe3 checkout, SCTP headers | **the real upstream libe3** (dApp role, `SCTP_ASSOCIATION` link layer) against `e3ap_test_server`: full session; two dApps in a row; the encoder tool still matches the pinned vectors; libe3 decodes what asn1tools emits |
+| `dapp_e3ap_libe3_codec.*`, `dapp_e3ap_v2_codec.*` (gtest, always built) | nothing | the eleven vectors produced by **libe3's own encoder** (pinned in `python/tests/fixtures/libe3_vectors.json` / `e3ap_libe3_vectors.inc`) decode and re-encode byte for byte through the V2 codec's libe3 profile; every OCUDU addition round-trips; a libe3-profile decoder reads every OCUDU-profile PDU as the libe3 message; on 24000 random PDUs APER and Protobuf accept and refuse the same values and translate into each other byte for byte, in both profiles |
+| `dapp_e3ap_protobuf_codec.*` (gtest, always built) | nothing | the eleven vectors produced by **libe3's own `ProtobufE3Encoder`** (pinned beside the APER ones, `e3ap_libe3_protobuf_vectors.inc`) decode and re-encode byte for byte; every procedure round-trips under both profiles, every OCUDU field included; libe3-profile bounds; proto3 decoding leniency (order, packing, merging, unknown fields, wrong wire types); malformed input refused; 20000 mutated inputs never crash and whatever is accepted re-encodes to a fixed point |
+| `dapp_e3ap_protobuf_conformance.*` (gtest, needs libprotobuf-dev and protoc) | libprotobuf | the OCUDU schema is a wire superset of libe3's (all 58 libe3 fields unchanged, additions >= 100); 12000 random PDUs of every procedure under both profiles serialise exactly as libprotobuf does; libe3's generated parser reads every OCUDU-profile PDU, and discarding the unknown fields leaves exactly the libe3-profile bytes; field order does not matter on decode |
+| `dapp_e3ap_sctp_server.serves_libe3_module_peers_*`, `serves_every_encoding_and_profile_on_one_port`, `drops_indications_the_libe3_module_cannot_carry` (gtest) | nothing | a libe3-profile peer runs setup, subscription, indication, control, report, delete and release beside an OCUDU-profile peer on one port; APER and Protobuf peers of both profiles share one port, each served in its own procedures; oversize objects are dropped and counted |
+| `dapp_e3ap_libe3.interop` (`python/tests/test_libe3_interop.py`) | asn1tools | every libe3 type has the identical root in E3AP-OCUDU-V2 and OCUDU adds only behind libe3's markers; `ocudu_e3`'s codec reproduces every libe3 vector; libe3 reads OCUDU-profile PDUs as the libe3 message |
+| `dapp_e3ap_libe3.e2e_sctp`, `.e2e_zmq` (`python/tests/test_libe3_e2e.py`, `-DOCUDU_DAPP_LIBE3_INTEROP=ON`) | a libe3 checkout, SCTP headers, libzmq, libprotobuf | **the real upstream libe3** (dApp role) against `e3ap_test_server` over `SCTP_ASSOCIATION`, ZMQ `ipc://` and ZMQ `tcp://`, each in APER and in Protobuf: full session; two dApps in a row; two concurrent dApps on the ZMQ sockets; the encoder tool still matches the pinned APER and Protobuf vectors, and libe3 decodes both to the same fields; libe3 decodes what Python emits |
 
-One finding from the vectors: asn1tools treats the `SIZE` constraint on
-libe3's `UTF8String` fields as PER-visible and encodes their length in a
-constrained field, while asn1c (libe3's and OCUDU's generator) uses an
-unconstrained length determinant as X.691 requires for a string type that is
-not a known-multiplier type. The two PDUs that carry `UTF8String`
-(`SetupRequest`, `SetupResponse`) therefore do not cross between asn1tools and
-asn1c; the other nine do, byte for byte. This is the corner `E3AP-OCUDU-V1`
-avoids by carrying text as `OCTET STRING`, and the reason the Python gate pins
-that divergence instead of using asn1tools as the reference for libe3 bytes.
-
-What still needs the other party: identifier widths, text carriage and the
-payload bound are root-level differences, so a single merged module (the
-"E3AP 2.0" proposal in the comparison paper) needs Northeastern's agreement.
-Until then the dialect above is the interoperability path, and it is tested
-end to end.
+What is left to align with libe3 is upstreaming, not wire: proposing the OCUDU
+additions (fragmentation, by-reference delivery, causes, control response) to
+libe3, so that one module and one `.proto` file serve both projects.
 
 The reference client tarball ships a **trimmed** `class-c-publication-v1.fbs`
 whose `ElementType` and `GridMaskGranularity` enumerators are numbered
@@ -559,13 +638,13 @@ streams you need, apply RNTI filters) is a client responsibility.
 
 ## Independent client checklist
 
-1. Compile the four `schemas/e3/*.asn1` modules with an APER stack (asn1tools, asn1c).  
-2. Carry text as UTF-8 `OCTET STRING`; carry 64-bit counters as 8-byte network-order octets.  
+1. Compile `e3ap-ocudu-v2.asn1` and the three service-model modules with an APER stack (asn1c; with asn1tools, read SIZE-constrained `UTF8String` as `OCTET STRING`, see `ocudu_e3.libe3.asn1c_equivalent_grammar`), or use `schemas/e3/protobuf/e3ap-ocudu-v2.proto`.  
+2. Set `ocuduProfile` in the setup request for the OCUDU procedures; carry 64-bit counters as 8-byte network-order octets.  
 3. Frame by SCTP message boundaries (`MSG_EOR`); never rely on a length prefix.  
 4. Complete setup before any other procedure; echo the assigned `dAppIdentifier`.  
 5. Reassemble fragments by `(subscriptionId, sequence)` and PDU `id`; verify `payloadBytes`.  
 6. Treat `droppedObjects` and `routeEpoch` changes as visible discontinuities, not errors.  
-7. Golden vectors: `python/tests/test_e3ap_client.py` and `tests/unittests/dapp/e3ap_codec_test.cpp` pin identical setup bytes.
+7. Golden vectors: `python/tests/fixtures/libe3_vectors.json` (libe3's own encoders, APER and Protobuf); a V2 message without additions must reproduce them.
 
 ## Related
 

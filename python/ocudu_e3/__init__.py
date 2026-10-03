@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 """Python client for the OCUDU E3 interface.
 
-The package speaks E3AP-OCUDU-V1 (ASN.1 APER over SCTP) to the embedded OCUDU
+The package speaks E3AP-OCUDU-V2 (libe3 E3AP 1.0.0 with OCUDU extension additions, ASN.1 APER
+over SCTP) to the embedded OCUDU
 E3 agent: setup, telemetry subscriptions with fragmented indications, and the
 dApp management service model carried as control actions. It also decodes the
 packed telemetry metadata used by the pull-based ``dataPoll`` path so the same

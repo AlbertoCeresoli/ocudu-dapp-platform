@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
-"""E3AP-OCUDU-V1 client: setup, subscriptions, indications, and control.
+"""E3AP-OCUDU-V2 client: setup, subscriptions, indications, and control.
 
 Typical use::
 
@@ -28,6 +28,7 @@ from . import management as mgmt
 from .schema import (
     E3AP_DEFAULT_PORT,
     E3AP_MAX_FRAGMENT_BYTES,
+    E3AP_OCUDU_PROFILE,
     E3AP_MAX_PAYLOAD_BYTES,
     MANAGEMENT_CONTROL_REQUEST,
     RAN_FUNCTION_MANAGEMENT,
@@ -252,6 +253,8 @@ class E3Client:
         self.on_xapp_control: Optional[Callable[[int, bytes], None]] = None
         # Stamp every outbound E3-PDU with the realtime clock (libe3 envelope field).
         self.stamp_timestamps = True
+        # Last E3-SequenceID this client assigned to a report.
+        self._next_sequence = 0
         # Realtime timestamp of the last PDU received from the agent, when present.
         self.last_agent_timestamp_ns: Optional[int] = None
         # Indications whose by-reference row was overwritten before it was read.
@@ -362,38 +365,8 @@ class E3Client:
     # Procedures
     # ------------------------------------------------------------------
     def setup(self) -> SetupResult:
-        """Complete E3 setup.
-
-        The request is stamped with the envelope timestamp by default. An agent
-        built before the field existed cannot decode a stamped PDU and answers
-        with a protocol error (or closes the association); in that case the
-        client reconnects once and repeats the setup unstamped, and stays
-        unstamped for the life of the client.
-        """
-        try:
-            return self._setup_once()
-        except (E3ProtocolError, E3TransportError) as error:
-            legacy_agent = self.stamp_timestamps and (
-                isinstance(error, E3TransportError) or getattr(error, "cause", None) == "protocolError"
-            )
-            if not legacy_agent:
-                raise
-        self.stamp_timestamps = False
-        self._reconnect()
+        """Complete E3 setup (stamped with the envelope timestamp unless ``stamp_timestamps`` is off)."""
         return self._setup_once()
-
-    def _reconnect(self) -> None:
-        try:
-            self._association.close()
-        except Exception:  # noqa: BLE001 - best effort before reconnecting
-            pass
-        try:
-            self._association = SctpAssociation(self.host, self.port, timeout=self.timeout)
-        except SctpTransportError as error:
-            raise E3TransportError(str(error)) from error
-        self._next_id = 1
-        self._indication_assembly = _FragmentAssembly(E3AP_MAX_PAYLOAD_BYTES)
-        self._control_assembly = _FragmentAssembly(E3AP_MAX_PAYLOAD_BYTES)
 
     def _setup_once(self) -> SetupResult:
         """Run E3 Setup and learn the RAN functions the agent offers."""
@@ -406,6 +379,9 @@ class E3Client:
                 "dAppName": self.dapp_name.encode("utf-8"),
                 "dAppVersion": self.dapp_version.encode("utf-8"),
                 "vendor": self.vendor.encode("utf-8"),
+                # Ask for the OCUDU procedures (fragmentation, by-reference delivery, control
+                # responses); without it the agent would run libe3's.
+                "ocuduProfile": E3AP_OCUDU_PROFILE,
             },
         )
         _, _, body = self._wait_for(lambda i, n, b: n == "setupResponse" and b.get("requestId") == pdu_id, self.timeout)
@@ -488,10 +464,14 @@ class E3Client:
             "telemetryIdentifierList": ids,
             "controlIdentifierList": [],
         }
+        # libe3's root ranges (periodicity 0..1000 ms, time 0..3600 s) first; wider values ride in
+        # the OCUDU additions with the root field absent.
         if periodicity_ms is not None:
-            body["periodicity"] = int(periodicity_ms)
+            body["periodicity" if int(periodicity_ms) <= 1000 else "periodicityLong"] = int(periodicity_ms)
         if subscription_time_s is not None:
-            body["subscriptionTime"] = int(subscription_time_s)
+            body["subscriptionTime" if int(subscription_time_s) <= 3600 else "subscriptionTimeLong"] = int(
+                subscription_time_s
+            )
         if configs:
             body["subscriptionData"] = self.codec.encode(
                 "Telemetry-SubscriptionData", {"configs": [config.to_asn() for config in configs]}
@@ -524,22 +504,40 @@ class E3Client:
         self.subscriptions[subscription.subscription_id] = subscription
         return subscription
 
-    def report(self, ran_function_id: int, data: bytes, timeout: Optional[float] = None) -> None:
-        """Send an E3 dApp Report (northbound, for the agent's E2SM-DAPP bridge) and wait for its ack."""
+    def report(
+        self, ran_function_id: int, data: bytes, timeout: Optional[float] = None, sequence_id: Optional[int] = None
+    ) -> int:
+        """Send an E3 dApp Report (northbound, for the agent's E2SM-DAPP bridge) and wait for its ack.
+
+        ``sequence_id`` (1..2^32-1) correlates the E2-E3 procedure this report starts: the agent copies
+        it into the E2SM-DAPP indication and an xApp reacting to the report echoes it. When omitted
+        the client assigns the next one. Returns the sequence identifier sent.
+        """
         dapp_id = self._require_setup()
         if not data:
             raise ValueError("report data must not be empty")
+        if sequence_id is None:
+            self._next_sequence = self._next_sequence % 0xFFFFFFFF + 1
+            sequence_id = self._next_sequence
+        if not 1 <= int(sequence_id) <= 0xFFFFFFFF:
+            raise ValueError("sequence_id must be 1..4294967295")
         pdu_id = self._take_id()
         self._send(
             pdu_id,
             "dAppReport",
-            {"dAppIdentifier": dapp_id, "ranFunctionIdentifier": int(ran_function_id), "reportData": bytes(data)},
+            {
+                "dAppIdentifier": dapp_id,
+                "ranFunctionIdentifier": int(ran_function_id),
+                "sequenceId": int(sequence_id),
+                "reportData": bytes(data),
+            },
         )
         _, _, ack = self._wait_for(
             lambda i, n, b: n == "messageAck" and b.get("requestId") == pdu_id, timeout or self.timeout
         )
         if ack.get("responseCode") != "positive":
             raise E3ProtocolError("E3 report refused", ack.get("cause"), _text(ack.get("detail")))
+        return int(sequence_id)
 
     def unsubscribe(self, subscription: Union[int, E3Subscription]) -> None:
         dapp_id = self._require_setup()

@@ -6,7 +6,9 @@
 
 Git Markdown companion: \c docs/dapp/e3_wire.md (normative prose).
 Normative schemas: \c schemas/e3/e3sm-ocudu-dapp-mgmt-v1.asn1,
-\c schemas/e3/e3ap-ocudu-v1.asn1, \c schemas/e3/e3sm-ocudu-telemetry-v1.asn1,
+\c schemas/e3/e3ap-ocudu-v2.asn1 (libe3 E3AP 1.0.0 with OCUDU extension
+additions; Protobuf form
+\c schemas/e3/protobuf/e3ap-ocudu-v2.proto), \c schemas/e3/e3sm-ocudu-telemetry-v1.asn1,
 \c schemas/e3/e3sm-ocudu-dapp-mgmt-carrier-v1.asn1 (all ASN.1 Aligned PER) and
 \c schemas/dapp/e3-data-profile-v1.fbs (FlatBuffers compatibility carrier).
 
@@ -77,8 +79,9 @@ filters need no codec.
 \section e3_wire_interop Interoperability
 
 The E3AP module mirrors the libe3 procedure set and field names but is not
-byte-compatible with libe3 (which lacks extension markers, bounds identifiers to
-1..100 and payloads to 32 KiB, and answers control actions with a bare ack).
+byte-compatible with libe3 (its envelope puts the timestamp in the root, it
+bounds payloads to 32 KiB and identifier lists to 1000 entries, and it answers
+control actions with a bare ack); since libe3 0.2.0 the identifier widths match.
 NVIDIA cuSense uses JSON over ZMQ. The reference SCTP client tarball carries a
 trimmed Class-C schema with renumbered enumerators; regenerate it from the
 normative OCUDU schema before interop.

@@ -1,0 +1,12 @@
+// Generated from python/tests/fixtures/libe3_vectors.json (Protobuf; see e3ap_protobuf_codec_test.cpp) by scripts/regen_libe3_vectors.py.
+{"SetupRequest", "082a10959a8fe6ac89dab0181a250a05312e302e30120b766563746f722d646170701a05302e322e31220877696e65736c6162"},
+{"SetupResponse", "082a10959a8fe6ac89dab0182226082a1a05312e302e3020072a0a766563746f722d72616e320d0801120201021a01012202dead"},
+{"SubscriptionRequest", "082a10959a8fe6ac89dab0182a0c080710011a020102283c3064"},
+{"SubscriptionDelete", "082a10959a8fe6ac89dab018320408071001"},
+{"SubscriptionResponse", "082a10959a8fe6ac89dab0183a06082a10072001"},
+{"IndicationMessage", "082a10959a8fe6ac89dab0184216080710011a100102030405060708090a0b0c0d0e0f10"},
+{"DAppControlAction", "082a10959a8fe6ac89dab0184a100807100118012202aabb2880bcc1960b"},
+{"DAppReport", "082a10959a8fe6ac89dab018520c08ac0210e8071a01cc209221"},
+{"XAppControlAction", "082a10959a8fe6ac89dab0185a0e08c0b80210011a02eeff20f0a204"},
+{"ReleaseMessage", "082a10959a8fe6ac89dab01862020807"},
+{"MessageAck", "082a10959a8fe6ac89dab0186a04082a1001"},
