@@ -26,6 +26,9 @@ import textwrap
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from check_dapp_interop_gate import REQUIRED
+from libe3_issue_coverage import BASELINE, TRACKER, issue_coverage
+
 REPO = Path(__file__).resolve().parents[1]
 GATE = REPO / "scripts" / "check_dapp_interop_gate.py"
 PINNED = REPO / "python" / "tests" / "fixtures" / "libe3_vectors.json"
@@ -83,9 +86,9 @@ def provenance(build: Path) -> dict:
     binaries = {}
     for name in ("e3ap_test_server", "dapp_runtime_test", "dapp_telemetry_allocation_test", "libe3_interop_dapp",
                  "libe3_interop_vectors"):
-        found = sorted(build.rglob(name))
-        binaries[name] = (dt.datetime.fromtimestamp(found[0].stat().st_mtime).isoformat(timespec="minutes")
-                          if found else "not built")
+        binary = build / "tests/unittests/dapp" / ("interop/libe3" if name.startswith("libe3_") else "") / name
+        binaries[name] = (dt.datetime.fromtimestamp(binary.stat().st_mtime).isoformat(timespec="minutes")
+                          if binary.is_file() else "not built")
     submodules = {}
     for line in sh("git", "submodule", "status", "third_party/libe3", "third_party/asn1c", cwd=REPO).splitlines():
         parts = line.split()
@@ -99,9 +102,12 @@ def provenance(build: Path) -> dict:
         "ocudu_dirty": "yes" if sh("git", "status", "--porcelain", "--untracked-files=no", cwd=REPO) else "no",
         "submodules": submodules,
         "patches": sorted(p.name for p in PATCHES.glob("*.patch")),
+        "vector_source": json.loads(PINNED.read_text()).get("source", "unknown"),
         "cmake_options": {k: cache_value(build, k) for k in ("CMAKE_BUILD_TYPE", "CMAKE_CXX_COMPILER", "ENABLE_E3",
                                                              "ENABLE_E3_ASN1_CODEC", "OCUDU_DAPP_LIBE3_INTEROP",
-                                                             "OCUDU_LIBE3_GIT_TAG")},
+                                                             "OCUDU_LIBE3_GIT_TAG", "OCUDU_LIBE3_SOURCE_DIR",
+                                                             "OCUDU_LIBE3_EFFECTIVE_VERSION",
+                                                             "OCUDU_LIBE3_EFFECTIVE_REVISION")},
         "toolchain": {
             "cmake": sh("cmake", "--version").splitlines()[0] if sh("cmake", "--version") else "",
             "python": platform.python_version(),
@@ -129,9 +135,10 @@ def load_tests(build: Path) -> list[dict]:
     tests = []
     for case in ET.parse(report).getroot().findall(".//testcase"):
         name = case.attrib.get("name", "")
-        failure = case.find("failure")
-        status = ("skipped" if case.find("skipped") is not None else "failed" if failure is not None
-                  else "passed" if case.attrib.get("status") == "run" else case.attrib.get("status", "unknown"))
+        status = ("failed" if case.find("failure") is not None or case.find("error") is not None
+                  else "skipped" if case.find("skipped") is not None
+                  else "passed" if case.attrib.get("status", "run") == "run"
+                  else case.attrib.get("status", "unknown"))
         out = case.find("system-out")
         tests.append({"name": name, "status": status, "time": float(case.attrib.get("time", 0.0)),
                       "output": plain(out.text or "") if out is not None else "",
@@ -222,6 +229,13 @@ def kernel_has_sctp() -> bool:
     return True
 
 
+def gate_verdict(tests: list[dict], returncode: int, profile: str) -> str:
+    """Known interoperability differences are not failures; missing required evidence is."""
+    passed = {t["name"] for t in tests if t["status"] == "passed"}
+    return ("PASSED" if returncode == 0 and tests and all(t["status"] == "passed" for t in tests)
+            and REQUIRED[profile] <= passed else "FAILED")
+
+
 def link_layers(tests: list[dict], summaries: list[dict], profile: str, kernel_sctp: bool) -> list[dict]:
     """One row per libe3 link layer: what ran against the OCUDU agent, and if not, why."""
     status = {t["name"]: t["status"] for t in tests}
@@ -272,10 +286,25 @@ def render_markdown(ctx: dict) -> str:
            "|---|---|---|---|---|---|---|"]
     out += [f"| {r['layer']} | {r['encoding']} | {r['libe3']} | {r['agent']} | **{r['verdict']}** | {r['sessions']} "
             f"| {r['reason']} |" for r in ctx["link_layers"]]
+    out += ["", "## libe3 issue #84: item-by-item comparison", "",
+            f"Tracking [wineslab/libe3#84]({TRACKER}). {BASELINE}", "",
+            "Test success describes the stated scope, not closure of the upstream issue. Remaining differences, "
+            "documentation-only items and untested transports do **not** fail CI. Regressions in required checks do.", "",
+            "`TESTED` means all named evidence passed; `PARTIAL`/`NOT RUN` means some/all evidence is absent or skipped. "
+            "SCTP evidence requires the host profile. APER uses a matched compiler; SCTP uses patch 0001, not stock libe3 SCTP.", "",
+            "| issue | topic | disposition | evidence this run | remaining difference / qualification |",
+            "|---|---|---|---|---|"]
+    out += [f"| [#{r['number']}]({r['url']}) | {r['topic']} | {r['disposition']} | {r['evidence_result']} | {r['note']} |"
+            for r in ctx["issues"]]
+    out += ["", "### Exact evidence for each issue", ""]
+    for r in ctx["issues"]:
+        out.append(f"- [#{r['number']}]({r['url']}): " + ("; ".join(
+            f"`{e['test']}` ({e['status']})" for e in r["evidence"]) or "documentation review only; no runtime check"))
     out += ["", "## Provenance", "",
            f"- ocudu `{p['ocudu_commit']}` ({p['ocudu_branch']}, uncommitted changes: {p['ocudu_dirty']})"]
     out += [f"- {k} `{v}`" for k, v in p["submodules"].items()]
     out += [f"- libe3 patches applied: {', '.join(p['patches']) or 'none'}",
+            f"- Pinned vector source: {p['vector_source']}",
             "- CMake: " + ", ".join(f"{k}={v}" for k, v in p["cmake_options"].items() if v),
             "- Toolchain: " + ", ".join(f"{k} {v}" for k, v in p["toolchain"].items() if v),
             "- Binaries: " + ", ".join(f"{k} {v}" for k, v in p["binaries"].items()), "",
@@ -309,6 +338,7 @@ def render_latex(ctx: dict) -> str:
          r"\urlstyle{tt}\sloppy",
          r"\hypersetup{colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black}",
          r"\setlength{\parskip}{4pt}\setlength{\parindent}{0pt}",
+         r"\setlength{\tabcolsep}{3.5pt}",
          r"\title{\vspace{-1cm}OCUDU $\leftrightarrow$ libe3 interoperability report}",
          r"\author{Generated by \texttt{scripts/libe3\_interop\_report.py}}", r"\date{" + esc(p["generated"]) + "}",
          r"\begin{document}\maketitle",
@@ -323,17 +353,31 @@ def render_latex(ctx: dict) -> str:
          r">{\raggedright\arraybackslash}p{3.6cm}>{\raggedright\arraybackslash}p{3.0cm}>{\raggedright\arraybackslash}p{1.6cm}"
          r">{\raggedright\arraybackslash}p{1.7cm}>{\raggedright\arraybackslash}p{2.3cm}@{}}\toprule",
          r"link layer & encoding & libe3 side & OCUDU agent side & result & full sessions & note\\\midrule\endhead"]
-    L += [" & ".join([esc(r["layer"]), esc(r["encoding"]), path(r["libe3"]), esc(r["agent"]),
+    L += [" & ".join([esc(r["layer"]), esc(r["encoding"]), " ".join(path(word) for word in r["libe3"].split()), esc(r["agent"]),
                       r"\textbf{\textcolor{" + ("green!50!black" if r["verdict"] == "PASSED" else
                                                  "orange!80!black" if r["verdict"] == "SKIPPED" else "red!70!black")
                       + "}{" + r["verdict"] + "}}", esc(r["sessions"]), esc(r["reason"])]) + r"\\"
           for r in ctx["link_layers"]]
     L += [r"\bottomrule\end{longtable}\normalsize",
+          r"\section*{libe3 issue \#84: item-by-item comparison}",
+          r"Tracker: \url{" + TRACKER + "}. " + esc(BASELINE),
+          "Remaining differences and absent optional transport coverage are informational, not CI failures. "
+          "TESTED means all listed evidence passed, not that the upstream issue is closed. PARTIAL/NOT RUN marks "
+          "missing or skipped evidence. APER uses a matched compiler; SCTP uses local patch 0001."]
+    for r in ctx["issues"]:
+        L += [r"\Needspace*{5\baselineskip}\subsection*{\href{" + r["url"] + "}{\\#" + str(r["number"])
+              + "}: " + esc(r["topic"]) + "}",
+              esc(r["disposition"] + "; evidence: " + r["evidence_result"] + ". " + r["note"])]
+        if r["evidence"]:
+            L += [r"{\small " + r"\par ".join(path(e["test"]) + " (" + esc(e["status"]) + ")"
+                                              for e in r["evidence"]) + "}"]
+    L += [
          r"\Needspace*{8\baselineskip}\section*{Provenance}", r"\begin{itemize}\raggedright\setlength{\itemsep}{0pt}",
          r"\item ocudu \texttt{" + esc(p["ocudu_commit"]) + "} (" + esc(p["ocudu_branch"]) + ", uncommitted changes: "
          + p["ocudu_dirty"] + ")"]
     L += [r"\item " + esc(k) + r" \texttt{" + esc(v) + "}" for k, v in p["submodules"].items()]
     L += [r"\item libe3 patches applied: " + (", ".join(path(x) for x in p["patches"]) or "none"),
+          r"\item Pinned vector source: " + esc(p["vector_source"]),
           r"\item CMake: " + ", ".join(esc(k) + "=" + path(v) for k, v in p["cmake_options"].items() if v),
           r"\item Toolchain: " + ", ".join(esc(f"{k} {v}") for k, v in p["toolchain"].items() if v),
           r"\item Binaries (build time): " + ", ".join(esc(k) + " " + esc(v) for k, v in p["binaries"].items()),
@@ -346,7 +390,7 @@ def render_latex(ctx: dict) -> str:
           r"ProtobufE3Encoder output and reproduces it byte for byte (that codec is further checked against libprotobuf "
           r"on random PDUs of both the libe3 schema and the OCUDU superset schema); the last column says over which link "
           r"layer and encoding the real libe3 dApp exchanged the procedure with the OCUDU agent in the end-to-end session.",
-          r"\small\begin{longtable}{@{}>{\raggedright\arraybackslash}p{2.9cm}>{\raggedright\arraybackslash}p{1.3cm}"
+          r"\small\begin{longtable}{@{}>{\raggedright\arraybackslash}p{3.1cm}>{\raggedright\arraybackslash}p{1.3cm}"
           r">{\raggedright\arraybackslash}p{1.6cm}>{\raggedright\arraybackslash}p{1.8cm}>{\raggedright\arraybackslash}p{1.6cm}"
           r">{\raggedright\arraybackslash}p{6.4cm}@{}}\toprule",
           r"procedure & APER vector & APER codec reproduces & Protobuf codec reproduces & Python $\leftrightarrow$ libe3 & "
@@ -388,9 +432,12 @@ def main() -> int:
     parser.add_argument("--build", type=Path, required=True, help="build tree configured with OCUDU_DAPP_LIBE3_INTEROP=ON")
     parser.add_argument("--out", type=Path, help="output directory (default <build>/dapp-interop-report)")
     parser.add_argument("--no-run", action="store_true", help="render from the last gate run instead of running it")
-    parser.add_argument("--profile", choices=("host", "zmq"), default="host",
-                        help="gate profile: host (SCTP runner: SCTP and ZMQ legs) or zmq (any runner: ZMQ leg only)")
+    parser.add_argument("--profile", choices=("auto", "host", "zmq"), default="auto",
+                        help="auto detects kernel SCTP; host requires SCTP and ZMQ; zmq needs no kernel SCTP")
     args = parser.parse_args()
+    kernel_sctp = kernel_has_sctp()
+    if args.profile == "auto":
+        args.profile = "host" if kernel_sctp else "zmq"
     build = args.build.resolve()
     out = (args.out or build / "dapp-interop-report").resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -399,18 +446,33 @@ def main() -> int:
         rc, log = 0, (build / "dapp-interop.log").read_text() if (build / "dapp-interop.log").exists() else ""
     else:
         rc, log = run_gate(build, summary_file, args.profile)
-    tests = load_tests(build)
-    ctx = {"provenance": provenance(build), "tests": tests, "summaries": load_summaries(summary_file),
-           "gate_log": plain(log), "verdict": "PASSED" if rc == 0 and tests and all(t["status"] == "passed" for t in tests) else "FAILED"}
+    try:
+        tests, summaries = load_tests(build), load_summaries(summary_file)
+    except (ET.ParseError, ValueError, OSError) as error:
+        # Preserve a useful failed-run artifact even when the test process left
+        # truncated JUnit or session output behind.
+        tests, summaries, rc = [], [], 1
+        log += f"\nCannot load current test evidence: {error}\n"
+    ctx = {"provenance": provenance(build), "tests": tests, "summaries": summaries,
+           "gate_log": plain(log), "verdict": gate_verdict(tests, rc, args.profile), "issues": issue_coverage(tests)}
     ctx["coverage"] = coverage(tests, ctx["summaries"])
     ctx["profile"] = args.profile
-    ctx["kernel_sctp"] = kernel_has_sctp()
+    ctx["kernel_sctp"] = kernel_sctp
     ctx["link_layers"] = link_layers(tests, ctx["summaries"], args.profile, ctx["kernel_sctp"])
     (out / "libe3_interop_report.md").write_text(render_markdown(ctx))
     (out / "libe3_interop_report.tex").write_text(render_latex(ctx))
-    for name in ("dapp-interop.xml", "dapp-interop.log"):
+    (out / "libe3_issue_coverage.json").write_text(json.dumps(
+        {"tracker": TRACKER, "audit_baseline": BASELINE, "profile": args.profile, "verdict": ctx["verdict"],
+         "provenance": ctx["provenance"], "issues": ctx["issues"]}, indent=2) + "\n")
+    # Keep the current gate failure, including preflight diagnostics, with the artifact.
+    (out / "dapp-interop.log").write_text(plain(log))
+    for name in ("dapp-interop.xml",):
         if (build / name).exists():
-            shutil.copy2(build / name, out / name)
+            if build != out:
+                shutil.copy2(build / name, out / name)
+        else:
+            (out / name).unlink(missing_ok=True)
+    (out / "libe3_interop_report.pdf").unlink(missing_ok=True)
     pdf = "not rendered (pdflatex not found)"
     if shutil.which("pdflatex"):
         for _ in range(2):
@@ -420,7 +482,7 @@ def main() -> int:
         for suffix in (".aux", ".out"):
             (out / f"libe3_interop_report{suffix}").unlink(missing_ok=True)
     print(f"libe3 interop report: {ctx['verdict']}, {len(tests)} tests; markdown {out / 'libe3_interop_report.md'}; pdf {pdf}")
-    return rc
+    return rc or (0 if ctx["verdict"] == "PASSED" else 1)
 
 
 if __name__ == "__main__":

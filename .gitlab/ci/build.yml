@@ -594,6 +594,8 @@ dapp interoperability release gate:
     OS: ubuntu-24.04
     OCUDU_BUILD_DIR: build-dapp-interop-ci
     GIT_SUBMODULE_STRATEGY: recursive
+    # libe3 release 0.2.2; fail if CMake selects a different source checkout.
+    OCUDU_LIBE3_REF: 840b00f7583ee22160bc9b000aa067de9793df2c
     OCUDU_DAPP_SDK_URL: https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-sdk.git
     OCUDU_DAPP_SDK_REF: a8948460e2a45d5bcd1f8f6c9abfc75f89c98982
   script:
@@ -611,6 +613,7 @@ dapp interoperability release gate:
     - >-
       builder.sh -b "${OCUDU_BUILD_DIR}" -c gcc
       -m "-j${CPU_JOBS} dapp_runtime_test dapp_e3ap_protobuf_conformance_test dapp_telemetry_allocation_test e3ap_test_server libe3_interop_dapp libe3_interop_vectors ocudu-dappctl ocudu-pusch-replay"
+      -DOCUDU_LIBE3_EXPECTED_REVISION="${OCUDU_LIBE3_REF}"
       -DCMAKE_BUILD_TYPE=Release -DENABLE_DAPP=ON -DENABLE_E3=ON
       -DENABLE_E3_ASN1_CODEC=ON -DOCUDU_DAPP_LIBE3_INTEROP=ON -DENABLE_UHD=OFF .
     - python3 scripts/check_dapp_interop_gate.py --build "${OCUDU_BUILD_DIR}"
@@ -659,6 +662,7 @@ libe3 interoperability report:
     OS: ubuntu-24.04
     OCUDU_BUILD_DIR: build-dapp-libe3-ci
     GIT_SUBMODULE_STRATEGY: recursive
+    OCUDU_LIBE3_REF: 840b00f7583ee22160bc9b000aa067de9793df2c
   script:
     - |
       if python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP).close()"; then
@@ -676,6 +680,7 @@ libe3 interoperability report:
     - >-
       builder.sh -b "${OCUDU_BUILD_DIR}" -c gcc
       -m "-j${CPU_JOBS} dapp_runtime_test dapp_e3ap_protobuf_conformance_test dapp_telemetry_allocation_test e3ap_test_server libe3_interop_dapp libe3_interop_vectors ocudu-dappctl"
+      -DOCUDU_LIBE3_EXPECTED_REVISION="${OCUDU_LIBE3_REF}"
       -DCMAKE_BUILD_TYPE=Release -DENABLE_DAPP=ON -DENABLE_E3=ON
       -DENABLE_E3_ASN1_CODEC=ON -DOCUDU_DAPP_LIBE3_INTEROP=ON -DENABLE_UHD=OFF .
     - python3 scripts/libe3_interop_report.py --build "${OCUDU_BUILD_DIR}" --out libe3-interop-report --profile "${LIBE3_GATE_PROFILE}"

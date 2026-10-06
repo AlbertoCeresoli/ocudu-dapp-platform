@@ -1832,6 +1832,151 @@ TEST(dapp_e3ap_sctp_server, native_and_libe3_identifiers_remain_disjoint_during_
   EXPECT_EQ(action->xapp_control_data, (std::vector<uint8_t>{4, 5, 6}));
 }
 
+// wineslab/libe3#84, #96 and #100: reject invalid selections on both profiles,
+// including a valid first stream followed by an invalid one (rollback coverage).
+TEST(dapp_e3ap_sctp_server, rejects_unknown_subscription_ids_without_leaking_partial_admission)
+{
+  for (auto wire :
+       {client_wire::ocudu_aper, client_wire::libe3_aper, client_wire::ocudu_protobuf, client_wire::libe3_protobuf}) {
+    SCOPED_TRACE(static_cast<int>(wire));
+    fixture f;
+    auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config());
+    ASSERT_TRUE(server);
+    test_client peer(server.server->port(), wire);
+    auto        id = peer.setup();
+    ASSERT_TRUE(id);
+    e3ap_subscription_request valid;
+    valid.dapp_identifier         = *id;
+    valid.ran_function_identifier = e3ap_ran_function_telemetry;
+    valid.telemetry_identifiers   = {telemetry_id_pusch_crc};
+    for (unsigned scenario = 0; scenario != 5; ++scenario) {
+      SCOPED_TRACE(scenario);
+      auto request = valid;
+      auto cause   = e3ap_cause::unsupported_identifier;
+      switch (scenario) {
+        case 0:
+          request.ran_function_identifier = 999;
+          cause                           = e3ap_cause::unsupported_ran_function;
+          break;
+        case 1:
+          request.telemetry_identifiers.push_back(999);
+          break;
+        case 2:
+          request.control_identifiers = {999};
+          cause                       = e3ap_cause::invalid_request;
+          break;
+        case 3:
+          request.telemetry_identifiers.push_back(telemetry_id_pusch_crc);
+          break;
+        case 4:
+          request.dapp_identifier = *id == 1 ? 2 : 1;
+          cause                   = e3ap_cause::invalid_request;
+          break;
+      }
+      e3ap_pdu pdu;
+      pdu.id      = 1001 + scenario; // request IDs are not restricted to the old 1..1000 range.
+      pdu.message = request;
+      ASSERT_TRUE(peer.send(pdu));
+      auto reply = peer.receive_as<e3ap_subscription_response>();
+      ASSERT_TRUE(reply);
+      EXPECT_EQ(reply->request_id, pdu.id);
+      EXPECT_EQ(reply->response_code, e3ap_response_code::negative);
+      EXPECT_FALSE(reply->subscription_id);
+      if (peer.ocudu_profile()) {
+        EXPECT_EQ(reply->cause, cause);
+        EXPECT_FALSE(reply->detail.empty());
+      } else {
+        EXPECT_FALSE(reply->cause);
+        EXPECT_TRUE(reply->detail.empty());
+      }
+      EXPECT_EQ(server.server->metrics().live_subscriptions, 0U);
+      EXPECT_FALSE(f.store->has_active(telemetry_stream_pusch_crc));
+    }
+    // Rejection must not poison the association or consume its admission capacity.
+    e3ap_pdu pdu;
+    pdu.id      = 1010;
+    pdu.message = valid;
+    ASSERT_TRUE(peer.send(pdu));
+    auto accepted = peer.receive_as<e3ap_subscription_response>();
+    ASSERT_TRUE(accepted);
+    EXPECT_EQ(accepted->response_code, e3ap_response_code::positive);
+    EXPECT_TRUE(f.store->has_active(telemetry_stream_pusch_crc));
+  }
+}
+
+// wineslab/libe3#88 and #97: document OCUDU's bounded multi-subscription policy;
+// matching this policy is not a claim that libe3's own RAN uses the same one.
+TEST(dapp_e3ap_sctp_server, repeat_subscriptions_report_grants_and_preserve_existing_ids_at_capacity)
+{
+  for (auto wire :
+       {client_wire::ocudu_aper, client_wire::libe3_aper, client_wire::ocudu_protobuf, client_wire::libe3_protobuf}) {
+    SCOPED_TRACE(static_cast<int>(wire));
+    fixture f;
+    auto    config                        = test_server_config();
+    config.maximum_subscriptions_per_dapp = 2;
+    auto server                           = e3ap_sctp_server::create(&f.service, f.store, config);
+    ASSERT_TRUE(server);
+    test_client peer(server.server->port(), wire);
+    auto        id = peer.setup();
+    ASSERT_TRUE(id);
+    e3ap_subscription_request request;
+    request.dapp_identifier         = *id;
+    request.ran_function_identifier = e3ap_ran_function_telemetry;
+    request.telemetry_identifiers   = {telemetry_id_pusch_crc};
+    e3ap_pdu pdu;
+    pdu.id      = 2;
+    pdu.message = request;
+    std::vector<uint16_t> granted_ids;
+    for (unsigned attempt = 0; attempt != 3; ++attempt) {
+      ASSERT_TRUE(peer.send(pdu));
+      auto reply = peer.receive_as<e3ap_subscription_response>();
+      ASSERT_TRUE(reply);
+      EXPECT_EQ(reply->request_id, pdu.id);
+      if (attempt == 2) {
+        EXPECT_EQ(reply->response_code, e3ap_response_code::negative);
+        EXPECT_FALSE(reply->subscription_id);
+        if (peer.ocudu_profile()) {
+          EXPECT_EQ(reply->cause, e3ap_cause::resource_exhausted);
+        }
+      } else {
+        ASSERT_EQ(reply->response_code, e3ap_response_code::positive);
+        ASSERT_TRUE(reply->subscription_id);
+        if (wire == client_wire::libe3_protobuf) {
+          // Upstream Protobuf has no granted-list fields. This is a documented
+          // #88 limitation, not permission to add OCUDU fields to that profile.
+          EXPECT_FALSE(reply->telemetry_identifiers);
+          EXPECT_FALSE(reply->control_identifiers);
+        } else {
+          EXPECT_EQ(reply->telemetry_identifiers, std::optional<std::vector<uint16_t>>(request.telemetry_identifiers));
+          EXPECT_EQ(reply->control_identifiers, std::optional<std::vector<uint16_t>>(std::vector<uint16_t>{}));
+        }
+        granted_ids.push_back(*reply->subscription_id);
+      }
+      ++pdu.id;
+    }
+    ASSERT_EQ(granted_ids.size(), 2U);
+    EXPECT_NE(granted_ids[0], granted_ids[1]);
+    EXPECT_EQ(server.server->metrics().live_subscriptions, 2U);
+    for (uint16_t subscription_id : granted_ids) {
+      pdu.message = e3ap_subscription_delete{*id, subscription_id};
+      ASSERT_TRUE(peer.send(pdu));
+      if (peer.ocudu_profile()) {
+        auto reply = peer.receive_as<e3ap_message_ack>();
+        ASSERT_TRUE(reply);
+        EXPECT_EQ(reply->response_code, e3ap_response_code::positive);
+      } else {
+        auto reply = peer.receive_as<e3ap_subscription_response>();
+        ASSERT_TRUE(reply);
+        EXPECT_EQ(reply->response_code, e3ap_response_code::positive);
+        EXPECT_EQ(reply->subscription_id, subscription_id);
+      }
+      ++pdu.id;
+    }
+    EXPECT_EQ(server.server->metrics().live_subscriptions, 0U);
+    EXPECT_FALSE(f.store->has_active(telemetry_stream_pusch_crc));
+  }
+}
+
 TEST(dapp_e3ap_sctp_server, subscription_wrap_never_replaces_a_live_libe3_subscription)
 {
   fixture f;

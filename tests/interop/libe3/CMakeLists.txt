@@ -58,16 +58,44 @@ endif ()
 # another checkout instead; the git fetch is a fallback for trees without the
 # submodule.
 set(OCUDU_LIBE3_GIT_REPOSITORY "https://github.com/wineslab/libe3.git" CACHE STRING "Upstream libe3 repository (fallback when the submodule is absent)")
-set(OCUDU_LIBE3_GIT_TAG "0.2.1" CACHE STRING "Upstream libe3 commit (fallback when the submodule is absent)")
+# Release 0.2.2. Use the immutable commit, not a movable tag, for fallback builds.
+set(OCUDU_LIBE3_GIT_TAG "840b00f7583ee22160bc9b000aa067de9793df2c" CACHE STRING "Upstream libe3 commit (fallback when the submodule is absent)")
 set(OCUDU_LIBE3_SOURCE_DIR "" CACHE PATH "libe3 checkout to build instead of the submodule")
 set(OCUDU_LIBE3_SUBMODULE_DIR ${PROJECT_SOURCE_DIR}/third_party/libe3)
+
+# Record the source actually selected, rather than reporting an ignored fallback
+# tag when a submodule is present. Never apply patches to a caller's checkout.
+set(OCUDU_LIBE3_SELECTED_SOURCE "${OCUDU_LIBE3_SOURCE_DIR}")
+if (NOT OCUDU_LIBE3_SELECTED_SOURCE AND EXISTS ${OCUDU_LIBE3_SUBMODULE_DIR}/CMakeLists.txt)
+  set(OCUDU_LIBE3_SELECTED_SOURCE "${OCUDU_LIBE3_SUBMODULE_DIR}")
+endif ()
+set(OCUDU_LIBE3_REVISION "${OCUDU_LIBE3_GIT_TAG}")
+set(OCUDU_LIBE3_VERSION "unknown (fallback fetch)")
+if (OCUDU_LIBE3_SELECTED_SOURCE)
+  execute_process(COMMAND git -C "${OCUDU_LIBE3_SELECTED_SOURCE}" rev-parse HEAD
+    OUTPUT_VARIABLE OCUDU_LIBE3_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE OCUDU_LIBE3_GIT_RESULT)
+  if (NOT OCUDU_LIBE3_GIT_RESULT EQUAL 0)
+    message(FATAL_ERROR "libe3 interop source must be a git checkout with a verifiable revision")
+  endif ()
+  file(STRINGS "${OCUDU_LIBE3_SELECTED_SOURCE}/VERSION" OCUDU_LIBE3_VERSION LIMIT_COUNT 1)
+endif ()
+set(OCUDU_LIBE3_EFFECTIVE_REVISION "${OCUDU_LIBE3_REVISION}" CACHE INTERNAL "Selected libe3 source revision" FORCE)
+set(OCUDU_LIBE3_EFFECTIVE_VERSION "${OCUDU_LIBE3_VERSION}" CACHE INTERNAL "Selected libe3 release version" FORCE)
+set(OCUDU_LIBE3_EXPECTED_REVISION "" CACHE STRING "Require this exact libe3 revision (CI provenance guard)")
+if (OCUDU_LIBE3_EXPECTED_REVISION AND NOT OCUDU_LIBE3_EXPECTED_REVISION STREQUAL OCUDU_LIBE3_REVISION)
+  message(FATAL_ERROR "Selected libe3 ${OCUDU_LIBE3_REVISION}, expected ${OCUDU_LIBE3_EXPECTED_REVISION}")
+endif ()
+message(STATUS "libe3 interop source: ${OCUDU_LIBE3_VERSION} (${OCUDU_LIBE3_REVISION})")
 
 file(GLOB OCUDU_LIBE3_PATCHES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/patches/*.patch)
 list(SORT OCUDU_LIBE3_PATCHES)
 # A CMake list would be split into separate arguments by the patch step; the
 # script splits on '|' instead.
 string(REPLACE ";" "|" OCUDU_LIBE3_PATCH_ARGUMENT "${OCUDU_LIBE3_PATCHES}")
-set(OCUDU_LIBE3_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/libe3-prefix)
+# A changed pin must rebuild the external library even in an existing build tree.
+string(SHA256 OCUDU_LIBE3_SOURCE_KEY "${OCUDU_LIBE3_SELECTED_SOURCE}:${OCUDU_LIBE3_REVISION}")
+string(SUBSTRING "${OCUDU_LIBE3_SOURCE_KEY}" 0 16 OCUDU_LIBE3_SOURCE_KEY)
+set(OCUDU_LIBE3_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/libe3-${OCUDU_LIBE3_SOURCE_KEY}-prefix)
 set(OCUDU_LIBE3_INSTALL_DIR ${OCUDU_LIBE3_PREFIX}/install)
 set(OCUDU_LIBE3_LIBRARY ${OCUDU_LIBE3_INSTALL_DIR}/lib/liblibe3.a)
 set(OCUDU_LIBE3_ASN1_LIBRARY ${OCUDU_LIBE3_INSTALL_DIR}/lib/libasn1_e3ap.a)
@@ -78,15 +106,13 @@ if (OCUDU_LIBE3_PROTOBUF)
 endif ()
 
 set(OCUDU_LIBE3_SOURCE_ARGS)
-if (OCUDU_LIBE3_SOURCE_DIR)
-  set(OCUDU_LIBE3_SOURCE_ARGS SOURCE_DIR ${OCUDU_LIBE3_SOURCE_DIR})
-elseif (EXISTS ${OCUDU_LIBE3_SUBMODULE_DIR}/CMakeLists.txt)
+if (OCUDU_LIBE3_SELECTED_SOURCE)
   set(OCUDU_LIBE3_SOURCE_ARGS
-    # The submodule's .git is a gitfile with a path relative to the checkout;
-    # it must not travel with the copy, and the patches apply to plain files.
+    # Remove Git metadata only from the private build copy: a submodule has a
+    # gitfile, while an explicit source checkout may have a .git directory.
     DOWNLOAD_COMMAND ${CMAKE_COMMAND} -E rm -rf <SOURCE_DIR>
-            COMMAND ${CMAKE_COMMAND} -E copy_directory ${OCUDU_LIBE3_SUBMODULE_DIR} <SOURCE_DIR>
-            COMMAND ${CMAKE_COMMAND} -E rm -f <SOURCE_DIR>/.git)
+            COMMAND ${CMAKE_COMMAND} -E copy_directory ${OCUDU_LIBE3_SELECTED_SOURCE} <SOURCE_DIR>
+            COMMAND ${CMAKE_COMMAND} -E rm -rf <SOURCE_DIR>/.git)
 else ()
   message(STATUS "libe3 submodule not checked out; fetching ${OCUDU_LIBE3_GIT_TAG} from ${OCUDU_LIBE3_GIT_REPOSITORY}")
   set(OCUDU_LIBE3_SOURCE_ARGS

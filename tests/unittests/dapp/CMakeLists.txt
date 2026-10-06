@@ -104,6 +104,9 @@ if (ENABLE_E3)
 
     find_program(DAPP_TEST_PYTHON_EXECUTABLE python3)
     if (DAPP_TEST_PYTHON_EXECUTABLE)
+      add_test(NAME dapp_e3ap_libe3.report
+        COMMAND ${DAPP_TEST_PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/tests/test_libe3_interop_report.py)
+      set_tests_properties(dapp_e3ap_libe3.report PROPERTIES TIMEOUT 30 LABELS "dapp;e3;python;interop")
       add_test(NAME dapp_e3_shared_region.validation
         COMMAND ${DAPP_TEST_PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/tests/test_shared_region.py)
       set_tests_properties(dapp_e3_shared_region.validation PROPERTIES TIMEOUT 30 LABELS "dapp;e3;python")

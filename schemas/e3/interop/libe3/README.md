@@ -22,6 +22,13 @@ against:
 (three provenance comment lines added) and checked against the submodule at
 configure time; `schemas/e3/protobuf/e3ap-ocudu-v2.proto` is its wire superset.
 
-The end-to-end interoperability tests under `tests/interop/libe3` build the
-upstream library itself (same commit, plus the patches in that directory) and
-run its dApp role against the OCUDU agent.
+The schemas are unchanged in release **0.2.2**, commit
+`840b00f7583ee22160bc9b000aa067de9793df2c` (2026-10-05), now selected by
+`third_party/libe3`. Configure-time checks compare both vendored schemas to
+that checkout. Historical copy provenance above is retained.
+
+The end-to-end tests under `tests/interop/libe3` build that 0.2.2 library
+(plus the patches in that directory), run its dApp role against the OCUDU
+agent, and recheck the 0.2.1 fixtures against the current encoder. See the
+[interop report guide](../../../../tests/interop/libe3/README.md) for
+compiler/transport qualifications and the itemized libe3 #84 comparison.

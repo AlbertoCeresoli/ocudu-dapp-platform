@@ -17,7 +17,16 @@ import xml.etree.ElementTree as ET
 REQUIRED = {
     # SCTP-capable runners: everything, both libe3 link layers, both libe3 encodings.
     "host": {
-        "dapp_e3ap_libe3.e2e_sctp", "dapp_e3ap_libe3.e2e_zmq", "dapp_e3ap_libe3.interop",
+        "dapp_e3ap_libe3.e2e_sctp", "dapp_e3ap_libe3.e2e_zmq", "dapp_e3ap_libe3.interop", "dapp_e3ap_libe3.report",
+        "dapp_e3ap_sctp_server.rejects_unknown_protocol_and_profile_versions_before_allocating_an_id",
+        "dapp_e3ap_sctp_server.normalizes_periodicity_units_before_applying_defaults_and_hard_floors",
+        "dapp_e3ap_sctp_server.rejected_setup_does_not_pin_the_proposed_profile",
+        "dapp_e3ap_sctp_server.hard_floor_and_millisecond_overrides_survive_store_lease_recovery",
+        "dapp_e3ap_sctp_server.subscription_expiry_reclaims_shared_memory_and_admission_budget",
+        "dapp_e3ap_sctp_server.finite_subscription_expires_despite_continuous_store_lease_renewal",
+        "dapp_e3ap_sctp_server.quiet_subscription_survives_idle_until_expiry_or_peer_disconnect",
+        "dapp_e3ap_sctp_server.rejects_unknown_subscription_ids_without_leaking_partial_admission",
+        "dapp_e3ap_sctp_server.repeat_subscriptions_report_grants_and_preserve_existing_ids_at_capacity",
         "dapp_e3ap_python.cross_language", "dapp_e3_shared_region.validation",
         "dapp_e3ap_libe3_codec.decodes_and_reproduces_vectors_from_the_upstream_libe3_encoder",
         "dapp_e3ap_sctp_server.serves_every_encoding_and_profile_on_one_port",
@@ -40,7 +49,7 @@ REQUIRED = {
     # Any runner (no kernel SCTP needed): libe3 interop over the ZMQ link layer (APER and Protobuf),
     # libe3's encoder vectors against our codecs, and the schema-level checks.
     "zmq": {
-        "dapp_e3ap_libe3.e2e_zmq", "dapp_e3ap_libe3.interop",
+        "dapp_e3ap_libe3.e2e_zmq", "dapp_e3ap_libe3.interop", "dapp_e3ap_libe3.report",
         "dapp_e3ap_libe3_codec.decodes_and_reproduces_vectors_from_the_upstream_libe3_encoder",
         "dapp_e3ap_libe3_codec.round_trips_every_procedure_of_the_libe3_module",
         "dapp_e3ap_libe3_codec.refuses_values_the_libe3_module_cannot_carry",
@@ -68,12 +77,16 @@ def main():
     parser.add_argument("--profile", choices=REQUIRED, default="host")
     args = parser.parse_args()
     build = args.build.resolve()
+    # A preflight failure must not leave last run's green JUnit as current evidence.
+    report = build / "dapp-interop.xml"
+    report.unlink(missing_ok=True)
+    (build / "dapp-interop.log").unlink(missing_ok=True)
     base = ["ctest", "--test-dir", str(build)]
     selections = {
         "host": ["-R", r"^dapp_e3|^dapp_portable_data_store|^portable_data_store_test|^dapp_telemetry_isolation|^dapp_package_signature",
                  "-E", "by_reference_delivery_is_faster_than_in_band"],
         # Only what runs without kernel SCTP: the agent's SCTP carrier tests stay in the host profile.
-        "zmq": ["-R", r"^dapp_e3ap_libe3\.(e2e_zmq|interop)$|^dapp_e3ap_libe3_codec\.|^dapp_e3ap_protobuf_(codec|conformance)\.|^dapp_e3ap_v2_codec\."],
+        "zmq": ["-R", r"^dapp_e3ap_libe3\.(e2e_zmq|interop|report)$|^dapp_e3ap_libe3_codec\.|^dapp_e3ap_protobuf_(codec|conformance)\.|^dapp_e3ap_v2_codec\."],
         "sdk": [],
     }
     selection = selections[args.profile]
@@ -82,7 +95,6 @@ def main():
     missing = REQUIRED[args.profile] - tests
     if missing:
         raise RuntimeError("required interop tests missing (check dependencies/options/build): " + ", ".join(sorted(missing)))
-    report = build / "dapp-interop.xml"
     command = base + selection + ["-j1", "--no-tests=error", "--verbose", "--output-junit", str(report)]
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
     (build / "dapp-interop.log").write_text(result.stdout)

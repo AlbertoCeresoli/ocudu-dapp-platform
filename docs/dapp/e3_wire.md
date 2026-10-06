@@ -30,7 +30,7 @@ the others through `dataSubscriptions list`.
 
 The E3AP module, **E3AP-OCUDU-V2** (`schemas/e3/e3ap-ocudu-v2.asn1`), is the
 Northeastern University libe3 E3AP 1.0.0 module (`messages/asn1/V1/e3ap-1.0.0.asn1`,
-libe3 0.2.1) with OCUDU **extension additions**: everything before each of
+libe3 0.2.2, unchanged from 0.2.1) with OCUDU **extension additions**: everything before each of
 libe3's extension markers is libe3's module, type for type, and OCUDU adds only
 after them. A message without additions is therefore a libe3 message, bit for
 bit, and libe3 reads OCUDU's messages of its own procedures (it skips the
@@ -297,7 +297,7 @@ negative responses carry an optional `E3-Cause` and `detail`.
    absent selects libe3, and other values are refused before assigning an ID.
    OCUDU clients require the profile grant and exact version in the response.
    The string alone does **not** identify the libe3 schema revision: this build
-   remains pinned to 0.2.1 and its compiler profile (see interoperability notes).
+   remains pinned to 0.2.2 and its compiler profile (see interoperability notes).
 2. **Subscription.** `E3-SubscriptionRequest { dAppIdentifier, ranFunctionIdentifier, telemetryIdentifierList, controlIdentifierList, subscriptionTime? (0..3600 s), periodicity? (0..1000), subscriptionData?, deliveryMode?, minimumByReferenceBytes?, subscriptionTimeLong? (0..86400 s), periodicityLong? (0..60000 ms) }`.
    Values beyond libe3's root ranges travel in the `...Long` additions with the
    root field absent.
@@ -344,7 +344,7 @@ Units are explicit and must not be inferred from the value:
 
 | Setting | Unit and bound | Meaning |
 |---------|----------------|---------|
-| libe3-profile `periodicity` | microseconds, 0..1000 (pinned 0.2.1 grammar) | 1000 requests 1 ms, not 1 s |
+| libe3-profile `periodicity` | microseconds, 0..1000 (pinned 0.2.2 grammar) | 1000 requests 1 ms, not 1 s |
 | OCUDU profile-1 `periodicity` / `periodicityLong` | milliseconds, 0..1000 / 0..60000 | Existing OCUDU wire/client behavior is retained |
 | OCUDU `minimumIntervalMs` / Python `periodicity_ms` | milliseconds | Per-stream `minimumIntervalMs` takes precedence over procedure periodicity |
 | `subscriptionTime` / OCUDU `subscriptionTimeLong` | seconds, 0..3600 / 0..86400 | Positive means finite lifetime; zero or absent means until delete, release or disconnect |
@@ -535,9 +535,16 @@ route exactly as a management-socket subscription would.
 
 ## Interoperability notes
 
+The CI [interop report](../../tests/interop/libe3/README.md) compares against
+libe3 release 0.2.2 and links each OCUDU-related item in
+[wineslab/libe3#84](https://github.com/wineslab/libe3/issues/84), with exact
+test evidence and remaining differences. Known differences are informational,
+not test failures. SCTP runs when supported by the runner kernel; otherwise
+the report explicitly marks it skipped and still qualifies the ZMQ path.
+
 | Topic | OCUDU | libe3 (Northeastern) | NVIDIA cuSense |
 |-------|-------|----------------------|----------------|
-| Module | E3AP-OCUDU-V2 = libe3 E3AP 1.0.0 + extension additions | E3AP 1.0.0 (0.2.1) | JSON messages |
+| Module | E3AP-OCUDU-V2 = libe3 E3AP 1.0.0 + extension additions | E3AP 1.0.0 (0.2.2) | JSON messages |
 | Encoding | ASN.1 APER or Protobuf (same messages, same profiles) | ASN.1 APER, JSON, or Protobuf (run-time selected) | JSON |
 | Transport | SCTP, message boundaries, streams; libe3's ZMQ link layer for libe3 peers | ZMQ (IPC/TCP), POSIX sockets with a 4-byte length prefix (three channels), or, with the patch in `tests/interop/libe3/patches`, one native SCTP association with message boundaries (`E3LinkLayer::SCTP_ASSOCIATION`) | ZMQ REQ/REP + PUB/SUB |
 | Envelope | `E3-PDU { id, timestamp OPTIONAL, msg CHOICE }` (libe3's) | the same | `common_headers { type, message_id, timestamp }` |

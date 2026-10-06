@@ -3,7 +3,14 @@
 This directory proves, with the real upstream library, that a dApp built on
 [libe3](https://github.com/wineslab/libe3) (Northeastern University) attaches
 to the OCUDU E3AP agent and runs a complete E3AP session, and that the two
-ASN.1 encoders agree byte for byte.
+ASN.1 encoders agree byte for byte **with a matched ASN.1 compiler**. It is not
+a claim of compatibility with every stock libe3 compiler/transport combination.
+
+The current upstream test dependency is release **0.2.2** (October 5, 2026),
+commit `840b00f7583ee22160bc9b000aa067de9793df2c`. Its APER/Protobuf schemas and
+transport implementation are unchanged from 0.2.1. The older pinned vectors
+remain regression fixtures and are also checked against the freshly built
+0.2.2 encoder; their historical provenance is intentionally retained.
 
 ## What is built
 
@@ -11,7 +18,7 @@ With `-DOCUDU_DAPP_LIBE3_INTEROP=ON` the build:
 
 1. copies the `third_party/libe3` submodule (github.com/wineslab/libe3,
    pinned; the grammar in `schemas/e3/interop/libe3` is checked against it at
-   configure time) into the build tree, or uses
+   configure time) into the build tree, or copies
    `-DOCUDU_LIBE3_SOURCE_DIR=<checkout>`, or, without the submodule, fetches
    `OCUDU_LIBE3_GIT_TAG`;
 2. applies `patches/*.patch` to that copy (skipping any already present);
@@ -50,7 +57,49 @@ reported, every required test with status and time, and the captured output
 of the interoperability tests. Markdown always, PDF when `pdflatex` is on the
 path; the `libe3 interoperability report` CI job publishes the directory as an
 artifact exposed on the merge request. The exit code is
-the gate's.
+nonzero for a failed gate or incomplete required test evidence, including when
+rendering saved results with `--no-run`.
+
+### Issue-by-issue compatibility artifact
+
+Every report links [wineslab/libe3#84](https://github.com/wineslab/libe3/issues/84)
+and each of its 27 OCUDU-related items, plus the related subscription-lifetime
+issue #95. The tracker originally audited OCUDU `38fc00bb526c` against libe3
+0.2.1; its descriptions are not assumed to describe the current checkout.
+
+Markdown and PDF list each issue's current disposition, exact test names and
+their results, and remaining limitations. `libe3_issue_coverage.json` carries
+the same evidence and provenance for automated consumers. The mapping is
+maintained in `scripts/libe3_issue_coverage.py` and tested by
+`dapp_e3ap_libe3.report`.
+
+- `ALIGNED` describes the current implementation under the stated scope;
+  `PROFILE-QUALIFIED` is conditional coverage; `REMAINING-DIFFERENCE` is an
+  intentional or unresolved difference. None asserts that an upstream issue
+  is closed.
+- Independently, `TESTED`, `PARTIAL`, `NOT RUN`, `FAILED`, and `DOCUMENTATION`
+  describe evidence from this run. A generic codec pass cannot substitute for
+  a missing named lifecycle or transport test.
+- Known differences **do not fail CI**. Required test failures, missing tests,
+  or unexpected skips within the selected profile do fail CI.
+- The default `--profile auto` probes kernel SCTP. With support it runs the
+  host profile; without support it runs the ZMQ profile and records SCTP as
+  **SKIPPED**, without failure. Explicit `host` requires SCTP and is useful
+  when qualifying a designated SCTP runner.
+
+CI requires the exact 0.2.2 revision via `OCUDU_LIBE3_EXPECTED_REVISION`; the
+report records `OCUDU_LIBE3_EFFECTIVE_VERSION` and
+`OCUDU_LIBE3_EFFECTIVE_REVISION` selected at configure time. Source selection
+is explicit checkout, then submodule, then fallback Git pin. Changing the
+fallback pin alone does not override a checked-out submodule. The external
+build path changes with the selected revision to avoid reusing an older
+library after upgrading the submodule.
+
+For example, the #88 check asserts granted telemetry/control lists on APER
+and the OCUDU Protobuf profile, but their **absence** on the libe3 Protobuf
+profile: its upstream `SubscriptionResponse` has no such fields. Neither
+encoding returns an effective granted periodicity. These limitations are
+recorded, not converted into CI failures or undocumented wire extensions.
 
 ## The patches
 
@@ -118,7 +167,7 @@ python3 scripts/regen_libe3_vectors.py --vectors build/tests/unittests/dapp/inte
 
 ## CI and the report
 
-`scripts/libe3_interop_report.py --build <build> --profile host|zmq` runs the
+`scripts/libe3_interop_report.py --build <build> --profile auto|host|zmq` runs the
 fail-closed gate (`scripts/check_dapp_interop_gate.py`) and renders Markdown
 and PDF: result, a per-link-layer table (passed, or skipped and why), the
 procedure coverage against libe3's encoder vectors, every session the libe3
