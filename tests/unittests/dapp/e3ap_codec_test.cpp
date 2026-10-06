@@ -140,7 +140,7 @@ TEST(dapp_e3ap_codec, subscription_and_control_messages_round_trip)
   subscription.dapp_identifier         = 3;
   subscription.ran_function_identifier = e3ap_ran_function_telemetry;
   subscription.telemetry_identifiers   = {1, 2, 5};
-  subscription.periodicity_ms          = 50;
+  subscription.periodicity             = 50;
   subscription.subscription_data       = *data_bytes.value;
   pdu.message                          = subscription;
   auto encoded                         = e3ap_v2_codec::encode(pdu, e3ap_profile::ocudu);

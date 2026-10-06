@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -38,6 +39,63 @@ SERVER = os.environ.get("OCUDU_E3AP_TEST_SERVER")
 SETUP_GOLDEN_HEX = "00000100312e302e30007800300076"
 # The same PDU with the envelope timestamp 1756800000000000000 ns (libe3's root field).
 SETUP_TS_GOLDEN_HEX = "4000081861684ac56800000100312e302e30007800300076"
+
+
+class ClientNegotiationTests(unittest.TestCase):
+    def client(self):
+        with patch("ocudu_e3.e3ap.SctpAssociation"):
+            return E3Client()
+
+    def test_setup_requires_exact_version_and_explicit_profile_grant(self):
+        accepted = {"responseCode": "positive", "e3apProtocolVersion": b"1.0.0", "ocuduProfile": 1,
+                    "dAppIdentifier": 101, "ranIdentifier": b"test"}
+        for key, values in (("e3apProtocolVersion", (None, b"1.", b"1.1.0", b"2.0.0")),
+                            ("ocuduProfile", (None, 0, 2, 255))):
+            for value in values:
+                with self.subTest(key=key, value=value), self.client() as client:
+                    body = {**accepted, key: value}
+                    client._send = Mock()
+                    client._wait_for = Mock(return_value=(1, "setupResponse", body))
+                    with self.assertRaises(E3ProtocolError):
+                        client.setup()
+                    self.assertIsNone(client.dapp_id)
+        with self.client() as client:
+            client._send = Mock()
+            client._wait_for = Mock(return_value=(1, "setupResponse", accepted))
+            self.assertEqual(client.setup().dapp_id, 101)
+
+    def test_expired_subscription_delete_releases_local_reader(self):
+        with self.client() as client:
+            client.dapp_id = 101
+            subscription = Mock()
+            client.subscriptions[7] = subscription
+            client._send = Mock()
+            client._wait_for = Mock(return_value=(1, "messageAck", {"responseCode": "negative", "cause": "notFound"}))
+            client.unsubscribe(7)
+            subscription.region_reader.close.assert_called_once()
+            self.assertNotIn(7, client.subscriptions)
+            with self.assertRaises(E3ProtocolError):
+                client.unsubscribe(8)
+
+    def test_close_and_release_close_shared_readers(self):
+        from ocudu_e3.e3ap import E3TransportError
+
+        for operation in ("close", "release", "failed_release"):
+            with self.subTest(operation=operation):
+                client = self.client()
+                client.dapp_id = 101
+                subscription = Mock()
+                client.subscriptions[7] = subscription
+                client._send = Mock()
+                client._wait_for = Mock(return_value=(1, "messageAck", {"responseCode": "positive"}))
+                if operation == "failed_release":
+                    client._send.side_effect = E3TransportError("peer went away")
+                    client.release()
+                else:
+                    getattr(client, operation)()
+                subscription.region_reader.close.assert_called_once()
+                self.assertFalse(client.subscriptions)
+                self.assertIsNone(client.dapp_id)
 
 
 class OfflineCodecTests(unittest.TestCase):

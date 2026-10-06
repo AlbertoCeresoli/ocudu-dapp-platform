@@ -396,7 +396,8 @@ private:
     if ((revents & POLLOUT) != 0 || item.wants_write()) {
       flush_or_fail(item);
     }
-    if (!item.is_closing() && item.idle(monotonic_ns(), idle_ns())) {
+    if (!item.is_closing() && item.idle(monotonic_ns(), idle_ns()) &&
+        (item.wants_write() || !carrier.retain_idle_association(item))) {
       idle_closed.fetch_add(1, std::memory_order_relaxed);
       item.close();
     }

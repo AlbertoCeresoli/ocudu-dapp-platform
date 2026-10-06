@@ -76,6 +76,8 @@ E3AP-OCUDU-V2 DEFINITIONS AUTOMATIC TAGS ::= BEGIN
         telemetryIdentifierList SEQUENCE (SIZE (0..1000)) OF INTEGER (1..65535),
         controlIdentifierList   SEQUENCE (SIZE (0..1000)) OF INTEGER (1..65535),
         subscriptionTime        INTEGER (0..3600) OPTIONAL,
+        -- Microseconds for libe3; milliseconds for legacy OCUDU profile 1.
+        -- Normalize by the accepted setup profile, not by the numeric value.
         periodicity             INTEGER (0..1000) OPTIONAL,
         ...,
         -- OCUDU: service-model subscription parameters (Telemetry-SubscriptionData).

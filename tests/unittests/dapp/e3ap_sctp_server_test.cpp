@@ -287,6 +287,351 @@ void publish_crc(telemetry_publisher& publisher, const pusch_crc_diagnostic& eve
 
 } // namespace
 
+TEST(dapp_e3ap_sctp_server, rejects_unknown_protocol_and_profile_versions_before_allocating_an_id)
+{
+  for (auto wire :
+       {client_wire::ocudu_aper, client_wire::libe3_aper, client_wire::ocudu_protobuf, client_wire::libe3_protobuf}) {
+    SCOPED_TRACE(static_cast<int>(wire));
+    fixture f;
+    auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config());
+    ASSERT_TRUE(server) << server.detail;
+    test_client peer(server.server->port(), wire);
+    ASSERT_TRUE(peer.ok());
+    e3ap_setup_request request;
+    request.dapp_name    = "version-test";
+    request.dapp_version = "1";
+    request.vendor       = "test";
+    if (peer.ocudu_profile()) {
+      request.ocudu_profile = e3ap_ocudu_profile_version;
+    }
+    e3ap_pdu pdu;
+    pdu.id             = 1;
+    const auto refused = [&]() {
+      pdu.message = request;
+      EXPECT_TRUE(peer.send(pdu));
+      auto response = peer.receive_as<e3ap_setup_response>();
+      EXPECT_TRUE(response);
+      if (response) {
+        EXPECT_EQ(response->response_code, e3ap_response_code::negative);
+        EXPECT_FALSE(response->dapp_identifier);
+        EXPECT_FALSE(response->ocudu_profile);
+        if (peer.ocudu_profile()) {
+          EXPECT_EQ(response->cause, e3ap_cause::unsupported_protocol_version);
+        }
+      }
+      ++pdu.id;
+    };
+    for (const auto* version : {"1.", "1.invalid", "1.0.1", "1.1.0", "2.0.0"}) {
+      request.e3ap_protocol_version = version;
+      refused();
+    }
+    request.e3ap_protocol_version = e3ap_version_string;
+    if (peer.ocudu_profile()) {
+      for (uint8_t profile : {2, 255}) {
+        request.ocudu_profile = profile;
+        refused();
+      }
+    }
+    EXPECT_EQ(server.server->metrics().setups_completed, 0U);
+    EXPECT_EQ(server.server->metrics().setups_rejected, pdu.id - 1);
+    // A correction on the bound encoding is allowed; only this setup owns an ID.
+    ASSERT_TRUE(peer.setup());
+    EXPECT_EQ(server.server->metrics().setups_completed, 1U);
+  }
+}
+
+TEST(dapp_e3ap_sctp_server, normalizes_periodicity_units_before_applying_defaults_and_hard_floors)
+{
+  for (auto wire :
+       {client_wire::ocudu_aper, client_wire::libe3_aper, client_wire::ocudu_protobuf, client_wire::libe3_protobuf}) {
+    SCOPED_TRACE(static_cast<int>(wire));
+    fixture f;
+    auto    config = test_server_config();
+    config.streams = default_telemetry_streams();
+    for (auto& stream : config.streams) {
+      if (stream.telemetry_id == telemetry_id_pusch_crc) {
+        stream.minimum_interval_us    = 700;
+        stream.hard_floor_interval_us = 0;
+      }
+    }
+    auto server = e3ap_sctp_server::create(&f.service, f.store, config);
+    ASSERT_TRUE(server);
+    test_client peer(server.server->port(), wire);
+    auto        id = peer.setup();
+    ASSERT_TRUE(id);
+    e3ap_subscription_request request;
+    request.dapp_identifier         = *id;
+    request.ran_function_identifier = e3ap_ran_function_telemetry;
+    request.telemetry_identifiers   = {telemetry_id_pusch_crc};
+    e3ap_pdu pdu;
+    pdu.id = 10;
+    for (auto interval : {std::optional<uint32_t>{},
+                          std::optional<uint32_t>{0},
+                          std::optional<uint32_t>{1},
+                          std::optional<uint32_t>{1000}}) {
+      request.periodicity = interval;
+      pdu.message         = request;
+      ASSERT_TRUE(peer.send(pdu));
+      auto response = peer.receive_as<e3ap_subscription_response>();
+      ASSERT_TRUE(response && response->subscription_id);
+      ASSERT_EQ(response->response_code, e3ap_response_code::positive);
+      const uint64_t expected = interval ? uint64_t{*interval} * (peer.ocudu_profile() ? 1000 : 1) : 700;
+      EXPECT_EQ(f.store->demand(telemetry_stream_pusch_crc).fastest_requested_us, expected);
+      pdu.message = e3ap_subscription_delete{*id, *response->subscription_id};
+      ASSERT_TRUE(peer.send(pdu));
+      if (peer.ocudu_profile()) {
+        ASSERT_TRUE(peer.receive_as<e3ap_message_ack>());
+      } else {
+        ASSERT_TRUE(peer.receive_as<e3ap_subscription_response>());
+      }
+      ++pdu.id;
+    }
+    // Prove this reaches emission filtering, not just the store's demand field:
+    // libe3 1000 means 1 ms, not 1 s. 20 ms spaced records must both be emitted.
+    if (!peer.ocudu_profile()) {
+      pdu.message = request;
+      ASSERT_TRUE(peer.send(pdu));
+      ASSERT_TRUE(peer.receive_as<e3ap_subscription_response>());
+      publish_crc(*f.publisher, {0x4601, slot_point{1, 20, 3}, true});
+      ASSERT_TRUE(peer.receive_as<e3ap_indication_message>());
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      publish_crc(*f.publisher, {0x4601, slot_point{1, 20, 4}, true});
+      ASSERT_TRUE(
+          wait_until([&] { return server.server->metrics().indications_sent == 2; }, std::chrono::milliseconds(500)));
+      ASSERT_TRUE(peer.receive_as<e3ap_indication_message>());
+    }
+  }
+}
+
+TEST(dapp_e3ap_sctp_server, rejected_setup_does_not_pin_the_proposed_profile)
+{
+  for (auto wire : {client_wire::ocudu_aper, client_wire::ocudu_protobuf}) {
+    fixture f;
+    auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config());
+    ASSERT_TRUE(server);
+    test_client        peer(server.server->port(), wire);
+    e3ap_setup_request request;
+    request.dapp_name     = "retry";
+    request.dapp_version  = "1";
+    request.vendor        = "test";
+    request.ocudu_profile = 2;
+    e3ap_pdu pdu;
+    pdu.id      = 1;
+    pdu.message = request;
+    ASSERT_TRUE(peer.send(pdu));
+    auto response = peer.receive_as<e3ap_setup_response>();
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->response_code, e3ap_response_code::negative);
+    request.ocudu_profile.reset(); // retry as libe3, not OCUDU profile 1
+    pdu.id      = 2;
+    pdu.message = request;
+    ASSERT_TRUE(peer.send(pdu));
+    response = peer.receive_as<e3ap_setup_response>();
+    ASSERT_TRUE(response && response->dapp_identifier);
+    EXPECT_EQ(response->response_code, e3ap_response_code::positive);
+    EXPECT_FALSE(response->ocudu_profile);
+    EXPECT_LE(*response->dapp_identifier, e3ap_libe3_codec::dapp_identifier_pool);
+    EXPECT_EQ(server.server->metrics().libe3_setups_completed, 1U);
+  }
+}
+
+TEST(dapp_e3ap_sctp_server, hard_floor_and_millisecond_overrides_survive_store_lease_recovery)
+{
+  for (auto wire :
+       {client_wire::ocudu_aper, client_wire::libe3_aper, client_wire::ocudu_protobuf, client_wire::libe3_protobuf}) {
+    SCOPED_TRACE(static_cast<int>(wire));
+    fixture f;
+    auto    config = test_server_config();
+    config.streams = default_telemetry_streams();
+    for (auto& stream : config.streams) {
+      if (stream.telemetry_id == telemetry_id_pusch_crc) {
+        stream.hard_floor_interval_us = 1500;
+      }
+    }
+    auto server = e3ap_sctp_server::create(&f.service, f.store, config);
+    ASSERT_TRUE(server);
+    test_client peer(server.server->port(), wire);
+    auto        id = peer.setup();
+    ASSERT_TRUE(id);
+    e3ap_subscription_request request;
+    request.dapp_identifier         = *id;
+    request.ran_function_identifier = e3ap_ran_function_telemetry;
+    request.telemetry_identifiers   = {telemetry_id_pusch_crc};
+    request.periodicity             = 1;
+    if (peer.ocudu_profile()) {
+      telemetry_subscription_config stream;
+      stream.telemetry_id        = telemetry_id_pusch_crc;
+      stream.minimum_interval_ms = 5;
+      stream.cell_id             = 3;
+      stream.sample_every_n      = 2;
+      stream.drop_policy         = telemetry_drop_policy::drop_newest;
+      telemetry_subscription_data data;
+      data.configs.push_back(stream);
+      auto encoded = e3ap_codec::encode(data);
+      ASSERT_TRUE(encoded);
+      request.subscription_data = *encoded.value;
+    }
+    e3ap_pdu pdu;
+    pdu.id      = 2;
+    pdu.message = request;
+    ASSERT_TRUE(peer.send(pdu));
+    ASSERT_TRUE(peer.receive_as<e3ap_subscription_response>());
+    const uint64_t expected_us = peer.ocudu_profile() ? 5000 : 1500;
+    EXPECT_EQ(f.store->demand(telemetry_stream_pusch_crc).fastest_requested_us, expected_us);
+    auto before = f.store->subscriptions();
+    ASSERT_EQ(before.subscriptions.size(), 1U);
+    // Simulate a lost store lease while leaving the protocol subscription valid.
+    ASSERT_TRUE(f.store->unsubscribe(before.subscriptions[0].request.subscription_id));
+    ASSERT_TRUE(wait_until([&] { return f.store->demand(telemetry_stream_pusch_crc).active == 1; }));
+    auto after = f.store->subscriptions();
+    ASSERT_EQ(after.subscriptions.size(), 1U);
+    const auto& restored = after.subscriptions[0].request;
+    EXPECT_EQ(restored.requested_interval_us, expected_us);
+    EXPECT_EQ(restored.cell_id, before.subscriptions[0].request.cell_id);
+    EXPECT_EQ(restored.sample_every_n, before.subscriptions[0].request.sample_every_n);
+    EXPECT_EQ(restored.drop_policy, before.subscriptions[0].request.drop_policy);
+  }
+}
+
+TEST(dapp_e3ap_sctp_server, subscription_expiry_reclaims_shared_memory_and_admission_budget)
+{
+  fixture f;
+  auto    config                        = test_server_config();
+  config.maximum_payload_bytes          = 65536;
+  config.shared_region_rows             = 1;
+  config.maximum_shared_region_bytes    = 65664;
+  config.maximum_subscriptions_per_dapp = 1;
+  auto server                           = e3ap_sctp_server::create(&f.service, f.store, config, f.connections);
+  ASSERT_TRUE(server);
+  test_client peer(server.server->port());
+  auto        id = peer.setup();
+  ASSERT_TRUE(id);
+  e3ap_subscription_request request;
+  request.dapp_identifier         = *id;
+  request.ran_function_identifier = e3ap_ran_function_telemetry;
+  request.telemetry_identifiers   = {telemetry_id_pusch_crc};
+  request.subscription_time_s     = 1;
+  request.delivery_mode           = e3ap_delivery_mode::by_reference;
+  e3ap_pdu pdu;
+  pdu.id      = 2;
+  pdu.message = request;
+  ASSERT_TRUE(peer.send(pdu));
+  auto first = peer.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(first && first->shared_region);
+  ASSERT_TRUE(wait_until([&] { return server.server->metrics().subscriptions_expired == 1; }));
+  const int descriptor = ::shm_open(first->shared_region->region_name.c_str(), O_RDONLY, 0);
+  EXPECT_EQ(descriptor, -1);
+  if (descriptor >= 0) {
+    ::close(descriptor);
+  } else {
+    EXPECT_EQ(errno, ENOENT);
+  }
+  EXPECT_TRUE(f.store->subscriptions().subscriptions.empty());
+  request.subscription_time_s = 0;
+  pdu.id                      = 3;
+  pdu.message                 = request;
+  ASSERT_TRUE(peer.send(pdu));
+  auto second = peer.receive_as<e3ap_subscription_response>();
+  ASSERT_TRUE(second && second->shared_region);
+  EXPECT_EQ(second->response_code, e3ap_response_code::positive);
+  EXPECT_NE(second->shared_region->region_name, first->shared_region->region_name);
+}
+
+TEST(dapp_e3ap_sctp_server, finite_subscription_expires_despite_continuous_store_lease_renewal)
+{
+  for (auto wire :
+       {client_wire::ocudu_aper, client_wire::libe3_aper, client_wire::ocudu_protobuf, client_wire::libe3_protobuf}) {
+    SCOPED_TRACE(static_cast<int>(wire));
+    fixture f;
+    auto    config  = test_server_config();
+    config.lease_us = 100'000; // renewed by idle drains many times before the 1 s protocol lifetime
+    auto server     = e3ap_sctp_server::create(&f.service, f.store, config, f.connections);
+    ASSERT_TRUE(server);
+    test_client peer(server.server->port(), wire);
+    auto        id = peer.setup();
+    ASSERT_TRUE(id);
+    e3ap_subscription_request request;
+    request.dapp_identifier         = *id;
+    request.ran_function_identifier = e3ap_ran_function_telemetry;
+    request.telemetry_identifiers   = {telemetry_id_pusch_crc};
+    request.subscription_time_s     = 1;
+    e3ap_pdu pdu;
+    pdu.id      = 2;
+    pdu.message = request;
+    ASSERT_TRUE(peer.send(pdu));
+    auto granted = peer.receive_as<e3ap_subscription_response>();
+    ASSERT_TRUE(granted && granted->subscription_id);
+    // Traffic and store lease renewal must not extend the subscription duration.
+    for (unsigned index = 0; index != 3; ++index) {
+      publish_crc(*f.publisher, {0x4601, slot_point{1, 20, 3}, true});
+      ASSERT_TRUE(peer.receive_as<e3ap_indication_message>());
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    EXPECT_EQ(server.server->metrics().subscriptions_expired, 0U);
+    ASSERT_TRUE(
+        wait_until([&] { return server.server->metrics().subscriptions_expired == 1; }, std::chrono::seconds(3)));
+    EXPECT_EQ(server.server->metrics().live_subscriptions, 0U);
+    EXPECT_EQ(server.server->metrics().subscriptions_removed, 1U);
+    EXPECT_TRUE(f.store->subscriptions().subscriptions.empty());
+    EXPECT_FALSE(f.store->has_active(telemetry_stream_pusch_crc));
+    ASSERT_TRUE(wait_until([&] {
+      auto records = f.connections->snapshot();
+      return records.size() == 1 && records[0].subscriptions.empty();
+    }));
+    // Deleting an expired subscription must finish in the peer's procedure dialect.
+    pdu.id      = 3;
+    pdu.message = e3ap_subscription_delete{*id, *granted->subscription_id};
+    ASSERT_TRUE(peer.send(pdu));
+    if (peer.ocudu_profile()) {
+      auto response = peer.receive_as<e3ap_message_ack>();
+      ASSERT_TRUE(response);
+      EXPECT_EQ(response->cause, e3ap_cause::not_found);
+    } else {
+      auto response = peer.receive_as<e3ap_subscription_response>();
+      ASSERT_TRUE(response);
+      EXPECT_EQ(response->response_code, e3ap_response_code::negative);
+      EXPECT_EQ(response->subscription_id, granted->subscription_id);
+    }
+  }
+}
+
+TEST(dapp_e3ap_sctp_server, quiet_subscription_survives_idle_until_expiry_or_peer_disconnect)
+{
+  for (auto duration : {std::optional<uint32_t>{}, std::optional<uint32_t>{0}, std::optional<uint32_t>{1}}) {
+    fixture f;
+    auto    config                = test_server_config();
+    config.transport.idle_timeout = std::chrono::milliseconds(200);
+    auto server                   = e3ap_sctp_server::create(&f.service, f.store, config);
+    ASSERT_TRUE(server);
+    {
+      test_client peer(server.server->port());
+      auto        id = peer.setup();
+      ASSERT_TRUE(id);
+      e3ap_subscription_request request;
+      request.dapp_identifier         = *id;
+      request.ran_function_identifier = e3ap_ran_function_telemetry;
+      request.telemetry_identifiers   = {telemetry_id_pusch_crc};
+      request.subscription_time_s     = duration;
+      e3ap_pdu pdu;
+      pdu.id      = 2;
+      pdu.message = request;
+      ASSERT_TRUE(peer.send(pdu));
+      ASSERT_TRUE(peer.receive_as<e3ap_subscription_response>());
+      std::this_thread::sleep_for(std::chrono::milliseconds(400));
+      EXPECT_EQ(server.server->metrics().transport.live_associations, 1U);
+      EXPECT_EQ(server.server->metrics().transport.idle_closures, 0U);
+      EXPECT_EQ(server.server->metrics().live_subscriptions, 1U);
+      if (duration.value_or(0) != 0) {
+        ASSERT_TRUE(wait_until([&] { return server.server->metrics().transport.live_associations == 0; }));
+        EXPECT_EQ(server.server->metrics().subscriptions_expired, 1U);
+        EXPECT_EQ(server.server->metrics().transport.idle_closures, 1U);
+      }
+    } // A real disconnect still reclaims an unlimited quiet subscription.
+    ASSERT_TRUE(wait_until([&] { return server.server->metrics().live_subscriptions == 0; }));
+    EXPECT_FALSE(f.store->has_active(telemetry_stream_pusch_crc));
+  }
+}
+
 TEST(dapp_e3ap_sctp_server, completes_setup_and_advertises_ran_functions)
 {
   fixture f;

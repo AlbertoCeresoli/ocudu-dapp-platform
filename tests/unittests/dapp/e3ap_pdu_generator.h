@@ -227,7 +227,7 @@ private:
       request.subscription_time_s = static_cast<uint32_t>(range(0, ocudu() ? 86400 : 3600));
     }
     if (coin()) {
-      request.periodicity_ms = static_cast<uint32_t>(range(0, ocudu() ? 60000 : 1000));
+      request.periodicity = static_cast<uint32_t>(range(0, ocudu() ? 60000 : 1000));
     }
     if (ocudu()) {
       request.subscription_data = coin() ? bytes(1, 200) : std::vector<uint8_t>{};

@@ -84,6 +84,8 @@ struct stream_binding {
   uint16_t                               telemetry_id{};
   uint32_t                               interface_id{};
   management::identifier                 store_id;
+  /// Preserve admitted filters, rate and queue policy across store-lease recovery.
+  portable_subscription_request          store_request;
   std::vector<uint16_t>                  rnti_filter;
   uint64_t                               minimum_interval_ns{};
   std::unordered_map<uint16_t, uint64_t> last_emission_ns;
@@ -94,6 +96,8 @@ struct subscription_state {
   uint16_t                    subscription_id{};
   uint16_t                    ran_function{};
   std::vector<stream_binding> streams;
+  /// Protocol lifetime, independent of the renewable portable-store lease.
+  std::optional<std::chrono::steady_clock::time_point> expires_at;
   /// Present when the dApp asked for by-reference delivery.
   std::unique_ptr<e3_shared_region> region;
   uint32_t                          minimum_by_reference_bytes{};
@@ -242,7 +246,7 @@ portable_drop_policy to_store_policy(telemetry_drop_policy policy) noexcept
 
 bool protocol_version_supported(const std::string& version) noexcept
 {
-  return version.rfind("1.", 0) == 0;
+  return version == e3ap_version_string;
 }
 
 } // namespace
@@ -585,7 +589,11 @@ struct e3ap_sctp_server::implementation {
       setups_rejected.fetch_add(1, std::memory_order_relaxed);
     } else if (!protocol_version_supported(request.e3ap_protocol_version)) {
       response.cause  = e3ap_cause::unsupported_protocol_version;
-      response.detail = "E3AP protocol version must be 1.x";
+      response.detail = "unsupported E3AP protocol version; expected " + std::string(e3ap_version_string);
+      setups_rejected.fetch_add(1, std::memory_order_relaxed);
+    } else if (request.ocudu_profile && *request.ocudu_profile != e3ap_ocudu_profile_version) {
+      response.cause  = e3ap_cause::unsupported_protocol_version;
+      response.detail = "unsupported OCUDU profile version; expected " + std::to_string(e3ap_ocudu_profile_version);
       setups_rejected.fetch_add(1, std::memory_order_relaxed);
     } else if (!allocate_dapp_id_into(session)) {
       response.cause  = e3ap_cause::resource_exhausted;
@@ -615,6 +623,11 @@ struct e3ap_sctp_server::implementation {
     }
     publish_connection(session);
     send_reply(association, session, pdu_id, response);
+    if (!session.setup_done) {
+      // A rejected proposal must not pin its profile/units for a corrected
+      // SetupRequest. Only successful setup establishes the session contract.
+      session.wire_bound = false;
+    }
   }
 
   void handle_subscription(sctp_association&                association,
@@ -647,6 +660,7 @@ struct e3ap_sctp_server::implementation {
     if (request.telemetry_identifiers.empty() || !request.control_identifiers.empty()) {
       return reject(e3ap_cause::invalid_request, "telemetry subscriptions name at least one telemetry and no control");
     }
+    expire_subscriptions(session);
     if (session.subscriptions.size() >= config.maximum_subscriptions_per_dapp) {
       return reject(e3ap_cause::resource_exhausted, "subscription limit for this dApp reached");
     }
@@ -705,10 +719,12 @@ struct e3ap_sctp_server::implementation {
       // carrier thins this subscription back to its own interval when another
       // subscriber drives the producer faster, with 10 % slack so capture
       // jitter never halves the rate.
-      const std::optional<uint32_t> requested_ms =
-          config_for.minimum_interval_ms ? config_for.minimum_interval_ms : request.periodicity_ms;
-      uint64_t effective_us =
-          requested_ms ? uint64_t{*requested_ms} * 1000ULL : record->minimum_interval_us.value_or(0);
+      auto requested_interval = request.requested_interval(session.profile);
+      if (config_for.minimum_interval_ms) {
+        requested_interval = std::chrono::milliseconds(*config_for.minimum_interval_ms);
+      }
+      uint64_t effective_us = requested_interval ? static_cast<uint64_t>(requested_interval->count())
+                                                 : record->minimum_interval_us.value_or(0);
       // Enforce the advertised hardFloorIntervalUs at admission: it "bounds what
       // any subscriber may request", so a faster request must not drive the
       // store's demand signal below the operator's floor.
@@ -730,6 +746,7 @@ struct e3ap_sctp_server::implementation {
         failure = "store rejected telemetry " + std::to_string(telemetry_id) + ": " + admitted.detail;
         break;
       }
+      binding.store_request = store_request;
       created.streams.push_back(std::move(binding));
     }
     if (!failure.empty()) {
@@ -770,6 +787,9 @@ struct e3ap_sctp_server::implementation {
     }
     session.next_subscription_id =
         session.next_subscription_id >= last_subscription_id ? 1 : session.next_subscription_id + 1;
+    if (request.subscription_time_s.value_or(0) != 0) {
+      created.expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(*request.subscription_time_s);
+    }
     const uint16_t id         = created.subscription_id;
     session.subscriptions[id] = std::move(created);
     subscriptions_created.fetch_add(1, std::memory_order_relaxed);
@@ -798,20 +818,56 @@ struct e3ap_sctp_server::implementation {
     }
   }
 
+  /// Runs only on the carrier worker, never on a radio producer. Reuse the
+  /// normal removal path so expiry returns store demand, SHM and admission
+  /// budgets just like delete/release. It does not synthesize a delete reply.
+  void expire_subscriptions(dapp_session& session) noexcept
+  {
+    const auto now     = std::chrono::steady_clock::now();
+    bool       changed = false;
+    for (auto it = session.subscriptions.begin(); it != session.subscriptions.end();) {
+      if (it->second.expires_at && now >= *it->second.expires_at) {
+        remove_subscription(session, it->second);
+        it = session.subscriptions.erase(it);
+        subscriptions_expired.fetch_add(1, std::memory_order_relaxed);
+        changed = true;
+      } else {
+        ++it;
+      }
+    }
+    if (changed) {
+      publish_connection(session);
+    }
+  }
+
   void handle_subscription_delete(sctp_association&               association,
                                   dapp_session&                   session,
                                   uint32_t                        pdu_id,
                                   const e3ap_subscription_delete& request) noexcept
   {
+    const auto reject = [&](e3ap_cause cause, const char* detail) {
+      if (session.libe3) {
+        // libe3 waits for SubscriptionResponse even when the subscription has
+        // already expired; a MessageAck would leave its delete pending.
+        e3ap_subscription_response response;
+        response.request_id      = pdu_id;
+        response.dapp_identifier = request.dapp_identifier;
+        response.subscription_id = request.subscription_id;
+        send_reply(association, session, pdu_id, response);
+      } else {
+        ack(association, session, pdu_id, false, cause, detail);
+      }
+    };
     if (!session.setup_done) {
-      return ack(association, session, pdu_id, false, e3ap_cause::setup_required, "complete E3 setup first");
+      return reject(e3ap_cause::setup_required, "complete E3 setup first");
     }
     if (request.dapp_identifier != session.dapp_id) {
-      return ack(association, session, pdu_id, false, e3ap_cause::invalid_request, "dApp identifier mismatch");
+      return reject(e3ap_cause::invalid_request, "dApp identifier mismatch");
     }
+    expire_subscriptions(session);
     auto found = session.subscriptions.find(request.subscription_id);
     if (found == session.subscriptions.end()) {
-      return ack(association, session, pdu_id, false, e3ap_cause::not_found, "subscription does not exist");
+      return reject(e3ap_cause::not_found, "subscription does not exist");
     }
     remove_subscription(session, found->second);
     session.subscriptions.erase(found);
@@ -1028,7 +1084,7 @@ struct e3ap_sctp_server::implementation {
           if (!polled) {
             if (polled.code == portable_subscription_code::not_found) {
               // The lease lapsed (for example while the association was stalled); renew.
-              resubscribe(binding, item.second, session);
+              resubscribe(binding);
             }
             break;
           }
@@ -1046,19 +1102,9 @@ struct e3ap_sctp_server::implementation {
     }
   }
 
-  void
-  resubscribe(stream_binding& binding, const subscription_state& subscription, const dapp_session& session) noexcept
+  void resubscribe(stream_binding& binding) noexcept
   {
-    static_cast<void>(subscription);
-    static_cast<void>(session);
-    portable_subscription_request request;
-    request.subscription_id     = binding.store_id;
-    request.interface_id        = binding.interface_id;
-    request.queue_depth_chunks  = telemetry_queue_depth(binding.telemetry_id, config.queue_depth_chunks);
-    request.maximum_chunk_bytes = 64 * 1024;
-    request.lease_us            = config.lease_us;
-    request.drop_policy         = portable_drop_policy::coalesce_latest;
-    static_cast<void>(store->subscribe(request));
+    static_cast<void>(store->subscribe(binding.store_request));
     binding.assembly.reset();
   }
 
@@ -1281,6 +1327,7 @@ struct e3ap_sctp_server::implementation {
   std::atomic<uint64_t>                    setups_rejected{0};
   std::atomic<uint64_t>                    subscriptions_created{0};
   std::atomic<uint64_t>                    subscriptions_removed{0};
+  std::atomic<uint64_t>                    subscriptions_expired{0};
   std::atomic<uint64_t>                    control_requests{0};
   std::atomic<uint64_t>                    control_failures{0};
   std::atomic<uint64_t>                    indications_sent{0};
@@ -1476,9 +1523,20 @@ void e3ap_sctp_server::on_timer(std::vector<sctp_association*>& associations)
     if (session->control && now - session->control->started_ns > assembly_timeout_ns) {
       session->control.reset();
     }
+    state->expire_subscriptions(*session);
     state->drain(*association, *session);
   }
   state->flush_xapp_controls(associations);
+}
+
+bool e3ap_sctp_server::retain_idle_association(sctp_association& association) noexcept
+{
+  auto* session = state->session_of(association);
+  if (session == nullptr || !session->setup_done) {
+    return false;
+  }
+  state->expire_subscriptions(*session);
+  return !session->subscriptions.empty();
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,6 +1635,7 @@ e3ap_sctp_server_metrics e3ap_sctp_server::metrics() const noexcept
   result.setups_rejected           = state->setups_rejected.load(std::memory_order_relaxed);
   result.subscriptions_created     = state->subscriptions_created.load(std::memory_order_relaxed);
   result.subscriptions_removed     = state->subscriptions_removed.load(std::memory_order_relaxed);
+  result.subscriptions_expired     = state->subscriptions_expired.load(std::memory_order_relaxed);
   result.control_requests          = state->control_requests.load(std::memory_order_relaxed);
   result.control_failures          = state->control_failures.load(std::memory_order_relaxed);
   result.indications_sent          = state->indications_sent.load(std::memory_order_relaxed);

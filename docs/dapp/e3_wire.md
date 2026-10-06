@@ -78,13 +78,14 @@ executor; the gain actions address a radio-unit port and carry the gain in dB.
 snapshot plus up to 64 current downstream E3 associations and their bounded
 telemetry subscription descriptions.
 
-Primitive conventions (shared by every OCUDU E3 module):
+Primitive conventions for OCUDU service-model modules (E3AP V2's libe3-rooted
+text fields instead use `UTF8String`; see interoperability notes):
 
 | Type | Encoding notes |
 |------|----------------|
 | `Identifier` | `OCTET STRING (SIZE (16))`, UUID-like |
 | `Hash256` | 32 raw bytes |
-| Bounded text | `OCTET STRING`, UTF-8; malformed UTF-8 **must** be rejected. PER does not make SIZE constraints on `UTF8String` visible and encoders disagree on that corner, so OCUDU never uses `UTF8String` on the wire |
+| Bounded text | `OCTET STRING`, UTF-8; malformed UTF-8 **must** be rejected. The service models avoid the generator-dependent `UTF8String` length encoding used by the E3AP root. |
 | `Unsigned64` / `Signed64` | 8-byte network-order integers carried as `OCTET STRING (SIZE (8))` |
 | `REAL` | Present only for measurements; non-finite values are omitted (fields are OPTIONAL) |
 | `TypedValue` | CHOICE of bool, signed, unsigned, real, string, bytes |
@@ -130,7 +131,7 @@ by `(routeEpoch, publicationSequence)` with contiguous `chunkIndex`. Interfaces:
 | Streams | Stream 0 carries procedures; stream 1 carries indications. Clients may send everything on stream 0. |
 | PPID | `0x00E3A001` (project-private, informational) |
 | Largest PDU | 32 KiB fragment + envelope (64 KiB bound, `e3ap_v2_codec::maximum_pdu_bytes`) |
-| Idle close | Associations quiet longer than `idle_timeout_ms` (default 30 s) are closed; an association that has not completed setup within `setup_timeout_ms` (default 5 s) is closed |
+| Idle close | Quiet associations without a valid subscription close after `idle_timeout_ms` (default 30 s). Valid subscriptions retain a quiet, fully drained SCTP association; stalled output and transport failure still close it. Setup must complete within `setup_timeout_ms` (default 5 s). |
 | Admission | Optional `allowed_peers` list of literal addresses; `maximum_associations` (default 8) |
 | Event notifications | Not subscribed; receivers skip `MSG_NOTIFICATION` deliveries defensively |
 | Socket options | **Both peers** preset `SO_SNDBUF`/`SO_RCVBUF` (2 MiB or more) *before* the association exists (listener before `listen()`, client before `connect()`) and set `SCTP_DELAYED_SACK` with `sack_delay = 0`, `sack_freq = 1`. See "Socket options" below. |
@@ -286,17 +287,22 @@ negative responses carry an optional `E3-Cause` and `detail`.
 
 ### Procedures
 
-1. **Setup.** `E3-SetupRequest { e3apProtocolVersion "1.x", dAppName, dAppVersion (1..11 bytes), vendor, ocuduProfile?, dAppInstance? }`.
+1. **Setup.** `E3-SetupRequest { e3apProtocolVersion "1.0.0", dAppName, dAppVersion (1..11 bytes), vendor, ocuduProfile?, dAppInstance? }`.
    The agent answers `E3-SetupResponse` with the assigned `dAppIdentifier`,
    its `ranIdentifier`, `ranInstance`, payload/fragment bounds, and the
    `ranFunctionList`. A second setup on the same association is refused with
    `setupAlreadyComplete`; every other procedure before setup fails with
    `setupRequired`.
-2. **Subscription.** `E3-SubscriptionRequest { dAppIdentifier, ranFunctionIdentifier, telemetryIdentifierList, controlIdentifierList, subscriptionTime? (0..3600 s), periodicity? (0..1000 ms), subscriptionData?, deliveryMode?, minimumByReferenceBytes?, subscriptionTimeLong? (0..86400), periodicityLong? (0..60000) }`.
+   The version must match exactly. Only `ocuduProfile = 1` is supported;
+   absent selects libe3, and other values are refused before assigning an ID.
+   OCUDU clients require the profile grant and exact version in the response.
+   The string alone does **not** identify the libe3 schema revision: this build
+   remains pinned to 0.2.1 and its compiler profile (see interoperability notes).
+2. **Subscription.** `E3-SubscriptionRequest { dAppIdentifier, ranFunctionIdentifier, telemetryIdentifierList, controlIdentifierList, subscriptionTime? (0..3600 s), periodicity? (0..1000), subscriptionData?, deliveryMode?, minimumByReferenceBytes?, subscriptionTimeLong? (0..86400 s), periodicityLong? (0..60000 ms) }`.
    Values beyond libe3's root ranges travel in the `...Long` additions with the
    root field absent.
    Only RAN function 10 (telemetry) accepts subscriptions; `controlIdentifierList`
-   must be empty. `periodicity` (ms) is the per-RNTI capture interval requested
+   must be empty. `periodicity` is the per-RNTI capture interval requested
    for every telemetry in the request (`0` = every event; absent = the stream's
    advertised default floor); `subscriptionData` is an APER
    `Telemetry-SubscriptionData` with per-telemetry filters and an overriding
@@ -330,6 +336,50 @@ the reassembled length against `payloadBytes` before decoding. `fragmentIndex`
 and `fragmentCount` are `OPTIONAL` additions meaning 0 and 1 when absent, so a
 whole payload carries no extension group and is byte-identical to libe3's
 message.
+
+### Subscription timing and lifetime
+
+The agent normalizes wire intervals to `std::chrono::microseconds` at admission.
+Units are explicit and must not be inferred from the value:
+
+| Setting | Unit and bound | Meaning |
+|---------|----------------|---------|
+| libe3-profile `periodicity` | microseconds, 0..1000 (pinned 0.2.1 grammar) | 1000 requests 1 ms, not 1 s |
+| OCUDU profile-1 `periodicity` / `periodicityLong` | milliseconds, 0..1000 / 0..60000 | Existing OCUDU wire/client behavior is retained |
+| OCUDU `minimumIntervalMs` / Python `periodicity_ms` | milliseconds | Per-stream `minimumIntervalMs` takes precedence over procedure periodicity |
+| `subscriptionTime` / OCUDU `subscriptionTimeLong` | seconds, 0..3600 / 0..86400 | Positive means finite lifetime; zero or absent means until delete, release or disconnect |
+
+These units apply equally to APER and Protobuf. No value is silently clamped or
+rounded. Zero interval requests every event, absent uses the stream default,
+and admission enforces `hardFloorIntervalUs` after unit conversion. Recovering
+a portable-store lease preserves the admitted interval, cell/sample filters and
+drop policy. The C++ wire member is now `periodicity` (previously misleadingly
+named `periodicity_ms`); protocol handlers must use `requested_interval(profile)`.
+
+A finite protocol lifetime starts at admission on a monotonic clock and is
+independent of renewable internal store leases. Traffic, polling and lease
+recovery do not extend it. Expiry on the carrier worker removes the subscription,
+producer demand, registry entry and owned shared region, returning its admission
+budget. The worker checks expiry before draining; already queued/in-flight
+indications can still arrive afterwards. `subscriptions_expired` counts these
+removals and is included in `subscriptions_removed`.
+
+Expiry sends no unsolicited delete response. A later delete returns not-found
+(negative `SubscriptionResponse` for libe3; negative `MessageAck` with `notFound`
+for OCUDU). The Python client treats not-found for a locally held subscription
+as completed cleanup, closing its SHM reader; `close()`/`release()` also close
+all remaining readers.
+
+Quiet valid SCTP subscriptions are exempt from the application idle timeout
+only with an empty outbound queue. Normal SCTP peer-loss detection, stalled
+output timeout, setup timeout, and association/subscription limits remain in
+force. After the last subscription is deleted or expires, normal idle policy
+applies; an already-idle association may close immediately. ZMQ's configured
+idle policy is unchanged: PUB/SUB lacks per-peer SCTP liveness, so it does not
+use this exemption. Protocol subscription expiry applies on both transports.
+
+The proposed libe3 periodicity-range widening is a separate APER wire change.
+This update does not change ASN.1 constraints, the libe3 pin or golden vectors.
 
 ### RAN functions
 
@@ -614,9 +664,12 @@ twice while a single dApp is attached. It exists for libe3 interoperability
 | `dapp_e3ap_libe3.interop` (`python/tests/test_libe3_interop.py`) | asn1tools | every libe3 type has the identical root in E3AP-OCUDU-V2 and OCUDU adds only behind libe3's markers; `ocudu_e3`'s codec reproduces every libe3 vector; libe3 reads OCUDU-profile PDUs as the libe3 message |
 | `dapp_e3ap_libe3.e2e_sctp`, `.e2e_zmq` (`python/tests/test_libe3_e2e.py`, `-DOCUDU_DAPP_LIBE3_INTEROP=ON`) | a libe3 checkout, SCTP headers, libzmq, libprotobuf | **the real upstream libe3** (dApp role) against `e3ap_test_server` over `SCTP_ASSOCIATION`, ZMQ `ipc://` and ZMQ `tcp://`, each in APER and in Protobuf: full session; two dApps in a row; two concurrent dApps on the ZMQ sockets; the encoder tool still matches the pinned APER and Protobuf vectors, and libe3 decodes both to the same fields; libe3 decodes what Python emits |
 
-What is left to align with libe3 is upstreaming, not wire: proposing the OCUDU
-additions (fragmentation, by-reference delivery, causes, control response) to
-libe3, so that one module and one `.proto` file serve both projects.
+Remaining alignment includes stock-toolchain APER Setup compatibility (the
+tests above use the patched/pinned generator), coordinated adoption of future
+libe3 schema revisions, and proposing OCUDU additions (fragmentation,
+by-reference delivery, causes, control response) upstream. Structural schema
+alignment and passing the patched-peer tests are not a stock-libe3 compatibility
+claim.
 
 The reference client tarball ships a **trimmed** `class-c-publication-v1.fbs`
 whose `ElementType` and `GridMaskGranularity` enumerators are numbered

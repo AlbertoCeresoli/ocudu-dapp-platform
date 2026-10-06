@@ -709,8 +709,12 @@ void set_message(const context& ctx, E3V2_E3_PDU_t& pdu, const e3ap_subscription
   };
   place(source.subscription_time_s, destination.subscriptionTime, destination.subscriptionTimeLong,
         root_subscription_time, long_subscription_time, "subscription time");
-  place(source.periodicity_ms, destination.periodicity, destination.periodicityLong, root_periodicity,
-        long_periodicity, "periodicity");
+  place(source.periodicity,
+        destination.periodicity,
+        destination.periodicityLong,
+        root_periodicity,
+        long_periodicity,
+        "periodicity");
   if (ctx.ocudu()) {
     if (!source.subscription_data.empty()) {
       if (source.subscription_data.size() > e3ap_maximum_function_data) {
@@ -736,14 +740,14 @@ e3ap_subscription_request read_message(const context& ctx, const E3V2_E3_Subscri
   result.telemetry_identifiers   = read_identifier_list(source.telemetryIdentifierList, "telemetry identifier");
   result.control_identifiers     = read_identifier_list(source.controlIdentifierList, "control identifier");
   result.subscription_time_s     = read_optional(source.subscriptionTime, 0, root_subscription_time, "subscription time");
-  result.periodicity_ms          = read_optional(source.periodicity, 0, root_periodicity, "periodicity");
+  result.periodicity             = read_optional(source.periodicity, 0, root_periodicity, "periodicity");
   if (ctx.ocudu()) {
     if (source.subscriptionTimeLong != nullptr) {
       result.subscription_time_s =
           read_optional(source.subscriptionTimeLong, 0, long_subscription_time, "subscription time");
     }
     if (source.periodicityLong != nullptr) {
-      result.periodicity_ms = read_optional(source.periodicityLong, 0, long_periodicity, "periodicity");
+      result.periodicity = read_optional(source.periodicityLong, 0, long_periodicity, "periodicity");
     }
     if (source.subscriptionData != nullptr) {
       result.subscription_data = read_bytes(*source.subscriptionData, e3ap_maximum_function_data);

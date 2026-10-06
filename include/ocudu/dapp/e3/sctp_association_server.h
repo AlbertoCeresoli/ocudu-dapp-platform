@@ -25,7 +25,8 @@ struct sctp_server_config {
   std::vector<std::string> allowed_peers;
   /// Concurrent associations; further accepts are rejected.
   uint32_t maximum_associations{16};
-  /// Associations quiet for longer than this are closed.
+  /// Associations quiet for longer than this are closed unless the carrier
+  /// retains an idle, fully drained association (e.g. a valid subscription).
   std::chrono::milliseconds idle_timeout{30000};
   /// How long a gracefully closing association may keep undelivered output
   /// before its slot is reclaimed anyway.
@@ -93,6 +94,15 @@ public:
   virtual void on_opened(sctp_association& association) { static_cast<void>(association); }
   virtual void on_message(sctp_association& association, ocudu::span<const uint8_t> message) = 0;
   virtual void on_closed(sctp_association& association) { static_cast<void>(association); }
+  /// Called at idle timeout only when the SCTP send queue is empty. A carrier
+  /// may retain an association with valid application work even without data.
+  /// Does not override transport failure, stalled-output timeout or close().
+  /// ZMQ has no per-peer SCTP liveness and does not use this exemption.
+  virtual bool retain_idle_association(sctp_association& association) noexcept
+  {
+    static_cast<void>(association);
+    return false;
+  }
   /// Periodic hook while associations exist; used for publication draining.
   virtual void on_timer(std::vector<sctp_association*>& associations) { static_cast<void>(associations); }
 };

@@ -6,6 +6,7 @@
 #include "ocudu/dapp/e3/telemetry_types.h"
 #include "ocudu/dapp/management/types.h"
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -159,8 +160,8 @@ struct e3ap_ran_function_definition {
   std::string           ran_function_version;
 };
 
-/// First PDU on a new association: identifies the dApp. A major-compatible
-/// protocol version ("1.x") is required; every other procedure before setup
+/// First PDU on a new association: identifies the dApp. The exact supported
+/// protocol version (\ref e3ap_version_string) is required; every other procedure before setup
 /// fails with \ref e3ap_cause::setup_required.
 struct e3ap_setup_request {
   std::string e3ap_protocol_version{e3ap_version_string};
@@ -201,22 +202,30 @@ struct e3ap_setup_response {
 
 /// Subscribes to telemetry streams of one RAN function. Only RAN function 10
 /// (telemetry) accepts subscriptions and \c control_identifiers must stay
-/// empty. Subscriptions live until deleted, released, or the association
-/// closes.
+/// empty. Subscriptions live until their requested duration expires, they are
+/// deleted or released, or the association closes.
 struct e3ap_subscription_request {
   uint16_t              dapp_identifier{};
   uint16_t              ran_function_identifier{};
   std::vector<uint16_t> telemetry_identifiers;
   std::vector<uint16_t> control_identifiers;
   /// Requested subscription duration in seconds (wire range 0..86400).
-  /// Carried for E3AP compatibility; the embedded agent does not expire
-  /// subscriptions on it.
+  /// Absent or zero means no duration limit. Positive durations are measured
+  /// from admission with a monotonic clock; store polling never extends them.
   std::optional<uint32_t> subscription_time_s;
-  /// Requested per-RNTI capture interval in milliseconds for every telemetry
-  /// in the request (0 = every event; absent = the stream's advertised default
-  /// floor). A per-telemetry \c minimum_interval_ms in \c subscription_data
-  /// overrides it; the configured hard floor bounds the stream as a whole.
-  std::optional<uint32_t> periodicity_ms;
+  /// Raw wire interval: microseconds for libe3, milliseconds for legacy OCUDU
+  /// profile 1 (in both APER and Protobuf). Use requested_interval() at admission,
+  /// never interpret this integer directly. Zero means every event; absent uses
+  /// the stream default. Explicit per-stream minimum_interval_ms overrides it.
+  std::optional<uint32_t>                  periodicity;
+  std::optional<std::chrono::microseconds> requested_interval(e3ap_profile profile) const noexcept
+  {
+    if (!periodicity) {
+      return std::nullopt;
+    }
+    return profile == e3ap_profile::libe3 ? std::chrono::microseconds(*periodicity)
+                                          : std::chrono::microseconds(std::chrono::milliseconds(*periodicity));
+  }
   /// Opaque APER Telemetry-SubscriptionData with per-telemetry filters.
   std::vector<uint8_t> subscription_data;
   /// Ask for bulk tensors by reference through a shared region.

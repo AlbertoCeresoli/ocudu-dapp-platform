@@ -99,11 +99,11 @@ TEST(dapp_e3ap_libe3_codec, round_trips_every_procedure_of_the_libe3_module)
   subscription.dapp_identifier         = 3;
   subscription.ran_function_identifier = e3ap_ran_function_telemetry;
   subscription.telemetry_identifiers   = {2};
-  subscription.periodicity_ms          = 100;
+  subscription.periodicity             = 100;
   subscription.subscription_time_s     = 60;
   auto subscription_back               = round_trip(subscription, 2);
   EXPECT_EQ(subscription_back.telemetry_identifiers, (std::vector<uint16_t>{2}));
-  EXPECT_EQ(subscription_back.periodicity_ms, std::optional<uint32_t>(100));
+  EXPECT_EQ(subscription_back.periodicity, std::optional<uint32_t>(100));
   EXPECT_TRUE(subscription_back.subscription_data.empty());
 
   e3ap_subscription_response granted;

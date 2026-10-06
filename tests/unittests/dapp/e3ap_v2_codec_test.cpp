@@ -109,7 +109,7 @@ TEST(dapp_e3ap_v2_codec, wider_subscription_ranges_ride_in_additions_and_root_st
   request.ran_function_identifier = e3ap_ran_function_telemetry;
   request.telemetry_identifiers   = {2};
   request.subscription_time_s     = 86400;
-  request.periodicity_ms          = 1000; // fits libe3's root
+  request.periodicity             = 1000; // fits libe3's root
   e3ap_pdu pdu;
   pdu.id      = 3;
   pdu.message = request;
@@ -120,13 +120,13 @@ TEST(dapp_e3ap_v2_codec, wider_subscription_ranges_ride_in_additions_and_root_st
   ASSERT_TRUE(back) << back.detail;
   const auto& read = std::get<e3ap_subscription_request>(back.value->message);
   EXPECT_EQ(read.subscription_time_s, std::optional<uint32_t>(86400));
-  EXPECT_EQ(read.periodicity_ms, std::optional<uint32_t>(1000));
+  EXPECT_EQ(read.periodicity, std::optional<uint32_t>(1000));
   // A libe3 peer sees no subscription time (the root field is absent) and the root periodicity.
   auto libe3_view = e3ap_v2_codec::decode(*encoded.value, e3ap_profile::libe3);
   ASSERT_TRUE(libe3_view) << libe3_view.detail;
   const auto& plain = std::get<e3ap_subscription_request>(libe3_view.value->message);
   EXPECT_FALSE(plain.subscription_time_s);
-  EXPECT_EQ(plain.periodicity_ms, std::optional<uint32_t>(1000));
+  EXPECT_EQ(plain.periodicity, std::optional<uint32_t>(1000));
 }
 
 TEST(dapp_e3ap_v2_codec, sequence_identifiers_are_mandatory_on_reports_and_xapp_controls)

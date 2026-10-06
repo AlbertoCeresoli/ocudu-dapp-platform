@@ -387,7 +387,7 @@ void put_body(Sink& sink, const encode_context& context, const e3ap_subscription
   if (source.subscription_time_s && *source.subscription_time_s > context.bounds.subscription_time) {
     fail("subscription time exceeds " + std::string(context.module()) + "'s bound");
   }
-  if (source.periodicity_ms && *source.periodicity_ms > context.bounds.periodicity) {
+  if (source.periodicity && *source.periodicity > context.bounds.periodicity) {
     fail("periodicity exceeds " + std::string(context.module()) + "'s bound");
   }
   put_scalar(sink, 1, identifier(context, source.dapp_identifier, "dApp identifier"));
@@ -395,7 +395,7 @@ void put_body(Sink& sink, const encode_context& context, const e3ap_subscription
   put_packed(sink, 3, telemetry);
   put_packed(sink, 4, control);
   put_optional(sink, 5, source.subscription_time_s);
-  put_optional(sink, 6, source.periodicity_ms);
+  put_optional(sink, 6, source.periodicity);
   if (!context.ocudu()) {
     return;
   }
@@ -1169,7 +1169,7 @@ e3ap_subscription_request read_subscription_request(const decode_context& contex
         return true;
       case 6:
         E3_EXPECT(wire_varint);
-        result.periodicity_ms = read_uint32(input);
+        result.periodicity = read_uint32(input);
         return true;
       case 100:
         E3_EXPECT(wire_length);
@@ -1199,7 +1199,7 @@ e3ap_subscription_request read_subscription_request(const decode_context& contex
   if (result.subscription_time_s && *result.subscription_time_s > context.bounds.subscription_time) {
     fail("subscription time exceeds " + std::string(context.module()) + "'s bound");
   }
-  if (result.periodicity_ms && *result.periodicity_ms > context.bounds.periodicity) {
+  if (result.periodicity && *result.periodicity > context.bounds.periodicity) {
     fail("periodicity exceeds " + std::string(context.module()) + "'s bound");
   }
   return result;

@@ -190,11 +190,11 @@ TEST(dapp_e3ap_protobuf_codec, round_trips_every_procedure_under_the_libe3_profi
   subscription.dapp_identifier         = 3;
   subscription.ran_function_identifier = e3ap_ran_function_telemetry;
   subscription.telemetry_identifiers   = {2, 7};
-  subscription.periodicity_ms          = 0; // optional: present though zero
+  subscription.periodicity             = 0; // optional: present though zero
   subscription.subscription_time_s     = 60;
   subscription.subscription_data       = {1, 2, 3};
   auto subscription_back               = round_trip(subscription, libe3_profile);
-  EXPECT_EQ(subscription_back.periodicity_ms, std::optional<uint32_t>(0));
+  EXPECT_EQ(subscription_back.periodicity, std::optional<uint32_t>(0));
   EXPECT_EQ(subscription_back.telemetry_identifiers, (std::vector<uint16_t>{2, 7}));
   EXPECT_TRUE(subscription_back.subscription_data.empty());
 
@@ -285,7 +285,7 @@ TEST(dapp_e3ap_protobuf_codec, round_trips_every_ocudu_field_under_the_ocudu_pro
   subscription.ran_function_identifier    = e3ap_ran_function_telemetry;
   subscription.telemetry_identifiers      = {5};
   subscription.subscription_time_s        = 86400;
-  subscription.periodicity_ms             = 60000;
+  subscription.periodicity                = 60000;
   subscription.subscription_data          = std::vector<uint8_t>(1000, 0x11);
   subscription.delivery_mode              = e3ap_delivery_mode::by_reference;
   subscription.minimum_by_reference_bytes = 0;
@@ -478,10 +478,10 @@ TEST(dapp_e3ap_protobuf_codec, refuses_values_the_libe3_profile_cannot_carry)
   e3ap_subscription_request subscription;
   subscription.dapp_identifier         = 1;
   subscription.ran_function_identifier = 1;
-  subscription.periodicity_ms          = 1001;
+  subscription.periodicity             = 1001;
   EXPECT_FALSE(e3ap_protobuf_codec::representable(subscription, libe3_profile)) << "periodicity over 1000";
   EXPECT_TRUE(e3ap_protobuf_codec::representable(subscription, ocudu_profile));
-  subscription.periodicity_ms        = std::nullopt;
+  subscription.periodicity           = std::nullopt;
   subscription.telemetry_identifiers = std::vector<uint16_t>(1001, 1);
   EXPECT_FALSE(e3ap_protobuf_codec::representable(subscription, libe3_profile)) << "list over 1000";
 
@@ -525,7 +525,7 @@ TEST(dapp_e3ap_protobuf_codec, decoder_accepts_any_valid_proto3_serialisation)
   EXPECT_EQ(request.dapp_identifier, 4);
   EXPECT_EQ(request.ran_function_identifier, 10);
   EXPECT_EQ(request.telemetry_identifiers, (std::vector<uint16_t>{9, 10, 11}));
-  EXPECT_EQ(request.periodicity_ms, std::optional<uint32_t>(50));
+  EXPECT_EQ(request.periodicity, std::optional<uint32_t>(50));
   EXPECT_TRUE(request.subscription_data.empty());
   // Under the OCUDU profile field 100 is subscription_data.
   auto superset = e3ap_protobuf_codec::decode(pdu, ocudu_profile);

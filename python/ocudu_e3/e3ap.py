@@ -263,6 +263,12 @@ class E3Client:
     # ------------------------------------------------------------------
     def close(self) -> None:
         self._association.close()
+        for subscription in self.subscriptions.values():
+            if subscription.region_reader is not None:
+                subscription.region_reader.close()
+        self.subscriptions.clear()
+        self.dapp_id = None
+        self.setup_result = None
 
     def __enter__(self) -> "E3Client":
         return self
@@ -387,6 +393,10 @@ class E3Client:
         _, _, body = self._wait_for(lambda i, n, b: n == "setupResponse" and b.get("requestId") == pdu_id, self.timeout)
         if body.get("responseCode") != "positive":
             raise E3ProtocolError("E3 setup refused", body.get("cause"), _text(body.get("detail")))
+        if _text(body.get("e3apProtocolVersion")) != "1.0.0":
+            raise E3ProtocolError("unsupported E3AP protocol version in setup response")
+        if body.get("ocuduProfile") != E3AP_OCUDU_PROFILE:
+            raise E3ProtocolError("requested OCUDU profile was not granted")
         functions: Dict[int, RanFunction] = {}
         for entry in body.get("ranFunctionList", []):
             function = RanFunction(
@@ -449,6 +459,12 @@ class E3Client:
     ) -> E3Subscription:
         """Subscribe to telemetry streams of RAN function 10.
 
+        ``periodicity_ms`` uses OCUDU profile-1 milliseconds, not libe3's
+        microseconds. A positive ``subscription_time_s`` expires at the agent
+        even while indications flow; absent or zero lasts until delete/release
+        or disconnect. The server does not send a synthetic delete response on
+        expiry; closing/unsubscribing still releases this client's SHM mapping.
+
         With ``by_reference`` the agent maps a shared-memory region for this
         subscription and delivers large tensors through it; the client maps the
         region read-only and fills each record's bulk field from it (a torn
@@ -464,7 +480,7 @@ class E3Client:
             "telemetryIdentifierList": ids,
             "controlIdentifierList": [],
         }
-        # libe3's root ranges (periodicity 0..1000 ms, time 0..3600 s) first; wider values ride in
+        # Profile-1 wire ranges (periodicity 0..1000 ms, time 0..3600 s) first; wider values ride in
         # the OCUDU additions with the root field absent.
         if periodicity_ms is not None:
             body["periodicity" if int(periodicity_ms) <= 1000 else "periodicityLong"] = int(periodicity_ms)
@@ -545,7 +561,10 @@ class E3Client:
         pdu_id = self._take_id()
         self._send(pdu_id, "subscriptionDelete", {"dAppIdentifier": dapp_id, "subscriptionId": subscription_id})
         _, _, ack = self._wait_for(lambda i, n, b: n == "messageAck" and b.get("requestId") == pdu_id, self.timeout)
-        if ack.get("responseCode") != "positive":
+        # A finite subscription may have expired at the agent. Its local SHM
+        # reader still belongs to us and must be released by unsubscribe().
+        expired_local = subscription_id in self.subscriptions and ack.get("cause") == "notFound"
+        if ack.get("responseCode") != "positive" and not expired_local:
             raise E3ProtocolError("E3 subscription delete refused", ack.get("cause"), _text(ack.get("detail")))
         removed = self.subscriptions.pop(subscription_id, None)
         if removed is not None and removed.region_reader is not None:
@@ -555,13 +574,13 @@ class E3Client:
         """Send E3 Release; the agent removes every subscription and closes the association."""
         dapp_id = self._require_setup()
         pdu_id = self._take_id()
-        self._send(pdu_id, "releaseMessage", {"dAppIdentifier": dapp_id})
         try:
+            self._send(pdu_id, "releaseMessage", {"dAppIdentifier": dapp_id})
             self._wait_for(lambda i, n, b: n == "messageAck" and b.get("requestId") == pdu_id, self.timeout)
         except E3TransportError:
             pass
-        self.subscriptions.clear()
-        self.close()
+        finally:
+            self.close()
 
     # ------------------------------------------------------------------
     # Indications

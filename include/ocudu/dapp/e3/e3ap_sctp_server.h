@@ -58,11 +58,11 @@ struct e3ap_sctp_server_config {
   /// Wire: E3AP-OCUDU-V2 (schemas/e3/e3ap-ocudu-v2.asn1) is libe3's E3AP 1.0.0 module with OCUDU
   /// extension additions, in APER or in Protobuf (schemas/e3/protobuf), so libe3 peers and OCUDU
   /// peers speak the same protocol. The encoding is detected per association from its setup
-  /// request; the profile comes from the request's ocuduProfile: present selects the OCUDU
+  /// request; the profile comes from the request's ocuduProfile: value 1 selects the OCUDU
   /// procedures (fragmentation, by-reference delivery, E3-ControlResponse, causes), absent the libe3
   /// procedures: dApp identifiers 1..100 (any 1..65535 is valid on the wire), whole payloads of at
   /// most 32 KiB, E3-MessageAck in place of E3-ControlResponse; indications that do not fit are
-  /// counted in \c libe3_indications_dropped.
+  /// counted in \c libe3_indications_dropped. Unknown profile versions are refused.
   ///
   /// Accept libe3-profile peers (setup requests without ocuduProfile).
   bool libe3_profile{true};
@@ -102,6 +102,9 @@ struct e3ap_sctp_server_metrics {
   uint64_t libe3_indications_dropped{};
   /// Associations that completed setup in Protobuf (either profile).
   uint64_t protobuf_setups_completed{};
+  /// Finite-duration subscriptions removed at their monotonic deadline.
+  /// Also included in subscriptions_removed.
+  uint64_t subscriptions_expired{};
 };
 
 /// One E3-DAppReport received from a dApp, handed to the report handler on the
@@ -182,6 +185,7 @@ private:
   void on_opened(sctp_association& association) override;
   void on_message(sctp_association& association, ocudu::span<const uint8_t> message) override;
   void on_closed(sctp_association& association) override;
+  bool retain_idle_association(sctp_association& association) noexcept override;
   void on_timer(std::vector<sctp_association*>& associations) override;
 
   std::unique_ptr<implementation> state;

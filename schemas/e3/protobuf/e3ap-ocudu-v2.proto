@@ -87,6 +87,7 @@ message SubscriptionRequest {
   repeated uint32 telemetry_identifier_list = 3;
   repeated uint32 control_identifier_list = 4;
   optional uint32 subscription_time = 5;
+  // Microseconds for libe3; milliseconds for legacy OCUDU profile 1.
   optional uint32 periodicity = 6;
 
   // Opaque APER Telemetry-SubscriptionData.
