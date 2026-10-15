@@ -182,7 +182,7 @@ if (OCUDU_DAPP_CLASS_C_METADATA)
   target_sources(dapp_runtime_test PRIVATE
     class_c_metadata_test.cpp
     class_c_publication_encoder_test.cpp)
-  target_include_directories(dapp_runtime_test PRIVATE ${PROJECT_BINARY_DIR}/lib/dapp/generated)
+  target_include_directories(dapp_runtime_test PRIVATE ${PROJECT_BINARY_DIR}/lib/dapp/generated ${FLATBUFFERS_INCLUDE_DIR})
 endif ()
 target_link_libraries(dapp_runtime_test
   ocudu_dapp_runtime
