@@ -494,6 +494,109 @@ private:
   std::vector<std::shared_ptr<dapp_process_package_factory>> process_factories;
 };
 
+/// Forwards UE-context SRS configurations and timing advance commands from the scheduler hooks to the E3 telemetry
+/// publisher, once one is attached (the publisher is created after the hook topology).
+class ue_event_bridge final : public scheduler_dapp_ue_event_sink
+{
+public:
+#ifdef OCUDU_DAPP_APP_SERVICE_SCTP_E3
+  void attach(std::shared_ptr<dapp::e3::telemetry_publisher> publisher_)
+  {
+    holder = std::move(publisher_);
+    publisher.store(holder.get(), std::memory_order_release);
+  }
+#endif
+
+  void publish_srs_config(const scheduler_dapp_srs_config_event& event) noexcept override
+  {
+#ifdef OCUDU_DAPP_APP_SERVICE_SCTP_E3
+    auto* target = publisher.load(std::memory_order_acquire);
+    if (target == nullptr) {
+      return;
+    }
+    dapp::e3::srs_config_metadata_v1 record;
+    record.rnti  = event.rnti;
+    record.event = static_cast<uint8_t>(event.event);
+    record.flags =
+        static_cast<uint8_t>((event.srs_configured ? 0x01U : 0U) | (event.srs_configured && event.derived_valid ? 0x02U : 0U));
+    record.ue_index                  = event.ue_index;
+    record.numerology                = event.numerology;
+    record.n_ta_offset               = event.n_ta_offset;
+    record.bwp_start_rb              = event.bwp_start_rb;
+    record.bwp_size_rb               = event.bwp_size_rb;
+    if (event.srs_configured) {
+      record.resource_id               = event.resource_id;
+      record.nof_ports                 = event.nof_ports;
+      record.comb_size                 = event.comb_size;
+      record.comb_offset               = event.comb_offset;
+      record.cyclic_shift              = event.cyclic_shift;
+      record.start_position            = event.start_position;
+      record.nof_symbols               = event.nof_symbols;
+      record.repetition_factor         = event.repetition_factor;
+      record.freq_domain_position      = event.freq_domain_position;
+      record.c_srs                     = event.c_srs;
+      record.b_srs                     = event.b_srs;
+      record.b_hop                     = event.b_hop;
+      record.group_or_sequence_hopping = event.group_or_sequence_hopping;
+      record.freq_domain_shift         = event.freq_domain_shift;
+      record.sequence_id               = event.sequence_id;
+      record.period_slots              = event.period_slots;
+      record.offset_slots              = event.offset_slots;
+      record.start_symbol              = event.start_symbol;
+    }
+    if (event.srs_configured && event.derived_valid) {
+      record.cyclic_shift_maximum       = event.cyclic_shift_maximum;
+      record.sequence_length            = event.sequence_length;
+      record.mapping_initial_subcarrier = event.mapping_initial_subcarrier;
+      record.sequence_group             = event.sequence_group;
+      record.sequence_number            = event.sequence_number;
+    }
+    target->publish_srs_config(static_cast<uint16_t>(event.cell_id), record);
+#endif
+  }
+
+  bool ta_commands_active() noexcept override
+  {
+#ifdef OCUDU_DAPP_APP_SERVICE_SCTP_E3
+    auto* target = publisher.load(std::memory_order_acquire);
+    if (target == nullptr) {
+      return false;
+    }
+    target->poll_srs_config_snapshot();
+    return target->ta_command_active();
+#else
+    return false;
+#endif
+  }
+
+  void publish_ta_command(slot_point slot, const scheduler_dapp_ta_command_event& event) noexcept override
+  {
+#ifdef OCUDU_DAPP_APP_SERVICE_SCTP_E3
+    auto* target = publisher.load(std::memory_order_acquire);
+    if (target == nullptr) {
+      return;
+    }
+    dapp::e3::ta_command_metadata_v1 record;
+    record.rnti = event.rnti;
+    if (slot.valid()) {
+      record.radio_slot.sfn        = static_cast<uint16_t>(slot.sfn());
+      record.radio_slot.slot       = static_cast<uint8_t>(slot.slot_index());
+      record.radio_slot.numerology = static_cast<uint8_t>(slot.numerology());
+    }
+    record.source     = static_cast<uint8_t>(event.source);
+    record.tag_id     = event.tag_id;
+    record.ta_command = event.ta_command;
+    target->publish_ta_command(static_cast<uint16_t>(event.cell_id), record);
+#endif
+  }
+
+private:
+#ifdef OCUDU_DAPP_APP_SERVICE_SCTP_E3
+  std::shared_ptr<dapp::e3::telemetry_publisher> holder;
+  std::atomic<dapp::e3::telemetry_publisher*>    publisher{nullptr};
+#endif
+};
+
 bool valid_srs_preview(const ocudu_dapp_srs_isac_cir_preview_v1& output,
                        uint64_t                                  expected_source_sequence,
                        uint32_t                                  expected_resource_id,
@@ -1045,6 +1148,7 @@ struct dapp_service::implementation {
   std::shared_ptr<scheduler_dapp_interference_cache>         interference;
   std::shared_ptr<quiet_reservation_manager>                 reservations;
   std::shared_ptr<ul_plan_broker>                            ul_plans;
+  std::shared_ptr<ue_event_bridge>                           ue_events;
   std::shared_ptr<prepared_output_broker>                    output_broker;
   std::unique_ptr<dapp::instance_manager>                    manager;
   std::vector<std::shared_ptr<dapp_process_package_factory>> process_factories;
@@ -1098,6 +1202,7 @@ bool build_hook_topology(const std::shared_ptr<dapp::native_hook_registry>&     
                          const std::shared_ptr<scheduler_dapp_interference_cache>&   interference,
                          const std::shared_ptr<quiet_reservation_manager>&           reservations,
                          const std::shared_ptr<ul_plan_broker>&                      ul_plans,
+                         const std::shared_ptr<ue_event_bridge>&                     ue_events,
                          const std::shared_ptr<prepared_output_broker>&              output_broker,
                          std::vector<dapp::management::package_record>&              packages,
                          std::vector<std::shared_ptr<dapp_process_package_factory>>& process_factories,
@@ -1286,7 +1391,8 @@ bool build_hook_topology(const std::shared_ptr<dapp::native_hook_registry>&     
                                           reservations,
                                           ul_plans,
                                           config.scheduler_evaluation_only ? scheduler_dapp_policy_mode::evaluation_only
-                                                                           : scheduler_dapp_policy_mode::authoritative);
+                                                                           : scheduler_dapp_policy_mode::authoritative,
+                                          ue_events);
   if (!upper_phy_provider || !interference || !reservations || !scheduler_provider) {
     detail = "unable to construct dApp hook providers";
     return false;
@@ -1530,6 +1636,7 @@ dapp_service_create_result dapp_service::create(dapp_service_config config) noex
         config.quiet_reservation.maximum_source_prb_slots_per_window;
     service->reservations  = create_quiet_reservation_manager({widths.data(), nof_widths}, quiet_policy);
     service->ul_plans      = std::make_shared<ul_plan_broker>(config.cells);
+    service->ue_events     = std::make_shared<ue_event_bridge>();
     service->output_broker = std::make_shared<prepared_output_broker>(
         service->interference, service->reservations, config.cells, config.srs_isac_report_sink);
     if (!service->interference || !service->reservations || !service->ul_plans || !service->output_broker) {
@@ -1576,6 +1683,7 @@ dapp_service_create_result dapp_service::create(dapp_service_config config) noex
                              service->interference,
                              service->reservations,
                              service->ul_plans,
+                             service->ue_events,
                              service->output_broker,
                              packages,
                              service->process_factories,
@@ -1665,6 +1773,7 @@ dapp_service_create_result dapp_service::create(dapp_service_config config) noex
         return {{}, std::move(created.second)};
       }
       service->telemetry = std::move(created.first);
+      service->ue_events->attach(service->telemetry);
       struct telemetry_json_adapter final : dapp_metrics_json_sink {
         explicit telemetry_json_adapter(std::shared_ptr<dapp::e3::telemetry_publisher> publisher_) :
           publisher(std::move(publisher_))

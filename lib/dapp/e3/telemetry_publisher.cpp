@@ -6,8 +6,11 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <new>
 #include <type_traits>
 #include <vector>
@@ -218,6 +221,13 @@ struct telemetry_publisher::implementation {
   std::atomic<uint64_t>                                                          dropped{0};
   std::atomic<uint64_t>                                                          oversized{0};
   std::atomic<uint64_t>                                                          invalid{0};
+
+  /// Latest SRS configuration per (cell << 16 | RNTI), with its cell; guarded by srs_config_mutex.
+  std::map<uint32_t, std::pair<uint16_t, srs_config_metadata_v1>> srs_configs;
+  uint32_t                                                        srs_config_epoch{0};
+  std::mutex                                                      srs_config_mutex;
+  /// Subscriber count of srs.config seen by the last snapshot poll.
+  std::atomic<uint32_t> srs_config_subscribers{0};
 };
 
 std::pair<std::shared_ptr<telemetry_publisher>, std::string>
@@ -488,6 +498,81 @@ bool telemetry_publisher::publish_metrics_json(std::string_view json) noexcept
 bool telemetry_publisher::metrics_json_active() const noexcept
 {
   return state->config.store->has_active(telemetry_stream_gnb_metrics_json);
+}
+
+namespace {
+
+/// Configuration part of an SRS configuration record: everything after the event, epoch and UE index.
+bool same_srs_config(const srs_config_metadata_v1& lhs, const srs_config_metadata_v1& rhs) noexcept
+{
+  constexpr std::size_t begin = offsetof(srs_config_metadata_v1, numerology);
+  return lhs.flags == rhs.flags && std::memcmp(reinterpret_cast<const uint8_t*>(&lhs) + begin,
+                                               reinterpret_cast<const uint8_t*>(&rhs) + begin,
+                                               sizeof(srs_config_metadata_v1) - begin) == 0;
+}
+
+} // namespace
+
+void telemetry_publisher::publish_srs_config(uint16_t cell_id, srs_config_metadata_v1 record) noexcept
+{
+  try {
+    std::lock_guard<std::mutex> lock(state->srs_config_mutex);
+    const uint32_t              key   = (static_cast<uint32_t>(cell_id) << 16U) | record.rnti;
+    auto                        entry = state->srs_configs.find(key);
+    const auto                  event = static_cast<srs_config_event>(record.event);
+    const bool                  changed =
+        event == srs_config_event::created || event == srs_config_event::removed || entry == state->srs_configs.end() ||
+        !same_srs_config(entry->second.second, record);
+    if (changed) {
+      ++state->srs_config_epoch;
+    }
+    record.config_epoch = state->srs_config_epoch;
+    if (event == srs_config_event::removed) {
+      if (entry != state->srs_configs.end()) {
+        state->srs_configs.erase(entry);
+      }
+    } else {
+      state->srs_configs[key] = {cell_id, record};
+    }
+    if (state->config.store->has_active(telemetry_stream_srs_config)) {
+      state->publish(telemetry_stream_srs_config, cell_id, record, &record.event, 1);
+    }
+  } catch (...) {
+    state->invalid.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void telemetry_publisher::poll_srs_config_snapshot() noexcept
+{
+  const uint32_t subscribers = state->config.store->demand(telemetry_stream_srs_config).active;
+  const uint32_t seen        = state->srs_config_subscribers.load(std::memory_order_relaxed);
+  if (subscribers <= seen) {
+    if (subscribers < seen) {
+      state->srs_config_subscribers.store(subscribers, std::memory_order_relaxed);
+    }
+    return;
+  }
+  std::unique_lock<std::mutex> lock(state->srs_config_mutex, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return;
+  }
+  state->srs_config_subscribers.store(subscribers, std::memory_order_relaxed);
+  for (const auto& [key, entry] : state->srs_configs) {
+    srs_config_metadata_v1 record = entry.second;
+    record.event                  = static_cast<uint8_t>(srs_config_event::snapshot);
+    state->publish(telemetry_stream_srs_config, entry.first, record, &record.event, 1);
+  }
+}
+
+void telemetry_publisher::publish_ta_command(uint16_t cell_id, const ta_command_metadata_v1& record) noexcept
+{
+  ta_command_metadata_v1 copy = record;
+  state->publish(telemetry_stream_ta_command, cell_id, copy, &copy.source, 1);
+}
+
+bool telemetry_publisher::ta_command_active() const noexcept
+{
+  return state->config.store->has_active(telemetry_stream_ta_command);
 }
 
 telemetry_publisher_metrics telemetry_publisher::metrics() const noexcept

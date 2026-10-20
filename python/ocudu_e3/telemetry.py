@@ -243,6 +243,82 @@ class ClassCPortableRecord:
     tensor: bytes = field(repr=False)
 
 
+@dataclass
+class SrsDerivedMapping:
+    """Mapping of transmit port 0 derived from an SRS resource (TS 38.211 6.4.1.4)."""
+
+    start_symbol: int
+    sequence_length: int
+    mapping_initial_subcarrier: int  # k0 within the BWP, as in SrsChannelRecord
+    sequence_group: int
+    sequence_number: int
+    cyclic_shift_maximum: int
+
+
+@dataclass
+class SrsResourceParameters:
+    """Periodic SRS-Resource of one UE context (TS 38.331 field meanings)."""
+
+    resource_id: int
+    nof_ports: int
+    comb_size: int
+    comb_offset: int
+    cyclic_shift: int
+    start_position: int  # symbols counted from the end of the slot
+    nof_symbols: int
+    repetition_factor: int
+    freq_domain_position: int
+    freq_domain_shift: int
+    c_srs: int
+    b_srs: int
+    b_hop: int
+    group_or_sequence_hopping: int  # 0 neither, 1 group, 2 sequence
+    sequence_id: int
+    period_slots: int
+    offset_slots: int
+    bwp_start_rb: int
+    bwp_size_rb: int
+    derived: Optional[SrsDerivedMapping] = None
+
+
+SRS_CONFIG_EVENTS = {1: "created", 2: "reconfigured", 3: "applied", 4: "removed", 5: "snapshot"}
+
+
+@dataclass
+class SrsConfigRecord:
+    """SRS configuration of one UE context; ``config_epoch`` advances on every change."""
+
+    rnti: int
+    event: int
+    config_epoch: int
+    ue_index: int
+    numerology: int
+    n_ta_offset: int  # N_TA,offset in units of T_c
+    resource: Optional[SrsResourceParameters] = None
+
+    @property
+    def event_name(self) -> str:
+        return SRS_CONFIG_EVENTS.get(self.event, str(self.event))
+
+
+TA_COMMAND_SOURCES = {1: "rar", 2: "mac_ce"}
+
+
+@dataclass
+class TaCommandRecord:
+    """One timing advance command: RAR T_A (0..3846) or MAC CE T_A (0..63, 31 = no change)."""
+
+    rnti: int
+    radio_slot: RadioSlot
+    source: int
+    tag_id: int
+    ta_command: int
+
+    @property
+    def source_name(self) -> str:
+        return TA_COMMAND_SOURCES.get(self.source, str(self.source))
+
+
 TelemetryRecord = Union[
     PuschSymbolsRecord,
     PuschCrcRecord,
@@ -251,6 +327,8 @@ TelemetryRecord = Union[
     GnbMetricsJsonRecord,
     ClassCPortableRecord,
     PuschGridRecord,
+    SrsConfigRecord,
+    TaCommandRecord,
 ]
 
 
@@ -380,6 +458,60 @@ def _record_from_asn(kind: str, body: dict) -> TelemetryRecord:
         return GnbMetricsJsonRecord(json_bytes=body["json"])
     if kind == "classCPortable":
         return ClassCPortableRecord(interface_id=body["interfaceId"], metadata=body.get("metadata", b""), tensor=body["tensor"])
+    if kind == "srsConfig":
+        resource = None
+        if "resource" in body:
+            r = body["resource"]
+            derived = None
+            if "derived" in r:
+                d = r["derived"]
+                derived = SrsDerivedMapping(
+                    start_symbol=d["startSymbol"],
+                    sequence_length=d["sequenceLength"],
+                    mapping_initial_subcarrier=d["mappingInitialSubcarrier"],
+                    sequence_group=d["sequenceGroup"],
+                    sequence_number=d["sequenceNumber"],
+                    cyclic_shift_maximum=d["cyclicShiftMaximum"],
+                )
+            resource = SrsResourceParameters(
+                resource_id=r["resourceId"],
+                nof_ports=r["nofPorts"],
+                comb_size=r["combSize"],
+                comb_offset=r["combOffset"],
+                cyclic_shift=r["cyclicShift"],
+                start_position=r["startPosition"],
+                nof_symbols=r["nofSymbols"],
+                repetition_factor=r["repetitionFactor"],
+                freq_domain_position=r["freqDomainPosition"],
+                freq_domain_shift=r["freqDomainShift"],
+                c_srs=r["cSrs"],
+                b_srs=r["bSrs"],
+                b_hop=r["bHop"],
+                group_or_sequence_hopping=r["groupOrSequenceHopping"],
+                sequence_id=r["sequenceId"],
+                period_slots=r["periodSlots"],
+                offset_slots=r["offsetSlots"],
+                bwp_start_rb=r["bwpStartRb"],
+                bwp_size_rb=r["bwpSizeRb"],
+                derived=derived,
+            )
+        return SrsConfigRecord(
+            rnti=body["rnti"],
+            event=body["event"],
+            config_epoch=body["configEpoch"],
+            ue_index=body["ueIndex"],
+            numerology=body["numerology"],
+            n_ta_offset=body["nTaOffset"],
+            resource=resource,
+        )
+    if kind == "taCommand":
+        return TaCommandRecord(
+            rnti=body["rnti"],
+            radio_slot=_slot(body["radioSlot"]),
+            source=body["source"],
+            tag_id=body["tagId"],
+            ta_command=body["taCommand"],
+        )
     raise ValueError(f"unknown telemetry object {kind}")
 
 
@@ -492,7 +624,13 @@ _INTERFACE_TO_KIND = {
     STORE_INTERFACES["pusch.dmrs_channel"]: 4,
     STORE_INTERFACES["gnb.metrics_json"]: 5,
     STORE_INTERFACES["pusch.grid"]: 6,
+    STORE_INTERFACES["srs.config"]: 7,
+    STORE_INTERFACES["ta.command"]: 8,
 }
+
+# srs_config_metadata_v1 and ta_command_metadata_v1 after the header.
+_SRS_CONFIG = struct.Struct("<HBBIH" + "14B" + "7H" + "BB" + "4H")
+_TA_COMMAND = struct.Struct("<H" + "HBB" + "BBH")
 
 
 def _finite(value: float) -> Optional[float]:
@@ -557,6 +695,25 @@ def decode_store_publication(interface_id: int, metadata: bytes, tensor: bytes) 
             grant=_grant_from_packed(body, _GRID.size),
             resource_elements=tensor,
         )
+    if kind == 7:
+        f = _SRS_CONFIG.unpack(body)
+        rnti, event, flags, epoch, ue_index = f[0:5]
+        (numerology, resource_id, nof_ports, comb_size, comb_offset, cyclic_shift, start_position, nof_symbols,
+         repetition_factor, freq_domain_position, c_srs, b_srs, b_hop, hopping) = f[5:19]
+        freq_domain_shift, sequence_id, period, offset, n_ta_offset, bwp_start_rb, bwp_size_rb = f[19:26]
+        start_symbol, cs_max, sequence_length, k0, group, number = f[26:32]
+        resource = None
+        if flags & 0x01:
+            resource = SrsResourceParameters(
+                resource_id, nof_ports, comb_size, comb_offset, cyclic_shift, start_position, nof_symbols,
+                repetition_factor, freq_domain_position, freq_domain_shift, c_srs, b_srs, b_hop, hopping, sequence_id,
+                period, offset, bwp_start_rb, bwp_size_rb,
+                SrsDerivedMapping(start_symbol, sequence_length, k0, group, number, cs_max) if flags & 0x02 else None,
+            )
+        return SrsConfigRecord(rnti, event, epoch, ue_index, numerology, n_ta_offset, resource)
+    if kind == 8:
+        f = _TA_COMMAND.unpack(body)
+        return TaCommandRecord(rnti=f[0], radio_slot=RadioSlot(*f[1:4]), source=f[4], tag_id=f[5], ta_command=f[6])
     if kind == 2:
         fields = _PUSCH_CRC.unpack(body)
         return PuschCrcRecord(rnti=fields[0], radio_slot=RadioSlot(*fields[1:4]), crc_ok=bool(fields[4]))

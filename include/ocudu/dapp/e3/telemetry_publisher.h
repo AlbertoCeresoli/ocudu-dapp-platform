@@ -75,6 +75,21 @@ public:
   /// Constant-time gate used by producers that hold a JSON report.
   bool metrics_json_active() const noexcept;
 
+  /// Publishes the SRS configuration of one UE context. Control path: may allocate and lock. The publisher assigns
+  /// \c config_epoch (it advances when a context is created or removed, or its configuration changes) and keeps the
+  /// latest record per cell and RNTI, which \ref poll_srs_config_snapshot replays to new subscribers.
+  void publish_srs_config(uint16_t cell_id, srs_config_metadata_v1 record) noexcept;
+
+  /// Replays every cached SRS configuration, as snapshot events, once the srs.config stream has gained a subscriber.
+  /// Real-time safe: constant time when nothing changed, and skipped while a configuration update holds the cache.
+  void poll_srs_config_snapshot() noexcept;
+
+  /// Publishes one timing advance command. Real-time safe.
+  void publish_ta_command(uint16_t cell_id, const ta_command_metadata_v1& record) noexcept;
+
+  /// Constant-time gate for the timing advance producer.
+  bool ta_command_active() const noexcept;
+
   telemetry_publisher_metrics metrics() const noexcept;
 
 private:

@@ -647,10 +647,10 @@ TEST(dapp_e3ap_sctp_server, completes_setup_and_advertises_ran_functions)
   ASSERT_EQ(client.last_setup.ran_functions.size(), 2U);
   const auto& telemetry = client.last_setup.ran_functions[0];
   EXPECT_EQ(telemetry.ran_function_identifier, e3ap_ran_function_telemetry);
-  EXPECT_EQ(telemetry.telemetry_identifiers.size(), 8U);
+  EXPECT_EQ(telemetry.telemetry_identifiers.size(), 10U);
   auto catalog = e3ap_codec::decode_telemetry_function(telemetry.ran_function_data);
   ASSERT_TRUE(catalog) << catalog.detail;
-  EXPECT_EQ(catalog.value->streams.size(), 8U);
+  EXPECT_EQ(catalog.value->streams.size(), 10U);
   const auto& management = client.last_setup.ran_functions[1];
   EXPECT_EQ(management.ran_function_identifier, e3ap_ran_function_management);
   EXPECT_EQ(management.control_identifiers, std::vector<uint16_t>{1});
@@ -1652,7 +1652,7 @@ TEST(dapp_e3ap_sctp_server, serves_libe3_module_peers_on_the_same_port_beside_na
   EXPECT_FALSE(peer.last_setup.cause.has_value()) << "OCUDU-only fields do not reach a libe3 peer";
   ASSERT_EQ(peer.last_setup.ran_functions.size(), 2U);
   EXPECT_EQ(peer.last_setup.ran_functions[0].ran_function_identifier, e3ap_ran_function_telemetry);
-  EXPECT_EQ(peer.last_setup.ran_functions[0].telemetry_identifiers, (std::vector<uint16_t>{1, 2, 3, 4, 5, 6, 7, 8}));
+  EXPECT_EQ(peer.last_setup.ran_functions[0].telemetry_identifiers, (std::vector<uint16_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
   EXPECT_EQ(peer.last_setup.ran_functions[1].control_identifiers, std::vector<uint16_t>{1});
   auto catalog = e3ap_codec::decode_telemetry_function(peer.last_setup.ran_functions[0].ran_function_data);
   ASSERT_TRUE(catalog) << catalog.detail;

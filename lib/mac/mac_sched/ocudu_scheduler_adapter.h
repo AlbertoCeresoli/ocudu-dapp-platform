@@ -13,13 +13,13 @@
 #include "uci_cell_decoder.h"
 #include "ocudu/adt/slotted_array.h"
 #include "ocudu/ran/slot_point_extended.h"
+#include "ocudu/scheduler/dapp/scheduler_dapp_policy.h"
 #include "ocudu/scheduler/mac_scheduler.h"
 #include "ocudu/support/async/manual_event.h"
 #include <memory>
+#include <optional>
 
 namespace ocudu {
-
-class scheduler_dapp_hook_provider;
 
 struct ocudu_mac_sched_config {
   const mac_expert_config& mac_cfg;
@@ -184,6 +184,28 @@ private:
 
   /// Handler for each DU cell.
   slotted_id_table<du_cell_index_t, cell_handler, MAX_NOF_DU_CELLS> cell_handlers;
+
+  /// Reports a UE context's SRS configuration to the dApp hooks. \c cfg is null when the configuration is unchanged
+  /// (the last reported one is repeated) or the context is removed.
+  void publish_dapp_srs_config(scheduler_dapp_srs_config_event::kind event,
+                               du_ue_index_t                         ue_index,
+                               du_cell_index_t                       cell_index,
+                               rnti_t                                rnti,
+                               const sched_ue_config_request*        cfg);
+
+  /// dApp hooks, also handed to the scheduler.
+  std::shared_ptr<scheduler_dapp_hook_provider> dapp_hooks;
+  /// Cell parameters the SRS configuration events carry, by DU cell.
+  struct dapp_cell_context {
+    uint8_t  numerology{};
+    uint16_t n_ta_offset{};
+    uint16_t bwp_start_rb{};
+    uint16_t bwp_size_rb{};
+    unsigned nof_symbols_per_slot{};
+  };
+  std::array<std::optional<dapp_cell_context>, MAX_NOF_DU_CELLS> dapp_cells;
+  /// Last SRS configuration event reported per UE context.
+  std::array<std::optional<scheduler_dapp_srs_config_event>, MAX_NOF_DU_UES> dapp_ue_srs;
 };
 
 } // namespace ocudu

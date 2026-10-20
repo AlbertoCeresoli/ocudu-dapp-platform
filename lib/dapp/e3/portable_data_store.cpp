@@ -26,7 +26,7 @@ uint64_t monotonic_ns() noexcept
 }
 
 constexpr std::size_t nof_class_c_interfaces = 2;
-constexpr std::size_t nof_telemetry_streams  = telemetry_stream_pusch_grid - telemetry_stream_pusch_symbols +
+constexpr std::size_t nof_telemetry_streams  = telemetry_stream_last - telemetry_stream_pusch_symbols +
                                               1; // derived: adding a stream cannot leave the tables short
 constexpr std::size_t nof_store_interfaces = nof_class_c_interfaces + nof_telemetry_streams;
 

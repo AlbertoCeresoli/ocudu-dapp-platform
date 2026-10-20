@@ -418,6 +418,10 @@ void mac_cell_processor::handle_slot_indication_impl(slot_point_extended      sl
   // Update DL buffer state for the allocated logical channels.
   update_logical_channel_dl_buffer_states(sl_res.dl);
 
+  if (dapp_hooks) {
+    publish_dapp_ta_commands(sl_tx, sl_res.dl);
+  }
+
   // Write PCAP.
   write_tx_pdu_pcap(sl_tx, sl_res, data_res);
 
@@ -527,6 +531,46 @@ void mac_cell_processor::assemble_dl_data_request(mac_dl_data_result&    data_re
   for (const dl_paging_allocation& pg : dl_res.paging_grants) {
     for (unsigned cw_idx = 0, e = pg.pdsch_cfg.codewords.size(); cw_idx != e; ++cw_idx) {
       data_res.paging_pdus.emplace_back(cw_idx, shared_transport_block(paging_assembler.encode_paging_pdu(pg)));
+    }
+  }
+}
+
+void mac_cell_processor::publish_dapp_ta_commands(slot_point sl_tx, const dl_sched_result& dl_res)
+{
+  // The gate runs every slot: it also lets the hooks replay state to new subscribers.
+  if (not dapp_hooks->ta_commands_active() or (dl_res.rar_grants.empty() and dl_res.ue_grants.empty())) {
+    return;
+  }
+  scheduler_dapp_ta_command_event event;
+  event.cell_id = static_cast<uint32_t>(cell_cfg.cell_index);
+
+  event.source = scheduler_dapp_ta_command_event::kind::random_access_response;
+  for (const rar_information& rar : dl_res.rar_grants) {
+    for (const rar_ul_grant& grant : rar.grants) {
+      event.rnti       = to_value(grant.temp_crnti);
+      event.tag_id     = 0;
+      event.ta_command = grant.ta;
+      dapp_hooks->publish_ta_command(sl_tx, event);
+    }
+  }
+
+  // A retransmission repeats a TB whose TA command was already reported.
+  event.source = scheduler_dapp_ta_command_event::kind::mac_ce;
+  for (const dl_msg_alloc& grant : dl_res.ue_grants) {
+    for (unsigned i_tb = 0; i_tb != grant.tb_list.size(); ++i_tb) {
+      if (i_tb >= grant.pdsch_cfg.codewords.size() or not grant.pdsch_cfg.codewords[i_tb].new_data) {
+        continue;
+      }
+      for (const dl_msg_lc_info& lc_info : grant.tb_list[i_tb].lc_chs_to_sched) {
+        const auto* ta = std::get_if<ta_cmd_ce_payload>(&lc_info.ce_payload);
+        if (lc_info.lcid != lcid_dl_sch_t::TA_CMD or ta == nullptr) {
+          continue;
+        }
+        event.rnti       = to_value(grant.pdsch_cfg.rnti);
+        event.tag_id     = ta->tag_id.value();
+        event.ta_command = static_cast<uint16_t>(ta->ta_cmd);
+        dapp_hooks->publish_ta_command(sl_tx, event);
+      }
     }
   }
 }

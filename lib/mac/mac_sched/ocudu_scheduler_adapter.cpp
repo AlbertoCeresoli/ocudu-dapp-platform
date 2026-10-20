@@ -3,6 +3,10 @@
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 #include "ocudu_scheduler_adapter.h"
+#include "ocudu/ran/cyclic_prefix.h"
+#include "ocudu/ran/srs/srs_bandwidth_configuration.h"
+#include "ocudu/ran/srs/srs_information.h"
+#include "ocudu/ran/srs/srs_resource_configuration.h"
 #include "ocudu/scheduler/result/sched_result.h"
 #include "ocudu/scheduler/scheduler_factory.h"
 #include "ocudu/support/async/async_timer.h"
@@ -35,6 +39,124 @@ make_scheduler_ue_reconfiguration_request(const mac_ue_reconfiguration_request& 
   return ret;
 }
 
+/// First resource of the first periodic SRS resource set of a UE cell configuration, if any.
+static const srs_config::srs_resource* find_periodic_srs_resource(const ue_cell_config& cell)
+{
+  if (not cell.serv_cell_cfg.ul_config.has_value() or not cell.serv_cell_cfg.ul_config->init_ul_bwp.srs_cfg.has_value()) {
+    return nullptr;
+  }
+  const srs_config& srs = *cell.serv_cell_cfg.ul_config->init_ul_bwp.srs_cfg;
+  for (const auto& res_set : srs.srs_res_set_list) {
+    if (not std::holds_alternative<srs_config::srs_resource_set::periodic_resource_type>(res_set.res_type)) {
+      continue;
+    }
+    for (const auto res_id : res_set.srs_res_id_list) {
+      for (const auto& res : srs.srs_res_list) {
+        if (res.id.ue_res_id == res_id and res.periodicity_and_offset.has_value()) {
+          return &res;
+        }
+      }
+    }
+  }
+  return nullptr;
+}
+
+/// Fills the TS 38.331 resource and its TS 38.211 mapping of transmit port 0 into an SRS configuration event.
+static void fill_srs_resource(scheduler_dapp_srs_config_event& event,
+                              const srs_config::srs_resource& res,
+                              unsigned                        nof_symbols_per_slot)
+{
+  event.srs_configured            = true;
+  event.resource_id               = static_cast<uint8_t>(res.id.ue_res_id);
+  event.nof_ports                 = static_cast<uint8_t>(res.nof_ports);
+  event.comb_size                 = static_cast<uint8_t>(res.tx_comb.size);
+  event.comb_offset               = res.tx_comb.tx_comb_offset;
+  event.cyclic_shift              = res.tx_comb.tx_comb_cyclic_shift;
+  event.start_position            = res.res_mapping.start_pos;
+  event.nof_symbols               = static_cast<uint8_t>(res.res_mapping.nof_symb);
+  event.repetition_factor         = static_cast<uint8_t>(res.res_mapping.rept_factor);
+  event.freq_domain_position      = res.freq_domain_pos;
+  event.freq_domain_shift         = res.freq_domain_shift;
+  event.c_srs                     = res.freq_hop.c_srs;
+  event.b_srs                     = res.freq_hop.b_srs;
+  event.b_hop                     = res.freq_hop.b_hop;
+  event.group_or_sequence_hopping = static_cast<uint8_t>(res.grp_or_seq_hop);
+  event.sequence_id               = res.sequence_id;
+  event.period_slots              = static_cast<uint16_t>(res.periodicity_and_offset->period);
+  event.offset_slots              = res.periodicity_and_offset->offset;
+  event.start_symbol              = static_cast<uint8_t>(nof_symbols_per_slot - res.res_mapping.start_pos - 1);
+
+  // get_srs_information() asserts on hopping and on an invalid (C_SRS, B_SRS) pair: check both first.
+  if (res.grp_or_seq_hop != srs_group_or_sequence_hopping::neither or res.freq_hop.b_hop < res.freq_hop.b_srs or
+      not srs_configuration_get(res.freq_hop.c_srs, res.freq_hop.b_srs).has_value()) {
+    return;
+  }
+  srs_resource_configuration phy_res;
+  phy_res.nof_antenna_ports   = static_cast<srs_resource_configuration::one_two_four_enum>(res.nof_ports);
+  phy_res.nof_symbols         = res.res_mapping.nof_symb;
+  phy_res.start_symbol        = event.start_symbol;
+  phy_res.configuration_index = res.freq_hop.c_srs;
+  phy_res.sequence_id         = res.sequence_id;
+  phy_res.bandwidth_index     = res.freq_hop.b_srs;
+  phy_res.comb_size           = res.tx_comb.size;
+  phy_res.comb_offset         = res.tx_comb.tx_comb_offset;
+  phy_res.cyclic_shift        = res.tx_comb.tx_comb_cyclic_shift;
+  phy_res.freq_position       = res.freq_domain_pos;
+  phy_res.freq_shift          = res.freq_domain_shift;
+  phy_res.freq_hopping        = res.freq_hop.b_hop;
+  phy_res.hopping             = res.grp_or_seq_hop;
+  if (not phy_res.is_valid()) {
+    return;
+  }
+  const srs_information info       = get_srs_information(phy_res, 0);
+  event.derived_valid              = true;
+  event.cyclic_shift_maximum       = static_cast<uint8_t>(info.n_cs_max);
+  event.sequence_length            = static_cast<uint16_t>(info.sequence_length);
+  event.mapping_initial_subcarrier = static_cast<uint16_t>(info.mapping_initial_subcarrier);
+  event.sequence_group             = static_cast<uint16_t>(info.sequence_group);
+  event.sequence_number            = static_cast<uint16_t>(info.sequence_number);
+}
+
+void ocudu_scheduler_adapter::publish_dapp_srs_config(scheduler_dapp_srs_config_event::kind event,
+                                                      du_ue_index_t                         ue_index,
+                                                      du_cell_index_t                       cell_index,
+                                                      rnti_t                                rnti,
+                                                      const sched_ue_config_request*        cfg)
+{
+  if (not dapp_hooks or ue_index >= MAX_NOF_DU_UES or cell_index >= MAX_NOF_DU_CELLS or
+      not dapp_cells[cell_index].has_value()) {
+    return;
+  }
+  const dapp_cell_context& cell = *dapp_cells[cell_index];
+  auto&                    last = dapp_ue_srs[ue_index];
+
+  scheduler_dapp_srs_config_event result;
+  if (cfg == nullptr and last.has_value() and event != scheduler_dapp_srs_config_event::kind::removed) {
+    // Unchanged configuration: repeat the last one under the new event.
+    result = *last;
+  } else {
+    result.cell_id      = static_cast<uint32_t>(cell_index);
+    result.rnti         = to_value(rnti);
+    result.ue_index     = static_cast<uint16_t>(ue_index);
+    result.numerology   = cell.numerology;
+    result.n_ta_offset  = cell.n_ta_offset;
+    result.bwp_start_rb = cell.bwp_start_rb;
+    result.bwp_size_rb  = cell.bwp_size_rb;
+    if (cfg != nullptr and cfg->cells.has_value() and not cfg->cells->empty()) {
+      if (const auto* res = find_periodic_srs_resource(cfg->cells->front())) {
+        fill_srs_resource(result, *res, cell.nof_symbols_per_slot);
+      }
+    }
+  }
+  result.event = event;
+  if (event == scheduler_dapp_srs_config_event::kind::removed) {
+    last.reset();
+  } else {
+    last = result;
+  }
+  dapp_hooks->publish_srs_config(result);
+}
+
 ocudu_scheduler_adapter::ocudu_scheduler_adapter(const ocudu_mac_sched_config& params, rnti_manager& rnti_mng_) :
   rnti_mng(rnti_mng_),
   rlf_handler(params.mac_cfg, params.ctrl_exec),
@@ -44,7 +166,8 @@ ocudu_scheduler_adapter::ocudu_scheduler_adapter(const ocudu_mac_sched_config& p
   notifier(*this),
   sched_impl(create_scheduler(scheduler_config{params.sched_cfg, notifier, params.dapp_hooks})),
   rach_handler(*sched_impl, rnti_mng, logger),
-  pos_handler(create_positioning_handler(*sched_impl, params.ctrl_exec, params.timers, logger))
+  pos_handler(create_positioning_handler(*sched_impl, params.ctrl_exec, params.timers, logger)),
+  dapp_hooks(params.dapp_hooks)
 {
   ocudu_assert(last_slot_point.is_lock_free(), "slot point is not lock free");
   ocudu_assert(last_slot_tp.is_lock_free(), "slot time_point is not lock free");
@@ -54,6 +177,17 @@ void ocudu_scheduler_adapter::add_cell(const mac_scheduler_cell_creation_request
 {
   // Setup UCI decoder for new cell.
   cell_handlers.emplace(msg.cell_params.cell_index, *this, msg.cell_params.sched_req);
+
+  if (msg.cell_params.cell_index < MAX_NOF_DU_CELLS) {
+    const ran_cell_config&   ran = msg.cell_params.sched_req.ran;
+    const bwp_configuration& bwp = ran.ul_cfg_common.init_ul_bwp.generic_params;
+    dapp_cells[msg.cell_params.cell_index] =
+        dapp_cell_context{static_cast<uint8_t>(to_numerology_value(bwp.scs)),
+                          static_cast<uint16_t>(ran.ta_offset),
+                          static_cast<uint16_t>(bwp.crbs.start()),
+                          static_cast<uint16_t>(bwp.crbs.length()),
+                          get_nsymb_per_slot(bwp.cp)};
+  }
 
   // Forward cell configuration to scheduler.
   auto sched_req                      = msg.cell_params.sched_req;
@@ -98,6 +232,11 @@ async_task<bool> ocudu_scheduler_adapter::handle_ue_creation_request(const mac_u
     CORO_AWAIT_VALUE(bool res, sched_cfg_notif_map[msg.ue_index].ue_config_ready);
     sched_cfg_notif_map[msg.ue_index].ue_config_ready.reset();
 
+    if (res) {
+      publish_dapp_srs_config(
+          scheduler_dapp_srs_config_event::kind::created, msg.ue_index, msg.cell_index, msg.crnti, &msg.sched_cfg);
+    }
+
     CORO_RETURN(res);
   });
 }
@@ -113,6 +252,14 @@ async_task<bool> ocudu_scheduler_adapter::handle_ue_reconfiguration_request(cons
     // Await Scheduler notification.
     CORO_AWAIT(sched_cfg_notif_map[msg.ue_index].ue_config_ready);
     sched_cfg_notif_map[msg.ue_index].ue_config_ready.reset();
+
+    if (msg.ue_index < MAX_NOF_DU_UES and dapp_ue_srs[msg.ue_index].has_value()) {
+      publish_dapp_srs_config(scheduler_dapp_srs_config_event::kind::reconfigured,
+                              msg.ue_index,
+                              static_cast<du_cell_index_t>(dapp_ue_srs[msg.ue_index]->cell_id),
+                              msg.crnti,
+                              msg.sched_cfg.cells.has_value() ? &msg.sched_cfg : nullptr);
+    }
 
     CORO_RETURN(true);
   });
@@ -140,6 +287,9 @@ async_task<void> ocudu_scheduler_adapter::handle_ue_removal_request(const mac_ue
     CORO_AWAIT(sched_cfg_notif_map[msg.ue_index].ue_config_ready);
     sched_cfg_notif_map[msg.ue_index].ue_config_ready.reset();
 
+    publish_dapp_srs_config(
+        scheduler_dapp_srs_config_event::kind::removed, msg.ue_index, msg.cell_index, msg.rnti, nullptr);
+
     // In case the UE was created via CFRA, remove the RA preamble.
     cell_handlers[msg.cell_index].get_rach_handler().handle_cfra_deallocation(msg.ue_index);
 
@@ -158,6 +308,15 @@ void ocudu_scheduler_adapter::handle_ue_config_applied(du_ue_index_t ue_index)
 
   // Notify scheduler that the UE confirmed the configuration.
   sched_impl->handle_ue_config_applied(ue_index);
+
+  if (ue_index < MAX_NOF_DU_UES and dapp_ue_srs[ue_index].has_value()) {
+    const scheduler_dapp_srs_config_event& last = *dapp_ue_srs[ue_index];
+    publish_dapp_srs_config(scheduler_dapp_srs_config_event::kind::applied,
+                            ue_index,
+                            static_cast<du_cell_index_t>(last.cell_id),
+                            to_rnti(last.rnti),
+                            nullptr);
+  }
 }
 
 /// Converts BSR MAC CE (See 38.321, 6.1.3.1) to Scheduler UL BSR event type.

@@ -18,6 +18,8 @@
 --   6 classc.spectrum      host snapshot of the Class-C Spectrum publication (0x00010001)
 --   7 classc.srs_isac      host snapshot of the Class-C SRS-ISAC publication (0x00010002)
 --   8 pusch.grid           raw pre-equalization PUSCH resource grid with grant parameters (0x00020006)
+--   9 srs.config           SRS configuration per UE context, on every change and to new subscribers (0x00020007)
+--  10 ta.command           timing advance commands sent to UEs, RAR and MAC CE (0x00020008)
 -- The service model defines no control identifiers.
 --
 -- E3-SubscriptionRequest.periodicity, when nonzero, is the per-RNTI minimum
@@ -220,6 +222,66 @@ PuschDmrsChannelRecord ::= SEQUENCE {
   ...
 }
 
+-- Periodic SRS-Resource of one UE context (TS 38.331 field meanings).
+SrsResourceParameters ::= SEQUENCE {
+  resourceId             INTEGER (0..63),
+  nofPorts               INTEGER (1..4),
+  combSize               INTEGER (2..8),
+  combOffset             INTEGER (0..7),
+  cyclicShift            INTEGER (0..11),
+  startPosition          INTEGER (0..13),      -- symbols counted from the end of the slot
+  nofSymbols             INTEGER (1..14),
+  repetitionFactor       INTEGER (1..14),
+  freqDomainPosition     INTEGER (0..67),
+  freqDomainShift        INTEGER (0..268),
+  cSrs                   INTEGER (0..63),
+  bSrs                   INTEGER (0..3),
+  bHop                   INTEGER (0..3),
+  groupOrSequenceHopping INTEGER (0..2),       -- 0 neither, 1 group hopping, 2 sequence hopping
+  sequenceId             INTEGER (0..1023),
+  periodSlots            INTEGER (1..2560),
+  offsetSlots            INTEGER (0..2559),
+  bwpStartRb             INTEGER (0..274),
+  bwpSizeRb              INTEGER (1..275),
+  -- Mapping of transmit port 0 (TS 38.211 6.4.1.4); absent with group, sequence or frequency hopping.
+  derived                SrsDerivedMapping OPTIONAL,
+  ...
+}
+
+SrsDerivedMapping ::= SEQUENCE {
+  startSymbol              INTEGER (0..13),
+  sequenceLength           INTEGER (0..65535),  -- pilots per symbol, M_sc,b^SRS
+  mappingInitialSubcarrier INTEGER (0..65535),  -- k0 within the BWP, as in SrsChannelRecord
+  sequenceGroup            INTEGER (0..29),
+  sequenceNumber           INTEGER (0..1),
+  cyclicShiftMaximum       INTEGER (0..12),
+  ...
+}
+
+-- SRS configuration of one UE context as set by the DU. configEpoch advances whenever any context is created or
+-- removed, or its configuration changes; snapshot records replay the current state to a new subscriber.
+SrsConfigRecord ::= SEQUENCE {
+  rnti        Rnti,
+  event       INTEGER (1..5),          -- 1 created, 2 reconfigured, 3 applied, 4 removed, 5 snapshot
+  configEpoch INTEGER (0..4294967295),
+  ueIndex     INTEGER (0..65535),
+  numerology  INTEGER (0..4),
+  nTaOffset   INTEGER (0..65535),      -- N_TA,offset of the cell in units of T_c
+  resource    SrsResourceParameters OPTIONAL, -- absent when the context has no periodic SRS resource
+  ...
+}
+
+-- One timing advance command sent to a UE: the RAR's T_A (0..3846) or a MAC CE's T_A (0..63, 31 = no change).
+-- radioSlot is the PDSCH slot that carries it.
+TaCommandRecord ::= SEQUENCE {
+  rnti      Rnti,
+  radioSlot RadioSlot,
+  source    INTEGER (1..2),            -- 1 random access response, 2 MAC CE
+  tagId     INTEGER (0..3),
+  taCommand INTEGER (0..3846),
+  ...
+}
+
 -- Byte-for-byte relay of one already-generated gNB JSON metrics report.
 GnbMetricsJsonRecord ::= SEQUENCE {
   -- Empty when the bytes were delivered by reference (E3-TensorDescriptor).
@@ -248,7 +310,9 @@ Telemetry-Object ::= CHOICE {
   -- open type whose length is fragmented above 16 KiB, which several PER
   -- decoders do not implement, and grid captures are routinely larger.
   puschGrid        PuschGridRecord,
-  ...
+  ...,
+  srsConfig        SrsConfigRecord,
+  taCommand        TaCommandRecord
 }
 
 -- One published object as reassembled from E3-IndicationMessage fragments.

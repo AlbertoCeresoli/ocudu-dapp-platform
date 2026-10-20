@@ -954,11 +954,13 @@ public:
                                std::shared_ptr<scheduler_dapp_ul_plan_sink>       plan_sink_,
                                scheduler_dapp_guardrails                          guardrails_,
                                std::chrono::nanoseconds                           deadline_,
-                               scheduler_dapp_policy_mode                         mode_) :
+                               scheduler_dapp_policy_mode                         mode_,
+                               std::shared_ptr<scheduler_dapp_ue_event_sink>      ue_events_) :
     target(std::move(target_)),
     interference(std::move(interference_)),
     reservations(std::move(reservations_)),
     plan_sink(std::move(plan_sink_)),
+    ue_events(std::move(ue_events_)),
     guardrails(guardrails_),
     deadline(deadline_),
     mode(mode_)
@@ -969,6 +971,22 @@ public:
   {
     if (plan_sink) {
       plan_sink->publish(cell_id, slot, result);
+    }
+  }
+
+  void publish_srs_config(const scheduler_dapp_srs_config_event& event) noexcept override
+  {
+    if (ue_events) {
+      ue_events->publish_srs_config(event);
+    }
+  }
+
+  bool ta_commands_active() noexcept override { return ue_events && ue_events->ta_commands_active(); }
+
+  void publish_ta_command(slot_point slot, const scheduler_dapp_ta_command_event& event) noexcept override
+  {
+    if (ue_events) {
+      ue_events->publish_ta_command(slot, event);
     }
   }
 
@@ -988,6 +1006,7 @@ private:
   std::shared_ptr<scheduler_dapp_interference_cache> interference;
   std::shared_ptr<quiet_reservation_manager>         reservations;
   std::shared_ptr<scheduler_dapp_ul_plan_sink>       plan_sink;
+  std::shared_ptr<scheduler_dapp_ue_event_sink>      ue_events;
   scheduler_dapp_guardrails                          guardrails;
   std::chrono::nanoseconds                           deadline;
   scheduler_dapp_policy_mode                         mode;
@@ -1066,7 +1085,8 @@ ocudu::create_scheduler_dapp_hook_provider(std::shared_ptr<scheduler_dapp_target
                                            std::chrono::nanoseconds                           deadline,
                                            std::shared_ptr<quiet_reservation_manager>         reservations,
                                            std::shared_ptr<scheduler_dapp_ul_plan_sink>       plan_sink,
-                                           scheduler_dapp_policy_mode                         mode) noexcept
+                                           scheduler_dapp_policy_mode                         mode,
+                                           std::shared_ptr<scheduler_dapp_ue_event_sink>      ue_events) noexcept
 {
   if (!target || target->lane_count() == 0 || deadline.count() <= 0 || deadline > std::chrono::seconds(1)) {
     return {};
@@ -1078,7 +1098,8 @@ ocudu::create_scheduler_dapp_hook_provider(std::shared_ptr<scheduler_dapp_target
                                                           std::move(plan_sink),
                                                           guardrails,
                                                           deadline,
-                                                          mode);
+                                                          mode,
+                                                          std::move(ue_events));
   } catch (...) {
     return {};
   }

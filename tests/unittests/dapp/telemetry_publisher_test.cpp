@@ -394,3 +394,154 @@ TEST(dapp_telemetry_publisher, publishes_raw_grid_captures_with_grant_parameters
   ASSERT_TRUE(decoded) << decoded.detail;
   EXPECT_EQ(std::get<pusch_grid_record>(decoded.value->object).grant.tbs_bytes, 777U);
 }
+
+namespace {
+
+srs_config_metadata_v1 make_srs_config(uint16_t rnti, srs_config_event event, uint8_t comb_offset)
+{
+  srs_config_metadata_v1 record;
+  record.rnti                       = rnti;
+  record.event                      = static_cast<uint8_t>(event);
+  record.flags                      = 0x03;
+  record.numerology                 = 1;
+  record.nof_ports                  = 2;
+  record.comb_size                  = 4;
+  record.comb_offset                = comb_offset;
+  record.nof_symbols                = 1;
+  record.repetition_factor          = 1;
+  record.c_srs                      = 11;
+  record.sequence_id                = 1;
+  record.period_slots               = 20;
+  record.offset_slots               = 7;
+  record.n_ta_offset                = 25600;
+  record.bwp_size_rb                = 51;
+  record.start_symbol               = 13;
+  record.cyclic_shift_maximum       = 12;
+  record.sequence_length            = 120;
+  record.mapping_initial_subcarrier = 60 + comb_offset;
+  record.sequence_group             = 1;
+  return record;
+}
+
+srs_config_record drain_srs_config(portable_data_store& store, uint8_t suffix)
+{
+  std::vector<uint8_t>       metadata;
+  std::vector<uint8_t>       tensor;
+  portable_publication_chunk chunk;
+  EXPECT_TRUE(drain_one(store, make_id(suffix), metadata, tensor, chunk));
+  auto converted = e3ap_codec::from_publication(chunk.interface_id, 0, 1, chunk.route_epoch, 0, metadata, tensor);
+  EXPECT_TRUE(converted) << converted.detail;
+  // Through the wire codec as well.
+  auto encoded = e3ap_codec::encode(*converted.value);
+  EXPECT_TRUE(encoded) << encoded.detail;
+  auto decoded = e3ap_codec::decode_telemetry(*encoded.value);
+  EXPECT_TRUE(decoded) << decoded.detail;
+  return std::get<srs_config_record>(decoded.value->object);
+}
+
+} // namespace
+
+TEST(dapp_telemetry_publisher, srs_config_epochs_follow_changes_and_replay_to_new_subscribers)
+{
+  auto                       store = make_store();
+  telemetry_publisher_config config;
+  config.store = store;
+  auto created = telemetry_publisher::create(config);
+  ASSERT_TRUE(created.first) << created.second;
+  auto& publisher = *created.first;
+
+  // Before any subscriber: cached, not published.
+  publisher.publish_srs_config(0, make_srs_config(0x4601, srs_config_event::created, 0));
+  EXPECT_EQ(publisher.metrics().published, 0U);
+
+  // A new subscriber gets the cached state as a snapshot on the next poll.
+  ASSERT_TRUE(store->subscribe(subscribe_request(20, telemetry_stream_srs_config)));
+  publisher.poll_srs_config_snapshot();
+  auto snapshot = drain_srs_config(*store, 20);
+  EXPECT_EQ(snapshot.rnti, 0x4601U);
+  EXPECT_EQ(snapshot.event, static_cast<uint8_t>(srs_config_event::snapshot));
+  EXPECT_EQ(snapshot.config_epoch, 1U);
+  EXPECT_EQ(snapshot.n_ta_offset, 25600U);
+  ASSERT_TRUE(snapshot.resource);
+  EXPECT_EQ(snapshot.resource->period_slots, 20U);
+  EXPECT_EQ(snapshot.resource->offset_slots, 7U);
+  ASSERT_TRUE(snapshot.resource->derived);
+  EXPECT_EQ(snapshot.resource->derived->mapping_initial_subcarrier, 60U);
+  EXPECT_EQ(snapshot.resource->derived->sequence_length, 120U);
+  // No new subscriber: no replay.
+  publisher.poll_srs_config_snapshot();
+  EXPECT_EQ(publisher.metrics().published, 1U);
+
+  // Applying the same configuration keeps the epoch; a changed one advances it.
+  publisher.publish_srs_config(0, make_srs_config(0x4601, srs_config_event::applied, 0));
+  EXPECT_EQ(drain_srs_config(*store, 20).config_epoch, 1U);
+  publisher.publish_srs_config(0, make_srs_config(0x4601, srs_config_event::reconfigured, 1));
+  auto changed = drain_srs_config(*store, 20);
+  EXPECT_EQ(changed.config_epoch, 2U);
+  ASSERT_TRUE(changed.resource && changed.resource->derived);
+  EXPECT_EQ(changed.resource->comb_offset, 1U);
+  EXPECT_EQ(changed.resource->derived->mapping_initial_subcarrier, 61U);
+
+  // Removal advances the epoch and drops the context from later snapshots.
+  srs_config_metadata_v1 removed;
+  removed.rnti  = 0x4601;
+  removed.event = static_cast<uint8_t>(srs_config_event::removed);
+  publisher.publish_srs_config(0, removed);
+  auto gone = drain_srs_config(*store, 20);
+  EXPECT_EQ(gone.config_epoch, 3U);
+  EXPECT_FALSE(gone.resource);
+  publisher.publish_srs_config(0, make_srs_config(0x4602, srs_config_event::created, 0));
+  EXPECT_EQ(drain_srs_config(*store, 20).config_epoch, 4U);
+  ASSERT_TRUE(store->subscribe(subscribe_request(21, telemetry_stream_srs_config)));
+  publisher.poll_srs_config_snapshot();
+  EXPECT_EQ(drain_srs_config(*store, 21).rnti, 0x4602U);
+  std::vector<uint8_t>       metadata;
+  std::vector<uint8_t>       tensor;
+  portable_publication_chunk chunk;
+  EXPECT_FALSE(drain_one(*store, make_id(21), metadata, tensor, chunk));
+}
+
+TEST(dapp_telemetry_publisher, publishes_ta_commands)
+{
+  auto                       store = make_store();
+  telemetry_publisher_config config;
+  config.store = store;
+  auto created = telemetry_publisher::create(config);
+  ASSERT_TRUE(created.first) << created.second;
+  auto& publisher = *created.first;
+  EXPECT_FALSE(publisher.ta_command_active());
+  ASSERT_TRUE(store->subscribe(subscribe_request(22, telemetry_stream_ta_command)));
+  EXPECT_TRUE(publisher.ta_command_active());
+
+  ta_command_metadata_v1 rar;
+  rar.rnti       = 0x4601;
+  rar.radio_slot = {100, 3, 1};
+  rar.source     = static_cast<uint8_t>(ta_command_source::random_access_response);
+  rar.ta_command = 3846;
+  ta_command_metadata_v1 ce = rar;
+  ce.source                 = static_cast<uint8_t>(ta_command_source::mac_ce);
+  ce.ta_command             = 33;
+  ce.tag_id                 = 1;
+
+  // The test subscription coalesces to the latest object: drain each command before the next.
+  for (const auto& expected : {rar, ce}) {
+    publisher.publish_ta_command(0, expected);
+    std::vector<uint8_t>       metadata;
+    std::vector<uint8_t>       tensor;
+    portable_publication_chunk chunk;
+    ASSERT_TRUE(drain_one(*store, make_id(22), metadata, tensor, chunk));
+    auto converted = e3ap_codec::from_publication(chunk.interface_id, 0, 1, chunk.route_epoch, 0, metadata, tensor);
+    ASSERT_TRUE(converted) << converted.detail;
+    auto encoded = e3ap_codec::encode(*converted.value);
+    ASSERT_TRUE(encoded) << encoded.detail;
+    auto decoded = e3ap_codec::decode_telemetry(*encoded.value);
+    ASSERT_TRUE(decoded) << decoded.detail;
+    const auto& record = std::get<ta_command_record>(decoded.value->object);
+    EXPECT_EQ(record.rnti, expected.rnti);
+    EXPECT_EQ(record.radio_slot.sfn, 100U);
+    EXPECT_EQ(record.radio_slot.slot, 3U);
+    EXPECT_EQ(record.source, expected.source);
+    EXPECT_EQ(record.tag_id, expected.tag_id);
+    EXPECT_EQ(record.ta_command, expected.ta_command);
+  }
+}

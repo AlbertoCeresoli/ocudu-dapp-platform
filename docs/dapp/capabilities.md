@@ -293,7 +293,7 @@ results.
 
 ## Telemetry streams
 
-The upper PHY publishes eight streams (`OCUDU-TELEMETRY-SM`, RAN function 10;
+The upper PHY and the MAC publish ten streams (`OCUDU-TELEMETRY-SM`, RAN function 10;
 ids in `python/ocudu_e3/schema.py`, store records in
 `include/ocudu/dapp/e3/telemetry_types.h`). All are reachable by **push**
 (E3AP subscriptions with fragmented indications) and by **pull**
@@ -310,6 +310,8 @@ Full record layouts: [e3_wire.md](e3_wire.md).
 | 6 | `classc.spectrum` | `0x00010001` | Class-C spectrum snapshot: `OCC3` FlatBuffers envelope + complete uplink resource grid tensor | producer rate |
 | 7 | `classc.srs_isac` | `0x00010002` | Class-C SRS-ISAC snapshot: `OCC3` envelope + channel-estimate tensor | producer rate |
 | 8 | `pusch.grid` | `0x00020006` | Raw **pre-equalization** REs of one grant, all rx ports, DM-RS included, plus `PuschGrantParameters` — everything needed to re-run CE/EQ/decode offline (HARQ/RV/NDI, scrambling ids, LDPC base graph, TBS/LBRM, MCS index+table, DM-RS mask/type/CDM, BWP and 275-bit CRB mask, DC position, UCI bit counts and beta offsets) | 100 ms; **20 ms default hard floor** |
+| 9 | `srs.config` | `0x00020007` | SRS configuration of each UE context as the MAC hands it to the scheduler: the periodic TS 38.331 SRS-Resource (ports, comb, cyclic shift, symbols, C_SRS/B_SRS/b_hop, hopping, sequence id, **period and slot offset**), BWP, N_TA,offset and, without hopping, the TS 38.211 mapping of port 0 (start symbol, k0, sequence length, u, v). Events: created, reconfigured, applied, removed, plus a **snapshot** of every current context when a subscriber arrives. `configEpoch` advances on every creation, removal or change. Subscribe with `dropOldest`/`dropNewest`: `coalesceLatest` would merge events | none (every event) |
+| 10 | `ta.command` | `0x00020008` | Every timing advance command in a committed DL result: the RAR's 12-bit T_A (by TC-RNTI) and each new TA Command MAC CE (6-bit T_A, TAG id), with the PDSCH slot. Same drop-policy advice as `srs.config` | none (every command) |
 
 Rate control has three layers ([yaml_configuration.md](yaml_configuration.md)
 § Telemetry publication floors): the `telemetry_*_min_interval_ms` **default

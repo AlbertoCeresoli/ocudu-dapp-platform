@@ -59,6 +59,10 @@ std::optional<uint32_t> ocudu::dapp::e3::telemetry_interface_for(uint16_t teleme
       return telemetry_stream_gnb_metrics_json;
     case telemetry_id_pusch_grid:
       return telemetry_stream_pusch_grid;
+    case telemetry_id_srs_config:
+      return telemetry_stream_srs_config;
+    case telemetry_id_ta_command:
+      return telemetry_stream_ta_command;
     case telemetry_id_class_c_spectrum:
       return OCUDU_DAPP_INTERFACE_SPECTRUM_V1;
     case telemetry_id_class_c_srs_isac:
@@ -83,6 +87,10 @@ std::optional<uint16_t> ocudu::dapp::e3::telemetry_id_for(uint32_t interface_id)
       return telemetry_id_gnb_metrics_json;
     case telemetry_stream_pusch_grid:
       return telemetry_id_pusch_grid;
+    case telemetry_stream_srs_config:
+      return telemetry_id_srs_config;
+    case telemetry_stream_ta_command:
+      return telemetry_id_ta_command;
     case OCUDU_DAPP_INTERFACE_SPECTRUM_V1:
       return telemetry_id_class_c_spectrum;
     case OCUDU_DAPP_INTERFACE_SRS_ISAC_V1:
@@ -151,6 +159,20 @@ std::vector<telemetry_stream_record> ocudu::dapp::e3::default_telemetry_streams(
        false,
        telemetry_stream_pusch_grid,
        100'000,
+       {}},
+      {telemetry_id_srs_config,
+       "srs.config",
+       "SRS configuration per UE context (TS 38.331 SRS-Resource, period, offset, epoch) on every change",
+       false,
+       telemetry_stream_srs_config,
+       std::nullopt,
+       {}},
+      {telemetry_id_ta_command,
+       "ta.command",
+       "Timing advance commands sent to UEs: RAR T_A and every Timing Advance Command MAC CE",
+       false,
+       telemetry_stream_ta_command,
+       std::nullopt,
        {}},
   };
 }

@@ -14,6 +14,10 @@ extern "C" {
 #include "PuschSymbolsRecord.h"
 #include "RadioSlot.h"
 #include "SrsChannelRecord.h"
+#include "SrsConfigRecord.h"
+#include "SrsDerivedMapping.h"
+#include "SrsResourceParameters.h"
+#include "TaCommandRecord.h"
 #include "Telemetry-DropPolicy.h"
 #include "Telemetry-IndicationData.h"
 #include "Telemetry-Object.h"
@@ -551,6 +555,122 @@ pusch_dmrs_channel_record read_object(const PuschDmrsChannelRecord_t& source)
   return result;
 }
 
+void set_object(Telemetry_Object_t& destination, const srs_config_record& source)
+{
+  auto& record        = *(destination.choice.srsConfig = make_asn<SrsConfigRecord_t>());
+  destination.present = Telemetry_Object_PR_srsConfig;
+  set_u64(record.rnti, source.rnti);
+  set_u64(record.event, read_ranged(source.event, 1, 5, "SRS config event"));
+  set_u64(record.configEpoch, source.config_epoch);
+  set_u64(record.ueIndex, source.ue_index);
+  set_u64(record.numerology, read_ranged(source.numerology, 0, 4, "numerology"));
+  set_u64(record.nTaOffset, source.n_ta_offset);
+  if (!source.resource) {
+    return;
+  }
+  const srs_resource_parameters& from = *source.resource;
+  auto&                          to   = *(record.resource = make_asn<SrsResourceParameters_t>());
+  set_u64(to.resourceId, read_ranged(from.resource_id, 0, 63, "SRS resource id"));
+  set_u64(to.nofPorts, read_ranged(from.nof_ports, 1, 4, "SRS port count"));
+  set_u64(to.combSize, read_ranged(from.comb_size, 2, 8, "comb size"));
+  set_u64(to.combOffset, read_ranged(from.comb_offset, 0, 7, "comb offset"));
+  set_u64(to.cyclicShift, read_ranged(from.cyclic_shift, 0, 11, "cyclic shift"));
+  set_u64(to.startPosition, read_ranged(from.start_position, 0, 13, "start position"));
+  set_u64(to.nofSymbols, read_ranged(from.nof_symbols, 1, 14, "SRS symbol count"));
+  set_u64(to.repetitionFactor, read_ranged(from.repetition_factor, 1, 14, "repetition factor"));
+  set_u64(to.freqDomainPosition, read_ranged(from.freq_domain_position, 0, 67, "frequency domain position"));
+  set_u64(to.freqDomainShift, read_ranged(from.freq_domain_shift, 0, 268, "frequency domain shift"));
+  set_u64(to.cSrs, read_ranged(from.c_srs, 0, 63, "C_SRS"));
+  set_u64(to.bSrs, read_ranged(from.b_srs, 0, 3, "B_SRS"));
+  set_u64(to.bHop, read_ranged(from.b_hop, 0, 3, "b_hop"));
+  set_u64(to.groupOrSequenceHopping, read_ranged(from.group_or_sequence_hopping, 0, 2, "hopping"));
+  set_u64(to.sequenceId, read_ranged(from.sequence_id, 0, 1023, "SRS sequence id"));
+  set_u64(to.periodSlots, read_ranged(from.period_slots, 1, 2560, "SRS period"));
+  set_u64(to.offsetSlots, read_ranged(from.offset_slots, 0, 2559, "SRS offset"));
+  set_u64(to.bwpStartRb, read_ranged(from.bwp_start_rb, 0, 274, "BWP start"));
+  set_u64(to.bwpSizeRb, read_ranged(from.bwp_size_rb, 1, 275, "BWP size"));
+  if (from.derived) {
+    const srs_derived_mapping& mapping = *from.derived;
+    auto&                      derived = *(to.derived = make_asn<SrsDerivedMapping_t>());
+    set_u64(derived.startSymbol, read_ranged(mapping.start_symbol, 0, 13, "start symbol"));
+    set_u64(derived.sequenceLength, mapping.sequence_length);
+    set_u64(derived.mappingInitialSubcarrier, mapping.mapping_initial_subcarrier);
+    set_u64(derived.sequenceGroup, read_ranged(mapping.sequence_group, 0, 29, "sequence group"));
+    set_u64(derived.sequenceNumber, read_ranged(mapping.sequence_number, 0, 1, "sequence number"));
+    set_u64(derived.cyclicShiftMaximum, read_ranged(mapping.cyclic_shift_maximum, 0, 12, "cyclic shift maximum"));
+  }
+}
+
+srs_config_record read_object(const SrsConfigRecord_t& source)
+{
+  srs_config_record result;
+  result.rnti         = read_u16(source.rnti, "RNTI");
+  result.event        = static_cast<uint8_t>(read_ranged(source.event, 1, 5, "SRS config event"));
+  result.config_epoch = static_cast<uint32_t>(read_ranged(source.configEpoch, 0, 4294967295ULL, "config epoch"));
+  result.ue_index     = read_u16(source.ueIndex, "UE index");
+  result.numerology   = static_cast<uint8_t>(read_ranged(source.numerology, 0, 4, "numerology"));
+  result.n_ta_offset  = read_u16(source.nTaOffset, "N_TA offset");
+  if (source.resource == nullptr) {
+    return result;
+  }
+  const auto&              from = *source.resource;
+  srs_resource_parameters& to   = result.resource.emplace();
+  to.resource_id                = static_cast<uint8_t>(read_ranged(from.resourceId, 0, 63, "SRS resource id"));
+  to.nof_ports                  = static_cast<uint8_t>(read_ranged(from.nofPorts, 1, 4, "SRS port count"));
+  to.comb_size                  = static_cast<uint8_t>(read_ranged(from.combSize, 2, 8, "comb size"));
+  to.comb_offset                = static_cast<uint8_t>(read_ranged(from.combOffset, 0, 7, "comb offset"));
+  to.cyclic_shift               = static_cast<uint8_t>(read_ranged(from.cyclicShift, 0, 11, "cyclic shift"));
+  to.start_position             = static_cast<uint8_t>(read_ranged(from.startPosition, 0, 13, "start position"));
+  to.nof_symbols                = static_cast<uint8_t>(read_ranged(from.nofSymbols, 1, 14, "SRS symbol count"));
+  to.repetition_factor = static_cast<uint8_t>(read_ranged(from.repetitionFactor, 1, 14, "repetition factor"));
+  to.freq_domain_position =
+      static_cast<uint8_t>(read_ranged(from.freqDomainPosition, 0, 67, "frequency domain position"));
+  to.freq_domain_shift = static_cast<uint16_t>(read_ranged(from.freqDomainShift, 0, 268, "frequency domain shift"));
+  to.c_srs             = static_cast<uint8_t>(read_ranged(from.cSrs, 0, 63, "C_SRS"));
+  to.b_srs             = static_cast<uint8_t>(read_ranged(from.bSrs, 0, 3, "B_SRS"));
+  to.b_hop             = static_cast<uint8_t>(read_ranged(from.bHop, 0, 3, "b_hop"));
+  to.group_or_sequence_hopping = static_cast<uint8_t>(read_ranged(from.groupOrSequenceHopping, 0, 2, "hopping"));
+  to.sequence_id               = static_cast<uint16_t>(read_ranged(from.sequenceId, 0, 1023, "SRS sequence id"));
+  to.period_slots              = static_cast<uint16_t>(read_ranged(from.periodSlots, 1, 2560, "SRS period"));
+  to.offset_slots              = static_cast<uint16_t>(read_ranged(from.offsetSlots, 0, 2559, "SRS offset"));
+  to.bwp_start_rb              = static_cast<uint16_t>(read_ranged(from.bwpStartRb, 0, 274, "BWP start"));
+  to.bwp_size_rb               = static_cast<uint16_t>(read_ranged(from.bwpSizeRb, 1, 275, "BWP size"));
+  if (from.derived != nullptr) {
+    const auto&          mapping = *from.derived;
+    srs_derived_mapping& derived = to.derived.emplace();
+    derived.start_symbol         = static_cast<uint8_t>(read_ranged(mapping.startSymbol, 0, 13, "start symbol"));
+    derived.sequence_length      = read_u16(mapping.sequenceLength, "sequence length");
+    derived.mapping_initial_subcarrier = read_u16(mapping.mappingInitialSubcarrier, "subcarrier");
+    derived.sequence_group = static_cast<uint8_t>(read_ranged(mapping.sequenceGroup, 0, 29, "sequence group"));
+    derived.sequence_number = static_cast<uint8_t>(read_ranged(mapping.sequenceNumber, 0, 1, "sequence number"));
+    derived.cyclic_shift_maximum =
+        static_cast<uint8_t>(read_ranged(mapping.cyclicShiftMaximum, 0, 12, "cyclic shift maximum"));
+  }
+  return result;
+}
+
+void set_object(Telemetry_Object_t& destination, const ta_command_record& source)
+{
+  auto& record        = *(destination.choice.taCommand = make_asn<TaCommandRecord_t>());
+  destination.present = Telemetry_Object_PR_taCommand;
+  set_u64(record.rnti, source.rnti);
+  set_radio_slot(record.radioSlot, source.radio_slot);
+  set_u64(record.source, read_ranged(source.source, 1, 2, "TA command source"));
+  set_u64(record.tagId, read_ranged(source.tag_id, 0, 3, "TAG id"));
+  set_u64(record.taCommand, read_ranged(source.ta_command, 0, 3846, "TA command"));
+}
+
+ta_command_record read_object(const TaCommandRecord_t& source)
+{
+  ta_command_record result;
+  result.rnti       = read_u16(source.rnti, "RNTI");
+  result.radio_slot = read_radio_slot(source.radioSlot);
+  result.source     = static_cast<uint8_t>(read_ranged(source.source, 1, 2, "TA command source"));
+  result.tag_id     = static_cast<uint8_t>(read_ranged(source.tagId, 0, 3, "TAG id"));
+  result.ta_command = static_cast<uint16_t>(read_ranged(source.taCommand, 0, 3846, "TA command"));
+  return result;
+}
+
 void set_object(Telemetry_Object_t& destination, const gnb_metrics_json_record& source)
 {
   auto& record        = *(destination.choice.gnbMetricsJson = make_asn<GnbMetricsJsonRecord_t>());
@@ -639,6 +759,12 @@ telemetry_indication read_indication(const Telemetry_IndicationData_t& source)
       break;
     case Telemetry_Object_PR_puschGrid:
       result.object = read_object(*object.choice.puschGrid);
+      break;
+    case Telemetry_Object_PR_srsConfig:
+      result.object = read_object(*object.choice.srsConfig);
+      break;
+    case Telemetry_Object_PR_taCommand:
+      result.object = read_object(*object.choice.taCommand);
       break;
     default:
       throw std::runtime_error("unknown telemetry object");
@@ -1167,6 +1293,68 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
           record.estimates.assign(tensor.begin(), tensor.end());
         }
         result.object = std::move(record);
+        break;
+      }
+      case telemetry_kind::srs_config: {
+        srs_config_metadata_v1 source;
+        if (metadata.size() != sizeof(source)) {
+          return {std::nullopt, "SRS config metadata size mismatch"};
+        }
+        std::memcpy(&source, metadata.data(), sizeof(source));
+        srs_config_record record;
+        record.rnti         = source.rnti;
+        record.event        = source.event;
+        record.config_epoch = source.config_epoch;
+        record.ue_index     = source.ue_index;
+        record.numerology   = source.numerology;
+        record.n_ta_offset  = source.n_ta_offset;
+        if ((source.flags & 0x01U) != 0) {
+          srs_resource_parameters& resource  = record.resource.emplace();
+          resource.resource_id               = source.resource_id;
+          resource.nof_ports                 = source.nof_ports;
+          resource.comb_size                 = source.comb_size;
+          resource.comb_offset               = source.comb_offset;
+          resource.cyclic_shift              = source.cyclic_shift;
+          resource.start_position            = source.start_position;
+          resource.nof_symbols               = source.nof_symbols;
+          resource.repetition_factor         = source.repetition_factor;
+          resource.freq_domain_position      = source.freq_domain_position;
+          resource.freq_domain_shift         = source.freq_domain_shift;
+          resource.c_srs                     = source.c_srs;
+          resource.b_srs                     = source.b_srs;
+          resource.b_hop                     = source.b_hop;
+          resource.group_or_sequence_hopping = source.group_or_sequence_hopping;
+          resource.sequence_id               = source.sequence_id;
+          resource.period_slots              = source.period_slots;
+          resource.offset_slots              = source.offset_slots;
+          resource.bwp_start_rb              = source.bwp_start_rb;
+          resource.bwp_size_rb               = source.bwp_size_rb;
+          if ((source.flags & 0x02U) != 0) {
+            srs_derived_mapping& derived       = resource.derived.emplace();
+            derived.start_symbol               = source.start_symbol;
+            derived.sequence_length            = source.sequence_length;
+            derived.mapping_initial_subcarrier = source.mapping_initial_subcarrier;
+            derived.sequence_group             = static_cast<uint8_t>(source.sequence_group);
+            derived.sequence_number            = static_cast<uint8_t>(source.sequence_number);
+            derived.cyclic_shift_maximum       = source.cyclic_shift_maximum;
+          }
+        }
+        result.object = record;
+        break;
+      }
+      case telemetry_kind::ta_command: {
+        ta_command_metadata_v1 source;
+        if (metadata.size() != sizeof(source)) {
+          return {std::nullopt, "TA command metadata size mismatch"};
+        }
+        std::memcpy(&source, metadata.data(), sizeof(source));
+        ta_command_record record;
+        record.rnti       = source.rnti;
+        record.radio_slot = radio(source.radio_slot);
+        record.source     = source.source;
+        record.tag_id     = source.tag_id;
+        record.ta_command = source.ta_command;
+        result.object     = record;
         break;
       }
       case telemetry_kind::gnb_metrics_json: {

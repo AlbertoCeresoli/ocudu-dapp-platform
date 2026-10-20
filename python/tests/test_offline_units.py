@@ -795,5 +795,70 @@ class ClassCDecodeTests(unittest.TestCase):
         np.testing.assert_array_equal(result, np.array([1.5 - 0.5j, 2.0 + 3.0j], dtype=np.complex64))
 
 
+
+# ---------------------------------------------------------------------------
+# srs.config and ta.command
+# ---------------------------------------------------------------------------
+
+
+class SrsConfigAndTaCommandTests(unittest.TestCase):
+    codec = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.codec = ocudu_e3.load_codec()
+
+    def _indication(self, telemetry_id: int, obj) -> bytes:
+        zero = bytes(8)
+        return self.codec.encode(
+            "Telemetry-IndicationData",
+            {"telemetryId": telemetry_id, "cellId": 0, "sequence": zero, "routeEpoch": zero, "monotonicNs": zero,
+             "droppedObjects": zero, "object": obj},
+        )
+
+    def test_srs_config_indication(self):
+        resource = {"resourceId": 0, "nofPorts": 2, "combSize": 4, "combOffset": 1, "cyclicShift": 0,
+                    "startPosition": 0, "nofSymbols": 1, "repetitionFactor": 1, "freqDomainPosition": 0,
+                    "freqDomainShift": 5, "cSrs": 11, "bSrs": 0, "bHop": 0, "groupOrSequenceHopping": 0,
+                    "sequenceId": 1, "periodSlots": 20, "offsetSlots": 7, "bwpStartRb": 0, "bwpSizeRb": 51,
+                    "derived": {"startSymbol": 13, "sequenceLength": 120, "mappingInitialSubcarrier": 61,
+                                "sequenceGroup": 1, "sequenceNumber": 0, "cyclicShiftMaximum": 12}}
+        payload = self._indication(9, ("srsConfig", {"rnti": 0x4602, "event": 2, "configEpoch": 7, "ueIndex": 1,
+                                                     "numerology": 1, "nTaOffset": 25600, "resource": resource}))
+        indication = ocudu_e3.telemetry.decode_indication(self.codec, payload)
+        self.assertEqual(indication.stream, "srs.config")
+        record = indication.record
+        self.assertIsInstance(record, ocudu_e3.SrsConfigRecord)
+        self.assertEqual((record.rnti, record.event_name, record.config_epoch), (0x4602, "reconfigured", 7))
+        self.assertEqual((record.resource.period_slots, record.resource.offset_slots), (20, 7))
+        self.assertEqual(record.resource.derived.mapping_initial_subcarrier, 61)
+
+        removed = self._indication(9, ("srsConfig", {"rnti": 0x4602, "event": 4, "configEpoch": 8, "ueIndex": 1,
+                                                     "numerology": 1, "nTaOffset": 25600}))
+        self.assertIsNone(ocudu_e3.telemetry.decode_indication(self.codec, removed).record.resource)
+
+    def test_ta_command_indication(self):
+        payload = self._indication(10, ("taCommand", {"rnti": 0x4601, "radioSlot": {"sfn": 5, "slot": 3,
+                                                                                    "numerology": 1},
+                                                      "source": 1, "tagId": 0, "taCommand": 3846}))
+        indication = ocudu_e3.telemetry.decode_indication(self.codec, payload)
+        self.assertEqual(indication.stream, "ta.command")
+        self.assertEqual((indication.record.source_name, indication.record.ta_command), ("rar", 3846))
+
+    def test_store_publications(self):
+        from ocudu_e3.telemetry import _SRS_CONFIG, _TA_COMMAND, decode_store_publication
+
+        self.assertEqual(_HEADER.size + _SRS_CONFIG.size, 64)
+        self.assertEqual(_HEADER.size + _TA_COMMAND.size, 26)
+        body = _SRS_CONFIG.pack(0x4601, 1, 0x03, 3, 0, 1, 0, 2, 4, 0, 0, 0, 1, 1, 0, 11, 0, 0, 0,
+                                5, 1, 20, 7, 25600, 0, 51, 13, 12, 120, 60, 1, 0)
+        record = decode_store_publication(STORE_INTERFACES["srs.config"], _HEADER.pack(_MAGIC, 1, 7, 0) + body, b"\x01")
+        self.assertEqual((record.config_epoch, record.n_ta_offset), (3, 25600))
+        self.assertEqual(record.resource.derived.sequence_length, 120)
+        body = _TA_COMMAND.pack(0x4601, 5, 3, 1, 2, 0, 33)
+        record = decode_store_publication(STORE_INTERFACES["ta.command"], _HEADER.pack(_MAGIC, 1, 8, 0) + body, b"\x02")
+        self.assertEqual((record.source_name, record.ta_command, record.radio_slot.slot), ("mac_ce", 33, 3))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

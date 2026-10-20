@@ -330,6 +330,8 @@ telemetry identifiers:
 | 6 | `classc.spectrum` | Class-C spectrum snapshot (`OCC3` metadata + resource grid) | spectrum sensing observers |
 | 7 | `classc.srs_isac` | Class-C SRS-ISAC snapshot | ISAC observers |
 | 8 | `pusch.grid` | raw pre-equalization PUSCH resource grid (all Rx ports, DM-RS included) plus the grant parameters | offline CE/EQ research, recorders |
+| 9 | `srs.config` | SRS configuration per UE context (TS 38.331 SRS-Resource with period, offset and derived mapping), on every change plus a snapshot on subscribe, with a configuration epoch | SRS sharing between gNBs, positioning |
+| 10 | `ta.command` | timing advance commands sent to UEs: RAR T_A and every TA Command MAC CE | timing advance ledgers, positioning |
 
 Per-telemetry filters ride in `subscriptionData` (`Telemetry-SubscriptionConfig`):
 cell filter, `sampleEveryN`, drop policy (`coalesceLatest` by default so a slow

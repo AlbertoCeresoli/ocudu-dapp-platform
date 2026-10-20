@@ -29,6 +29,8 @@ TELEMETRY_IDS = {
     "classc.spectrum": 6,
     "classc.srs_isac": 7,
     "pusch.grid": 8,
+    "srs.config": 9,
+    "ta.command": 10,
 }
 TELEMETRY_NAMES = {value: key for key, value in TELEMETRY_IDS.items()}
 
@@ -42,6 +44,8 @@ STORE_INTERFACES = {
     "classc.spectrum": 0x00010001,
     "classc.srs_isac": 0x00010002,
     "pusch.grid": 0x00020006,
+    "srs.config": 0x00020007,
+    "ta.command": 0x00020008,
 }
 
 E3AP_DEFAULT_PORT = 36423

@@ -118,6 +118,8 @@ std::optional<e3ap_element_type> element_type_of(uint32_t interface_id) noexcept
       return e3ap_element_type::complex_fp32;
     case telemetry_kind::pusch_crc:
     case telemetry_kind::gnb_metrics_json:
+    case telemetry_kind::srs_config:
+    case telemetry_kind::ta_command:
       return e3ap_element_type::uint8;
   }
   return std::nullopt;
@@ -219,7 +221,9 @@ std::optional<uint16_t> record_rnti(uint32_t interface_id, ocudu::span<const uin
     case telemetry_kind::pusch_crc:
     case telemetry_kind::srs_channel:
     case telemetry_kind::pusch_dmrs_channel:
-    case telemetry_kind::pusch_grid: {
+    case telemetry_kind::pusch_grid:
+    case telemetry_kind::srs_config:
+    case telemetry_kind::ta_command: {
       // Every per-UE record places the RNTI directly after the common header.
       uint16_t rnti = 0;
       std::memcpy(&rnti, metadata.data() + sizeof(telemetry_metadata_header), sizeof(rnti));
@@ -265,6 +269,10 @@ uint32_t ocudu::dapp::e3::telemetry_queue_depth(uint16_t telemetry_id, uint32_t 
     case telemetry_id_gnb_metrics_json:
       // Reports are tens of KiB and periodic; two whole reports of up to 256 KiB.
       return 8;
+    case telemetry_id_srs_config:
+    case telemetry_id_ta_command:
+      // Small control-plane events; a snapshot replays one record per UE context.
+      return 16;
     default:
       return std::max<uint32_t>(1, large_object_depth);
   }

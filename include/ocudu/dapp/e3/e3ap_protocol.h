@@ -547,13 +547,67 @@ struct class_c_portable_record {
   std::vector<uint8_t> tensor;
 };
 
+/// Mapping of transmit port 0 derived from an SRS resource (TS 38.211 6.4.1.4).
+struct srs_derived_mapping {
+  uint8_t  start_symbol{};
+  uint16_t sequence_length{};
+  uint16_t mapping_initial_subcarrier{};
+  uint8_t  sequence_group{};
+  uint8_t  sequence_number{};
+  uint8_t  cyclic_shift_maximum{};
+};
+
+/// Periodic SRS-Resource of one UE context (TS 38.331).
+struct srs_resource_parameters {
+  uint8_t                            resource_id{};
+  uint8_t                            nof_ports{1};
+  uint8_t                            comb_size{2};
+  uint8_t                            comb_offset{};
+  uint8_t                            cyclic_shift{};
+  uint8_t                            start_position{};
+  uint8_t                            nof_symbols{1};
+  uint8_t                            repetition_factor{1};
+  uint8_t                            freq_domain_position{};
+  uint16_t                           freq_domain_shift{};
+  uint8_t                            c_srs{};
+  uint8_t                            b_srs{};
+  uint8_t                            b_hop{};
+  uint8_t                            group_or_sequence_hopping{};
+  uint16_t                           sequence_id{};
+  uint16_t                           period_slots{1};
+  uint16_t                           offset_slots{};
+  uint16_t                           bwp_start_rb{};
+  uint16_t                           bwp_size_rb{1};
+  std::optional<srs_derived_mapping> derived;
+};
+
+struct srs_config_record {
+  uint16_t                               rnti{};
+  uint8_t                                event{1};
+  uint32_t                               config_epoch{};
+  uint16_t                               ue_index{};
+  uint8_t                                numerology{};
+  uint16_t                               n_ta_offset{};
+  std::optional<srs_resource_parameters> resource;
+};
+
+struct ta_command_record {
+  uint16_t                   rnti{};
+  telemetry_radio_slot_value radio_slot{};
+  uint8_t                    source{1};
+  uint8_t                    tag_id{};
+  uint16_t                   ta_command{};
+};
+
 using telemetry_object = std::variant<pusch_symbols_record,
                                       pusch_crc_record,
                                       srs_channel_record,
                                       pusch_dmrs_channel_record,
                                       gnb_metrics_json_record,
                                       class_c_portable_record,
-                                      pusch_grid_record>;
+                                      pusch_grid_record,
+                                      srs_config_record,
+                                      ta_command_record>;
 
 struct telemetry_indication {
   uint16_t         telemetry_id{};
@@ -586,6 +640,8 @@ constexpr uint16_t telemetry_id_gnb_metrics_json   = 5;
 constexpr uint16_t telemetry_id_class_c_spectrum   = 6;
 constexpr uint16_t telemetry_id_class_c_srs_isac   = 7;
 constexpr uint16_t telemetry_id_pusch_grid         = 8;
+constexpr uint16_t telemetry_id_srs_config         = 9;
+constexpr uint16_t telemetry_id_ta_command         = 10;
 
 std::optional<uint32_t> telemetry_interface_for(uint16_t telemetry_id) noexcept;
 std::optional<uint16_t> telemetry_id_for(uint32_t interface_id) noexcept;
