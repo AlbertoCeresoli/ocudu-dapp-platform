@@ -182,6 +182,8 @@ if (OCUDU_DAPP_CLASS_C_METADATA)
   target_sources(dapp_runtime_test PRIVATE
     class_c_metadata_test.cpp
     class_c_publication_encoder_test.cpp)
+  # [srs-sharing] FLATBUFFERS_INCLUDE_DIR added: the generated headers include flatbuffers/flatbuffers.h, which is not
+  # on a default include path when FlatBuffers is built under a custom prefix (.local/ in this workspace).
   target_include_directories(dapp_runtime_test PRIVATE ${PROJECT_BINARY_DIR}/lib/dapp/generated ${FLATBUFFERS_INCLUDE_DIR})
 endif ()
 target_link_libraries(dapp_runtime_test

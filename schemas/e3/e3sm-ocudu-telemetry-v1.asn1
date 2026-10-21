@@ -222,6 +222,9 @@ PuschDmrsChannelRecord ::= SEQUENCE {
   ...
 }
 
+-- [srs-sharing] SrsResourceParameters, SrsDerivedMapping, SrsConfigRecord and TaCommandRecord are not in the upstream
+-- service model; they carry the srs.config (id 9) and ta.command (id 10) streams. Two copies of this file exist
+-- (schemas/e3/ and python/ocudu_e3/schema/): keep them identical.
 -- Periodic SRS-Resource of one UE context (TS 38.331 field meanings).
 SrsResourceParameters ::= SEQUENCE {
   resourceId             INTEGER (0..63),
@@ -311,6 +314,8 @@ Telemetry-Object ::= CHOICE {
   -- decoders do not implement, and grid captures are routinely larger.
   puschGrid        PuschGridRecord,
   ...,
+  -- [srs-sharing] Added after the extension marker, not in the root: the encoding of every existing alternative is
+  -- unchanged, so peers built from the upstream schema still decode all other objects.
   srsConfig        SrsConfigRecord,
   taCommand        TaCommandRecord
 }

@@ -39,6 +39,14 @@ make_scheduler_ue_reconfiguration_request(const mac_ue_reconfiguration_request& 
   return ret;
 }
 
+// [srs-sharing] srs.config producer helpers (not in upstream OCUDU).
+//
+// The record describes the first periodic SRS resource set, the one the DU configures for UL channel sounding;
+// aperiodic and semi-persistent sets are not reported. The record carries both the TS 38.331 parameters (what an RRC
+// message would relay) and the TS 38.211 mapping they derive to (what an estimator needs: k0, M, u, v), computed with
+// the PHY's own get_srs_information() so that the neighbour uses bit-exactly the same pilot positions and sequence as
+// the serving gNB.
+
 /// First resource of the first periodic SRS resource set of a UE cell configuration, if any.
 static const srs_config::srs_resource* find_periodic_srs_resource(const ue_cell_config& cell)
 {
@@ -84,6 +92,7 @@ static void fill_srs_resource(scheduler_dapp_srs_config_event& event,
   event.sequence_id               = res.sequence_id;
   event.period_slots              = static_cast<uint16_t>(res.periodicity_and_offset->period);
   event.offset_slots              = res.periodicity_and_offset->offset;
+  // startPosition counts symbols from the end of the slot (TS 38.331): l0 = N_symb^slot - 1 - startPosition.
   event.start_symbol              = static_cast<uint8_t>(nof_symbols_per_slot - res.res_mapping.start_pos - 1);
 
   // get_srs_information() asserts on hopping and on an invalid (C_SRS, B_SRS) pair: check both first.
@@ -108,6 +117,8 @@ static void fill_srs_resource(scheduler_dapp_srs_config_event& event,
   if (not phy_res.is_valid()) {
     return;
   }
+  // Port 0 only: the other ports share k0 and the base sequence and differ by their cyclic shift, which a consumer
+  // derives from cyclic_shift, cyclic_shift_maximum and nof_ports (TS 38.211 6.4.1.4.2).
   const srs_information info       = get_srs_information(phy_res, 0);
   event.derived_valid              = true;
   event.cyclic_shift_maximum       = static_cast<uint8_t>(info.n_cs_max);
@@ -117,6 +128,9 @@ static void fill_srs_resource(scheduler_dapp_srs_config_event& event,
   event.sequence_number            = static_cast<uint16_t>(info.sequence_number);
 }
 
+// [srs-sharing] Builds one srs.config event and hands it to the dApp hooks. Runs on the DU control executor. Cell-level
+// fields (numerology, N_TA,offset, BWP) come from the cache filled in add_cell(); the epoch is assigned later by the
+// telemetry publisher.
 void ocudu_scheduler_adapter::publish_dapp_srs_config(scheduler_dapp_srs_config_event::kind event,
                                                       du_ue_index_t                         ue_index,
                                                       du_cell_index_t                       cell_index,
@@ -178,6 +192,7 @@ void ocudu_scheduler_adapter::add_cell(const mac_scheduler_cell_creation_request
   // Setup UCI decoder for new cell.
   cell_handlers.emplace(msg.cell_params.cell_index, *this, msg.cell_params.sched_req);
 
+  // [srs-sharing] Cache the cell parameters every srs.config event of this cell carries.
   if (msg.cell_params.cell_index < MAX_NOF_DU_CELLS) {
     const ran_cell_config&   ran = msg.cell_params.sched_req.ran;
     const bwp_configuration& bwp = ran.ul_cfg_common.init_ul_bwp.generic_params;
@@ -232,6 +247,7 @@ async_task<bool> ocudu_scheduler_adapter::handle_ue_creation_request(const mac_u
     CORO_AWAIT_VALUE(bool res, sched_cfg_notif_map[msg.ue_index].ue_config_ready);
     sched_cfg_notif_map[msg.ue_index].ue_config_ready.reset();
 
+    // [srs-sharing] Reported once the scheduler has accepted the context, so the RNTI and resource are final.
     if (res) {
       publish_dapp_srs_config(
           scheduler_dapp_srs_config_event::kind::created, msg.ue_index, msg.cell_index, msg.crnti, &msg.sched_cfg);
@@ -253,6 +269,8 @@ async_task<bool> ocudu_scheduler_adapter::handle_ue_reconfiguration_request(cons
     CORO_AWAIT(sched_cfg_notif_map[msg.ue_index].ue_config_ready);
     sched_cfg_notif_map[msg.ue_index].ue_config_ready.reset();
 
+    // [srs-sharing] Only a reconfiguration that carries cell configuration can change the SRS resource; otherwise the
+    // last configuration is repeated (cfg = nullptr) and the publisher keeps the epoch.
     if (msg.ue_index < MAX_NOF_DU_UES and dapp_ue_srs[msg.ue_index].has_value()) {
       publish_dapp_srs_config(scheduler_dapp_srs_config_event::kind::reconfigured,
                               msg.ue_index,
@@ -287,6 +305,7 @@ async_task<void> ocudu_scheduler_adapter::handle_ue_removal_request(const mac_ue
     CORO_AWAIT(sched_cfg_notif_map[msg.ue_index].ue_config_ready);
     sched_cfg_notif_map[msg.ue_index].ue_config_ready.reset();
 
+    // [srs-sharing] Tell consumers the resource is free: a neighbour must stop looking for this UE's SRS.
     publish_dapp_srs_config(
         scheduler_dapp_srs_config_event::kind::removed, msg.ue_index, msg.cell_index, msg.rnti, nullptr);
 
@@ -309,6 +328,8 @@ void ocudu_scheduler_adapter::handle_ue_config_applied(du_ue_index_t ue_index)
   // Notify scheduler that the UE confirmed the configuration.
   sched_impl->handle_ue_config_applied(ue_index);
 
+  // [srs-sharing] The UE confirmed the pending configuration (RRCReconfigurationComplete): from this point it transmits
+  // SRS with the last reported resource. This is the event a neighbour should switch on.
   if (ue_index < MAX_NOF_DU_UES and dapp_ue_srs[ue_index].has_value()) {
     const scheduler_dapp_srs_config_event& last = *dapp_ue_srs[ue_index];
     publish_dapp_srs_config(scheduler_dapp_srs_config_event::kind::applied,

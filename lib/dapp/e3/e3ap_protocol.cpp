@@ -160,6 +160,8 @@ std::vector<telemetry_stream_record> ocudu::dapp::e3::default_telemetry_streams(
        telemetry_stream_pusch_grid,
        100'000,
        {}},
+      // [srs-sharing] Catalog entries advertised in the E3 setup response. Both are event streams: no rate floor
+      // (minimum_interval_us unset) because every record matters, and not Class C portable objects.
       {telemetry_id_srs_config,
        "srs.config",
        "SRS configuration per UE context (TS 38.331 SRS-Resource, period, offset, epoch) on every change",

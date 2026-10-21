@@ -647,6 +647,7 @@ TEST(dapp_e3ap_sctp_server, completes_setup_and_advertises_ran_functions)
   ASSERT_EQ(client.last_setup.ran_functions.size(), 2U);
   const auto& telemetry = client.last_setup.ran_functions[0];
   EXPECT_EQ(telemetry.ran_function_identifier, e3ap_ran_function_telemetry);
+  // [srs-sharing] 8 upstream streams + srs.config + ta.command.
   EXPECT_EQ(telemetry.telemetry_identifiers.size(), 10U);
   auto catalog = e3ap_codec::decode_telemetry_function(telemetry.ran_function_data);
   ASSERT_TRUE(catalog) << catalog.detail;

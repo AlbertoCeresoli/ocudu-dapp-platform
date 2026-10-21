@@ -801,6 +801,7 @@ class ClassCDecodeTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+# [srs-sharing] srs.config / ta.command decoding on the APER push path and the packed pull path.
 class SrsConfigAndTaCommandTests(unittest.TestCase):
     codec = None
 

@@ -75,6 +75,11 @@ public:
   virtual void publish(uint32_t cell_id, slot_point slot, const ul_sched_result& result) noexcept = 0;
 };
 
+// [srs-sharing] UE events for the srs.config and ta.command streams. They travel on scheduler_dapp_hook_provider
+// because it is the one dApp object that both producers already hold: the MAC scheduler adapter (UE configurations,
+// control executor) and the MAC cell processor (DL results, slot thread) both receive it through
+// ocudu_mac_sched_config::dapp_hooks. Reusing it adds no new dependency to the MAC. The provider forwards the events to
+// a scheduler_dapp_ue_event_sink, implemented by ue_event_bridge in apps/services/dapp/dapp_service.cpp.
 /// SRS configuration of one UE context, as the MAC hands it to the scheduler (TS 38.331 SRS-Resource of the first
 /// periodic resource set, plus the TS 38.211 mapping it derives to for transmit port 0).
 struct scheduler_dapp_srs_config_event {
@@ -151,6 +156,7 @@ public:
   virtual std::unique_ptr<scheduler_policy> decorate_scheduler_policy(std::unique_ptr<scheduler_policy> fallback,
                                                                       scheduler_dapp_policy_context     context) = 0;
   virtual void                              publish_ul_plan(uint32_t, slot_point, const ul_sched_result&) noexcept {}
+  // [srs-sharing] No-op defaults: providers that do not care about UE events (and test doubles) are unchanged.
   virtual void publish_srs_config(const scheduler_dapp_srs_config_event&) noexcept {}
   virtual bool ta_commands_active() noexcept { return false; }
   virtual void publish_ta_command(slot_point, const scheduler_dapp_ta_command_event&) noexcept {}
@@ -177,7 +183,7 @@ std::shared_ptr<scheduler_dapp_hook_provider> create_scheduler_dapp_hook_provide
     std::shared_ptr<quiet_reservation_manager>         reservations = {},
     std::shared_ptr<scheduler_dapp_ul_plan_sink>       plan_sink    = {},
     scheduler_dapp_policy_mode                         mode = scheduler_dapp_policy_mode::authoritative,
-    std::shared_ptr<scheduler_dapp_ue_event_sink>      ue_events = {}) noexcept;
+    std::shared_ptr<scheduler_dapp_ue_event_sink>      ue_events = {}) noexcept; // [srs-sharing] optional sink.
 
 /// Adapts an activated native hook point to the scheduler target.
 std::shared_ptr<scheduler_dapp_target>

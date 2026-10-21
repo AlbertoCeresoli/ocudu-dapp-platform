@@ -75,6 +75,8 @@ public:
   /// Constant-time gate used by producers that hold a JSON report.
   bool metrics_json_active() const noexcept;
 
+  // [srs-sharing] Producers of the srs.config and ta.command streams. They are fed by ue_event_bridge in
+  // apps/services/dapp/dapp_service.cpp, which receives the events from the MAC through the scheduler dApp hooks.
   /// Publishes the SRS configuration of one UE context. Control path: may allocate and lock. The publisher assigns
   /// \c config_epoch (it advances when a context is created or removed, or its configuration changes) and keeps the
   /// latest record per cell and RNTI, which \ref poll_srs_config_snapshot replays to new subscribers.

@@ -494,6 +494,11 @@ private:
   std::vector<std::shared_ptr<dapp_process_package_factory>> process_factories;
 };
 
+// [srs-sharing] Glue between the MAC-side UE events and the E3 telemetry publisher (not in upstream). The bridge
+// exists before the publisher: the hook topology, and with it the scheduler, is built first, the E3 server later. The
+// publisher pointer is therefore attached afterwards and read atomically. Events before attach() are dropped; none
+// occur in practice, since the service is created during gNB start-up, before any UE can attach.
+// Converting to the packed srs_config_metadata_v1 happens here so that the scheduler library stays free of E3 types.
 /// Forwards UE-context SRS configurations and timing advance commands from the scheduler hooks to the E3 telemetry
 /// publisher, once one is attached (the publisher is created after the hook topology).
 class ue_event_bridge final : public scheduler_dapp_ue_event_sink
@@ -555,6 +560,8 @@ public:
 #endif
   }
 
+  // Called by the MAC once per cell and slot. Besides gating the TA scan, it is the per-slot tick that drives the
+  // srs.config snapshot replay, so no extra timer or thread is needed for it.
   bool ta_commands_active() noexcept override
   {
 #ifdef OCUDU_DAPP_APP_SERVICE_SCTP_E3
@@ -1148,7 +1155,7 @@ struct dapp_service::implementation {
   std::shared_ptr<scheduler_dapp_interference_cache>         interference;
   std::shared_ptr<quiet_reservation_manager>                 reservations;
   std::shared_ptr<ul_plan_broker>                            ul_plans;
-  std::shared_ptr<ue_event_bridge>                           ue_events;
+  std::shared_ptr<ue_event_bridge>                           ue_events; // [srs-sharing]
   std::shared_ptr<prepared_output_broker>                    output_broker;
   std::unique_ptr<dapp::instance_manager>                    manager;
   std::vector<std::shared_ptr<dapp_process_package_factory>> process_factories;
@@ -1773,6 +1780,7 @@ dapp_service_create_result dapp_service::create(dapp_service_config config) noex
         return {{}, std::move(created.second)};
       }
       service->telemetry = std::move(created.first);
+      // [srs-sharing] From here on srs.config / ta.command events reach E3 subscribers.
       service->ue_events->attach(service->telemetry);
       struct telemetry_json_adapter final : dapp_metrics_json_sink {
         explicit telemetry_json_adapter(std::shared_ptr<dapp::e3::telemetry_publisher> publisher_) :

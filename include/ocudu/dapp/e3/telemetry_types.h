@@ -22,9 +22,16 @@ constexpr uint32_t telemetry_stream_srs_channel        = 0x00020003;
 constexpr uint32_t telemetry_stream_pusch_dmrs_channel = 0x00020004;
 constexpr uint32_t telemetry_stream_gnb_metrics_json   = 0x00020005;
 constexpr uint32_t telemetry_stream_pusch_grid         = 0x00020006;
+// [srs-sharing] The two streams below are not in the upstream platform. srs.config tells a dApp which periodic SRS
+// resource every UE context of this cell uses; ta.command relays every timing advance command sent to a UE. Together
+// they are what a neighbour gNB needs to find this cell's UE SRS in its own grid and to time-align it: dApp A reads
+// them and reports them to the xApp, which relays them to dApp B.
 constexpr uint32_t telemetry_stream_srs_config         = 0x00020007;
 constexpr uint32_t telemetry_stream_ta_command         = 0x00020008;
 /// Highest telemetry stream identifier: per-stream tables are sized from it.
+/// [srs-sharing] Upstream bounded the stream range (here and in portable_data_store.cpp) by
+/// telemetry_stream_pusch_grid, so any newer stream id wrote past the end of the store tables. Always point this at
+/// the last stream.
 constexpr uint32_t telemetry_stream_last = telemetry_stream_ta_command;
 
 constexpr bool is_telemetry_stream(uint32_t interface_id) noexcept
@@ -40,8 +47,8 @@ enum class telemetry_kind : uint16_t {
   pusch_dmrs_channel = 4,
   gnb_metrics_json   = 5,
   pusch_grid         = 6,
-  srs_config         = 7,
-  ta_command         = 8,
+  srs_config         = 7, ///< [srs-sharing] srs_config_metadata_v1.
+  ta_command         = 8, ///< [srs-sharing] ta_command_metadata_v1.
 };
 
 constexpr std::optional<telemetry_kind> telemetry_kind_of(uint32_t interface_id) noexcept
@@ -263,9 +270,18 @@ struct pusch_dmrs_channel_metadata_v1 {
   float                     target_code_rate{};  ///< Normalized target code rate R (0..1).
 };
 
+/// [srs-sharing] Lifecycle of a UE context's SRS configuration, as seen by the MAC scheduler adapter:
+///  - created: the DU created the UE context (after Msg3); the UE does not transmit SRS yet.
+///  - reconfigured: an RRC reconfiguration carrying a new cell configuration went to the UE; the resource may change.
+///  - applied: the UE confirmed the configuration (RRCReconfigurationComplete); from here on it transmits with it.
+///  - removed: the context was released; its resource may be reused by another UE.
+///  - snapshot: not a change, a replay of the cached state for a subscriber that joined late.
 /// Event of an SRS configuration record.
 enum class srs_config_event : uint8_t { created = 1, reconfigured = 2, applied = 3, removed = 4, snapshot = 5 };
 
+/// [srs-sharing] Packed form written to the portable data store. The E3 server converts it to the APER SrsConfigRecord
+/// in e3ap_codec::from_publication; the Python pull-path decoder (_SRS_CONFIG in python/ocudu_e3/telemetry.py) unpacks
+/// it byte by byte, so any layout change must be mirrored there. config_epoch is filled by the publisher, not the MAC.
 /// SRS configuration of one UE context as set by the DU: the periodic SRS-Resource of TS 38.331 plus the mapping it
 /// derives to (TS 38.211 6.4.1.4, transmit port 0). Published on every change and replayed to new subscribers, so a
 /// consumer always learns the current configuration. The tensor is one byte, a copy of \c event.
@@ -314,6 +330,10 @@ struct srs_config_metadata_v1 {
 /// Source of a timing advance command record.
 enum class ta_command_source : uint8_t { random_access_response = 1, mac_ce = 2 };
 
+/// [srs-sharing] Packed form of a ta.command record (mirrored by _TA_COMMAND in python/ocudu_e3/telemetry.py). The RAR
+/// T_A is absolute (N_TA = T_A * 16 * 64 / 2^mu T_c) and the MAC CE T_A is relative (N_TA += (T_A - 31) * 16 * 64 /
+/// 2^mu T_c): a consumer rebuilds the UE's current timing advance by accumulating them per RNTI (tools/ue_events.py
+/// and the RUN-O-RAN TA ledger).
 /// One timing advance command sent to a UE (TS 38.321 6.1.3.4 and 6.2.3): the RAR's 12-bit T_A (0..3846) or a MAC
 /// CE's 6-bit T_A (0..63, 31 = no change). radio_slot is the PDSCH slot carrying it. The tensor is one byte, a copy of
 /// \c source.
@@ -347,6 +367,7 @@ static_assert(sizeof(srs_channel_metadata_v1) == 66);
 static_assert(sizeof(srs_channel_metadata_v2) == 70);
 static_assert(sizeof(pusch_dmrs_channel_metadata_v1) == 70);
 static_assert(sizeof(gnb_metrics_json_metadata_v1) == 16);
+// [srs-sharing] Pinned: the Python pull-path decoder relies on these sizes.
 static_assert(sizeof(srs_config_metadata_v1) == 64);
 static_assert(sizeof(ta_command_metadata_v1) == 26);
 

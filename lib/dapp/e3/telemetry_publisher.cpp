@@ -222,6 +222,10 @@ struct telemetry_publisher::implementation {
   std::atomic<uint64_t>                                                          oversized{0};
   std::atomic<uint64_t>                                                          invalid{0};
 
+  // [srs-sharing] srs.config is the only stateful stream. Every other stream is fire-and-forget, but a config is
+  // published once per change, so a dApp that subscribes later (or restarts) would otherwise never learn the contexts
+  // that already exist. The publisher therefore caches the latest config per UE context, replays it to new
+  // subscribers, and numbers changes with an epoch that dApp B uses to drop a superseded config.
   /// Latest SRS configuration per (cell << 16 | RNTI), with its cell; guarded by srs_config_mutex.
   std::map<uint32_t, std::pair<uint16_t, srs_config_metadata_v1>> srs_configs;
   uint32_t                                                        srs_config_epoch{0};
@@ -502,6 +506,9 @@ bool telemetry_publisher::metrics_json_active() const noexcept
 
 namespace {
 
+/// [srs-sharing] Decides whether a reconfigured/applied event really changed the configuration. The record is packed
+/// (#pragma pack(1), size pinned in telemetry_types.h), so memcmp sees no padding bytes. The bytes compared start at
+/// numerology: rnti, event, epoch and ue_index differ legitimately between two events of the same configuration.
 /// Configuration part of an SRS configuration record: everything after the event, epoch and UE index.
 bool same_srs_config(const srs_config_metadata_v1& lhs, const srs_config_metadata_v1& rhs) noexcept
 {
@@ -516,6 +523,8 @@ bool same_srs_config(const srs_config_metadata_v1& lhs, const srs_config_metadat
 void telemetry_publisher::publish_srs_config(uint16_t cell_id, srs_config_metadata_v1 record) noexcept
 {
   try {
+    // [srs-sharing] Runs on the DU control executor (UE creation/reconfiguration/removal), never on the slot thread,
+    // so it may lock and allocate. The slot thread only touches the cache through try_lock in the snapshot poll.
     std::lock_guard<std::mutex> lock(state->srs_config_mutex);
     const uint32_t              key   = (static_cast<uint32_t>(cell_id) << 16U) | record.rnti;
     auto                        entry = state->srs_configs.find(key);
@@ -523,6 +532,9 @@ void telemetry_publisher::publish_srs_config(uint16_t cell_id, srs_config_metada
     const bool                  changed =
         event == srs_config_event::created || event == srs_config_event::removed || entry == state->srs_configs.end() ||
         !same_srs_config(entry->second.second, record);
+    // Epoch rule: a context appearing or disappearing always advances it; reconfigured/applied advance it only if the
+    // bytes differ, so the "applied" that confirms an already reported configuration keeps the same epoch (seen live:
+    // an unchanged reconfiguration keeps the epoch, the one that moves the UE from 1 to 2 SRS ports advances it).
     if (changed) {
       ++state->srs_config_epoch;
     }
@@ -534,6 +546,8 @@ void telemetry_publisher::publish_srs_config(uint16_t cell_id, srs_config_metada
     } else {
       state->srs_configs[key] = {cell_id, record};
     }
+    // The cache above is updated even without subscribers, so a later snapshot is complete. The one-byte tensor (a copy
+    // of the event) exists only because the data store rejects empty tensors.
     if (state->config.store->has_active(telemetry_stream_srs_config)) {
       state->publish(telemetry_stream_srs_config, cell_id, record, &record.event, 1);
     }
@@ -542,6 +556,13 @@ void telemetry_publisher::publish_srs_config(uint16_t cell_id, srs_config_metada
   }
 }
 
+// [srs-sharing] Called on every slot by the MAC cell processor (through ue_event_bridge::ta_commands_active), so the
+// common case must cost two atomic loads. When the subscriber count of srs.config grows, every cached config is
+// published again with event = snapshot. Existing subscribers also see the replay; it repeats records they already
+// have, with the same epochs, so it is harmless for them. If the control path holds the mutex, try_lock fails and the
+// replay waits for the next slot instead of blocking the slot thread. Consumers must subscribe with
+// dropOldest/dropNewest: the default coalesceLatest keeps only the last record and would merge the snapshot of several
+// contexts into one.
 void telemetry_publisher::poll_srs_config_snapshot() noexcept
 {
   const uint32_t subscribers = state->config.store->demand(telemetry_stream_srs_config).active;
@@ -564,6 +585,7 @@ void telemetry_publisher::poll_srs_config_snapshot() noexcept
   }
 }
 
+// [srs-sharing] Slot path: no lock, no allocation. The one-byte tensor is a copy of the source (RAR or MAC CE).
 void telemetry_publisher::publish_ta_command(uint16_t cell_id, const ta_command_metadata_v1& record) noexcept
 {
   ta_command_metadata_v1 copy = record;

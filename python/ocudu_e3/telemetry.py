@@ -243,6 +243,11 @@ class ClassCPortableRecord:
     tensor: bytes = field(repr=False)
 
 
+# [srs-sharing] Records of the srs.config and ta.command streams (not in the upstream client). They mirror
+# SrsConfigRecord / TaCommandRecord of e3sm-ocudu-telemetry-v1.asn1. Subscribe with drop_policy="dropOldest" (or
+# "dropNewest"): the default coalesceLatest keeps only the newest record and merges the events of different UEs.
+
+
 @dataclass
 class SrsDerivedMapping:
     """Mapping of transmit port 0 derived from an SRS resource (TS 38.211 6.4.1.4)."""
@@ -458,7 +463,7 @@ def _record_from_asn(kind: str, body: dict) -> TelemetryRecord:
         return GnbMetricsJsonRecord(json_bytes=body["json"])
     if kind == "classCPortable":
         return ClassCPortableRecord(interface_id=body["interfaceId"], metadata=body.get("metadata", b""), tensor=body["tensor"])
-    if kind == "srsConfig":
+    if kind == "srsConfig":  # [srs-sharing] APER push path
         resource = None
         if "resource" in body:
             r = body["resource"]
@@ -628,7 +633,9 @@ _INTERFACE_TO_KIND = {
     STORE_INTERFACES["ta.command"]: 8,
 }
 
-# srs_config_metadata_v1 and ta_command_metadata_v1 after the header.
+# [srs-sharing] srs_config_metadata_v1 and ta_command_metadata_v1 after the header (pull path,
+# decode_store_publication).
+# Must match the packed structs in include/ocudu/dapp/e3/telemetry_types.h field by field.
 _SRS_CONFIG = struct.Struct("<HBBIH" + "14B" + "7H" + "BB" + "4H")
 _TA_COMMAND = struct.Struct("<H" + "HBB" + "BBH")
 
@@ -695,7 +702,7 @@ def decode_store_publication(interface_id: int, metadata: bytes, tensor: bytes) 
             grant=_grant_from_packed(body, _GRID.size),
             resource_elements=tensor,
         )
-    if kind == 7:
+    if kind == 7:  # [srs-sharing] srs.config; flags bit0 = resource present, bit1 = derived mapping valid
         f = _SRS_CONFIG.unpack(body)
         rnti, event, flags, epoch, ue_index = f[0:5]
         (numerology, resource_id, nof_ports, comb_size, comb_offset, cyclic_shift, start_position, nof_symbols,
@@ -711,7 +718,7 @@ def decode_store_publication(interface_id: int, metadata: bytes, tensor: bytes) 
                 SrsDerivedMapping(start_symbol, sequence_length, k0, group, number, cs_max) if flags & 0x02 else None,
             )
         return SrsConfigRecord(rnti, event, epoch, ue_index, numerology, n_ta_offset, resource)
-    if kind == 8:
+    if kind == 8:  # [srs-sharing] ta.command
         f = _TA_COMMAND.unpack(body)
         return TaCommandRecord(rnti=f[0], radio_slot=RadioSlot(*f[1:4]), source=f[4], tag_id=f[5], ta_command=f[6])
     if kind == 2:

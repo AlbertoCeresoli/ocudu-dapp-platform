@@ -82,8 +82,8 @@ private:
   /// Update DL buffer states of the allocated DL bearers.
   void update_logical_channel_dl_buffer_states(const dl_sched_result& dl_res);
 
-  /// Reports the timing advance commands of a committed DL result (RAR T_A and new TA Command MAC CEs) to the dApp
-  /// hooks.
+  /// [srs-sharing] Reports the timing advance commands of a committed DL result (RAR T_A and new TA Command MAC CEs)
+  /// to the dApp hooks.
   void publish_dapp_ta_commands(slot_point sl_tx, const dl_sched_result& dl_res);
 
   void write_tx_pdu_pcap(slot_point sl_tx, const sched_result& sl_res, const mac_dl_data_result& dl_res);

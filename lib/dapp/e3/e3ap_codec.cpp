@@ -555,6 +555,8 @@ pusch_dmrs_channel_record read_object(const PuschDmrsChannelRecord_t& source)
   return result;
 }
 
+// [srs-sharing] APER encode/decode of the srs.config and ta.command records. Every field goes through read_ranged with
+// the ASN.1 bounds, so a corrupt record fails the encode here instead of producing an undecodable indication.
 void set_object(Telemetry_Object_t& destination, const srs_config_record& source)
 {
   auto& record        = *(destination.choice.srsConfig = make_asn<SrsConfigRecord_t>());
@@ -760,7 +762,7 @@ telemetry_indication read_indication(const Telemetry_IndicationData_t& source)
     case Telemetry_Object_PR_puschGrid:
       result.object = read_object(*object.choice.puschGrid);
       break;
-    case Telemetry_Object_PR_srsConfig:
+    case Telemetry_Object_PR_srsConfig: // [srs-sharing]
       result.object = read_object(*object.choice.srsConfig);
       break;
     case Telemetry_Object_PR_taCommand:
@@ -1295,6 +1297,8 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
         result.object = std::move(record);
         break;
       }
+      // [srs-sharing] Packed store record -> APER record. flags bit0 = periodic resource present, bit1 = derived
+      // TS 38.211 mapping valid (no hopping); the corresponding optional blocks are left out otherwise.
       case telemetry_kind::srs_config: {
         srs_config_metadata_v1 source;
         if (metadata.size() != sizeof(source)) {

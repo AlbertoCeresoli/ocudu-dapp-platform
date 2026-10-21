@@ -974,6 +974,7 @@ public:
     }
   }
 
+  // [srs-sharing] Pass-through to the UE event sink; without one, the TA gate stays closed and the MAC skips its scan.
   void publish_srs_config(const scheduler_dapp_srs_config_event& event) noexcept override
   {
     if (ue_events) {

@@ -547,6 +547,10 @@ struct class_c_portable_record {
   std::vector<uint8_t> tensor;
 };
 
+// [srs-sharing] Wire-side (APER) form of the srs.config and ta.command streams, built from the packed
+// srs_config_metadata_v1 / ta_command_metadata_v1 by e3ap_codec::from_publication. Field names follow TS 38.331
+// (SRS-Resource) so that the dApp A -> xApp -> dApp B relay can carry them unchanged. The optionals mirror the flags
+// byte of the packed record: no resource when the context has no periodic SRS, no derived mapping with hopping.
 /// Mapping of transmit port 0 derived from an SRS resource (TS 38.211 6.4.1.4).
 struct srs_derived_mapping {
   uint8_t  start_symbol{};
@@ -606,8 +610,8 @@ using telemetry_object = std::variant<pusch_symbols_record,
                                       gnb_metrics_json_record,
                                       class_c_portable_record,
                                       pusch_grid_record,
-                                      srs_config_record,
-                                      ta_command_record>;
+                                      srs_config_record,  // [srs-sharing]
+                                      ta_command_record>; // [srs-sharing]
 
 struct telemetry_indication {
   uint16_t         telemetry_id{};
@@ -640,6 +644,7 @@ constexpr uint16_t telemetry_id_gnb_metrics_json   = 5;
 constexpr uint16_t telemetry_id_class_c_spectrum   = 6;
 constexpr uint16_t telemetry_id_class_c_srs_isac   = 7;
 constexpr uint16_t telemetry_id_pusch_grid         = 8;
+// [srs-sharing] E3 telemetry ids of the two streams added for the SRS-sharing loop.
 constexpr uint16_t telemetry_id_srs_config         = 9;
 constexpr uint16_t telemetry_id_ta_command         = 10;
 

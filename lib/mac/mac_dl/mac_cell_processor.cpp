@@ -418,6 +418,7 @@ void mac_cell_processor::handle_slot_indication_impl(slot_point_extended      sl
   // Update DL buffer state for the allocated logical channels.
   update_logical_channel_dl_buffer_states(sl_res.dl);
 
+  // [srs-sharing] After the critical path: the slot results are already with the PHY, so the TA scan adds no latency.
   if (dapp_hooks) {
     publish_dapp_ta_commands(sl_tx, sl_res.dl);
   }
@@ -535,6 +536,10 @@ void mac_cell_processor::assemble_dl_data_request(mac_dl_data_result&    data_re
   }
 }
 
+// [srs-sharing] ta.command producer (not in upstream OCUDU). The DL result is the only place where every TA command
+// is visible once: the RAR grant's 12-bit T_A (absolute, addressed by TC-RNTI, which becomes the C-RNTI after
+// contention resolution) and each Timing Advance Command MAC CE (6-bit, relative, 31 = no change). A neighbour that
+// accumulates them knows the UE's transmit timing and can centre its delay window on it instead of searching blind.
 void mac_cell_processor::publish_dapp_ta_commands(slot_point sl_tx, const dl_sched_result& dl_res)
 {
   // The gate runs every slot: it also lets the hooks replay state to new subscribers.
@@ -554,7 +559,8 @@ void mac_cell_processor::publish_dapp_ta_commands(slot_point sl_tx, const dl_sch
     }
   }
 
-  // A retransmission repeats a TB whose TA command was already reported.
+  // A retransmission repeats a TB whose TA command was already reported: only new-data TBs count, otherwise a HARQ
+  // retransmission would be accumulated twice.
   event.source = scheduler_dapp_ta_command_event::kind::mac_ce;
   for (const dl_msg_alloc& grant : dl_res.ue_grants) {
     for (unsigned i_tb = 0; i_tb != grant.tb_list.size(); ++i_tb) {

@@ -185,6 +185,9 @@ private:
   /// Handler for each DU cell.
   slotted_id_table<du_cell_index_t, cell_handler, MAX_NOF_DU_CELLS> cell_handlers;
 
+  // [srs-sharing] srs.config producer. The adapter sees every UE configuration on its way from the DU manager to the
+  // scheduler (creation, reconfiguration, removal, and the UE's confirmation), which is exactly the lifecycle a
+  // neighbour needs to follow. Upstream only forward-declared scheduler_dapp_hook_provider here.
   /// Reports a UE context's SRS configuration to the dApp hooks. \c cfg is null when the configuration is unchanged
   /// (the last reported one is repeated) or the context is removed.
   void publish_dapp_srs_config(scheduler_dapp_srs_config_event::kind event,
@@ -205,6 +208,8 @@ private:
   };
   std::array<std::optional<dapp_cell_context>, MAX_NOF_DU_CELLS> dapp_cells;
   /// Last SRS configuration event reported per UE context.
+  /// [srs-sharing] Needed because reconfigurations without a cell configuration, and the "applied" notification, carry
+  /// no SRS fields: the last reported configuration is repeated under the new event.
   std::array<std::optional<scheduler_dapp_srs_config_event>, MAX_NOF_DU_UES> dapp_ue_srs;
 };
 

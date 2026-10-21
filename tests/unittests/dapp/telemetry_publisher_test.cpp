@@ -441,6 +441,7 @@ srs_config_record drain_srs_config(portable_data_store& store, uint8_t suffix)
 
 } // namespace
 
+// [srs-sharing] Epoch rule and snapshot replay of srs.config (see telemetry_publisher::publish_srs_config).
 TEST(dapp_telemetry_publisher, srs_config_epochs_follow_changes_and_replay_to_new_subscribers)
 {
   auto                       store = make_store();
@@ -501,6 +502,7 @@ TEST(dapp_telemetry_publisher, srs_config_epochs_follow_changes_and_replay_to_ne
   EXPECT_FALSE(drain_one(*store, make_id(21), metadata, tensor, chunk));
 }
 
+// [srs-sharing] ta.command through the publisher, the store, from_publication and the APER codec.
 TEST(dapp_telemetry_publisher, publishes_ta_commands)
 {
   auto                       store = make_store();
