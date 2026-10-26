@@ -324,7 +324,9 @@ each subscription back to its own interval**; the configured
 as a whole never publishes faster, whatever the mix of UEs and subscribers.
 Floors are checked before any capture work, so an idle stream costs one atomic
 load per event. Per-subscription filters add cell, `sampleEveryN`, drop policy
-(`coalesceLatest` default), and an RNTI list.
+(`coalesceLatest` default), an RNTI list and, on `classc.spectrum`, a grid
+region (slot period/offset × symbol range × PRB range) cropped in the store
+before the object is queued.
 
 Capture-cost notes ([known_limitations.md](known_limitations.md)):
 `pusch.grid` captures and the per-subcarrier `srs.channel` recompute read the

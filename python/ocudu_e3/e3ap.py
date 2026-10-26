@@ -123,6 +123,8 @@ class SubscriptionConfig:
     drop_policy: str = "coalesceLatest"  # dropNewest | dropOldest | coalesceLatest
     minimum_interval_ms: Optional[int] = None
     rnti_filter: Sequence[int] = ()
+    #: [srs-sharing] Crop classc.spectrum to a slot pattern and a symbol x PRB box at the gNB (``Telemetry-GridRegion``).
+    grid_region: Optional["GridRegion"] = None
 
     def to_asn(self) -> dict:
         body = {"telemetryId": _telemetry_id(self.telemetry)}
@@ -136,7 +138,35 @@ class SubscriptionConfig:
             body["minimumIntervalMs"] = int(self.minimum_interval_ms)
         if self.rnti_filter:
             body["rntiFilter"] = [int(r) for r in self.rnti_filter]
+        if self.grid_region is not None:
+            body["gridRegion"] = self.grid_region.to_asn()
         return body
+
+
+@dataclass
+class GridRegion:
+    """[srs-sharing] Resource-grid region of a ``classc.spectrum`` subscription (not in the upstream client).
+
+    The gNB delivers only the slots with ``(sfn * slots_per_frame + slot) % slot_period == slot_offset`` and of each
+    only symbols ``[first_symbol, first_symbol + nof_symbols)`` and PRBs ``[first_prb, first_prb + nof_prbs)`` of the
+    grid, on every receive port. The crop happens in the gNB's data store, before the object is queued, so it saves
+    the copy, the encoding, the transport and the decoding of everything outside the box. Decoded records carry the
+    window actually delivered (``ClassCPortableRecord.grid_window``).
+    """
+
+    slot_period: int = 1
+    slot_offset: int = 0
+    first_symbol: int = 0
+    nof_symbols: int = 14
+    first_prb: int = 0
+    nof_prbs: int = 275
+
+    def to_asn(self) -> dict:
+        if not 0 <= self.slot_offset < self.slot_period:
+            raise ValueError("slot_offset must be in [0, slot_period)")
+        return {"slotPeriod": int(self.slot_period), "slotOffset": int(self.slot_offset),
+                "firstSymbol": int(self.first_symbol), "nofSymbols": int(self.nof_symbols),
+                "firstPrb": int(self.first_prb), "nofPrbs": int(self.nof_prbs)}
 
 
 @dataclass

@@ -237,10 +237,26 @@ class GnbMetricsJsonRecord:
 
 
 @dataclass
+class GridWindow:
+    """[srs-sharing] Part of the source grid a region-cropped object carries (``Telemetry-GridWindow``).
+
+    The tensor is [rx_port][nof_symbols][nof_subcarriers], starting at symbol ``first_symbol`` and subcarrier
+    ``first_subcarrier`` of the source grid that the Class-C metadata still describes.
+    """
+
+    first_symbol: int
+    nof_symbols: int
+    first_subcarrier: int
+    nof_subcarriers: int
+
+
+@dataclass
 class ClassCPortableRecord:
     interface_id: int
     metadata: bytes = field(repr=False)
     tensor: bytes = field(repr=False)
+    #: [srs-sharing] Set when the subscription's grid region cropped the object; pass it to ``decode_spectrum``.
+    grid_window: Optional[GridWindow] = None
 
 
 # [srs-sharing] Records of the srs.config and ta.command streams (not in the upstream client). They mirror
@@ -462,7 +478,12 @@ def _record_from_asn(kind: str, body: dict) -> TelemetryRecord:
     if kind == "gnbMetricsJson":
         return GnbMetricsJsonRecord(json_bytes=body["json"])
     if kind == "classCPortable":
-        return ClassCPortableRecord(interface_id=body["interfaceId"], metadata=body.get("metadata", b""), tensor=body["tensor"])
+        window = None
+        if "gridWindow" in body:  # [srs-sharing]
+            w = body["gridWindow"]
+            window = GridWindow(w["firstSymbol"], w["nofSymbols"], w["firstSubcarrier"], w["nofSubcarriers"])
+        return ClassCPortableRecord(interface_id=body["interfaceId"], metadata=body.get("metadata", b""),
+                                    tensor=body["tensor"], grid_window=window)
     if kind == "srsConfig":  # [srs-sharing] APER push path
         resource = None
         if "resource" in body:

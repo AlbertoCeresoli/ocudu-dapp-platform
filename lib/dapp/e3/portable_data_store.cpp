@@ -53,7 +53,97 @@ bool same_request(const portable_subscription_request& left, const portable_subs
   return left.subscription_id == right.subscription_id && left.interface_id == right.interface_id &&
          left.cell_id == right.cell_id && left.sample_every_n == right.sample_every_n &&
          left.queue_depth_chunks == right.queue_depth_chunks && left.maximum_chunk_bytes == right.maximum_chunk_bytes &&
-         left.lease_us == right.lease_us && left.drop_policy == right.drop_policy;
+         left.lease_us == right.lease_us && left.drop_policy == right.drop_policy &&
+         left.grid_region == right.grid_region; // [srs-sharing]
+}
+
+// [srs-sharing] Resource-grid region filter (not in upstream). The checks below run on the producer thread for every
+// subscriber with a region, before anything is copied.
+
+/// Largest number of slots in one SFN cycle (1024 frames at numerology 4): no slot period can usefully exceed it.
+constexpr uint32_t maximum_region_slot_period = 1024U * (10U << 4U);
+constexpr uint32_t maximum_region_prbs        = OCUDU_DAPP_SPECTRUM_MAX_PRBS_V1;
+constexpr uint32_t region_symbols_per_slot    = 14;
+
+/// Admission check of a requested region. Only Class-C Spectrum publications carry a grid layout today.
+bool valid_region(const portable_subscription_request& request) noexcept
+{
+  if (!request.grid_region) {
+    return true;
+  }
+  const portable_grid_region& region = *request.grid_region;
+  return request.interface_id == OCUDU_DAPP_INTERFACE_SPECTRUM_V1 && region.slot_period >= 1 &&
+         region.slot_period <= maximum_region_slot_period && region.slot_offset < region.slot_period &&
+         region.first_symbol < region_symbols_per_slot && region.nof_symbols >= 1 &&
+         region.nof_symbols <= region_symbols_per_slot - region.first_symbol && region.first_prb < maximum_region_prbs &&
+         region.nof_prbs >= 1 && region.nof_prbs <= maximum_region_prbs - region.first_prb;
+}
+
+enum class region_match : uint8_t { deliver, skip, invalid };
+
+/// Decides whether one publication falls in the region and, if so, which window of its grid to copy. skip: wrong
+/// slot, or the box misses the grid entirely. invalid: the producer gave no usable layout for its tensor.
+region_match match_region(const portable_grid_region&        region,
+                          const portable_publication_source& source,
+                          portable_grid_window&              window) noexcept
+{
+  if (!source.grid) {
+    return region_match::invalid;
+  }
+  const portable_grid_layout& grid = *source.grid;
+  if (grid.numerology > 4 || grid.ports == 0 || grid.symbols == 0 || grid.symbols > region_symbols_per_slot ||
+      grid.subcarriers == 0 || grid.element_bytes == 0 ||
+      static_cast<uint64_t>(grid.ports) * grid.symbols * grid.subcarriers * grid.element_bytes !=
+          source.tensor.size()) {
+    return region_match::invalid;
+  }
+  // TS 38.211 6.4.1.4.4: an SRS occasion is a slot with (N_slot^frame * n_f + n_s - T_offset) mod T_SRS = 0.
+  const uint64_t slots_per_frame = 10U << grid.numerology;
+  const uint64_t absolute_slot   = static_cast<uint64_t>(grid.sfn) * slots_per_frame + grid.slot;
+  if (absolute_slot % region.slot_period != region.slot_offset) {
+    return region_match::skip;
+  }
+  // Clip the box to the grid. PRBs count from the grid's first subcarrier (the BWP start for classc.spectrum).
+  const uint32_t first_subcarrier = static_cast<uint32_t>(region.first_prb) * 12U;
+  const uint32_t end_symbol       = std::min<uint32_t>(region.first_symbol + region.nof_symbols, grid.symbols);
+  const uint32_t end_subcarrier =
+      static_cast<uint32_t>(std::min<uint64_t>((static_cast<uint64_t>(region.first_prb) + region.nof_prbs) * 12U,
+                                               grid.subcarriers));
+  if (region.first_symbol >= end_symbol || first_subcarrier >= end_subcarrier) {
+    return region_match::skip;
+  }
+  window.first_symbol     = region.first_symbol;
+  window.nof_symbols      = static_cast<uint8_t>(end_symbol - region.first_symbol);
+  window.first_subcarrier = first_subcarrier;
+  window.nof_subcarriers  = end_subcarrier - first_subcarrier;
+  return region_match::deliver;
+}
+
+/// Copies bytes [offset, offset + length) of the cropped tensor [port][window symbols][window subcarriers] into dst,
+/// gathering them from the full grid row by row. A row (one port and symbol) is contiguous in both tensors, so this is
+/// one memcpy per row; offset and length can split rows, which is how the cropped object is cut into store chunks.
+void copy_window(uint8_t*                    dst,
+                 std::size_t                 offset,
+                 std::size_t                 length,
+                 ocudu::span<const uint8_t>  tensor,
+                 const portable_grid_layout& grid,
+                 const portable_grid_window& window) noexcept
+{
+  const std::size_t row_bytes = static_cast<std::size_t>(window.nof_subcarriers) * grid.element_bytes;
+  std::size_t       row       = offset / row_bytes;
+  std::size_t       in_row    = offset % row_bytes;
+  while (length != 0) {
+    const std::size_t port   = row / window.nof_symbols;
+    const std::size_t symbol = window.first_symbol + row % window.nof_symbols;
+    const std::size_t source_offset =
+        ((port * grid.symbols + symbol) * grid.subcarriers + window.first_subcarrier) * grid.element_bytes + in_row;
+    const std::size_t count = std::min(length, row_bytes - in_row);
+    std::memcpy(dst, tensor.data() + source_offset, count);
+    dst += count;
+    length -= count;
+    ++row;
+    in_row = 0;
+  }
 }
 
 } // namespace
@@ -71,6 +161,8 @@ struct portable_data_store::implementation {
     uint32_t             metadata_size{};
     uint32_t             tensor_chunk_size{};
     std::vector<uint8_t> storage;
+    /// [srs-sharing] Window of a region-cropped object.
+    std::optional<portable_grid_window> grid_window;
   };
 
   struct subscription {
@@ -171,7 +263,7 @@ struct portable_data_store::implementation {
            request.sample_every_n != 0 && request.sample_every_n <= 65535 && request.queue_depth_chunks != 0 &&
            request.queue_depth_chunks <= 1024 && request.maximum_chunk_bytes >= config.minimum_chunk_bytes &&
            request.maximum_chunk_bytes <= config.maximum_chunk_bytes && request.lease_us >= config.minimum_lease_us &&
-           request.lease_us <= config.maximum_lease_us;
+           request.lease_us <= config.maximum_lease_us && valid_region(request);
     // A queue shorter than one maximum-size object is legal: publish_one drops
     // such objects as object_too_large instead of blocking, so small-object
     // streams can reserve proportionally less preallocated storage.
@@ -359,6 +451,7 @@ struct portable_data_store::implementation {
         chunk.chunk_count          = source.chunk_count;
         chunk.tensor_size          = source.tensor_size;
         chunk.dropped_objects      = source.dropped_objects;
+        chunk.grid_window          = source.grid_window;
         chunk.metadata.assign(source.storage.begin(), source.storage.begin() + source.metadata_size);
         chunk.tensor_chunk.assign(source.storage.begin() + source.metadata_size,
                                   source.storage.begin() + source.metadata_size + source.tensor_chunk_size);
@@ -441,18 +534,38 @@ struct portable_data_store::implementation {
         (item->request.cell_id && *item->request.cell_id != source.cell_id)) {
       return portable_publish_result::no_subscription;
     }
+    // [srs-sharing] Region filter before sampling, so sampleEveryN counts only the slots the region selects. A slot
+    // outside the region counts as sampled: like sampling, it is the subscriber's own choice, not a loss.
+    std::optional<portable_grid_window> window;
+    std::size_t                         tensor_bytes = source.tensor.size();
+    if (item->request.grid_region) {
+      portable_grid_window candidate;
+      switch (match_region(*item->request.grid_region, source, candidate)) {
+        case region_match::skip:
+          item->sampled_objects.fetch_add(1, std::memory_order_relaxed);
+          return portable_publish_result::sampled;
+        case region_match::invalid:
+          item->dropped_objects.fetch_add(1, std::memory_order_relaxed);
+          return portable_publish_result::invalid;
+        case region_match::deliver:
+          break;
+      }
+      window       = candidate;
+      tensor_bytes = static_cast<std::size_t>(source.grid->ports) * candidate.nof_symbols * candidate.nof_subcarriers *
+                     source.grid->element_bytes;
+    }
     const uint64_t ordinal = item->observed_objects.fetch_add(1, std::memory_order_relaxed);
     if (ordinal % item->request.sample_every_n != 0) {
       item->sampled_objects.fetch_add(1, std::memory_order_relaxed);
       return portable_publish_result::sampled;
     }
     const std::size_t chunks =
-        (source.tensor.size() + item->request.maximum_chunk_bytes - 1U) / item->request.maximum_chunk_bytes;
+        (tensor_bytes + item->request.maximum_chunk_bytes - 1U) / item->request.maximum_chunk_bytes;
     if (chunks == 0 || chunks > item->queue.size()) {
       item->dropped_objects.fetch_add(1, std::memory_order_relaxed);
       return portable_publish_result::object_too_large;
     }
-    const uint64_t copy_bytes = source.tensor.size() + source.metadata.size();
+    const uint64_t copy_bytes = tensor_bytes + source.metadata.size();
     if (copy_bytes > remaining_copy_bytes) {
       item->dropped_objects.fetch_add(1, std::memory_order_relaxed);
       return portable_publish_result::full;
@@ -483,24 +596,35 @@ struct portable_data_store::implementation {
       destination.route_epoch          = source.route_epoch;
       destination.chunk_index          = chunk_index;
       destination.chunk_count          = chunks;
-      destination.tensor_size          = source.tensor.size();
+      destination.tensor_size          = tensor_bytes;
       destination.dropped_objects      = dropped;
+      destination.grid_window          = window;
       destination.metadata_size        = chunk_index == 0 ? source.metadata.size() : 0;
       destination.tensor_chunk_size =
-          std::min<std::size_t>(item->request.maximum_chunk_bytes, source.tensor.size() - offset);
+          std::min<std::size_t>(item->request.maximum_chunk_bytes, tensor_bytes - offset);
       if (destination.metadata_size != 0) {
         std::memcpy(destination.storage.data(), source.metadata.data(), destination.metadata_size);
       }
-      std::memcpy(destination.storage.data() + destination.metadata_size,
-                  source.tensor.data() + offset,
-                  destination.tensor_chunk_size);
+      if (window) {
+        // [srs-sharing] Gather only the window from the full grid.
+        copy_window(destination.storage.data() + destination.metadata_size,
+                    offset,
+                    destination.tensor_chunk_size,
+                    source.tensor,
+                    *source.grid,
+                    *window);
+      } else {
+        std::memcpy(destination.storage.data() + destination.metadata_size,
+                    source.tensor.data() + offset,
+                    destination.tensor_chunk_size);
+      }
       offset += destination.tensor_chunk_size;
       item->head = (item->head + 1) % item->queue.size();
       ++item->count;
     }
     item->queued_chunks.store(item->count, std::memory_order_relaxed);
     item->published_objects.fetch_add(1, std::memory_order_relaxed);
-    item->published_tensor_bytes.fetch_add(source.tensor.size(), std::memory_order_relaxed);
+    item->published_tensor_bytes.fetch_add(tensor_bytes, std::memory_order_relaxed);
     remaining_copy_bytes -= copy_bytes;
     return portable_publish_result::published;
   }

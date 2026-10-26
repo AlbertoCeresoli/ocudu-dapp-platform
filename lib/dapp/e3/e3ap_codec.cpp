@@ -5,6 +5,8 @@
 
 extern "C" {
 #include "ClassCPortableRecord.h"
+#include "Telemetry-GridRegion.h"
+#include "Telemetry-GridWindow.h"
 #include "GnbMetricsJsonRecord.h"
 #include "Mgmt-RanFunctionData.h"
 #include "PuschCrcRecord.h"
@@ -704,6 +706,15 @@ void set_object(Telemetry_Object_t& destination, const class_c_portable_record& 
   }
   set_octets(record.metadata, source.metadata);
   set_octets(record.tensor, source.tensor);
+  // [srs-sharing] Window of a region-cropped object (extension addition).
+  if (source.grid_window) {
+    const portable_grid_window& from = *source.grid_window;
+    auto&                       to   = *(record.gridWindow = make_asn<Telemetry_GridWindow_t>());
+    set_u64(to.firstSymbol, read_ranged(from.first_symbol, 0, 13, "window first symbol"));
+    set_u64(to.nofSymbols, read_ranged(from.nof_symbols, 1, 14, "window symbol count"));
+    set_u64(to.firstSubcarrier, read_ranged(from.first_subcarrier, 0, 3299, "window first subcarrier"));
+    set_u64(to.nofSubcarriers, read_ranged(from.nof_subcarriers, 1, 3300, "window subcarrier count"));
+  }
 }
 
 class_c_portable_record read_object(const ClassCPortableRecord_t& source)
@@ -712,6 +723,15 @@ class_c_portable_record read_object(const ClassCPortableRecord_t& source)
   result.interface_id = static_cast<uint32_t>(read_ranged(source.interfaceId, 1, 4294967295ULL, "interface id"));
   result.metadata     = read_bytes(source.metadata, 65536);
   result.tensor       = read_bytes(source.tensor, e3ap_maximum_payload_bytes);
+  if (source.gridWindow != nullptr) { // [srs-sharing]
+    const auto&           from = *source.gridWindow;
+    portable_grid_window& to   = result.grid_window.emplace();
+    to.first_symbol            = static_cast<uint8_t>(read_ranged(from.firstSymbol, 0, 13, "window first symbol"));
+    to.nof_symbols             = static_cast<uint8_t>(read_ranged(from.nofSymbols, 1, 14, "window symbol count"));
+    to.first_subcarrier =
+        static_cast<uint32_t>(read_ranged(from.firstSubcarrier, 0, 3299, "window first subcarrier"));
+    to.nof_subcarriers = static_cast<uint32_t>(read_ranged(from.nofSubcarriers, 1, 3300, "window subcarrier count"));
+  }
   return result;
 }
 
@@ -901,6 +921,20 @@ void set_config(Telemetry_SubscriptionConfig_t& destination, const telemetry_sub
       }
     }
   }
+  // [srs-sharing] Resource-grid region (extension addition).
+  if (source.grid_region) {
+    const portable_grid_region& from = *source.grid_region;
+    if (from.slot_offset >= from.slot_period) {
+      throw std::runtime_error("grid region slot offset must be below its period");
+    }
+    auto& to = *(destination.gridRegion = make_asn<Telemetry_GridRegion_t>());
+    set_u64(to.slotPeriod, read_ranged(from.slot_period, 1, 163840, "grid region slot period"));
+    set_u64(to.slotOffset, read_ranged(from.slot_offset, 0, 163839, "grid region slot offset"));
+    set_u64(to.firstSymbol, read_ranged(from.first_symbol, 0, 13, "grid region first symbol"));
+    set_u64(to.nofSymbols, read_ranged(from.nof_symbols, 1, 14, "grid region symbol count"));
+    set_u64(to.firstPrb, read_ranged(from.first_prb, 0, 274, "grid region first PRB"));
+    set_u64(to.nofPrbs, read_ranged(from.nof_prbs, 1, 275, "grid region PRB count"));
+  }
 }
 
 telemetry_subscription_config read_config(const Telemetry_SubscriptionConfig_t& source)
@@ -931,6 +965,19 @@ telemetry_subscription_config read_config(const Telemetry_SubscriptionConfig_t& 
         throw std::runtime_error("RNTI filter entry is missing");
       }
       result.rnti_filter.push_back(read_u16(*source.rntiFilter->list.array[index], "RNTI"));
+    }
+  }
+  if (source.gridRegion != nullptr) { // [srs-sharing]
+    const auto&           from = *source.gridRegion;
+    portable_grid_region& to   = result.grid_region.emplace();
+    to.slot_period  = static_cast<uint32_t>(read_ranged(from.slotPeriod, 1, 163840, "grid region slot period"));
+    to.slot_offset  = static_cast<uint32_t>(read_ranged(from.slotOffset, 0, 163839, "grid region slot offset"));
+    to.first_symbol = static_cast<uint8_t>(read_ranged(from.firstSymbol, 0, 13, "grid region first symbol"));
+    to.nof_symbols  = static_cast<uint8_t>(read_ranged(from.nofSymbols, 1, 14, "grid region symbol count"));
+    to.first_prb    = static_cast<uint16_t>(read_ranged(from.firstPrb, 0, 274, "grid region first PRB"));
+    to.nof_prbs     = static_cast<uint16_t>(read_ranged(from.nofPrbs, 1, 275, "grid region PRB count"));
+    if (to.slot_offset >= to.slot_period) {
+      throw std::runtime_error("grid region slot offset must be below its period");
     }
   }
   return result;
@@ -1089,7 +1136,8 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
                                                                 uint64_t                   dropped_objects,
                                                                 ocudu::span<const uint8_t> metadata,
                                                                 ocudu::span<const uint8_t> tensor,
-                                                                bool                       include_bulk) noexcept
+                                                                bool                       include_bulk,
+                                                                std::optional<portable_grid_window> grid_window) noexcept
 {
   try {
     const auto telemetry_id = telemetry_id_for(interface_id);
@@ -1111,6 +1159,7 @@ codec_result<telemetry_indication> e3ap_codec::from_publication(uint32_t        
       if (include_bulk) {
         record.tensor.assign(tensor.begin(), tensor.end());
       }
+      record.grid_window  = grid_window; // [srs-sharing]
       result.monotonic_ns = 0;
       result.object       = std::move(record);
       return {std::move(result), {}};

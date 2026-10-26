@@ -722,6 +722,24 @@ class ClassCDecodeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             classc.decode_spectrum(metadata, tensor[:-8])
 
+    def test_decode_spectrum_with_a_grid_window(self):
+        # [srs-sharing] A region-cropped tensor holds only the window; the metadata still describes the full grid.
+        metadata, _tensor, grid = self._spectrum_envelope()
+        full = grid.reshape(self.RX, self.SYMBOLS, self.SUBCARRIERS)
+        window = ocudu_e3.GridWindow(first_symbol=1, nof_symbols=1, first_subcarrier=12, nof_subcarriers=12)
+        cropped = (full[:, 1:2, 12:24] * self.SCALE).astype(np.complex64).tobytes()
+        snapshot = classc.decode_spectrum(metadata, cropped, window)
+        self.assertEqual(snapshot.grid.shape, (2, 1, 12))
+        self.assertEqual((snapshot.first_symbol, snapshot.first_subcarrier), (1, 12))
+        self.assertEqual((snapshot.symbols, snapshot.subcarriers), (2, 24))  # source grid
+        np.testing.assert_allclose(snapshot.grid, full[:, 1:2, 12:24], rtol=1e-6)
+        self.assertEqual(snapshot.prb_power().shape, (1, 1))
+        with self.assertRaises(ValueError):
+            classc.decode_spectrum(metadata, cropped[:-8], window)
+        with self.assertRaises(ValueError):
+            outside = ocudu_e3.GridWindow(first_symbol=1, nof_symbols=2, first_subcarrier=0, nof_subcarriers=12)
+            classc.decode_spectrum(metadata, cropped, outside)
+
     def test_decode_srs_isac_bf16(self):
         rx, tx, points = 2, 1, 8
         n = rx * tx * points
@@ -816,6 +834,26 @@ class SrsConfigAndTaCommandTests(unittest.TestCase):
             {"telemetryId": telemetry_id, "cellId": 0, "sequence": zero, "routeEpoch": zero, "monotonicNs": zero,
              "droppedObjects": zero, "object": obj},
         )
+
+    def test_grid_region_subscription_and_window_record(self):
+        # [srs-sharing] Telemetry-GridRegion in a subscription config and Telemetry-GridWindow in a Class-C record.
+        region = ocudu_e3.GridRegion(slot_period=10, slot_offset=7, first_symbol=13, nof_symbols=1, first_prb=5,
+                                     nof_prbs=40)
+        config = ocudu_e3.SubscriptionConfig("classc.spectrum", drop_policy="dropOldest", grid_region=region)
+        encoded = self.codec.encode("Telemetry-SubscriptionData", {"configs": [config.to_asn()]})
+        decoded = self.codec.decode("Telemetry-SubscriptionData", encoded)["configs"][0]
+        self.assertEqual(decoded["gridRegion"], {"slotPeriod": 10, "slotOffset": 7, "firstSymbol": 13,
+                                                 "nofSymbols": 1, "firstPrb": 5, "nofPrbs": 40})
+        with self.assertRaises(ValueError):
+            ocudu_e3.GridRegion(slot_period=10, slot_offset=10).to_asn()
+
+        window = {"firstSymbol": 13, "nofSymbols": 1, "firstSubcarrier": 60, "nofSubcarriers": 480}
+        payload = self._indication(6, ("classCPortable", {"interfaceId": 0x00010001, "metadata": b"m", "tensor": b"t",
+                                                          "gridWindow": window}))
+        record = ocudu_e3.telemetry.decode_indication(self.codec, payload).record
+        self.assertEqual(record.grid_window, ocudu_e3.GridWindow(13, 1, 60, 480))
+        plain = self._indication(6, ("classCPortable", {"interfaceId": 0x00010001, "metadata": b"m", "tensor": b"t"}))
+        self.assertIsNone(ocudu_e3.telemetry.decode_indication(self.codec, plain).record.grid_window)
 
     def test_srs_config_indication(self):
         resource = {"resourceId": 0, "nofPorts": 2, "combSize": 4, "combOffset": 1, "cyclicShift": 0,

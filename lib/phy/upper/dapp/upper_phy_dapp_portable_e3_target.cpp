@@ -5,6 +5,7 @@
 #include <chrono>
 #include <limits>
 #include <new>
+#include <optional>
 
 using namespace ocudu;
 
@@ -15,6 +16,38 @@ uint64_t monotonic_ns() noexcept
   const auto value =
       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
   return value > 0 ? static_cast<uint64_t>(value) : 1;
+}
+
+/// [srs-sharing] Layout of a Spectrum resource grid for the store's region filter (not in upstream). Only a contiguous
+/// rank-3 [port][symbol][subcarrier] tensor qualifies, which is what make_host_resource_grid_tensor() produces; any
+/// other layout yields no descriptor, so region subscribers drop the object instead of cropping wrong bytes.
+std::optional<dapp::e3::portable_grid_layout> grid_layout_of(const ocudu_dapp_spectrum_input_v1& input) noexcept
+{
+  const ocudu_dapp_tensor_view_v1& tensor  = input.uplink_resource_grid;
+  const uint64_t                   element = tensor.byte_strides[2];
+  if (tensor.rank != 3 || element == 0 || element > 16 || tensor.dimensions[0] == 0 ||
+      tensor.dimensions[0] > std::numeric_limits<uint32_t>::max() || tensor.dimensions[1] == 0 ||
+      tensor.dimensions[1] > std::numeric_limits<uint32_t>::max() || tensor.dimensions[2] == 0 ||
+      tensor.dimensions[2] > std::numeric_limits<uint32_t>::max() ||
+      tensor.byte_strides[1] != tensor.dimensions[2] * element ||
+      tensor.byte_strides[0] != tensor.dimensions[1] * tensor.byte_strides[1] ||
+      tensor.byte_length != tensor.dimensions[0] * tensor.byte_strides[0]) {
+    return std::nullopt;
+  }
+  dapp::e3::portable_grid_layout layout;
+  layout.sfn           = input.invocation.radio_time.sfn;
+  layout.slot          = input.invocation.radio_time.slot;
+  layout.numerology    = static_cast<uint8_t>(input.invocation.radio_time.numerology);
+  layout.ports         = static_cast<uint32_t>(tensor.dimensions[0]);
+  layout.symbols       = static_cast<uint32_t>(tensor.dimensions[1]);
+  layout.subcarriers   = static_cast<uint32_t>(tensor.dimensions[2]);
+  layout.element_bytes = static_cast<uint32_t>(element);
+  return layout;
+}
+
+std::optional<dapp::e3::portable_grid_layout> grid_layout_of(const ocudu_dapp_srs_isac_input_v1&) noexcept
+{
+  return std::nullopt;
 }
 
 class portable_e3_target final : public upper_phy_dapp_publication_target
@@ -60,6 +93,7 @@ private:
     source.route_epoch          = route_epoch;
     source.metadata             = encoded.metadata;
     source.tensor               = {bytes, static_cast<std::size_t>(tensor.byte_length)};
+    source.grid                 = grid_layout_of(input); // [srs-sharing]
     static_cast<void>(store->publish(source));
   }
 

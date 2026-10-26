@@ -6,6 +6,8 @@
 #include "ocudu/dapp/use_cases/v1/spectrum.h"
 #include <atomic>
 #include <chrono>
+#include <cstring>
+#include <tuple>
 #include <gtest/gtest.h>
 #include <numeric>
 #include <thread>
@@ -354,4 +356,192 @@ TEST(dapp_portable_data_store, tracks_every_telemetry_interface_including_the_ne
   }
   EXPECT_FALSE(store.has_active(telemetry_stream_pusch_crc));
   EXPECT_EQ(store.demand(telemetry_stream_pusch_crc).active, 0U);
+}
+
+// [srs-sharing] Resource-grid region filter: slot rule, box crop, clipping, chunk-split gather and refusals.
+namespace {
+
+/// Full grid [port][symbol][subcarrier] of 4-byte elements whose value encodes its own coordinates.
+std::vector<uint8_t> coordinate_grid(uint32_t ports, uint32_t symbols, uint32_t subcarriers)
+{
+  std::vector<uint8_t> bytes(static_cast<std::size_t>(ports) * symbols * subcarriers * 4);
+  for (uint32_t port = 0; port != ports; ++port) {
+    for (uint32_t symbol = 0; symbol != symbols; ++symbol) {
+      for (uint32_t subcarrier = 0; subcarrier != subcarriers; ++subcarrier) {
+        const uint32_t value = (port << 24U) | (symbol << 16U) | subcarrier;
+        std::memcpy(&bytes[((static_cast<std::size_t>(port) * symbols + symbol) * subcarriers + subcarrier) * 4],
+                    &value,
+                    sizeof(value));
+      }
+    }
+  }
+  return bytes;
+}
+
+/// Expected crop of coordinate_grid(), built independently of the store's gather.
+std::vector<uint8_t> expected_window(uint32_t                    ports,
+                                     uint32_t                    symbols,
+                                     uint32_t                    subcarriers,
+                                     const portable_grid_window& window)
+{
+  const auto           full = coordinate_grid(ports, symbols, subcarriers);
+  std::vector<uint8_t> result;
+  for (uint32_t port = 0; port != ports; ++port) {
+    for (uint32_t symbol = window.first_symbol; symbol != window.first_symbol + window.nof_symbols; ++symbol) {
+      const auto begin =
+          full.begin() + ((static_cast<std::size_t>(port) * symbols + symbol) * subcarriers + window.first_subcarrier) * 4;
+      result.insert(result.end(), begin, begin + static_cast<std::ptrdiff_t>(window.nof_subcarriers) * 4);
+    }
+  }
+  return result;
+}
+
+portable_grid_layout grid_layout(uint16_t sfn, uint16_t slot, uint32_t ports, uint32_t subcarriers)
+{
+  return {sfn, slot, 1, ports, 14, subcarriers, 4};
+}
+
+portable_data_store_config grid_config()
+{
+  auto config                   = test_config();
+  config.maximum_retained_bytes = 16 * 1024 * 1024;
+  config.maximum_object_bytes   = 4 * 1024 * 1024;
+  config.maximum_chunk_bytes    = 4096;
+  return config;
+}
+
+portable_subscription_request grid_request(uint8_t suffix, portable_grid_region region)
+{
+  auto result                = request(suffix, portable_drop_policy::drop_oldest);
+  result.queue_depth_chunks  = 64;
+  result.maximum_chunk_bytes = 4096;
+  result.grid_region         = region;
+  return result;
+}
+
+std::vector<uint8_t> reassemble(const std::vector<portable_publication_chunk>& chunks)
+{
+  std::vector<uint8_t> tensor;
+  for (const auto& chunk : chunks) {
+    tensor.insert(tensor.end(), chunk.tensor_chunk.begin(), chunk.tensor_chunk.end());
+  }
+  return tensor;
+}
+
+} // namespace
+
+TEST(portable_data_store_grid_region, delivers_only_matching_slots_and_only_the_box)
+{
+  auto [store, detail] = portable_data_store::create(grid_config());
+  ASSERT_NE(store, nullptr) << detail;
+  // A's live SRS resource: period 10 slots, offset 7, symbol 13, PRBs 5..44 of a 51-PRB grid, two rx ports.
+  ASSERT_TRUE(store->subscribe(grid_request(1, {10, 7, 13, 1, 5, 40})));
+  const std::vector<uint8_t> metadata(16, 7);
+  const auto                 grid = coordinate_grid(2, 14, 612);
+
+  auto source = publication(1, metadata, grid);
+  source.grid = grid_layout(100, 8, 2, 612); // absolute slot 2008: 2008 % 10 = 8, not an occasion
+  EXPECT_EQ(store->publish(source), portable_publish_result::sampled);
+  auto skipped = store->poll(make_id(1), 8);
+  EXPECT_TRUE(skipped.chunks.empty());
+  EXPECT_EQ(skipped.subscription->sampled_objects, 1U);
+
+  source      = publication(2, metadata, grid);
+  source.grid = grid_layout(100, 7, 2, 612); // absolute slot 2007: an occasion
+  EXPECT_EQ(store->publish(source), portable_publish_result::published);
+  auto polled = store->poll(make_id(1), 8);
+  ASSERT_EQ(polled.chunks.size(), 1U);
+  ASSERT_TRUE(polled.chunks[0].grid_window.has_value());
+  const portable_grid_window window = *polled.chunks[0].grid_window;
+  EXPECT_EQ(window.first_symbol, 13U);
+  EXPECT_EQ(window.nof_symbols, 1U);
+  EXPECT_EQ(window.first_subcarrier, 60U);
+  EXPECT_EQ(window.nof_subcarriers, 480U);
+  EXPECT_EQ(polled.chunks[0].tensor_size, 2U * 480U * 4U);
+  EXPECT_EQ(polled.chunks[0].metadata, metadata);
+  EXPECT_EQ(polled.chunks[0].tensor_chunk, expected_window(2, 14, 612, window));
+  EXPECT_EQ(polled.subscription->published_tensor_bytes, 2U * 480U * 4U);
+}
+
+TEST(portable_data_store_grid_region, splits_rows_across_chunks_and_clips_the_box_to_the_grid)
+{
+  auto [store, detail] = portable_data_store::create(grid_config());
+  ASSERT_NE(store, nullptr) << detail;
+  // 14 symbols x PRBs 30..59 on a 51-PRB grid: clipped to PRBs 30..50; rows of 1008 B straddle 4 KiB chunks.
+  ASSERT_TRUE(store->subscribe(grid_request(1, {1, 0, 0, 14, 30, 30})));
+  // A plain subscriber on the same stream still gets the full grid.
+  auto plain               = request(2, portable_drop_policy::drop_oldest);
+  plain.queue_depth_chunks = 64;
+  plain.maximum_chunk_bytes = 4096;
+  ASSERT_TRUE(store->subscribe(plain));
+  const std::vector<uint8_t> metadata(16, 7);
+  const auto                 grid   = coordinate_grid(2, 14, 612);
+  auto                       source = publication(1, metadata, grid);
+  source.grid                       = grid_layout(0, 0, 2, 612);
+  EXPECT_EQ(store->publish(source), portable_publish_result::published);
+
+  std::vector<portable_publication_chunk> chunks;
+  for (int poll = 0; poll != 16; ++poll) {
+    auto polled = store->poll(make_id(1), 8);
+    chunks.insert(chunks.end(), polled.chunks.begin(), polled.chunks.end());
+  }
+  const portable_grid_window expected_box{0, 14, 360, 252};
+  ASSERT_FALSE(chunks.empty());
+  EXPECT_EQ(chunks.size(), chunks[0].chunk_count);
+  EXPECT_GT(chunks.size(), 1U);
+  for (const auto& chunk : chunks) {
+    ASSERT_TRUE(chunk.grid_window.has_value());
+    EXPECT_EQ(chunk.grid_window->first_subcarrier, expected_box.first_subcarrier);
+    EXPECT_EQ(chunk.grid_window->nof_subcarriers, expected_box.nof_subcarriers);
+  }
+  EXPECT_EQ(reassemble(chunks), expected_window(2, 14, 612, expected_box));
+
+  std::vector<portable_publication_chunk> full;
+  for (int poll = 0; poll != 16; ++poll) {
+    auto polled = store->poll(make_id(2), 8);
+    full.insert(full.end(), polled.chunks.begin(), polled.chunks.end());
+  }
+  ASSERT_FALSE(full.empty());
+  EXPECT_FALSE(full[0].grid_window.has_value());
+  EXPECT_EQ(reassemble(full), grid);
+}
+
+TEST(portable_data_store_grid_region, slot_rule_holds_across_the_sfn_wrap)
+{
+  auto [store, detail] = portable_data_store::create(grid_config());
+  ASSERT_NE(store, nullptr) << detail;
+  ASSERT_TRUE(store->subscribe(grid_request(1, {20, 19, 0, 1, 0, 1})));
+  const std::vector<uint8_t> metadata(16, 7);
+  const auto                 grid = coordinate_grid(1, 14, 12);
+  uint64_t                   sequence = 1;
+  for (const auto& [sfn, slot, expected] : std::vector<std::tuple<uint16_t, uint16_t, bool>>{
+           {1023, 19, true}, {0, 19, true}, {0, 0, false}, {511, 19, true}, {1023, 18, false}}) {
+    auto source = publication(sequence++, metadata, grid);
+    source.grid = grid_layout(sfn, slot, 1, 12);
+    EXPECT_EQ(store->publish(source) == portable_publish_result::published, expected) << sfn << "." << slot;
+  }
+}
+
+TEST(portable_data_store_grid_region, refuses_bad_regions_and_publications_without_a_layout)
+{
+  auto [store, detail] = portable_data_store::create(grid_config());
+  ASSERT_NE(store, nullptr) << detail;
+  auto telemetry         = grid_request(1, {1, 0, 0, 14, 0, 1});
+  telemetry.interface_id = telemetry_stream_pusch_grid;
+  EXPECT_FALSE(store->subscribe(telemetry)) << "regions are Class-C Spectrum only";
+  EXPECT_FALSE(store->subscribe(grid_request(2, {10, 10, 0, 1, 0, 1}))) << "offset must be below the period";
+  EXPECT_FALSE(store->subscribe(grid_request(3, {1, 0, 13, 2, 0, 1}))) << "symbols past the slot";
+  EXPECT_FALSE(store->subscribe(grid_request(4, {1, 0, 0, 1, 270, 6}))) << "PRBs past 275";
+  EXPECT_FALSE(store->subscribe(grid_request(5, {0, 0, 0, 1, 0, 1}))) << "zero period";
+
+  ASSERT_TRUE(store->subscribe(grid_request(6, {1, 0, 0, 1, 0, 1})));
+  const std::vector<uint8_t> metadata(16, 7);
+  const auto                 grid = coordinate_grid(1, 14, 12);
+  EXPECT_EQ(store->publish(publication(1, metadata, grid)), portable_publish_result::invalid) << "no layout";
+  auto source = publication(2, metadata, grid);
+  source.grid = grid_layout(0, 0, 2, 12); // claims two ports: does not match the tensor size
+  EXPECT_EQ(store->publish(source), portable_publish_result::invalid);
+  auto polled = store->poll(make_id(6), 8);
+  EXPECT_TRUE(polled.chunks.empty());
+  EXPECT_EQ(polled.subscription->dropped_objects, 2U);
 }

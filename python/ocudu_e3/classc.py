@@ -78,7 +78,12 @@ class SpectrumSnapshot:
     #: producer had no plan. See :data:`UL_USE_NAMES`.
     occupancy: Optional[np.ndarray]
     #: Resource grid shaped (rx_ports, symbols, subcarriers), complex64, already divided by ``scale``.
+    #: [srs-sharing] With a grid region it holds only the window: (rx_ports, window symbols, window subcarriers).
     grid: np.ndarray
+    #: [srs-sharing] Source-grid symbol and subcarrier of ``grid[:, 0, 0]``; zero for an uncropped grid. ``symbols``
+    #: and ``subcarriers`` above always describe the source grid, as the metadata does.
+    first_symbol: int = 0
+    first_subcarrier: int = 0
 
     @property
     def nof_prb(self) -> int:
@@ -97,11 +102,18 @@ class SpectrumSnapshot:
     def prb_power(self) -> np.ndarray:
         """Mean |x|^2 per (symbol, PRB), summed over receive ports; shape (symbols, nof_prb)."""
         power = (np.abs(self.grid) ** 2).sum(axis=0)  # (symbols, subcarriers)
-        return power[:, : self.nof_prb * 12].reshape(self.symbols, self.nof_prb, 12).mean(axis=2)
+        # [srs-sharing] Shape from the grid itself, so a region-cropped window works too (its PRBs are whole).
+        nof_symbols, nof_subcarriers = power.shape
+        nof_prb = nof_subcarriers // 12
+        return power[:, : nof_prb * 12].reshape(nof_symbols, nof_prb, 12).mean(axis=2)
 
 
-def decode_spectrum(metadata: bytes, tensor: bytes) -> SpectrumSnapshot:
-    """Decode a ``classc.spectrum`` record (``ClassCPortableRecord.metadata`` / ``.tensor``)."""
+def decode_spectrum(metadata: bytes, tensor: bytes, window=None) -> SpectrumSnapshot:
+    """Decode a ``classc.spectrum`` record (``ClassCPortableRecord.metadata`` / ``.tensor``).
+
+    [srs-sharing] Pass ``ClassCPortableRecord.grid_window`` as ``window`` for a subscription with a grid region: the
+    tensor then holds only that window, while the metadata (dimensions, offsets) still describes the source grid.
+    """
     if not PublicationEnvelope.PublicationEnvelopeBufferHasIdentifier(metadata, 0):
         raise ValueError("Class-C metadata does not carry the OCC3 identifier")
     envelope = PublicationEnvelope.GetRootAs(metadata, 0)
@@ -119,12 +131,21 @@ def decode_spectrum(metadata: bytes, tensor: bytes) -> SpectrumSnapshot:
 
     rx_ports, symbols, subcarriers = int(meta.RxPorts()), int(meta.Symbols()), int(meta.Subcarriers())
     element = descriptor.ElementType()
-    offset = int(descriptor.ByteOffset())
-    length = int(descriptor.ByteLength()) or len(tensor) - offset
-    payload = tensor[offset : offset + length]
-    expected = rx_ports * symbols * subcarriers * _ELEMENT_BYTES.get(element, 4)
+    # [srs-sharing] A cropped tensor is the window alone: the descriptor's offset and length refer to the source grid.
+    shape = (rx_ports, symbols, subcarriers)
+    if window is not None:
+        if (window.first_symbol + window.nof_symbols > symbols
+                or window.first_subcarrier + window.nof_subcarriers > subcarriers):
+            raise ValueError("grid window lies outside the source grid")
+        shape = (rx_ports, window.nof_symbols, window.nof_subcarriers)
+        payload = tensor
+    else:
+        offset = int(descriptor.ByteOffset())
+        length = int(descriptor.ByteLength()) or len(tensor) - offset
+        payload = tensor[offset : offset + length]
+    expected = shape[0] * shape[1] * shape[2] * _ELEMENT_BYTES.get(element, 4)
     if len(payload) != expected:
-        raise ValueError(f"tensor holds {len(payload)} bytes, expected {expected} for {rx_ports}x{symbols}x{subcarriers}")
+        raise ValueError(f"tensor holds {len(payload)} bytes, expected {expected} for {'x'.join(map(str, shape))}")
     if element == ElementType.ComplexBf16:
         grid = bf16_pairs_to_complex64(payload)
     elif element == ElementType.ComplexFp32:
@@ -134,7 +155,7 @@ def decode_spectrum(metadata: bytes, tensor: bytes) -> SpectrumSnapshot:
         grid = pairs[0::2] + 1j * pairs[1::2]
     else:
         raise ValueError(f"unsupported spectrum element type {element}")
-    grid = grid.reshape(rx_ports, symbols, subcarriers)
+    grid = grid.reshape(shape)
     scale = float(meta.Scale()) or 1.0
     if scale != 1.0:
         grid = grid / scale
@@ -168,6 +189,8 @@ def decode_spectrum(metadata: bytes, tensor: bytes) -> SpectrumSnapshot:
         occupancy_complete=bool(meta.OccupancyComplete()),
         occupancy=occupancy,
         grid=grid,
+        first_symbol=window.first_symbol if window is not None else 0,
+        first_subcarrier=window.first_subcarrier if window is not None else 0,
     )
 
 

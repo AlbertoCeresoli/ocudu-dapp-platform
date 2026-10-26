@@ -11,6 +11,7 @@
 #include "ocudu/dapp/e3/zmq_association_server.h"
 #include "ocudu/dapp/e3/management_service.h"
 #include "ocudu/dapp/e3/shared_region.h"
+#include "ocudu/dapp/use_cases/v1/spectrum.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -68,6 +69,8 @@ struct object_assembly {
   uint64_t             dropped_objects{};
   std::vector<uint8_t> metadata;
   std::vector<uint8_t> tensor;
+  /// [srs-sharing] Window of a region-cropped object, from chunk 0.
+  std::optional<portable_grid_window> grid_window;
 
   void reset() noexcept
   {
@@ -76,6 +79,7 @@ struct object_assembly {
     skipping = false;
     metadata.clear();
     tensor.clear();
+    grid_window.reset();
   }
 };
 
@@ -722,6 +726,12 @@ struct e3ap_sctp_server::implementation {
       binding.interface_id = *interface;
       binding.store_id     = store_identifier(session, created.subscription_id, telemetry_id);
       binding.rnti_filter  = config_for.rnti_filter;
+      // [srs-sharing] The store applies the region, so only Class-C Spectrum (the one producer that describes its
+      // grid layout to the store) can take one; anything else is refused here with a clear cause.
+      if (config_for.grid_region && *interface != OCUDU_DAPP_INTERFACE_SPECTRUM_V1) {
+        failure = "grid region is supported on classc.spectrum only";
+        break;
+      }
       // The subscriber's request (per-telemetry config first, then the
       // procedure-level periodicity) becomes the producer's capture demand;
       // an unspecified request keeps the advertised default floor. The
@@ -750,6 +760,7 @@ struct e3ap_sctp_server::implementation {
       store_request.lease_us              = config.lease_us;
       store_request.drop_policy           = to_store_policy(config_for.drop_policy);
       store_request.requested_interval_us = effective_us;
+      store_request.grid_region           = config_for.grid_region; // [srs-sharing]
       auto admitted                       = store->subscribe(store_request);
       if (!admitted) {
         failure = "store rejected telemetry " + std::to_string(telemetry_id) + ": " + admitted.detail;
@@ -1138,6 +1149,7 @@ struct e3ap_sctp_server::implementation {
       assembly.tensor_size     = chunk.tensor_size;
       assembly.dropped_objects = chunk.dropped_objects;
       assembly.metadata        = chunk.metadata;
+      assembly.grid_window     = chunk.grid_window;
       if (chunk.tensor_size > config.maximum_payload_bytes) {
         assembly.reset();
         indications_dropped.fetch_add(1, std::memory_order_relaxed);
@@ -1265,7 +1277,8 @@ struct e3ap_sctp_server::implementation {
                                                    assembly.dropped_objects,
                                                    assembly.metadata,
                                                    tensor_view,
-                                                   !written.has_value());
+                                                   !written.has_value(),
+                                                   assembly.grid_window);
     if (!indication) {
       indications_dropped.fetch_add(1, std::memory_order_relaxed);
       return;

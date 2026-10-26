@@ -4,6 +4,7 @@
 #include "ocudu/dapp/e3/e3ap_codec.h"
 #include "ocudu/dapp/e3/e3ap_v2_codec.h"
 #include "ocudu/dapp/e3/telemetry_types.h"
+#include "ocudu/dapp/use_cases/v1/spectrum.h"
 #include <cmath>
 #include <cstring>
 #include <gtest/gtest.h>
@@ -599,4 +600,52 @@ TEST(dapp_e3ap_codec, by_reference_descriptors_and_regions_round_trip)
   EXPECT_EQ(*ipc_location.ready_event_handle, event);
   EXPECT_EQ(ipc_location.byte_offset, 4096U);
   EXPECT_TRUE(ipc_back.by_reference->dimensions.empty());
+}
+
+// [srs-sharing] Telemetry-GridRegion in a subscription and Telemetry-GridWindow in a Class-C record survive APER.
+TEST(dapp_e3ap_codec, grid_region_and_window_round_trip)
+{
+  telemetry_subscription_data   data;
+  telemetry_subscription_config config;
+  config.telemetry_id = telemetry_id_class_c_spectrum;
+  config.drop_policy  = telemetry_drop_policy::drop_oldest;
+  config.grid_region  = portable_grid_region{10, 7, 13, 1, 5, 40};
+  data.configs.push_back(config);
+  data.configs.push_back(telemetry_subscription_config{telemetry_id_srs_channel}); // without a region
+  auto data_bytes = e3ap_codec::encode(data);
+  ASSERT_TRUE(data_bytes) << data_bytes.detail;
+  auto data_back = e3ap_codec::decode_subscription(*data_bytes.value);
+  ASSERT_TRUE(data_back) << data_back.detail;
+  ASSERT_EQ(data_back.value->configs.size(), 2U);
+  ASSERT_TRUE(data_back.value->configs[0].grid_region.has_value());
+  EXPECT_EQ(*data_back.value->configs[0].grid_region, (portable_grid_region{10, 7, 13, 1, 5, 40}));
+  EXPECT_FALSE(data_back.value->configs[1].grid_region.has_value());
+
+  telemetry_subscription_data bad;
+  bad.configs.push_back(config);
+  bad.configs[0].grid_region->slot_offset = 10;
+  EXPECT_FALSE(e3ap_codec::encode(bad)) << "offset must be below the period";
+
+  const std::vector<uint8_t> metadata(32, 3), tensor(3840, 5);
+  auto indication = e3ap_codec::from_publication(OCUDU_DAPP_INTERFACE_SPECTRUM_V1,
+                                                 0,
+                                                 9,
+                                                 17,
+                                                 0,
+                                                 metadata,
+                                                 tensor,
+                                                 true,
+                                                 portable_grid_window{13, 1, 60, 480});
+  ASSERT_TRUE(indication) << indication.detail;
+  auto bytes = e3ap_codec::encode(*indication.value);
+  ASSERT_TRUE(bytes) << bytes.detail;
+  auto decoded = e3ap_codec::decode_telemetry(*bytes.value);
+  ASSERT_TRUE(decoded) << decoded.detail;
+  const auto& record = std::get<class_c_portable_record>(decoded.value->object);
+  ASSERT_TRUE(record.grid_window.has_value());
+  EXPECT_EQ(record.grid_window->first_symbol, 13U);
+  EXPECT_EQ(record.grid_window->nof_symbols, 1U);
+  EXPECT_EQ(record.grid_window->first_subcarrier, 60U);
+  EXPECT_EQ(record.grid_window->nof_subcarriers, 480U);
+  EXPECT_EQ(record.tensor, tensor);
 }

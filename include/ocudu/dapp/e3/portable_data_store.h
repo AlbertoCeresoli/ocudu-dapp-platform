@@ -37,6 +37,8 @@ struct portable_publication_source {
   uint64_t                   route_epoch{};
   ocudu::span<const uint8_t> metadata;
   ocudu::span<const uint8_t> tensor;
+  /// [srs-sharing] Set by resource-grid producers; subscriptions with a grid region skip objects without it.
+  std::optional<portable_grid_layout> grid;
 };
 
 enum class portable_publish_result : uint8_t {

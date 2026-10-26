@@ -336,6 +336,16 @@ telemetry identifiers:
 Per-telemetry filters ride in `subscriptionData` (`Telemetry-SubscriptionConfig`):
 cell filter, `sampleEveryN`, drop policy (`coalesceLatest` by default so a slow
 dApp always sees the freshest object), `minimumIntervalMs`, and an RNTI list.
+On `classc.spectrum`, a `gridRegion` (slot period and offset, symbol range,
+PRB range) makes the store keep only the matching slots and copy only that box
+of each grid into the subscriber's queue; the record then carries a
+`gridWindow` with the part of the grid it holds, while the Class-C metadata
+still describes the full grid (`SubscriptionConfig(..., grid_region=GridRegion(...))`,
+then `decode_spectrum(record.metadata, record.tensor, record.grid_window)`).
+A region on any other stream is refused with `unsupportedIdentifier`. A
+subscription has one region; to follow several resources, open one
+subscription per resource, and to move a region, subscribe the new one before
+deleting the old one.
 Each subscribed telemetry reserves its own bounded store queue: 64 chunks for
 streams whose objects can reach the store's maximum object size
 (`pusch.symbols`, Class-C snapshots) and 8–16 chunks for the small-record

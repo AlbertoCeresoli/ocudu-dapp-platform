@@ -15,6 +15,7 @@
 #include "ocudu/dapp/e3/shared_region_layout.h"
 #include "ocudu/dapp/e3/telemetry_publisher.h"
 #include "ocudu/dapp/runtime/instance_manager.h"
+#include "ocudu/dapp/use_cases/v1/spectrum.h"
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
@@ -2078,4 +2079,99 @@ TEST(dapp_e3ap_sctp_server, shared_region_creation_does_not_unlink_an_existing_o
   ::close(fd);
   config.name = "/../bad";
   EXPECT_FALSE(e3_shared_region::create(config).first);
+}
+
+// [srs-sharing] A classc.spectrum subscription with a grid region gets only the matching slots, cropped in the store,
+// with the window in the record; a region on any other stream is refused at admission.
+TEST(dapp_e3ap_sctp_server, delivers_region_cropped_spectrum_and_refuses_regions_elsewhere)
+{
+  fixture f;
+  auto    server = e3ap_sctp_server::create(&f.service, f.store, test_server_config(), f.connections);
+  ASSERT_TRUE(server) << server.detail;
+  test_client client(server.server->port());
+  ASSERT_TRUE(client.ok());
+  auto dapp_id = client.setup();
+  ASSERT_TRUE(dapp_id);
+
+  const auto subscribe = [&](uint32_t request_id, uint16_t telemetry_id) {
+    telemetry_subscription_data   data;
+    telemetry_subscription_config config;
+    config.telemetry_id = telemetry_id;
+    config.drop_policy  = telemetry_drop_policy::drop_oldest;
+    config.grid_region  = portable_grid_region{10, 7, 13, 1, 5, 40};
+    data.configs.push_back(config);
+    e3ap_pdu pdu;
+    pdu.id = request_id;
+    e3ap_subscription_request subscription;
+    subscription.dapp_identifier         = *dapp_id;
+    subscription.ran_function_identifier = e3ap_ran_function_telemetry;
+    subscription.telemetry_identifiers   = {telemetry_id};
+    subscription.subscription_data       = *e3ap_codec::encode(data).value;
+    pdu.message                          = subscription;
+    EXPECT_TRUE(client.send(pdu));
+    return client.receive_as<e3ap_subscription_response>();
+  };
+
+  auto refused = subscribe(4, telemetry_id_pusch_grid);
+  ASSERT_TRUE(refused);
+  EXPECT_EQ(refused->response_code, e3ap_response_code::negative);
+  ASSERT_TRUE(refused->cause);
+  EXPECT_EQ(*refused->cause, e3ap_cause::unsupported_identifier);
+
+  auto accepted = subscribe(5, telemetry_id_class_c_spectrum);
+  ASSERT_TRUE(accepted);
+  ASSERT_EQ(accepted->response_code, e3ap_response_code::positive) << accepted->detail;
+  ASSERT_TRUE(wait_until([&] { return f.store->has_active(OCUDU_DAPP_INTERFACE_SPECTRUM_V1); }));
+
+  // Full grid of 2 ports x 14 symbols x 612 subcarriers, 4 bytes per element; every element encodes its position.
+  constexpr uint32_t   ports = 2, symbols = 14, subcarriers = 612;
+  std::vector<uint8_t> grid(ports * symbols * subcarriers * 4);
+  for (uint32_t index = 0; index != ports * symbols * subcarriers; ++index) {
+    std::memcpy(&grid[index * 4], &index, sizeof(index));
+  }
+  const std::vector<uint8_t> metadata(64, 0x5a);
+  for (uint16_t slot = 0; slot != 20; ++slot) {
+    portable_publication_source source;
+    source.interface_id         = OCUDU_DAPP_INTERFACE_SPECTRUM_V1;
+    source.publication_sequence = 1 + slot;
+    source.route_epoch          = 3;
+    source.metadata             = metadata;
+    source.tensor               = grid;
+    source.grid                 = portable_grid_layout{40, slot, 1, ports, symbols, subcarriers, 4};
+    f.store->publish(source);
+  }
+
+  // Slots 7 and 17 are the occasions (period 10, offset 7): exactly two objects, each 2 x 1 x 480 elements.
+  std::vector<telemetry_indication> received;
+  std::vector<uint8_t>              bytes;
+  while (received.size() < 2) {
+    auto indication = client.receive_as<e3ap_indication_message>();
+    ASSERT_TRUE(indication) << "indication stream stalled";
+    bytes.insert(bytes.end(), indication->protocol_data.begin(), indication->protocol_data.end());
+    if (indication->fragment_index + 1 != indication->fragment_count) {
+      continue;
+    }
+    auto decoded = e3ap_codec::decode_telemetry(bytes);
+    ASSERT_TRUE(decoded) << decoded.detail;
+    received.push_back(*decoded.value);
+    bytes.clear();
+  }
+  EXPECT_EQ(received[0].sequence, 8U);
+  EXPECT_EQ(received[1].sequence, 18U);
+  for (const auto& indication : received) {
+    const auto& record = std::get<class_c_portable_record>(indication.object);
+    EXPECT_EQ(record.metadata, metadata);
+    ASSERT_TRUE(record.grid_window.has_value());
+    EXPECT_EQ(record.grid_window->first_symbol, 13U);
+    EXPECT_EQ(record.grid_window->first_subcarrier, 60U);
+    EXPECT_EQ(record.grid_window->nof_subcarriers, 480U);
+    ASSERT_EQ(record.tensor.size(), 2U * 480U * 4U);
+    for (uint32_t port = 0; port != ports; ++port) {
+      for (uint32_t k = 0; k != 480; ++k) {
+        uint32_t value;
+        std::memcpy(&value, &record.tensor[(port * 480 + k) * 4], sizeof(value));
+        ASSERT_EQ(value, (port * symbols + 13) * subcarriers + 60 + k) << "port " << port << " subcarrier " << k;
+      }
+    }
+  }
 }

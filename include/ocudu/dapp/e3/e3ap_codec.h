@@ -39,7 +39,8 @@ public:
                                                              uint64_t                   dropped_objects,
                                                              ocudu::span<const uint8_t> metadata,
                                                              ocudu::span<const uint8_t> tensor,
-                                                             bool                       include_bulk = true) noexcept;
+                                                             bool                       include_bulk = true,
+                                                             std::optional<portable_grid_window> grid_window = {}) noexcept;
 
   /// Splits an encoded payload into fragments no larger than the bound.
   static std::vector<ocudu::span<const uint8_t>> fragment(ocudu::span<const uint8_t> payload,

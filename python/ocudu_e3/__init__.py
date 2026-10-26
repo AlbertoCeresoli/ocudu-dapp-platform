@@ -19,6 +19,7 @@ from .e3ap import (
     E3ProtocolError,
     E3Subscription,
     E3TransportError,
+    GridRegion,
     RanFunction,
     SetupResult,
     SubscriptionConfig,
@@ -44,6 +45,7 @@ except ImportError:  # pragma: no cover - flatbuffers not installed
     decode_srs_isac = decode_spectrum  # type: ignore[assignment]
 from .telemetry import (
     ClassCPortableRecord,
+    GridWindow,
     GnbMetricsJsonRecord,
     PuschCrcRecord,
     PuschDmrsChannelRecord,
@@ -71,6 +73,8 @@ __all__ = [
     "E3ProtocolError",
     "E3Subscription",
     "E3TransportError",
+    "GridRegion",
+    "GridWindow",
     "RanFunction",
     "SetupResult",
     "SubscriptionConfig",

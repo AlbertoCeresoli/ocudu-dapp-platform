@@ -411,7 +411,16 @@ Telemetry-IndicationData ::= SEQUENCE {
 Telemetry-SubscriptionConfig ::= SEQUENCE {
   telemetryId, cellId OPTIONAL, sampleEveryN DEFAULT 1,
   dropPolicy DEFAULT coalesceLatest, minimumIntervalMs OPTIONAL,
-  rntiFilter SEQUENCE OF Rnti OPTIONAL, ...
+  rntiFilter SEQUENCE OF Rnti OPTIONAL, ...,
+  gridRegion Telemetry-GridRegion OPTIONAL   -- classc.spectrum only
+}
+Telemetry-GridRegion ::= SEQUENCE {          -- deliver slots with (sfn*slotsPerFrame+slot) mod
+  slotPeriod, slotOffset,                    -- slotPeriod = slotOffset, and only symbols
+  firstSymbol, nofSymbols, firstPrb, nofPrbs, ... -- x PRBs of the box
+}
+ClassCPortableRecord ::= SEQUENCE {
+  interfaceId, metadata, tensor, ...,
+  gridWindow Telemetry-GridWindow OPTIONAL   -- set when a gridRegion cropped the tensor
 }
 ```
 

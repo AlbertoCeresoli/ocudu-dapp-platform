@@ -299,6 +299,32 @@ ClassCPortableRecord ::= SEQUENCE {
   metadata    OCTET STRING (SIZE (0..65536)),
   -- Empty when the bytes were delivered by reference (E3-TensorDescriptor).
   tensor      OCTET STRING (SIZE (0..maxTelemetryObjectBytes)),
+  ...,
+  -- [srs-sharing] Present when the subscription's gridRegion cropped the object: the tensor then holds
+  -- [port][nofSymbols][nofSubcarriers] of the source grid, while metadata still describes the full source grid.
+  gridWindow  Telemetry-GridWindow OPTIONAL
+}
+
+-- [srs-sharing] Resource-grid region of a subscription (classc.spectrum only; not in the upstream service model).
+-- The gNB delivers only the slots with (sfn * slotsPerFrame + slot) mod slotPeriod = slotOffset (the SRS occasion
+-- rule of TS 38.211 6.4.1.4.4) and of each only symbols [firstSymbol, firstSymbol + nofSymbols) and PRBs
+-- [firstPrb, firstPrb + nofPrbs), counted from the first subcarrier of the grid, on every receive port.
+Telemetry-GridRegion ::= SEQUENCE {
+  slotPeriod  INTEGER (1..163840),
+  slotOffset  INTEGER (0..163839),
+  firstSymbol INTEGER (0..13),
+  nofSymbols  INTEGER (1..14),
+  firstPrb    INTEGER (0..274),
+  nofPrbs     INTEGER (1..275),
+  ...
+}
+
+-- [srs-sharing] Part of the source grid a cropped object carries: the requested box clipped to the grid.
+Telemetry-GridWindow ::= SEQUENCE {
+  firstSymbol     INTEGER (0..13),
+  nofSymbols      INTEGER (1..14),
+  firstSubcarrier INTEGER (0..3299),
+  nofSubcarriers  INTEGER (1..3300),
   ...
 }
 
@@ -342,7 +368,10 @@ Telemetry-SubscriptionConfig ::= SEQUENCE {
   dropPolicy        Telemetry-DropPolicy DEFAULT coalesceLatest,
   minimumIntervalMs INTEGER (0..60000) OPTIONAL,
   rntiFilter        SEQUENCE (SIZE (1..maxTelemetryRntiFilter)) OF Rnti OPTIONAL,
-  ...
+  ...,
+  -- [srs-sharing] Crop the object to a slot pattern and a symbol x PRB box before it is queued (classc.spectrum
+  -- only). An extension addition: peers built from the upstream schema still decode every other field.
+  gridRegion        Telemetry-GridRegion OPTIONAL
 }
 
 Telemetry-SubscriptionData ::= SEQUENCE {

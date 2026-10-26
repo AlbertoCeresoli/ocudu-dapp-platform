@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "ocudu/dapp/e3/portable_data_types.h"
 #include "ocudu/dapp/e3/telemetry_types.h"
 #include "ocudu/dapp/management/types.h"
 #include <array>
@@ -378,6 +379,8 @@ struct telemetry_subscription_config {
   /// keeps the advertised default floor.
   std::optional<uint32_t> minimum_interval_ms;
   std::vector<uint16_t>   rnti_filter;
+  /// [srs-sharing] Telemetry-GridRegion: crop classc.spectrum to a slot pattern and a symbol x PRB box in the store.
+  std::optional<portable_grid_region> grid_region;
 };
 
 struct telemetry_subscription_data {
@@ -545,6 +548,8 @@ struct class_c_portable_record {
   uint32_t             interface_id{};
   std::vector<uint8_t> metadata;
   std::vector<uint8_t> tensor;
+  /// [srs-sharing] Telemetry-GridWindow: the part of the source grid the tensor holds after a region crop.
+  std::optional<portable_grid_window> grid_window;
 };
 
 // [srs-sharing] Wire-side (APER) form of the srs.config and ta.command streams, built from the packed
