@@ -7,6 +7,9 @@
 #include "e2sm/e2sm_ccc/e2sm_ccc_asn1_packer.h"
 #include "e2sm/e2sm_kpm/e2sm_kpm_asn1_packer.h"
 #include "e2sm/e2sm_rc/e2sm_rc_asn1_packer.h"
+#ifdef OCUDU_E2SM_DAPP
+#include "e2sm/e2sm_dapp/e2sm_dapp_asn1_packer.h" // [srs-sharing]
+#endif
 #include "ocudu/adt/byte_buffer.h"
 #include "ocudu/asn1/asn1_utils.h"
 #include "ocudu/e2/e2.h"
@@ -134,6 +137,21 @@ inline void fill_asn1_e2ap_setup_request(ocudulog::basic_logger&                
       logger.error("No E2SM interface found for RAN OID {}", ran_oid.c_str());
     }
   }
+
+#ifdef OCUDU_E2SM_DAPP
+  // [srs-sharing] E2SM-DAPP, registered by the DU E2 factory only when a dApp bridge exists.
+  if (e2ap_config.e2sm_dapp_enabled) {
+    std::string ran_oid     = e2sm_dapp_asn1_packer::oid;
+    uint32_t    ran_func_id = e2sm_dapp_asn1_packer::ran_func_id;
+    logger.info("Generate RAN function definition for OID: {}", ran_oid.c_str());
+    e2sm_interface* e2_iface = e2sm_mngr.get_e2sm_interface(ran_oid);
+    if (e2_iface) {
+      fill_ran_function_item(logger, setup, ran_oid, ran_func_id, e2_iface);
+    } else {
+      logger.error("No E2SM interface found for RAN OID {} (is the dApp service with E3 enabled?)", ran_oid.c_str());
+    }
+  }
+#endif
 
   // E2 node component config, one list entry per collected setup exchange.
   auto& list = setup->e2node_component_cfg_addition;

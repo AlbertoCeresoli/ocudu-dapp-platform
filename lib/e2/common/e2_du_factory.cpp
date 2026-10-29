@@ -16,6 +16,10 @@
 #include "e2sm/e2sm_rc/e2sm_rc_control_action_du_executor.h"
 #include "e2sm/e2sm_rc/e2sm_rc_control_service_impl.h"
 #include "e2sm/e2sm_rc/e2sm_rc_impl.h"
+#ifdef OCUDU_E2SM_DAPP
+#include "e2sm/e2sm_dapp/e2sm_dapp_impl.h" // [srs-sharing]
+#include "ocudu/ran/plmn_identity.h"
+#endif
 #include "ocudu/e2/e2_agent_dependencies.h"
 
 using namespace ocudu;
@@ -28,7 +32,8 @@ ocudu::create_e2_du_agent(const e2ap_configuration&                          e2a
                           odu::du_configurator*                              du_configurator_,
                           timer_factory                                      timers_,
                           task_executor&                                     e2_exec_,
-                          std::unique_ptr<e2_node_component_config_provider> node_component_config_provider_)
+                          std::unique_ptr<e2_node_component_config_provider> node_component_config_provider_,
+                          std::shared_ptr<e2sm_dapp_bridge>                  dapp_bridge_)
 {
   ocudulog::basic_logger& logger = ocudulog::fetch_basic_logger("E2-DU");
   e2_agent_dependencies   dependencies{
@@ -82,6 +87,34 @@ ocudu::create_e2_du_agent(const e2ap_configuration&                          e2a
                                                        std::move(e2sm_ccc_packer),
                                                        std::move(e2sm_ccc_iface)});
   }
+
+#ifdef OCUDU_E2SM_DAPP
+  // [srs-sharing] E2SM-DAPP: E3 dApp reports up to xApps and xApp controls down to dApps, through the dApp service's
+  // E3 server (dapp_bridge_). Without a bridge (no dApp service, or one without E3) it is not registered, and E2 Setup
+  // logs that it cannot list it.
+  if (e2ap_cfg_.e2sm_dapp_enabled) {
+    if (dapp_bridge_ == nullptr) {
+      logger.error("E2SM-DAPP is enabled but the gNB runs no dApp service with an E3 server: not registered");
+    } else {
+      e2sm_dapp_node_identity node;
+      if (auto plmn = plmn_identity::parse(e2ap_cfg_.plmn)) {
+        node.plmn = plmn.value().to_bytes();
+      }
+      node.nb_id = e2ap_cfg_.gnb_id.id;
+      if (e2ap_cfg_.gnb_du_id) {
+        node.cu_du_id = gnb_du_id_to_int(*e2ap_cfg_.gnb_du_id);
+      }
+      auto e2sm_dapp_packer = std::make_unique<e2sm_dapp_asn1_packer>();
+      auto e2sm_dapp_iface  = std::make_unique<e2sm_dapp_impl>(logger, *e2sm_dapp_packer, dapp_bridge_, node);
+      dependencies.e2sm_modules.emplace_back(e2sm_module{e2sm_dapp_asn1_packer::ran_func_id,
+                                                         e2sm_dapp_asn1_packer::oid,
+                                                         std::move(e2sm_dapp_packer),
+                                                         std::move(e2sm_dapp_iface)});
+    }
+  }
+#else
+  static_cast<void>(dapp_bridge_);
+#endif
 
   auto e2_ext = std::make_unique<e2_entity>(std::move(dependencies));
   return e2_ext;

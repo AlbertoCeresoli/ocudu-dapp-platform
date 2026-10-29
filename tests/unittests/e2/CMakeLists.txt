@@ -114,3 +114,11 @@ target_link_libraries(asn1_e2sm_ccc_test ocudulog ocudu_e2 e2ap_asn1 ocudu_pcap 
 )
 target_include_directories(asn1_e2sm_ccc_test PRIVATE ${CMAKE_SOURCE_DIR})
 gtest_discover_tests(asn1_e2sm_ccc_test)
+
+# [srs-sharing] E2SM-DAPP packer and service model, checked against FlexRIC's E2SM-DAPP encodings.
+if (TARGET ocudu_e2sm_dapp_asn1)
+  add_executable(e2sm_dapp_test e2sm_dapp_test.cpp)
+  target_link_libraries(e2sm_dapp_test ocudu_e2 ocudu_support ocudulog e2ap_asn1 GTest::gtest GTest::gtest_main)
+  target_include_directories(e2sm_dapp_test PRIVATE ${CMAKE_SOURCE_DIR})
+  gtest_discover_tests(e2sm_dapp_test)
+endif ()

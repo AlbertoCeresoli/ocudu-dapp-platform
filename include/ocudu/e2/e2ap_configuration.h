@@ -24,6 +24,9 @@ struct e2ap_configuration {
   bool                          e2sm_kpm_enabled            = false;
   bool                          e2sm_rc_enabled             = false;
   bool                          e2sm_ccc_enabled            = false;
+  /// [srs-sharing] E2SM-DAPP (SM ID 255): E3 dApp reports up to xApps and xApp controls down to dApps. Needs a dApp
+  /// service with an E3 server in the same process (the E2 agent reaches it through an e2sm_dapp_bridge).
+  bool e2sm_dapp_enabled = false;
 };
 
 } // namespace ocudu

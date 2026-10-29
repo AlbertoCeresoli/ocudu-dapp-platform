@@ -456,6 +456,8 @@ o_du_unit flexible_o_du_factory::create_flexible_o_du(const o_du_unit_dependenci
 #ifdef OCUDU_FLEXIBLE_DU_DAPP
   if (dapp_service) {
     odu_hi_unit_dependencies.o_du_hi_dependencies.du_hi.dapp_hooks = dapp_service->scheduler_hooks();
+    // [srs-sharing] E3 side of E2SM-DAPP, used when the E2 agent has it enabled.
+    odu_hi_unit_dependencies.o_du_hi_dependencies.e2_dapp_bridge = dapp_service->e2_dapp_bridge();
   }
 #endif
 

@@ -15,6 +15,7 @@
 namespace ocudu {
 
 class e2_node_component_config_provider;
+class e2sm_dapp_bridge; // [srs-sharing]
 
 /// Creates a instance of an E2 interface (with subscription manager)
 std::unique_ptr<e2_agent>
@@ -25,6 +26,8 @@ create_e2_du_agent(const e2ap_configuration&                          e2ap_cfg_,
                    odu::du_configurator*                              du_configurator_,
                    timer_factory                                      timers_,
                    task_executor&                                     e2_exec_,
-                   std::unique_ptr<e2_node_component_config_provider> node_component_config_provider_);
+                   std::unique_ptr<e2_node_component_config_provider> node_component_config_provider_,
+                   // [srs-sharing] E3 side of E2SM-DAPP (from the dApp service); E2SM-DAPP is registered only with one.
+                   std::shared_ptr<e2sm_dapp_bridge> dapp_bridge_ = nullptr);
 
 } // namespace ocudu

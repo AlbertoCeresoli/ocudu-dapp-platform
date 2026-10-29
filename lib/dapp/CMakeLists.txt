@@ -207,6 +207,56 @@ if (ENABLE_E3)
     target_compile_options(ocudu_dapp_libe3_asn1 PRIVATE -w)
     target_link_libraries(ocudu_dapp_libe3_asn1 PUBLIC ocudu_dapp_e3sm_asn1)
 
+    # [srs-sharing] E2SM-DAPP (schemas/e2/e2sm-dapp-v0.asn1, vendored from wineslab/dApp-flexric a30eedfc): the E2
+    # service model that bridges E3 dApp reports and xApp controls over E2 (lib/e2/e2sm/e2sm_dapp). Same generator
+    # and options as FlexRIC's (APER, compound names, indirect choice), so both ends encode alike. Generated with a
+    # type prefix (E2SMDAPP_) like the E3AP-OCUDU-V2 module, sharing the asn1c runtime of the two E3 libraries: only
+    # the prefixed module files and the runtime units neither of them already compiles are built here.
+    set(E2SM_DAPP_SCHEMA ${PROJECT_SOURCE_DIR}/schemas/e2/e2sm-dapp-v0.asn1)
+    set(E2SM_DAPP_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/e2sm_dapp_asn1)
+    file(MAKE_DIRECTORY ${E2SM_DAPP_GENERATED_DIR})
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${E2SM_DAPP_SCHEMA})
+    file(GLOB E2SM_DAPP_STALE ${E2SM_DAPP_GENERATED_DIR}/*.c ${E2SM_DAPP_GENERATED_DIR}/*.h)
+    if (E2SM_DAPP_STALE)
+      file(REMOVE ${E2SM_DAPP_STALE})
+    endif ()
+    execute_process(
+      COMMAND ${ASN1C_EXECUTABLE}
+        -pdu=E2SM-DAPP-EventTrigger -pdu=E2SM-DAPP-ActionDefinition
+        -pdu=E2SM-DAPP-IndicationHeader -pdu=E2SM-DAPP-IndicationMessage
+        -pdu=E2SM-DAPP-ControlHeader -pdu=E2SM-DAPP-ControlMessage -pdu=E2SM-DAPP-ControlOutcome
+        -pdu=E2SM-DAPP-RANFunctionDefinition
+        -gen-APER -no-gen-UPER -no-gen-JER -no-gen-BER -no-gen-XER
+        -no-gen-CBOR -no-gen-OER -no-gen-print -no-gen-random-fill
+        -fgen-only-pdu-deps -fno-include-deps -fcompound-names
+        -findirect-choice -flong-size=${E3_ASN1_LONG_BITS} -no-gen-example
+        -fprefix=E2SMDAPP_
+        -D ${E2SM_DAPP_GENERATED_DIR} ${E2SM_DAPP_SCHEMA}
+      RESULT_VARIABLE E2SM_DAPP_ASN1C_RESULT
+      OUTPUT_QUIET ERROR_VARIABLE E2SM_DAPP_ASN1C_ERROR)
+    if (NOT E2SM_DAPP_ASN1C_RESULT EQUAL 0)
+      message(FATAL_ERROR "asn1c failed to generate the E2SM-DAPP codec: ${E2SM_DAPP_ASN1C_ERROR}")
+    endif ()
+    file(GLOB E2SM_DAPP_MODULE_SOURCES CONFIGURE_DEPENDS ${E2SM_DAPP_GENERATED_DIR}/E2SMDAPP_*.c)
+    file(GLOB E2SM_DAPP_RUNTIME_SOURCES CONFIGURE_DEPENDS ${E2SM_DAPP_GENERATED_DIR}/*.c)
+    foreach (runtime_source ${E2SM_DAPP_RUNTIME_SOURCES})
+      get_filename_component(runtime_name ${runtime_source} NAME)
+      if (runtime_name MATCHES "^E2SMDAPP_" OR EXISTS ${E3_ASN1_GENERATED_DIR}/${runtime_name}
+          OR EXISTS ${E3_LIBE3_GENERATED_DIR}/${runtime_name})
+        continue()
+      endif ()
+      list(APPEND E2SM_DAPP_MODULE_SOURCES ${runtime_source})
+    endforeach ()
+    add_library(ocudu_e2sm_dapp_asn1 STATIC ${E2SM_DAPP_MODULE_SOURCES})
+    set_target_properties(ocudu_e2sm_dapp_asn1 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(ocudu_e2sm_dapp_asn1 SYSTEM PUBLIC ${E2SM_DAPP_GENERATED_DIR})
+    target_compile_definitions(ocudu_e2sm_dapp_asn1 PRIVATE
+      ASN_DISABLE_BER_SUPPORT ASN_DISABLE_XER_SUPPORT ASN_DISABLE_OER_SUPPORT
+      ASN_DISABLE_UPER_SUPPORT ASN_DISABLE_PRINT_SUPPORT ASN_DISABLE_RFILL_SUPPORT
+      ASN_DISABLE_JER_SUPPORT ASN_DISABLE_CBOR_SUPPORT)
+    target_compile_options(ocudu_e2sm_dapp_asn1 PRIVATE -w)
+    target_link_libraries(ocudu_e2sm_dapp_asn1 PUBLIC ocudu_dapp_libe3_asn1)
+
     add_library(ocudu_dapp_e3_codec STATIC e3/aper_codec.cpp)
     set_target_properties(ocudu_dapp_e3_codec PROPERTIES
       EXPORT_NAME DAppE3Codec

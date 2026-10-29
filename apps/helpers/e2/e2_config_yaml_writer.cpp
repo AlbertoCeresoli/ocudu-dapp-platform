@@ -17,4 +17,5 @@ void ocudu::fill_e2_config_in_yaml_schema(YAML::Node node, const e2_config& conf
   node["e2sm_kpm_enabled"] = config.e2sm_kpm_enabled;
   node["e2sm_rc_enabled"]  = config.e2sm_rc_enabled;
   node["e2sm_ccc_enabled"] = config.e2sm_ccc_enabled;
+  node["e2sm_dapp_enabled"] = config.e2sm_dapp_enabled; // [srs-sharing]
 }

@@ -21,6 +21,7 @@ e2ap_configuration ocudu::generate_e2_config(const o_du_high_e2_config& config,
   out_cfg.e2sm_kpm_enabled   = config.base_cfg.e2sm_kpm_enabled;
   out_cfg.e2sm_rc_enabled    = config.base_cfg.e2sm_rc_enabled;
   out_cfg.e2sm_ccc_enabled   = config.base_cfg.e2sm_ccc_enabled;
+  out_cfg.e2sm_dapp_enabled  = config.base_cfg.e2sm_dapp_enabled; // [srs-sharing]
 
   return out_cfg;
 }

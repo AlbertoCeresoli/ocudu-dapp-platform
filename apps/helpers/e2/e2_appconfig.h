@@ -29,6 +29,8 @@ struct e2_config {
   bool e2sm_rc_enabled = false;
   /// Whether to enable CCC service module.
   bool e2sm_ccc_enabled = false;
+  /// [srs-sharing] Whether to enable the E2SM-DAPP service module (DU only, needs the dApp service's E3 server).
+  bool e2sm_dapp_enabled = false;
 };
 
 } // namespace ocudu

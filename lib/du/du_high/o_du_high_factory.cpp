@@ -181,7 +181,8 @@ std::unique_ptr<o_du_high> ocudu::odu::make_o_du_high(const o_du_high_config&  c
                                     timer_factory{odu_dependencies.du_hi.timer_ctrl->get_timer_manager(),
                                                   odu_dependencies.du_hi.exec_mapper->du_e2_executor()},
                                     odu_dependencies.du_hi.exec_mapper->du_e2_executor(),
-                                    std::move(collector));
+                                    std::move(collector),
+                                    odu_dependencies.e2_dapp_bridge); // [srs-sharing]
 
   odu->set_e2_components(std::move(e2agent), std::move(adapter));
   odu->set_du_high(std::move(du_hi));

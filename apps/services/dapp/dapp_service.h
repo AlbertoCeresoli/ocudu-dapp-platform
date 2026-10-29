@@ -20,6 +20,7 @@
 
 namespace ocudu {
 
+class e2sm_dapp_bridge;
 class phy_diagnostic_sink;
 class scheduler_dapp_hook_provider;
 class scheduler_dapp_interference_cache;
@@ -245,6 +246,10 @@ public:
 
   /// Sink for the same stream that may be retained beyond the service lifetime.
   std::shared_ptr<dapp_metrics_json_sink> metrics_json_sink() const noexcept;
+
+  /// [srs-sharing] E3 side of the E2SM-DAPP RAN function (dApp reports up to xApps, xApp controls down to dApps);
+  /// null without an E3AP SCTP endpoint. Usable after the service stops, but then inert.
+  std::shared_ptr<e2sm_dapp_bridge> e2_dapp_bridge() const noexcept;
 
   /// Stops management ingress and its job executor. Call only after DU producers have stopped.
   void stop() noexcept;

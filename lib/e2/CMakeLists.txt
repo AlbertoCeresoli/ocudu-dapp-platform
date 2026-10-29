@@ -49,3 +49,13 @@ add_library(ocudu_e2 STATIC ${SOURCES})
 target_link_libraries(ocudu_e2 e2ap_asn1 ocudu_support)
 
 target_include_directories(ocudu_e2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# [srs-sharing] E2SM-DAPP (SM ID 255): built when the dApp platform generates its asn1c codecs (lib/dapp), which
+# include the E2SM-DAPP one. OCUDU_E2SM_DAPP lets the DU E2 factory register it.
+if (TARGET ocudu_e2sm_dapp_asn1)
+  target_sources(ocudu_e2 PRIVATE
+          e2sm/e2sm_dapp/e2sm_dapp_asn1_packer.cpp
+          e2sm/e2sm_dapp/e2sm_dapp_impl.cpp)
+  target_link_libraries(ocudu_e2 ocudu_e2sm_dapp_asn1)
+  target_compile_definitions(ocudu_e2 PUBLIC OCUDU_E2SM_DAPP=1)
+endif ()

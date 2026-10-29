@@ -32,6 +32,12 @@ static void configure_cli11_e2_args(CLI::App&          app,
   add_option(app, "--e2sm_kpm_enabled", e2_params.e2sm_kpm_enabled, "Enable KPM service module")->capture_default_str();
   add_option(app, "--e2sm_rc_enabled", e2_params.e2sm_rc_enabled, "Enable RC service module")->capture_default_str();
   add_option(app, "--e2sm_ccc_enabled", e2_params.e2sm_ccc_enabled, "Enable CCC service module")->capture_default_str();
+  // [srs-sharing]
+  add_option(app,
+             "--e2sm_dapp_enabled",
+             e2_params.e2sm_dapp_enabled,
+             "Enable the E2SM-DAPP service module (E3 dApp reports to xApps, xApp controls to dApps; DU only)")
+      ->capture_default_str();
 }
 
 void ocudu::configure_cli11_with_e2_config_schema(CLI::App&          app,

@@ -37,6 +37,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -52,6 +53,7 @@
 #ifdef OCUDU_DAPP_APP_SERVICE_SCTP_E3
 #include "ocudu/dapp/e3/e3ap_sctp_server.h"
 #include "ocudu/dapp/e3/telemetry_publisher.h"
+#include "ocudu/e2/e2sm/e2sm_dapp.h" // [srs-sharing]
 #ifdef OCUDU_DAPP_E3DP_CARRIER
 #include "ocudu/dapp/e3/e3dp_sctp_server.h"
 #endif
@@ -1138,6 +1140,122 @@ ocudu_dapp_host_api_v1 make_host_api(prepared_output_broker& broker) noexcept
 
 } // namespace
 
+#ifdef OCUDU_DAPP_APP_SERVICE_SCTP_E3
+namespace {
+
+// [srs-sharing] E3 side of E2SM-DAPP (not in upstream). The E2 agent's E2SM-DAPP module turns E3 dApp reports into E2
+// indications and E2 controls into E3 xApp control actions; this class is all it sees of E3. The E2 agent belongs to
+// the DU and may be torn down after this service stops, so the server pointer is cleared in stop() (detach()) and
+// every use takes the mutex: after detach(), reports stop and controls fail instead of touching a stopped server.
+class e3_e2sm_dapp_bridge final : public e2sm_dapp_bridge
+{
+public:
+  e3_e2sm_dapp_bridge(dapp::e3::e3ap_sctp_server& server_, std::shared_ptr<dapp::e3::e3_connection_registry> connections_) :
+    server(&server_), connections(std::move(connections_))
+  {
+  }
+
+  /// Installs the E3 report handler; separate from the constructor because the handler holds a weak reference to
+  /// this object, which needs it to be owned by a shared_ptr first.
+  static std::shared_ptr<e3_e2sm_dapp_bridge> create(dapp::e3::e3ap_sctp_server&                       server,
+                                                     std::shared_ptr<dapp::e3::e3_connection_registry> connections)
+  {
+    auto bridge = std::make_shared<e3_e2sm_dapp_bridge>(server, std::move(connections));
+    server.set_dapp_report_handler(
+        [weak = std::weak_ptr<e3_e2sm_dapp_bridge>(bridge)](const dapp::e3::e3ap_dapp_report_event& event) {
+          if (auto self = weak.lock()) {
+            self->on_report(event);
+          }
+        });
+    return bridge;
+  }
+
+  void set_report_listener(std::function<void(e2sm_dapp_report)> listener_) override
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    listener = std::move(listener_);
+  }
+
+  bool send_control(uint32_t dapp_id, uint32_t e3_ran_function_id, std::vector<uint8_t> data) override
+  {
+    // E3 identifiers are 16 bits; E2SM-DAPP carries them in wider integers.
+    if (dapp_id > std::numeric_limits<uint16_t>::max() || e3_ran_function_id > std::numeric_limits<uint16_t>::max()) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    if (server == nullptr || !is_connected(dapp_id)) {
+      return false;
+    }
+    return server->send_xapp_control_action(
+        static_cast<uint16_t>(dapp_id), static_cast<uint16_t>(e3_ran_function_id), std::move(data));
+  }
+
+  std::vector<e2sm_dapp_subscription_item> subscriptions() const override
+  {
+    // One item per dApp that finished E3 setup, with its E3 RAN functions sorted and deduplicated (a dApp may hold
+    // several subscriptions on one RAN function, e.g. for different telemetry streams).
+    std::map<uint32_t, std::vector<uint32_t>> by_dapp;
+    if (connections != nullptr) {
+      for (const auto& record : connections->snapshot()) {
+        if (!record.setup_complete || !record.dapp_id) {
+          continue;
+        }
+        auto& ids = by_dapp[*record.dapp_id];
+        for (const auto& subscription : record.subscriptions) {
+          ids.push_back(subscription.ran_function_id);
+        }
+      }
+    }
+    std::vector<e2sm_dapp_subscription_item> items;
+    for (auto& [dapp_id, ids] : by_dapp) {
+      std::sort(ids.begin(), ids.end());
+      ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+      items.push_back({dapp_id, std::move(ids)});
+    }
+    return items;
+  }
+
+  void detach()
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    server = nullptr;
+    listener = nullptr;
+  }
+
+private:
+  void on_report(const dapp::e3::e3ap_dapp_report_event& event)
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (server == nullptr || !listener) {
+      return;
+    }
+    listener({event.dapp_identifier, event.ran_function_identifier, event.report_data});
+  }
+
+  /// The E3 server queues controls for unknown dApps and only counts them as dropped later; checking the registry
+  /// first lets the E2 control response report the failure.
+  bool is_connected(uint32_t dapp_id) const
+  {
+    if (connections == nullptr) {
+      return true;
+    }
+    for (const auto& record : connections->snapshot()) {
+      if (record.setup_complete && record.dapp_id && *record.dapp_id == dapp_id) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  mutable std::mutex                                mutex;
+  dapp::e3::e3ap_sctp_server*                       server;
+  std::shared_ptr<dapp::e3::e3_connection_registry> connections;
+  std::function<void(e2sm_dapp_report)>             listener;
+};
+
+} // namespace
+#endif
+
 namespace {
 
 struct started_initial_instance {
@@ -1174,6 +1292,7 @@ struct dapp_service::implementation {
   std::shared_ptr<dapp::e3::telemetry_publisher> telemetry;
   std::shared_ptr<dapp_metrics_json_sink>        telemetry_json;
   std::unique_ptr<dapp::e3::e3ap_sctp_server>    e3ap_server;
+  std::shared_ptr<e3_e2sm_dapp_bridge>           e2_dapp; // [srs-sharing]
 #ifdef OCUDU_DAPP_E3DP_CARRIER
   std::unique_ptr<dapp::e3::e3dp_sctp_server> e3dp_server;
 #endif
@@ -1843,6 +1962,7 @@ dapp_service_create_result dapp_service::create(dapp_service_config config) noex
         return {{}, "unable to start the E3AP SCTP endpoint: " + endpoint.detail};
       }
       service->e3ap_server = std::move(endpoint.server);
+      service->e2_dapp     = e3_e2sm_dapp_bridge::create(*service->e3ap_server, service->connections); // [srs-sharing]
     }
 #ifdef OCUDU_DAPP_E3DP_CARRIER
     if (config.e3dp_sctp) {
@@ -1966,6 +2086,15 @@ bool dapp_service::publish_metrics_json(std::string_view json) noexcept
 #endif
 }
 
+std::shared_ptr<e2sm_dapp_bridge> dapp_service::e2_dapp_bridge() const noexcept
+{
+#ifdef OCUDU_DAPP_APP_SERVICE_SCTP_E3
+  return state->e2_dapp;
+#else
+  return nullptr;
+#endif
+}
+
 std::shared_ptr<dapp_metrics_json_sink> dapp_service::metrics_json_sink() const noexcept
 {
 #ifdef OCUDU_DAPP_APP_SERVICE_SCTP_E3
@@ -1986,6 +2115,9 @@ void dapp_service::stop() noexcept
     state->e3dp_server->stop();
   }
 #endif
+  if (state->e2_dapp) {
+    state->e2_dapp->detach(); // [srs-sharing]
+  }
   if (state->e3ap_server) {
     state->e3ap_server->stop();
   }

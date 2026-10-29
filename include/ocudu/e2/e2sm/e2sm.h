@@ -12,10 +12,11 @@
 #include "ocudu/support/async/async_task.h"
 #include <map>
 #include <variant>
+#include <vector>
 
 namespace ocudu {
 
-enum e2sm_service_model_t { KPM, RC, CCC, UNKNOWN_SM };
+enum e2sm_service_model_t { KPM, RC, CCC, DAPP /* [srs-sharing] E2SM-DAPP */, UNKNOWN_SM };
 
 struct e2sm_event_trigger_definition {
   enum e2sm_ric_service_type_t { REPORT, INSERT, POLICY, UNKNOWN };
@@ -23,9 +24,27 @@ struct e2sm_event_trigger_definition {
   uint64_t                report_period;
 };
 
+/// [srs-sharing] E2SM-DAPP action definition: only the report style (1 = E3 data reports, 2 = dApp subscription map).
+struct e2sm_dapp_action_definition {
+  uint32_t ric_style_type = 0;
+};
+
+/// [srs-sharing] E2SM-DAPP control header (format 1) and message (format 1): which dApp and E3 RAN function the
+/// control is for, and its opaque payload.
+struct e2sm_dapp_ctrl_hdr {
+  uint32_t e3_ran_function_id = 0;
+  uint32_t dapp_id            = 0;
+};
+struct e2sm_dapp_ctrl_msg {
+  std::vector<uint8_t> data;
+};
+
 struct e2sm_action_definition {
   e2sm_service_model_t                                                                            service_model;
-  std::variant<asn1::e2sm::e2sm_kpm_action_definition_s, asn1::e2sm::e2sm_rc_action_definition_s> action_definition;
+  std::variant<asn1::e2sm::e2sm_kpm_action_definition_s,
+               asn1::e2sm::e2sm_rc_action_definition_s,
+               e2sm_dapp_action_definition>
+      action_definition;
 };
 
 struct e2sm_ric_control_request {
@@ -33,8 +52,8 @@ struct e2sm_ric_control_request {
   bool                 ric_call_process_id_present  = false;
   bool                 ric_ctrl_ack_request_present = false;
   uint64_t             ric_call_process_id;
-  std::variant<asn1::e2sm::e2sm_rc_ctrl_hdr_s, asn1::e2sm_ccc::ric_ctrl_hdr_s> request_ctrl_hdr;
-  std::variant<asn1::e2sm::e2sm_rc_ctrl_msg_s, asn1::e2sm_ccc::ric_ctrl_msg_s> request_ctrl_msg;
+  std::variant<asn1::e2sm::e2sm_rc_ctrl_hdr_s, asn1::e2sm_ccc::ric_ctrl_hdr_s, e2sm_dapp_ctrl_hdr> request_ctrl_hdr;
+  std::variant<asn1::e2sm::e2sm_rc_ctrl_msg_s, asn1::e2sm_ccc::ric_ctrl_msg_s, e2sm_dapp_ctrl_msg> request_ctrl_msg;
   bool                                                                         ric_ctrl_ack_request;
 };
 

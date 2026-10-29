@@ -6,11 +6,13 @@
 
 #include "ocudu/du/du_high/du_high_configuration.h"
 #include "ocudu/e2/e2ap_configuration.h"
+#include <memory>
 
 namespace ocudu {
 
 class e2_du_metrics_interface;
 class e2_connection_client;
+class e2sm_dapp_bridge; // [srs-sharing]
 
 namespace fapi {
 class p5_requests_gateway;
@@ -49,6 +51,8 @@ struct o_du_high_dependencies {
   du_high_dependencies                       du_hi;
   e2_connection_client*                      e2_client          = nullptr;
   e2_du_metrics_interface*                   e2_du_metric_iface = nullptr;
+  /// [srs-sharing] E3 side of E2SM-DAPP, provided by the dApp service; null without one.
+  std::shared_ptr<e2sm_dapp_bridge> e2_dapp_bridge;
 };
 
 } // namespace odu
