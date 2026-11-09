@@ -59,6 +59,9 @@ struct srs_builder_params {
   unsigned sequence_id_reuse_factor = 1;
   /// \c p0, TS 38.331. Value in dBm. Only even values allowed within {-202,...,24}.
   int p0 = -84;
+  /// [srs-sharing] Upper bound on the SRS antenna ports configured to a UE (\c nrofSRS-Ports, TS 38.331); the UE's
+  /// capability is used up to it. With codebook-based PUSCH it also caps the uplink rank. Values: {1, 2, 4}.
+  unsigned max_nof_ports = 4;
 };
 
 } // namespace ocudu

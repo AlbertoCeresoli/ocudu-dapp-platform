@@ -102,9 +102,12 @@ void du_pusch_resource_manager::apply_config(cell_group_config&                 
   const du_cell_index_t cell_idx  = pcell_cfg.serv_cell_cfg.cell_index;
 
   set_pusch_mcs_table(pcell_cfg.serv_cell_cfg, select_mcs_table(cell_idx, ue_caps));
+  // [srs-sharing] With codebook-based PUSCH the SRS resource's ports are the PUSCH antenna ports (TS 38.214, Section
+  // 6.1.1.1), so the rank cannot exceed them: a cell capped to fewer SRS ports also caps the rank.
+  const unsigned nof_srs_ports = select_srs_nof_ports(cell_idx, ue_caps);
   set_ul_mimo(pcell_cfg,
-              select_max_rank(cell_idx, ue_caps),
-              select_srs_nof_ports(cell_idx, ue_caps),
+              std::min(select_max_rank(cell_idx, ue_caps), nof_srs_ports),
+              nof_srs_ports,
               select_tx_codebook_subset(cell_idx, ue_caps));
   set_max_ul_nof_harqs(pcell_cfg.serv_cell_cfg, select_max_nof_harqs(cell_idx, ue_caps));
   set_ul_dci_harq_num_field_size(pcell_cfg.serv_cell_cfg, select_dci_harq_field_size(cell_idx, ue_caps));
@@ -158,12 +161,14 @@ unsigned du_pusch_resource_manager::select_srs_nof_ports(du_cell_index_t        
                                                          const std::optional<ue_capability_summary>& ue_caps) const
 {
   nr_band band = cell_cfg_list[cell_idx].ran.ul_carrier.band;
+  // [srs-sharing] The cell's cap (srs: max_nof_ports in the gNB config) bounds what the UE's capability allows.
+  const unsigned cell_max = cell_cfg_list[cell_idx].ran.init_bwp.srs_cfg.max_nof_ports;
 
   if (not ue_caps.has_value() || ue_caps->bands.count(band) == 0) {
-    return ue_capability_summary::default_nof_srs_tx_ports;
+    return std::min(static_cast<unsigned>(ue_capability_summary::default_nof_srs_tx_ports), cell_max);
   }
 
-  return ue_caps->bands.at(band).nof_srs_tx_ports;
+  return std::min(static_cast<unsigned>(ue_caps->bands.at(band).nof_srs_tx_ports), cell_max);
 }
 
 unsigned du_pusch_resource_manager::select_max_rank(du_cell_index_t                             cell_idx,

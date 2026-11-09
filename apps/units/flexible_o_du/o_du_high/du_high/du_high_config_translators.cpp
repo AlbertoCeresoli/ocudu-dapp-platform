@@ -1054,6 +1054,7 @@ std::vector<odu::du_cell_config> ocudu::generate_du_cell_config(const du_high_un
     du_srs_cfg.cyclic_shift_reuse_factor = static_cast<nof_cyclic_shifts>(user_srs_cfg.cyclic_shift_reuse_factor);
     du_srs_cfg.sequence_id_reuse_factor  = user_srs_cfg.sequence_id_reuse_factor;
     du_srs_cfg.p0                        = user_srs_cfg.p0;
+    du_srs_cfg.max_nof_ports             = user_srs_cfg.max_nof_ports;  // [srs-sharing]
 
     // Parameters for Configured Grant.
     const du_high_configured_grants& user_cg_cfg = base_cell.cg_cfg;

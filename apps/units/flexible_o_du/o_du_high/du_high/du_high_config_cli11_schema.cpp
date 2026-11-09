@@ -1491,6 +1491,13 @@ static void configure_cli11_srs_args(CLI::App& app, du_high_unit_srs_config& srs
              "Enable the reuse of SRS sequence id with the set reuse factor")
       ->capture_default_str()
       ->check(CLI::IsMember({1, 2, 3, 5, 6, 10, 15, 30}));
+  // [srs-sharing] Cap on the SRS ports per UE (the UE's capability is used up to it); 1 also caps the uplink rank.
+  add_option(app,
+             "--max_nof_ports",
+             srs_params.max_nof_ports,
+             "Maximum number of SRS antenna ports configured to a UE (also caps the PUSCH rank)")
+      ->capture_default_str()
+      ->check(CLI::IsMember({1, 2, 4}));
   add_option_function<std::string>(
       app,
       "--p0",

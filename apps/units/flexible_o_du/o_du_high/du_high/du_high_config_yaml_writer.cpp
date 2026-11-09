@@ -641,6 +641,7 @@ static YAML::Node build_du_high_srs_section(const du_high_unit_srs_config& confi
   node["cyclic_shift_reuse"]   = config.cyclic_shift_reuse_factor;
   node["sequence_id_reuse"]    = config.sequence_id_reuse_factor;
   node["p0"]                   = config.p0;
+  node["max_nof_ports"]        = config.max_nof_ports;  // [srs-sharing]
 
   return node;
 }
