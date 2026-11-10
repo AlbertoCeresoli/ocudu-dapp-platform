@@ -46,6 +46,12 @@ extern "C" {
 #define OCUDU_DAPP_PROCESS_MANAGEMENT_GET_CONFIG_V1 2u
 #define OCUDU_DAPP_PROCESS_MANAGEMENT_SET_CONFIG_V1 3u
 #define OCUDU_DAPP_PROCESS_MANAGEMENT_MODEL_V1 4u
+/// [srs-sharing] A worker's own metrics, relayed like its configuration so that an out-of-process instance exposes
+/// them over E3 management as a native one does. Paged: request.item_offset is the first item; response.count the items
+/// in this response (one descriptor, or up to MAX_ENTRIES samples in payload.entries as name + value), response.flags
+/// MORE when items follow, and response.resulting_generation carries the total number of metrics.
+#define OCUDU_DAPP_PROCESS_MANAGEMENT_DESCRIBE_METRICS_V1 5u
+#define OCUDU_DAPP_PROCESS_MANAGEMENT_READ_METRICS_V1 6u
 #define OCUDU_DAPP_PROCESS_MANAGEMENT_DRY_RUN_V1 (UINT32_C(1) << 0u)
 #define OCUDU_DAPP_PROCESS_MANAGEMENT_MORE_V1 (UINT32_C(1) << 1u)
 #define OCUDU_DAPP_PROCESS_MANAGEMENT_MAX_ENTRIES_V1 4u
@@ -55,6 +61,9 @@ extern "C" {
 #define OCUDU_DAPP_PROCESS_MANAGEMENT_MODEL_ID_BYTES_V1 129u
 #define OCUDU_DAPP_PROCESS_MANAGEMENT_MODEL_VERSION_BYTES_V1 65u
 #define OCUDU_DAPP_PROCESS_MANAGEMENT_DETAIL_BYTES_V1 193u
+#define OCUDU_DAPP_PROCESS_MANAGEMENT_UNIT_BYTES_V1 33u // [srs-sharing] metric unit
+/// [srs-sharing] Upper bound on the metrics a worker may relay (keeps host storage and paging bounded).
+#define OCUDU_DAPP_PROCESS_MANAGEMENT_MAX_METRICS_V1 256u
 #define OCUDU_DAPP_ROUTE_DESCRIPTOR_DATA_V1 0u
 #define OCUDU_DAPP_ROUTE_DESCRIPTOR_NOTIFICATION_V1 1u
 #define OCUDU_DAPP_ROUTE_DESCRIPTOR_COMPLETION_V1 2u
@@ -202,9 +211,20 @@ typedef struct {
   uint64_t                           reserved[4];
 } ocudu_dapp_process_management_request_v1;
 
+/// [srs-sharing] One metric of a worker's catalog (DESCRIBE_METRICS).
+typedef struct {
+  char     name[OCUDU_DAPP_PROCESS_MANAGEMENT_KEY_BYTES_V1];
+  char     description[OCUDU_DAPP_PROCESS_MANAGEMENT_DESCRIPTION_BYTES_V1];
+  char     unit[OCUDU_DAPP_PROCESS_MANAGEMENT_UNIT_BYTES_V1];
+  uint32_t value_kind;
+  uint32_t flags;
+  uint64_t reserved[2];
+} ocudu_dapp_process_metric_descriptor_v1;
+
 typedef union {
   ocudu_dapp_process_config_descriptor_v1 descriptor;
   ocudu_dapp_process_config_entry_v1      entries[OCUDU_DAPP_PROCESS_MANAGEMENT_MAX_ENTRIES_V1];
+  ocudu_dapp_process_metric_descriptor_v1 metric_descriptor; // [srs-sharing] DESCRIBE_METRICS
 } ocudu_dapp_process_management_payload_v1;
 
 typedef struct {

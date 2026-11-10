@@ -111,7 +111,7 @@ bool all_zero(const uint64_t* values, std::size_t count) noexcept
 bool valid_management_operation(uint32_t operation) noexcept
 {
   return operation >= OCUDU_DAPP_PROCESS_MANAGEMENT_DESCRIBE_CONFIG_V1 &&
-         operation <= OCUDU_DAPP_PROCESS_MANAGEMENT_MODEL_V1;
+         operation <= OCUDU_DAPP_PROCESS_MANAGEMENT_READ_METRICS_V1; // [srs-sharing] metrics operations 5 and 6
 }
 
 bool valid_management_request(const ocudu_dapp_process_management_request_v1& request,
@@ -191,6 +191,36 @@ bool valid_management_response(const ocudu_dapp_process_management_response_v1& 
            all_zero(item.reserved, std::size(item.reserved)) &&
            ((response.flags & OCUDU_DAPP_PROCESS_MANAGEMENT_MORE_V1) != 0) ==
                (request.item_offset + 1 < response.count);
+  }
+  // [srs-sharing] Metrics: count = items in this page, resulting_generation = total, MORE iff items follow.
+  if (request.operation == OCUDU_DAPP_PROCESS_MANAGEMENT_DESCRIBE_METRICS_V1 ||
+      request.operation == OCUDU_DAPP_PROCESS_MANAGEMENT_READ_METRICS_V1) {
+    const uint64_t total = response.resulting_generation;
+    if (total > OCUDU_DAPP_PROCESS_MANAGEMENT_MAX_METRICS_V1) {
+      return false;
+    }
+    const uint64_t remaining = request.item_offset < total ? total - request.item_offset : 0;
+    const bool     describe  = request.operation == OCUDU_DAPP_PROCESS_MANAGEMENT_DESCRIBE_METRICS_V1;
+    const uint64_t expected =
+        std::min<uint64_t>(remaining, describe ? 1 : OCUDU_DAPP_PROCESS_MANAGEMENT_MAX_ENTRIES_V1);
+    if (response.count != expected ||
+        ((response.flags & OCUDU_DAPP_PROCESS_MANAGEMENT_MORE_V1) != 0) != (request.item_offset + expected < total)) {
+      return false;
+    }
+    if (describe) {
+      const auto& item = response.payload.metric_descriptor;
+      return expected == 0 || (terminated(item.name) && item.name[0] != '\0' && terminated(item.description) &&
+                               terminated(item.unit) && item.value_kind >= OCUDU_DAPP_VALUE_BOOL_V1 &&
+                               item.value_kind <= OCUDU_DAPP_VALUE_BYTES_V1 &&
+                               all_zero(item.reserved, std::size(item.reserved)));
+    }
+    for (uint32_t index = 0; index != response.count; ++index) {
+      const auto& item = response.payload.entries[index];
+      if (!terminated(item.key) || item.key[0] == '\0' || !valid_value(item.value)) {
+        return false;
+      }
+    }
+    return true;
   }
   if (request.operation == OCUDU_DAPP_PROCESS_MANAGEMENT_GET_CONFIG_V1) {
     if (response.resulting_generation == 0 || response.flags != 0) {

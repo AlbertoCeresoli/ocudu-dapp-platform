@@ -506,17 +506,74 @@ management_call_result class_c_process_instance::set_config(const ocudu_dapp_con
   return {result(managed.operation.status, managed.operation.detail.c_str()), 0, managed.response.resulting_generation};
 }
 
+// [srs-sharing] Pages the worker's metric catalog in (one descriptor per request). A worker that does not answer
+// (an older SDK, or no metrics in its management table) simply has none: the host's counters are still returned.
+void class_c_process_instance::fetch_worker_metric_descriptors_locked()
+{
+  worker_metric_descriptors.clear();
+  if (supervisor == nullptr) {
+    return;
+  }
+  ocudu_dapp_process_management_request_v1 request{};
+  request.struct_size = sizeof(request);
+  request.operation   = OCUDU_DAPP_PROCESS_MANAGEMENT_DESCRIBE_METRICS_V1;
+  for (uint32_t index = 0;; ++index) {
+    request.item_offset = index;
+    auto managed        = supervisor->manage(request);
+    if (!managed.operation || managed.response.status != OCUDU_DAPP_OK_V1 || managed.response.count != 1) {
+      if (index == 0 || !managed.operation) {
+        worker_metric_descriptors.clear();
+      }
+      return;
+    }
+    worker_metric_descriptors.push_back(managed.response.payload.metric_descriptor);
+    if ((managed.response.flags & OCUDU_DAPP_PROCESS_MANAGEMENT_MORE_V1) == 0 ||
+        worker_metric_descriptors.size() >= OCUDU_DAPP_PROCESS_MANAGEMENT_MAX_METRICS_V1) {
+      return;
+    }
+  }
+}
+
+// [srs-sharing] Pages the worker's metric values in (up to MAX_ENTRIES per request).
+void class_c_process_instance::fetch_worker_metric_samples_locked()
+{
+  worker_metric_samples.clear();
+  if (supervisor == nullptr) {
+    return;
+  }
+  ocudu_dapp_process_management_request_v1 request{};
+  request.struct_size = sizeof(request);
+  request.operation   = OCUDU_DAPP_PROCESS_MANAGEMENT_READ_METRICS_V1;
+  for (uint32_t offset = 0;;) {
+    request.item_offset = offset;
+    auto managed        = supervisor->manage(request);
+    if (!managed.operation || managed.response.status != OCUDU_DAPP_OK_V1) {
+      worker_metric_samples.clear();
+      return;
+    }
+    for (uint32_t index = 0; index != managed.response.count; ++index) {
+      worker_metric_samples.push_back(managed.response.payload.entries[index]);
+    }
+    offset += managed.response.count;
+    if ((managed.response.flags & OCUDU_DAPP_PROCESS_MANAGEMENT_MORE_V1) == 0 || managed.response.count == 0 ||
+        worker_metric_samples.size() >= OCUDU_DAPP_PROCESS_MANAGEMENT_MAX_METRICS_V1) {
+      return;
+    }
+  }
+}
+
 management_call_result class_c_process_instance::describe_metrics(ocudu_dapp_metric_descriptor_v1* descriptors,
                                                                   uint32_t                         capacity)
 {
   std::lock_guard<std::mutex> lock(management_mutex);
   refresh_locked();
+  fetch_worker_metric_descriptors_locked(); // [srs-sharing]
+  const auto total = static_cast<uint32_t>(process_metrics.size() + worker_metric_descriptors.size());
   if (descriptors == nullptr) {
-    return {result(OCUDU_DAPP_OK_V1), process_metrics.size(), 0};
+    return {result(OCUDU_DAPP_OK_V1), total, 0};
   }
-  if (capacity < process_metrics.size()) {
-    return {
-        result(OCUDU_DAPP_RESOURCE_V1, "process metric descriptor capacity is too small"), process_metrics.size(), 0};
+  if (capacity < total) {
+    return {result(OCUDU_DAPP_RESOURCE_V1, "process metric descriptor capacity is too small"), total, 0};
   }
   for (std::size_t index = 0; index != process_metrics.size(); ++index) {
     descriptors[index]             = {};
@@ -527,18 +584,31 @@ management_call_result class_c_process_instance::describe_metrics(ocudu_dapp_met
     descriptors[index].value_kind  = OCUDU_DAPP_VALUE_UINT64_V1;
     descriptors[index].flags       = process_metrics[index].flags;
   }
-  return {result(OCUDU_DAPP_OK_V1), process_metrics.size(), 0};
+  for (std::size_t index = 0; index != worker_metric_descriptors.size(); ++index) { // [srs-sharing]
+    const auto& wire = worker_metric_descriptors[index];
+    auto&       out  = descriptors[process_metrics.size() + index];
+    out              = {};
+    out.struct_size  = sizeof(out);
+    out.name         = wire.name;
+    out.description  = wire.description;
+    out.unit         = wire.unit;
+    out.value_kind   = wire.value_kind;
+    out.flags        = wire.flags;
+  }
+  return {result(OCUDU_DAPP_OK_V1), total, 0};
 }
 
 management_call_result class_c_process_instance::read_metrics(ocudu_dapp_metric_sample_v1* samples, uint32_t capacity)
 {
   std::lock_guard<std::mutex> lock(management_mutex);
   refresh_locked();
+  fetch_worker_metric_samples_locked(); // [srs-sharing]
+  const auto total = static_cast<uint32_t>(process_metrics.size() + worker_metric_samples.size());
   if (samples == nullptr) {
-    return {result(OCUDU_DAPP_OK_V1), process_metrics.size(), 0};
+    return {result(OCUDU_DAPP_OK_V1), total, 0};
   }
-  if (capacity < process_metrics.size()) {
-    return {result(OCUDU_DAPP_RESOURCE_V1, "process metric sample capacity is too small"), process_metrics.size(), 0};
+  if (capacity < total) {
+    return {result(OCUDU_DAPP_RESOURCE_V1, "process metric sample capacity is too small"), total, 0};
   }
   const auto snapshot = supervisor != nullptr ? supervisor->snapshot() : class_c_process_snapshot{};
   const std::array<uint64_t, process_metrics.size()> values{{
@@ -591,7 +661,14 @@ management_call_result class_c_process_instance::read_metrics(ocudu_dapp_metric_
     samples[index].value                  = unsigned_value(values[index]);
     samples[index].monotonic_timestamp_ns = timestamp;
   }
-  return {result(OCUDU_DAPP_OK_V1), process_metrics.size(), 0};
+  for (std::size_t index = 0; index != worker_metric_samples.size(); ++index) { // [srs-sharing]
+    auto& out                  = samples[process_metrics.size() + index];
+    out                        = {};
+    out.name                   = worker_metric_samples[index].key;
+    out.value                  = decode_value(worker_metric_samples[index].value);
+    out.monotonic_timestamp_ns = timestamp;
+  }
+  return {result(OCUDU_DAPP_OK_V1), total, 0};
 }
 
 management_call_result class_c_process_instance::manage_model(const ocudu_dapp_model_request_v1& model)

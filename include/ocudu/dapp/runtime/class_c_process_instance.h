@@ -9,6 +9,7 @@
 #include "lifecycle.h"
 #include <array>
 #include <memory>
+#include <vector>
 #include <mutex>
 
 namespace ocudu::dapp {
@@ -79,6 +80,12 @@ private:
   std::array<ocudu_dapp_process_config_descriptor_v1, OCUDU_DAPP_PROCESS_MANAGEMENT_MAX_ENTRIES_V1>
                                                                                                descriptor_storage{};
   std::array<ocudu_dapp_process_config_entry_v1, OCUDU_DAPP_PROCESS_MANAGEMENT_MAX_ENTRIES_V1> config_storage{};
+  // [srs-sharing] The worker's own metrics, relayed after the host's process counters (DESCRIBE/READ_METRICS). The
+  // descriptors and samples handed out point into this storage, valid until the next metrics call.
+  void fetch_worker_metric_descriptors_locked();
+  void fetch_worker_metric_samples_locked();
+  std::vector<ocudu_dapp_process_metric_descriptor_v1> worker_metric_descriptors;
+  std::vector<ocudu_dapp_process_config_entry_v1>      worker_metric_samples;
 };
 
 } // namespace ocudu::dapp
